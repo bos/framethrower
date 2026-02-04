@@ -1,0 +1,56 @@
+name: Screencast
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    macOS: '14.0'
+  xcodeVersion: '15.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.9'
+    SWIFT_STRICT_CONCURRENCY: complete
+    CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED: YES
+    CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION: YES_AGGRESSIVE
+    GCC_TREAT_WARNINGS_AS_ERRORS: YES
+    WARN_SWIFT3_OBJC_INFERENCE: YES
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+    SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
+    SWIFT_UPCOMING_FEATURE_EXISTENTIAL_ANY: YES
+    SWIFT_UPCOMING_FEATURE_GLOBAL_CONCURRENCY: YES
+    SWIFT_UPCOMING_FEATURE_IMPLICIT_OPEN_EXISTENTIALS: YES
+    SWIFT_UPCOMING_FEATURE_ISOLATED_DEFAULT_VALUES: YES
+    SWIFT_UPCOMING_FEATURE_REGION_BASED_ISOLATION: YES
+    SWIFT_UPCOMING_FEATURE_STRICT_CONCURRENCY: YES
+    SWIFT_UPCOMING_FEATURE_BARE_SLASH_REGEX_LITERALS: YES
+    SWIFT_UPCOMING_FEATURE_FORWARD_TRAILING_CLOSURES: YES
+    SWIFT_UPCOMING_FEATURE_IMPORT_OBJC_FORWARD_DECLARATIONS: YES
+    SWIFT_UPCOMING_FEATURE_DISABLE_OUTWARD_ACTOR_ISOLATION: YES
+    SWIFT_UPCOMING_FEATURE_CONSUMING_ARGUMENTS: YES
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  Screencast:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      - path: Resources
+        type: folder
+    entitlements:
+      path: Resources/Screencast.entitlements
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Screencast
+        CFBundleName: Screencast
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: 1
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.screencast
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        MACOSX_DEPLOYMENT_TARGET: '14.0'
+    dependencies: []

@@ -83,7 +83,9 @@ struct ContentView: View {
         GroupBox("Google Drive") {
             VStack(alignment: .leading, spacing: 12) {
                 TextField("Client ID", text: $model.clientID)
-                TextField("Redirect URI", text: $model.redirectURI)
+                SecureField("Client Secret", text: $model.clientSecret)
+                TextField("Redirect URI (read-only)", text: $model.redirectURI)
+                    .disabled(true)
 
                 HStack(spacing: 12) {
                     Button(model.isAuthorized ? "Re-authorize" : "Authorize") {
@@ -102,8 +104,9 @@ struct ContentView: View {
                 }
 
                 Text(
-                    "Use an OAuth client ID for a macOS app and a custom redirect URI, " +
-                    "for example: com.googleusercontent.apps.YOUR_CLIENT_ID:/oauth"
+                    "Use an OAuth desktop client. Paste the client ID and client secret. " +
+                    "The app will use a loopback redirect and fill it in after " +
+                    "authorization."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

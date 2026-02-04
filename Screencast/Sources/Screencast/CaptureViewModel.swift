@@ -18,6 +18,7 @@ final class CaptureViewModel: ObservableObject {
 
     @AppStorage("drive.clientID") var clientID: String = ""
     @AppStorage("drive.redirectURI") var redirectURI: String = ""
+    @AppStorage("drive.clientSecret") var clientSecret: String = ""
 
     private let recorder = ScreenRecorder()
     private let uploader = DriveUploader()
@@ -58,17 +59,24 @@ final class CaptureViewModel: ObservableObject {
             statusMessage = "Enter a Google OAuth client ID."
             return
         }
+        guard !clientSecret.isEmpty else {
+            statusMessage = "Enter the Google OAuth client secret for your desktop client."
+            return
+        }
 
-        let redirect = redirectURI.isEmpty ? "com.example.screencast:/oauth" : redirectURI
+        let redirect = "http://127.0.0.1:0/oauth"
         let config = OAuthConfig(
             clientID: clientID,
             redirectURI: redirect,
-            scopes: ["https://www.googleapis.com/auth/drive.file"]
+            scopes: ["https://www.googleapis.com/auth/drive"],
+            clientSecret: clientSecret
         )
 
         do {
             let client = OAuthClient(config: config)
-            tokens = try await client.authorize()
+            let (newTokens, redirect) = try await client.authorize()
+            tokens = newTokens
+            redirectURI = redirect
             statusMessage = "Signed in to Google Drive."
         } catch {
             statusMessage = "Auth failed: \(error.localizedDescription)"
@@ -89,7 +97,7 @@ final class CaptureViewModel: ObservableObject {
 
         do {
             let filter = try selectedFilter()
-            let configuration = try makeConfiguration()
+            let configuration = try makeConfiguration(filter: filter)
             let outputURL = try makeOutputURL()
 
             try await recorder.start(
@@ -151,39 +159,51 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    private func makeConfiguration() throws -> SCStreamConfiguration {
+    private func makeConfiguration(filter: SCContentFilter) throws -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = true
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.queueDepth = 6
+        let scale = Double(filter.pointPixelScale)
+        let pixelSize: (Double) -> Int = { points in
+            let raw = max(2, Int((points * scale).rounded()))
+            return raw % 2 == 0 ? raw : raw - 1
+        }
 
         switch captureKind {
         case .window:
             guard let id = selectedWindowID,
-                  let selected = windows.first(where: { $0.id == id }) else {
+                  windows.contains(where: { $0.id == id }) else {
                 throw URLError(.badURL)
             }
-            configuration.width = Int(selected.window.frame.width)
-            configuration.height = Int(selected.window.frame.height)
+            configuration.width = pixelSize(filter.contentRect.width)
+            configuration.height = pixelSize(filter.contentRect.height)
         case .display:
             guard let id = selectedDisplayID,
-                  let selected = displays.first(where: { $0.id == id }) else {
+                  displays.contains(where: { $0.id == id }) else {
                 throw URLError(.badURL)
             }
-            configuration.width = Int(selected.display.frame.width)
-            configuration.height = Int(selected.display.frame.height)
+            configuration.width = pixelSize(filter.contentRect.width)
+            configuration.height = pixelSize(filter.contentRect.height)
         case .area:
             guard let id = selectedDisplayID,
                   let selected = displays.first(where: { $0.id == id }) else {
                 throw URLError(.badURL)
             }
-            configuration.width = Int(area.width)
-            configuration.height = Int(area.height)
+            let displayFrame = selected.display.frame
+            let requested = CGRect(x: area.x, y: area.y, width: area.width, height: area.height)
+            let clamped = requested.intersection(displayFrame)
+            guard clamped.width >= 2, clamped.height >= 2 else {
+                throw URLError(.dataNotAllowed)
+            }
+            configuration.width = pixelSize(clamped.width)
+            configuration.height = pixelSize(clamped.height)
             if #available(macOS 14.0, *) {
-                configuration.sourceRect = area.rect
+                configuration.sourceRect = clamped
             } else {
-                configuration.width = Int(selected.display.frame.width)
-                configuration.height = Int(selected.display.frame.height)
+                configuration.width = pixelSize(filter.contentRect.width)
+                configuration.height = pixelSize(filter.contentRect.height)
             }
         }
 
@@ -191,8 +211,10 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func makeOutputURL() throws -> URL {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withDashSeparatorInDate]
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
         let filename = "Screencast-\(formatter.string(from: Date())).mp4"
 
         let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)
@@ -209,11 +231,18 @@ final class CaptureViewModel: ObservableObject {
             return current.accessToken
         }
 
-        let redirect = redirectURI.isEmpty ? "com.example.screencast:/oauth" : redirectURI
+        guard !clientSecret.isEmpty else {
+            throw OAuthClientError.serverError(
+                message: "Missing Google OAuth client secret."
+            )
+        }
+
+        let redirect = "http://127.0.0.1:0/oauth"
         let config = OAuthConfig(
             clientID: clientID,
             redirectURI: redirect,
-            scopes: ["https://www.googleapis.com/auth/drive.file"]
+            scopes: ["https://www.googleapis.com/auth/drive"],
+            clientSecret: clientSecret
         )
 
         let client = OAuthClient(config: config)

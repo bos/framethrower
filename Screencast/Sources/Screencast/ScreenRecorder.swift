@@ -2,84 +2,135 @@ import AVFoundation
 import Foundation
 import ScreenCaptureKit
 
-final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    private let videoQueue = DispatchQueue(label: "screencast.video.queue")
+final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, @unchecked Sendable {
+    private let callbackQueue = DispatchQueue(label: "screencast.recording.queue")
 
     private var stream: SCStream?
-    private var assetWriter: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var sessionStarted = false
+    private var recordingOutput: SCRecordingOutput?
+    private var outputURL: URL?
+    private var didStartRecording = false
+
+    private var finishContinuation: CheckedContinuation<Void, any Error>?
+    private var pendingFinishError: (any Error)?
+    private var didFinish = false
+
+    enum RecorderError: LocalizedError {
+        case noFramesCaptured
+        case writerFailed((any Error)?)
+
+        var errorDescription: String? {
+            switch self {
+            case .noFramesCaptured:
+                return "No frames were captured. Try recording again."
+            case let .writerFailed(error):
+                return error?.localizedDescription ?? "Recording failed."
+            }
+        }
+    }
 
     func start(
         filter: SCContentFilter,
         configuration: SCStreamConfiguration,
         outputURL: URL
     ) async throws {
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: configuration.width,
-            AVVideoHeightKey: configuration.height
-        ]
+        let recordingConfiguration = SCRecordingOutputConfiguration()
+        recordingConfiguration.outputURL = outputURL
+        recordingConfiguration.outputFileType = .mp4
+        recordingConfiguration.videoCodecType = .h264
 
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        input.expectsMediaDataInRealTime = true
+        let recordingOutput = SCRecordingOutput(
+            configuration: recordingConfiguration,
+            delegate: self
+        )
 
-        guard writer.canAdd(input) else {
-            throw URLError(.cannotCreateFile)
-        }
+        try stream.addRecordingOutput(recordingOutput)
 
-        writer.add(input)
-        assetWriter = writer
-        videoInput = input
-        sessionStarted = false
+        didStartRecording = false
+        self.outputURL = outputURL
+        pendingFinishError = nil
+        didFinish = false
 
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
         try await stream.startCapture()
         self.stream = stream
+        self.recordingOutput = recordingOutput
     }
 
     func stop() async throws {
         guard let stream else { return }
-        try await stream.stopCapture()
-        self.stream = nil
+        do {
+            try await stream.stopCapture()
+        } catch {
+            print("Stop capture reported error: \(error)")
+        }
 
-        await withCheckedContinuation { continuation in
-            videoInput?.markAsFinished()
-            assetWriter?.finishWriting {
-                continuation.resume()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            callbackQueue.async {
+                if self.didFinish {
+                    if let error = self.pendingFinishError {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                    self.didFinish = false
+                    self.pendingFinishError = nil
+                    return
+                }
+                self.finishContinuation = continuation
             }
         }
-        assetWriter = nil
-        videoInput = nil
-    }
 
-    func stream(
-        _ stream: SCStream,
-        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-        of type: SCStreamOutputType
-    ) {
-        guard type == .screen else { return }
-        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
-        guard let writer = assetWriter, let input = videoInput else { return }
+        self.stream = nil
 
-        if !sessionStarted {
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            writer.startWriting()
-            writer.startSession(atSourceTime: time)
-            sessionStarted = true
+        if !didStartRecording {
+            await cleanupFailedRecording()
+            throw RecorderError.noFramesCaptured
         }
 
-        guard input.isReadyForMoreMediaData else { return }
-        input.append(sampleBuffer)
+        if let outputURL,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: outputURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.intValue == 0 {
+            await cleanupFailedRecording()
+            throw RecorderError.noFramesCaptured
+        }
+
+        recordingOutput = nil
+        self.outputURL = nil
     }
 
-    func stream(
-        _ stream: SCStream,
-        didStopWithError error: any Error
-    ) {
-        print("Stream stopped with error: \(error)")
+    private func cleanupFailedRecording() async {
+        if let outputURL {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+    }
+
+    func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
+        didStartRecording = true
+    }
+
+    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: any Error) {
+        finishRecording(error: error)
+    }
+
+    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
+        finishRecording(error: nil)
+    }
+
+    private func finishRecording(error: (any Error)?) {
+        callbackQueue.async {
+            if let continuation = self.finishContinuation {
+                self.finishContinuation = nil
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+                return
+            }
+            self.pendingFinishError = error
+            self.didFinish = true
+        }
     }
 }

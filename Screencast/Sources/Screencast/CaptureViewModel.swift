@@ -16,13 +16,18 @@ final class CaptureViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var lastRecordingURL: URL?
 
-    @AppStorage("drive.clientID") var clientID: String = ""
-    @AppStorage("drive.redirectURI") var redirectURI: String = ""
-    @AppStorage("drive.clientSecret") var clientSecret: String = ""
+    private var clientID: String {
+        Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
+    }
+
+    private var clientSecret: String {
+        Bundle.main.object(forInfoDictionaryKey: "GDriveClientSecret") as? String ?? ""
+    }
 
     private let recorder = ScreenRecorder()
     private let uploader = DriveUploader()
-    private let keychain = KeychainStore(service: "Screencast.Drive")
+    private let tokenStorageKey = "drive.tokens"
+    private let userDefaults = UserDefaults.standard
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -62,21 +67,20 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func loadTokens() {
-        do {
-            let data = try keychain.read(account: "tokens")
-            tokens = try JSONDecoder().decode(OAuthTokens.self, from: data)
-        } catch {
+        guard let data = userDefaults.data(forKey: tokenStorageKey) else {
             tokens = nil
+            return
         }
+        tokens = try? JSONDecoder().decode(OAuthTokens.self, from: data)
     }
 
     func authorize() async {
         guard !clientID.isEmpty else {
-            statusMessage = "Enter a Google OAuth client ID."
+            statusMessage = "Missing Google OAuth client ID in Info.plist."
             return
         }
         guard !clientSecret.isEmpty else {
-            statusMessage = "Enter the Google OAuth client secret for your desktop client."
+            statusMessage = "Missing Google OAuth client secret in Info.plist."
             return
         }
 
@@ -90,9 +94,8 @@ final class CaptureViewModel: ObservableObject {
 
         do {
             let client = OAuthClient(config: config)
-            let (newTokens, redirect) = try await client.authorize()
+            let (newTokens, _) = try await client.authorize()
             tokens = newTokens
-            redirectURI = redirect
             statusMessage = "Signed in to Google Drive."
         } catch {
             statusMessage = "Auth failed: \(error.localizedDescription)"
@@ -100,11 +103,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func signOut() {
-        do {
-            try keychain.delete(account: "tokens")
-        } catch {
-            statusMessage = "Failed to remove token: \(error.localizedDescription)"
-        }
+        userDefaults.removeObject(forKey: tokenStorageKey)
         tokens = nil
     }
 
@@ -261,15 +260,19 @@ final class CaptureViewModel: ObservableObject {
         guard let current = tokens else {
             throw URLError(.userAuthenticationRequired)
         }
+        guard !clientID.isEmpty else {
+            throw OAuthClientError.serverError(
+                message: "Missing Google OAuth client ID in Info.plist."
+            )
+        }
+        if clientSecret.isEmpty {
+            throw OAuthClientError.serverError(
+                message: "Missing Google OAuth client secret in Info.plist."
+            )
+        }
 
         if !current.isExpired {
             return current.accessToken
-        }
-
-        guard !clientSecret.isEmpty else {
-            throw OAuthClientError.serverError(
-                message: "Missing Google OAuth client secret."
-            )
         }
 
         let redirect = "http://127.0.0.1:0/oauth"
@@ -288,11 +291,7 @@ final class CaptureViewModel: ObservableObject {
 
     private func persistTokens() {
         guard let tokens else { return }
-        do {
-            let data = try JSONEncoder().encode(tokens)
-            try keychain.write(account: "tokens", data: data)
-        } catch {
-            statusMessage = "Token save failed: \(error.localizedDescription)"
-        }
+        let data = try? JSONEncoder().encode(tokens)
+        userDefaults.set(data, forKey: tokenStorageKey)
     }
 }

@@ -81,12 +81,14 @@ final class OAuthClient {
     }
 
     func refresh(tokens: OAuthTokens) async throws -> OAuthTokens {
-        let body = [
+        var body = [
             "client_id": config.clientID,
-            "client_secret": config.clientSecret ?? "",
             "refresh_token": tokens.refreshToken,
             "grant_type": "refresh_token"
         ]
+        if let secret = config.clientSecret, !secret.isEmpty {
+            body["client_secret"] = secret
+        }
 
         let response: TokenResponse = try await postForm(body)
         let expiresAt = Date().addingTimeInterval(TimeInterval(response.expiresIn))
@@ -120,14 +122,16 @@ final class OAuthClient {
         verifier: String,
         redirectURI: String
     ) async throws -> OAuthTokens {
-        let body = [
+        var body = [
             "client_id": config.clientID,
-            "client_secret": config.clientSecret ?? "",
             "code": code,
             "code_verifier": verifier,
             "redirect_uri": redirectURI,
             "grant_type": "authorization_code"
         ]
+        if let secret = config.clientSecret, !secret.isEmpty {
+            body["client_secret"] = secret
+        }
 
         let response: TokenResponse = try await postForm(body)
         let expiresAt = Date().addingTimeInterval(TimeInterval(response.expiresIn))

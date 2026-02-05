@@ -13,6 +13,7 @@ struct ContentView: View {
             Divider()
             controls
             status
+            versionLabel
         }
         .padding(20)
         .frame(minWidth: 720, minHeight: 560)
@@ -88,16 +89,10 @@ struct ContentView: View {
     private var driveSection: some View {
         GroupBox("Google Drive") {
             VStack(alignment: .leading, spacing: 12) {
-                TextField("Client ID", text: $model.clientID)
-                SecureField("Client Secret", text: $model.clientSecret)
-                TextField("Redirect URI (read-only)", text: $model.redirectURI)
-                    .disabled(true)
-
                 HStack(spacing: 12) {
                     Button(model.isAuthorized ? "Re-authorize" : "Authorize") {
                         Task { await model.authorize() }
                     }
-                    .disabled(model.clientID.isEmpty)
 
                     Button("Sign Out") {
                         model.signOut()
@@ -109,13 +104,12 @@ struct ContentView: View {
                         .foregroundStyle(model.isAuthorized ? .green : .secondary)
                 }
 
-                Text(
-                    "Use an OAuth desktop client. Paste the client ID and client secret. " +
-                    "The app will use a loopback redirect and fill it in after " +
-                    "authorization."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text("This build uses a bundled OAuth desktop client and PKCE.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Authorization opens your browser and returns via a loopback URL.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
         }
@@ -147,6 +141,19 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .foregroundStyle(.secondary)
             .lineLimit(2)
+    }
+
+    private var versionLabel: some View {
+        let bundle = Bundle.main
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "0.0.0"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            ?? "0"
+
+        return Text("Version \(version) (Build \(build))")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 }
 

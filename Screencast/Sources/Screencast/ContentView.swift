@@ -45,10 +45,16 @@ struct ContentView: View {
                 if model.captureKind == .window {
                     Picker("Window", selection: $model.selectedWindowID) {
                         ForEach(model.windows) { window in
-                            Text("\(window.owningApplication) – \(window.title)")
+                            Text(window.displayName)
                                 .tag(Optional(window.id))
                         }
                     }
+                    Text("Only on-screen windows are shown. Bring the window forward and")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("click Refresh Sources if you do not see it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 if model.captureKind == .display || model.captureKind == .area {

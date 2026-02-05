@@ -34,12 +34,28 @@ final class CaptureViewModel: ObservableObject {
 
     func refreshSources() async {
         do {
-            let content = try await SCShareableContent.current
-            windows = content.windows.map(ShareableWindow.init)
+            let content = try await shareableContent()
+            let allWindows = content.windows.map(ShareableWindow.init)
+            let appBundleID = Bundle.main.bundleIdentifier
+            windows = allWindows
+                .filter { $0.isSelectable }
+                .filter { window in
+                    guard let appBundleID else { return true }
+                    return window.bundleIdentifier != appBundleID
+                }
+                .sorted { lhs, rhs in
+                    if lhs.owningApplication != rhs.owningApplication {
+                        return lhs.owningApplication < rhs.owningApplication
+                    }
+                    if lhs.title != rhs.title {
+                        return lhs.title < rhs.title
+                    }
+                    return lhs.id < rhs.id
+                }
             displays = content.displays.map(ShareableDisplay.init)
             selectedWindowID = windows.first?.id
             selectedDisplayID = displays.first?.id
-            statusMessage = "Sources refreshed."
+            statusMessage = "Sources refreshed. Showing \(windows.count) windows."
         } catch {
             statusMessage = "Failed to load sources: \(error.localizedDescription)"
         }
@@ -156,6 +172,25 @@ final class CaptureViewModel: ObservableObject {
                 throw URLError(.badURL)
             }
             return SCContentFilter(display: selected.display, excludingWindows: [])
+        }
+    }
+
+    private func shareableContent() async throws -> SCShareableContent {
+        try await withCheckedThrowingContinuation { continuation in
+            SCShareableContent.getExcludingDesktopWindows(
+                true,
+                onScreenWindowsOnly: true
+            ) { content, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let content else {
+                    continuation.resume(throwing: URLError(.unknown))
+                    return
+                }
+                continuation.resume(returning: content)
+            }
         }
     }
 

@@ -5,13 +5,40 @@ struct ShareableWindow: Identifiable, Hashable {
     let id: CGWindowID
     let title: String
     let owningApplication: String
+    let bundleIdentifier: String?
+    let windowLayer: Int
+    let onScreen: Bool
+    let frame: CGRect
     let window: SCWindow
 
     init(window: SCWindow) {
         id = window.windowID
-        title = window.title ?? "Untitled"
+        let rawTitle = window.title?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        title = rawTitle.isEmpty ? "Untitled" : rawTitle
         owningApplication = window.owningApplication?.applicationName ?? "Unknown App"
+        bundleIdentifier = window.owningApplication?.bundleIdentifier
+        windowLayer = window.windowLayer
+        onScreen = window.isOnScreen
+        frame = window.frame
         self.window = window
+    }
+
+    var displayName: String {
+        let sizeText = "\(Int(frame.width))x\(Int(frame.height))"
+        var details = ["id \(id)", sizeText]
+        if !onScreen {
+            details.append("off-screen")
+        }
+        if windowLayer != 0 {
+            details.append("layer \(windowLayer)")
+        }
+        let suffix = details.joined(separator: ", ")
+        return "\(owningApplication) - \(title) (\(suffix))"
+    }
+
+    var isSelectable: Bool {
+        onScreen && frame.width >= 64 && frame.height >= 64
     }
 }
 

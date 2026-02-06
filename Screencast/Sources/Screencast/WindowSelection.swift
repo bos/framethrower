@@ -198,21 +198,11 @@ private final class WindowSelectionView: NSView {
         return label
     }()
     private lazy var cameraCursor: NSCursor = {
-        if let base = NSImage(systemSymbolName: "camera.fill",
-                              accessibilityDescription: nil) {
-            let config = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
-            let symbol = base.withSymbolConfiguration(config) ?? base
-            let image = symbol.twoToneSymbol(
-                fill: NSColor.systemYellow,
-                outline: NSColor.black.withAlphaComponent(0.85),
-                outlineOffset: NSPoint(x: 1, y: -1)
-            )
-            return NSCursor(
-                image: image,
-                hotSpot: NSPoint(x: image.size.width / 2, y: image.size.height / 2)
-            )
-        }
-        return .crosshair
+        let image = makeCameraCursorImage()
+        return NSCursor(
+            image: image,
+            hotSpot: NSPoint(x: image.size.width / 2, y: image.size.height / 2)
+        )
     }()
 
     var highlightedFrame: CGRect? {
@@ -338,23 +328,45 @@ private final class WindowSelectionView: NSView {
 }
 
 private extension NSImage {
-    func twoToneSymbol(fill: NSColor,
-                       outline: NSColor,
-                       outlineOffset: NSPoint) -> NSImage {
-        let image = NSImage(size: size)
-        image.lockFocus()
-        let rect = NSRect(origin: .zero, size: size)
-        let symbol = (copy() as? NSImage) ?? self
-        symbol.isTemplate = true
-        outline.set()
-        symbol.draw(in: rect.offsetBy(dx: outlineOffset.x, dy: outlineOffset.y),
-                    from: .zero,
-                    operation: .sourceIn,
-                    fraction: 1.0)
-        fill.set()
-        symbol.draw(in: rect, from: .zero, operation: .sourceIn, fraction: 1.0)
-        image.unlockFocus()
-        return image
+    func drawCameraIcon(in rect: NSRect,
+                        fill: NSColor,
+                        stroke: NSColor) {
+        let radius = min(rect.width, rect.height) / 2 - 1
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let outer = NSBezierPath()
+        outer.appendArc(withCenter: center,
+                        radius: radius,
+                        startAngle: 0,
+                        endAngle: 360)
+        stroke.setStroke()
+        outer.lineWidth = 2
+        outer.stroke()
+
+        let inner = NSBezierPath()
+        inner.appendArc(withCenter: center,
+                        radius: radius - 2,
+                        startAngle: 0,
+                        endAngle: 360)
+        fill.setFill()
+        inner.fill()
+
+        let body = NSBezierPath(roundedRect: NSRect(
+            x: center.x - radius * 0.55,
+            y: center.y - radius * 0.25,
+            width: radius * 1.1,
+            height: radius * 0.7
+        ), xRadius: 2, yRadius: 2)
+        stroke.setFill()
+        body.fill()
+
+        let lens = NSBezierPath(ovalIn: NSRect(
+            x: center.x - radius * 0.18,
+            y: center.y - radius * 0.05,
+            width: radius * 0.36,
+            height: radius * 0.36
+        ))
+        fill.setFill()
+        lens.fill()
     }
 }
 
@@ -368,6 +380,29 @@ private func format(_ rect: CGRect) -> String {
            rect.origin.y,
            rect.size.width,
            rect.size.height)
+}
+
+private func makeCameraCursorImage() -> NSImage {
+    let size = NSSize(width: 24, height: 24)
+    let image = NSImage(size: size)
+    image.lockFocus()
+    let rect = NSRect(origin: .zero, size: size)
+    NSColor.black.setFill()
+    rect.fill()
+    image.unlockFocus()
+
+    let composed = NSImage(size: size)
+    composed.lockFocus()
+    let clearRect = NSRect(origin: .zero, size: size)
+    NSColor.clear.setFill()
+    clearRect.fill()
+    composed.drawCameraIcon(
+        in: clearRect,
+        fill: NSColor.systemYellow,
+        stroke: NSColor.black.withAlphaComponent(0.9)
+    )
+    composed.unlockFocus()
+    return composed
 }
 
 private final class WindowSelectionWindow: NSWindow {

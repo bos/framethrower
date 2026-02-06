@@ -16,12 +16,13 @@ final class CaptureViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var lastRecordingURL: URL?
 
-    @Published var slackTargetKind: SlackTargetKind = .channel
+    @Published var slackTargetKind: SlackTargetKind = .person
     @Published var slackChannels: [SlackChannel] = []
     @Published var slackUsers: [SlackUser] = []
     @Published var selectedSlackChannelID: String?
     @Published var selectedSlackUserID: String?
     @Published var isSlackUploading = false
+    @Published var isSlackRefreshing = false
 
     private var clientID: String {
         Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
@@ -104,6 +105,9 @@ final class CaptureViewModel: ObservableObject {
             return
         }
         slackTokens = try? JSONDecoder().decode(SlackTokens.self, from: data)
+        if slackTokens != nil {
+            Task { await refreshSlackTargets() }
+        }
     }
 
     func authorize() async {
@@ -176,14 +180,32 @@ final class CaptureViewModel: ObservableObject {
             statusMessage = "Connect Slack first."
             return
         }
+        isSlackRefreshing = true
+        defer { isSlackRefreshing = false }
         do {
             let api = SlackAPI(token: token)
             let channels = try await api.listChannels()
             let users = try await api.listUsers()
-            slackChannels = channels.sorted { $0.name < $1.name }
-            slackUsers = users.sorted { $0.displayName < $1.displayName }
-            selectedSlackChannelID = slackChannels.first?.id
-            selectedSlackUserID = slackUsers.first?.id
+            let channelList = channels.sorted {
+                $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+            let userList = users.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+            slackChannels = channelList
+
+            let currentUserID = slackTokens?.userID
+            if let currentUserID, let index = userList.firstIndex(where: { $0.id == currentUserID }) {
+                var reordered = userList
+                let currentUser = reordered.remove(at: index)
+                slackUsers = [currentUser] + reordered
+                selectedSlackUserID = currentUser.id
+            } else {
+                slackUsers = userList
+                selectedSlackUserID = userList.first?.id
+            }
+
+            selectedSlackChannelID = channelList.first?.id
             statusMessage = "Slack targets refreshed."
         } catch {
             statusMessage = "Slack refresh failed: \(error.localizedDescription)"

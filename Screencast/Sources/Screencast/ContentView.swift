@@ -110,12 +110,6 @@ struct ContentView: View {
                         .foregroundStyle(model.isAuthorized ? .green : .secondary)
                 }
 
-                Text("This build uses a bundled OAuth desktop client and PKCE.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Authorization opens your browser and returns via a loopback URL.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
         }
@@ -152,6 +146,7 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
 
                 if model.slackTargetKind == .channel {
+                    let isEmpty = model.slackChannels.isEmpty
                     Picker("Channel", selection: $model.selectedSlackChannelID) {
                         ForEach(model.slackChannels) { channel in
                             let label = channel.isPrivate
@@ -160,22 +155,21 @@ struct ContentView: View {
                             Text(label).tag(Optional(channel.id))
                         }
                     }
+                    .disabled(isEmpty || model.isSlackRefreshing)
+                    .opacity(isEmpty || model.isSlackRefreshing ? 0.5 : 1.0)
                 }
 
                 if model.slackTargetKind == .person {
+                    let isEmpty = model.slackUsers.isEmpty
                     Picker("Person", selection: $model.selectedSlackUserID) {
                         ForEach(model.slackUsers) { user in
                             Text(user.label).tag(Optional(user.id))
                         }
                     }
+                    .disabled(isEmpty || model.isSlackRefreshing)
+                    .opacity(isEmpty || model.isSlackRefreshing ? 0.5 : 1.0)
                 }
 
-                Text(
-                    "Add this redirect URL in your Slack app: " +
-                    "https://screencast-auth.bosullivan.workers.dev/slack/oauth"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
         }

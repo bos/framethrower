@@ -25,10 +25,10 @@ settings:
     SWIFT_UPCOMING_FEATURE_IMPORT_OBJC_FORWARD_DECLARATIONS: YES
     SWIFT_UPCOMING_FEATURE_DISABLE_OUTWARD_ACTOR_ISOLATION: YES
     SWIFT_UPCOMING_FEATURE_CONSUMING_ARGUMENTS: YES
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
-    INFOPLIST_KEY_CFBundleVersion: "1"
-    INFOPLIST_KEY_CFBundleShortVersionString: "0.1.0"
+    MARKETING_VERSION: "0.1.7"
+    CURRENT_PROJECT_VERSION: "8"
+    INFOPLIST_KEY_CFBundleVersion: "8"
+    INFOPLIST_KEY_CFBundleShortVersionString: "0.1.7"
 
 configs:
   Debug: debug
@@ -49,8 +49,16 @@ targets:
       properties:
         CFBundleDisplayName: Screencast
         CFBundleName: Screencast
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.7"
+        CFBundleVersion: "8"
+        GDriveClientID: ""
+        GDriveClientSecret: ""
+        SlackClientID: ""
+        SlackClientSecret: ""
+        CFBundleURLTypes:
+          - CFBundleURLName: "Slack OAuth"
+            CFBundleURLSchemes:
+              - "screencast-slack"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.screencast

@@ -17,12 +17,27 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.5</string>
+	<string>0.1.7</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Slack OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>screencast-slack</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>8</string>
 	<key>GDriveClientID</key>
 	<string></string>
 	<key>GDriveClientSecret</key>
+	<string></string>
+	<key>SlackClientID</key>
+	<string></string>
+	<key>SlackClientSecret</key>
 	<string></string>
 </dict>
 </plist>

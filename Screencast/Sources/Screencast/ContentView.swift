@@ -11,6 +11,8 @@ struct ContentView: View {
             Divider()
             driveSection
             Divider()
+            slackSection
+            Divider()
             controls
             status
             versionLabel
@@ -19,7 +21,11 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 560)
         .onAppear {
             model.loadTokens()
+            model.loadSlackTokens()
             Task { await model.refreshSources() }
+        }
+        .onOpenURL { url in
+            SlackCallbackRouter.shared.handle(url: url)
         }
     }
 
@@ -115,6 +121,66 @@ struct ContentView: View {
         }
     }
 
+    private var slackSection: some View {
+        GroupBox("Slack") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    Button(model.isSlackAuthorized ? "Reconnect" : "Connect Slack") {
+                        Task { await model.connectSlack() }
+                    }
+
+                    Button("Sign Out") {
+                        model.signOutSlack()
+                    }
+                    .disabled(!model.isSlackAuthorized)
+
+                    Button("Refresh Targets") {
+                        Task { await model.refreshSlackTargets() }
+                    }
+                    .disabled(!model.isSlackAuthorized)
+
+                    Spacer()
+                    Text(model.isSlackAuthorized ? "Connected" : "Not connected")
+                        .foregroundStyle(model.isSlackAuthorized ? .green : .secondary)
+                }
+
+                Picker("Target", selection: $model.slackTargetKind) {
+                    ForEach(SlackTargetKind.allCases) { kind in
+                        Text(kind.rawValue).tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if model.slackTargetKind == .channel {
+                    Picker("Channel", selection: $model.selectedSlackChannelID) {
+                        ForEach(model.slackChannels) { channel in
+                            let label = channel.isPrivate
+                                ? "[private] #\(channel.name)"
+                                : "#\(channel.name)"
+                            Text(label).tag(Optional(channel.id))
+                        }
+                    }
+                }
+
+                if model.slackTargetKind == .person {
+                    Picker("Person", selection: $model.selectedSlackUserID) {
+                        ForEach(model.slackUsers) { user in
+                            Text(user.label).tag(Optional(user.id))
+                        }
+                    }
+                }
+
+                Text(
+                    "Add this redirect URL in your Slack app: " +
+                    "https://screencast-auth.bosullivan.workers.dev/slack/oauth"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
     private var controls: some View {
         HStack(spacing: 16) {
             Button(model.isRecording ? "Recording…" : "Start Recording") {
@@ -131,6 +197,11 @@ struct ContentView: View {
                 Task { await model.uploadLastRecording() }
             }
             .disabled(model.isUploading || !model.isAuthorized)
+
+            Button("Upload to Slack") {
+                Task { await model.uploadLastRecordingToSlack() }
+            }
+            .disabled(model.isSlackUploading || !model.isSlackAuthorized)
 
             Spacer()
         }

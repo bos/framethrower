@@ -16,6 +16,13 @@ final class CaptureViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var lastRecordingURL: URL?
 
+    @Published var slackTargetKind: SlackTargetKind = .channel
+    @Published var slackChannels: [SlackChannel] = []
+    @Published var slackUsers: [SlackUser] = []
+    @Published var selectedSlackChannelID: String?
+    @Published var selectedSlackUserID: String?
+    @Published var isSlackUploading = false
+
     private var clientID: String {
         Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
     }
@@ -24,17 +31,34 @@ final class CaptureViewModel: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "GDriveClientSecret") as? String ?? ""
     }
 
+    private var slackClientID: String {
+        Bundle.main.object(forInfoDictionaryKey: "SlackClientID") as? String ?? ""
+    }
+
+    private var slackClientSecret: String {
+        Bundle.main.object(forInfoDictionaryKey: "SlackClientSecret") as? String ?? ""
+    }
+
     private let recorder = ScreenRecorder()
     private let uploader = DriveUploader()
     private let tokenStorageKey = "drive.tokens"
+    private let slackTokenStorageKey = "slack.tokens"
     private let userDefaults = UserDefaults.standard
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
     }
 
+    private var slackTokens: SlackTokens? {
+        didSet { persistSlackTokens() }
+    }
+
     var isAuthorized: Bool {
         tokens != nil
+    }
+
+    var isSlackAuthorized: Bool {
+        slackTokens != nil
     }
 
     func refreshSources() async {
@@ -74,6 +98,14 @@ final class CaptureViewModel: ObservableObject {
         tokens = try? JSONDecoder().decode(OAuthTokens.self, from: data)
     }
 
+    func loadSlackTokens() {
+        guard let data = userDefaults.data(forKey: slackTokenStorageKey) else {
+            slackTokens = nil
+            return
+        }
+        slackTokens = try? JSONDecoder().decode(SlackTokens.self, from: data)
+    }
+
     func authorize() async {
         guard !clientID.isEmpty else {
             statusMessage = "Missing Google OAuth client ID in Info.plist."
@@ -99,6 +131,107 @@ final class CaptureViewModel: ObservableObject {
             statusMessage = "Signed in to Google Drive."
         } catch {
             statusMessage = "Auth failed: \(error.localizedDescription)"
+        }
+    }
+
+    func connectSlack() async {
+        guard !slackClientID.isEmpty else {
+            statusMessage = "Missing Slack client ID in Info.plist."
+            return
+        }
+        guard !slackClientSecret.isEmpty else {
+            statusMessage = "Missing Slack client secret in Info.plist."
+            return
+        }
+
+        let config = SlackOAuthConfig(
+            clientID: slackClientID,
+            clientSecret: slackClientSecret,
+            redirectURI: slackRedirectURI,
+            userScopes: slackScopes
+        )
+
+        do {
+            let client = SlackOAuthClient(config: config)
+            let tokens = try await client.authorize()
+            slackTokens = tokens
+            statusMessage = "Connected to Slack."
+            await refreshSlackTargets()
+        } catch {
+            statusMessage = "Slack auth failed: \(error.localizedDescription)"
+        }
+    }
+
+    func signOutSlack() {
+        userDefaults.removeObject(forKey: slackTokenStorageKey)
+        slackTokens = nil
+        slackChannels = []
+        slackUsers = []
+        selectedSlackChannelID = nil
+        selectedSlackUserID = nil
+    }
+
+    func refreshSlackTargets() async {
+        guard let token = slackTokens?.accessToken else {
+            statusMessage = "Connect Slack first."
+            return
+        }
+        do {
+            let api = SlackAPI(token: token)
+            let channels = try await api.listChannels()
+            let users = try await api.listUsers()
+            slackChannels = channels.sorted { $0.name < $1.name }
+            slackUsers = users.sorted { $0.displayName < $1.displayName }
+            selectedSlackChannelID = slackChannels.first?.id
+            selectedSlackUserID = slackUsers.first?.id
+            statusMessage = "Slack targets refreshed."
+        } catch {
+            statusMessage = "Slack refresh failed: \(error.localizedDescription)"
+        }
+    }
+
+    func uploadLastRecordingToSlack() async {
+        guard let fileURL = resolveRecordingURL() else {
+            statusMessage = "Record something first."
+            return
+        }
+        guard let token = slackTokens?.accessToken else {
+            statusMessage = "Connect Slack first."
+            return
+        }
+        isSlackUploading = true
+        defer { isSlackUploading = false }
+
+        do {
+            let size = try fileSize(for: fileURL)
+            statusMessage = "Slack upload starting: \(fileURL.path) (\(size) bytes)"
+            if size == 0 {
+                throw URLError(.zeroByteResource)
+            }
+            let api = SlackAPI(token: token)
+            let channelID: String
+            switch slackTargetKind {
+            case .channel:
+                guard let selected = selectedSlackChannelID else {
+                    throw URLError(.badURL)
+                }
+                channelID = selected
+            case .person:
+                guard let selected = selectedSlackUserID else {
+                    throw URLError(.badURL)
+                }
+                channelID = try await api.openDM(userID: selected)
+            }
+
+            let filename = fileURL.lastPathComponent
+            try await api.uploadFile(
+                fileURL: fileURL,
+                filename: filename,
+                channelID: channelID
+            )
+            statusMessage = "Uploaded to Slack."
+        } catch {
+            statusMessage = "Slack upload failed: \(error.localizedDescription)"
         }
     }
 
@@ -140,7 +273,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func uploadLastRecording() async {
-        guard let fileURL = lastRecordingURL else {
+        guard let fileURL = resolveRecordingURL() else {
             statusMessage = "Record something first."
             return
         }
@@ -293,5 +426,69 @@ final class CaptureViewModel: ObservableObject {
         guard let tokens else { return }
         let data = try? JSONEncoder().encode(tokens)
         userDefaults.set(data, forKey: tokenStorageKey)
+    }
+
+    private func resolveRecordingURL() -> URL? {
+        if let fileURL = lastRecordingURL,
+           FileManager.default.fileExists(atPath: fileURL.path) {
+            return fileURL
+        }
+        if let latest = findLatestRecording() {
+            lastRecordingURL = latest
+            return latest
+        }
+        return nil
+    }
+
+    private func findLatestRecording() -> URL? {
+        let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+        let candidates = items.filter { url in
+            url.lastPathComponent.hasPrefix("Screencast-") && url.pathExtension == "mp4"
+        }
+        let sorted = candidates.sorted { lhs, rhs in
+            let ldate = (try? lhs.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                ?? .distantPast
+            let rdate = (try? rhs.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                ?? .distantPast
+            return ldate > rdate
+        }
+        return sorted.first
+    }
+
+    private func fileSize(for url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    private func persistSlackTokens() {
+        guard let slackTokens else { return }
+        let data = try? JSONEncoder().encode(slackTokens)
+        userDefaults.set(data, forKey: slackTokenStorageKey)
+    }
+
+    private var slackRedirectURI: String {
+        "https://screencast-auth.bosullivan.workers.dev/slack/oauth"
+    }
+
+    private var slackScopes: [String] {
+        [
+            "files:write",
+            "chat:write",
+            "channels:read",
+            "groups:read",
+            "im:read",
+            "im:write",
+            "mpim:read",
+            "mpim:write",
+            "users:read"
+        ]
     }
 }

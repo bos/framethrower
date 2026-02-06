@@ -62,6 +62,13 @@ enum CaptureSourceKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum SlackTargetKind: String, CaseIterable, Identifiable {
+    case channel = "Channel"
+    case person = "Person"
+
+    var id: String { rawValue }
+}
+
 struct CaptureArea: Hashable {
     var x: Double = 0
     var y: Double = 0

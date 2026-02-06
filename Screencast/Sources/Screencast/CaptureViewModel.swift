@@ -1,9 +1,22 @@
 import Foundation
+import CoreGraphics
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
 
 @MainActor
 final class CaptureViewModel: ObservableObject {
+    enum LogLevel {
+        case info
+        case error
+    }
+
+    struct LogEntry: Identifiable {
+        let id = UUID()
+        let date: Date
+        let message: String
+        let level: LogLevel
+    }
+
     @Published var captureKind: CaptureSourceKind = .window
     @Published var windows: [ShareableWindow] = []
     @Published var displays: [ShareableDisplay] = []
@@ -14,15 +27,23 @@ final class CaptureViewModel: ObservableObject {
     @Published var isRecording = false
     @Published var isUploading = false
     @Published var statusMessage = ""
+    @Published var logs: [LogEntry] = []
     @Published var lastRecordingURL: URL?
 
-    @Published var slackTargetKind: SlackTargetKind = .person
+    @Published var slackTargetKind: SlackTargetKind = .person {
+        didSet { persistSlackSelection() }
+    }
     @Published var slackChannels: [SlackChannel] = []
     @Published var slackUsers: [SlackUser] = []
-    @Published var selectedSlackChannelID: String?
-    @Published var selectedSlackUserID: String?
+    @Published var selectedSlackChannelID: String? {
+        didSet { persistSlackSelection() }
+    }
+    @Published var selectedSlackUserID: String? {
+        didSet { persistSlackSelection() }
+    }
     @Published var isSlackUploading = false
     @Published var isSlackRefreshing = false
+    @Published var hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
 
     private var clientID: String {
         Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
@@ -44,7 +65,14 @@ final class CaptureViewModel: ObservableObject {
     private let uploader = DriveUploader()
     private let tokenStorageKey = "drive.tokens"
     private let slackTokenStorageKey = "slack.tokens"
+    private let slackTargetKindKey = "slack.targetKind"
+    private let slackSelectedUserKey = "slack.selectedUserID"
+    private let slackSelectedChannelKey = "slack.selectedChannelID"
+    private let slackCachedUsersKey = "slack.cachedUsers"
+    private let slackCachedChannelsKey = "slack.cachedChannels"
     private let userDefaults = UserDefaults.standard
+    private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Screencast.log")
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -62,7 +90,36 @@ final class CaptureViewModel: ObservableObject {
         slackTokens != nil
     }
 
+    var selectedWindow: ShareableWindow? {
+        guard let id = selectedWindowID else { return nil }
+        return windows.first(where: { $0.id == id })
+    }
+
+    func requestScreenRecordingPermission() {
+        let preflight = CGPreflightScreenCaptureAccess()
+        if preflight {
+            hasScreenRecordingPermission = true
+            return
+        }
+        let granted = CGRequestScreenCaptureAccess()
+        hasScreenRecordingPermission = granted
+        if granted {
+            log("Screen recording permission granted. Restart the app if needed.")
+        } else {
+            log("Screen recording permission denied.", level: .error)
+        }
+    }
+
     func refreshSources() async {
+        hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        guard hasScreenRecordingPermission else {
+            windows = []
+            displays = []
+            selectedWindowID = nil
+            selectedDisplayID = nil
+            log("Screen recording permission is required.", level: .error)
+            return
+        }
         do {
             let content = try await shareableContent()
             let allWindows = content.windows.map(ShareableWindow.init)
@@ -85,9 +142,63 @@ final class CaptureViewModel: ObservableObject {
             displays = content.displays.map(ShareableDisplay.init)
             selectedWindowID = windows.first?.id
             selectedDisplayID = displays.first?.id
-            statusMessage = "Sources refreshed. Showing \(windows.count) windows."
+            log("Sources refreshed. Showing \(windows.count) windows.")
         } catch {
-            statusMessage = "Failed to load sources: \(error.localizedDescription)"
+            log("Failed to load sources: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    func selectArea() async {
+        guard captureKind == .area else { return }
+        let frame = selectedDisplayFrame() ?? NSScreen.main?.frame ?? .zero
+        guard frame.width >= 2, frame.height >= 2 else {
+            log("No display available for area selection.", level: .error)
+            return
+        }
+        do {
+            let selected = try await AreaSelectionCoordinator.selectArea(in: frame)
+            area = CaptureArea(
+                x: selected.origin.x,
+                y: selected.origin.y,
+                width: selected.width,
+                height: selected.height
+            )
+            log("Area selected.")
+        } catch AreaSelectionError.cancelled {
+            log("Area selection cancelled.")
+        } catch {
+            log("Area selection failed: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    func selectWindow() async {
+        guard captureKind == .window else { return }
+        guard hasScreenRecordingPermission else {
+            log("Enable Screen Recording permission and restart the app.", level: .error)
+            return
+        }
+
+        do {
+            let bundleID = Bundle.main.bundleIdentifier
+            let selectedID = try await WindowSelectionCoordinator.selectWindow(
+                excludingBundleID: bundleID
+            ) { [weak self] message in
+                self?.log(message)
+            }
+            if windows.isEmpty {
+                await refreshSources()
+            }
+            if windows.contains(where: { $0.id == selectedID }) {
+                selectedWindowID = selectedID
+                log("Window selected.")
+            } else {
+                selectedWindowID = selectedID
+                log("Window selected. If it is missing from the list, refresh sources.")
+            }
+        } catch WindowSelectionError.cancelled {
+            log("Window selection cancelled.")
+        } catch {
+            log("Window selection failed: \(error.localizedDescription)", level: .error)
         }
     }
 
@@ -100,23 +211,70 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func loadSlackTokens() {
+        loadSlackCachedTargets()
         guard let data = userDefaults.data(forKey: slackTokenStorageKey) else {
             slackTokens = nil
             return
         }
         slackTokens = try? JSONDecoder().decode(SlackTokens.self, from: data)
+        loadSlackSelection()
         if slackTokens != nil {
             Task { await refreshSlackTargets() }
         }
     }
 
+    func loadSlackSelection() {
+        if let raw = userDefaults.string(forKey: slackTargetKindKey),
+           let kind = SlackTargetKind(rawValue: raw) {
+            slackTargetKind = kind
+        }
+        if let savedUserID = userDefaults.string(forKey: slackSelectedUserKey) {
+            selectedSlackUserID = savedUserID
+        }
+        if let savedChannelID = userDefaults.string(forKey: slackSelectedChannelKey) {
+            selectedSlackChannelID = savedChannelID
+        }
+    }
+
+    private func persistSlackSelection() {
+        userDefaults.set(slackTargetKind.rawValue, forKey: slackTargetKindKey)
+        userDefaults.set(selectedSlackUserID, forKey: slackSelectedUserKey)
+        userDefaults.set(selectedSlackChannelID, forKey: slackSelectedChannelKey)
+    }
+
+    private func loadSlackCachedTargets() {
+        if let data = userDefaults.data(forKey: slackCachedChannelsKey),
+           let cached = try? JSONDecoder().decode([SlackChannel].self, from: data) {
+            slackChannels = cached
+            if selectedSlackChannelID == nil {
+                selectedSlackChannelID = slackChannels.first?.id
+            }
+        }
+        if let data = userDefaults.data(forKey: slackCachedUsersKey),
+           let cached = try? JSONDecoder().decode([SlackUser].self, from: data) {
+            slackUsers = cached
+            if selectedSlackUserID == nil {
+                selectedSlackUserID = slackUsers.first?.id
+            }
+        }
+    }
+
+    private func persistSlackCachedTargets() {
+        if let data = try? JSONEncoder().encode(slackChannels) {
+            userDefaults.set(data, forKey: slackCachedChannelsKey)
+        }
+        if let data = try? JSONEncoder().encode(slackUsers) {
+            userDefaults.set(data, forKey: slackCachedUsersKey)
+        }
+    }
+
     func authorize() async {
         guard !clientID.isEmpty else {
-            statusMessage = "Missing Google OAuth client ID in Info.plist."
+            log("Missing Google OAuth client ID in Info.plist.", level: .error)
             return
         }
         guard !clientSecret.isEmpty else {
-            statusMessage = "Missing Google OAuth client secret in Info.plist."
+            log("Missing Google OAuth client secret in Info.plist.", level: .error)
             return
         }
 
@@ -132,19 +290,19 @@ final class CaptureViewModel: ObservableObject {
             let client = OAuthClient(config: config)
             let (newTokens, _) = try await client.authorize()
             tokens = newTokens
-            statusMessage = "Signed in to Google Drive."
+            log("Signed in to Google Drive.")
         } catch {
-            statusMessage = "Auth failed: \(error.localizedDescription)"
+            log("Auth failed: \(error.localizedDescription)", level: .error)
         }
     }
 
     func connectSlack() async {
         guard !slackClientID.isEmpty else {
-            statusMessage = "Missing Slack client ID in Info.plist."
+            log("Missing Slack client ID in Info.plist.", level: .error)
             return
         }
         guard !slackClientSecret.isEmpty else {
-            statusMessage = "Missing Slack client secret in Info.plist."
+            log("Missing Slack client secret in Info.plist.", level: .error)
             return
         }
 
@@ -159,15 +317,18 @@ final class CaptureViewModel: ObservableObject {
             let client = SlackOAuthClient(config: config)
             let tokens = try await client.authorize()
             slackTokens = tokens
-            statusMessage = "Connected to Slack."
+            log("Connected to Slack.")
             await refreshSlackTargets()
         } catch {
-            statusMessage = "Slack auth failed: \(error.localizedDescription)"
+            log("Slack auth failed: \(error.localizedDescription)", level: .error)
         }
     }
 
     func signOutSlack() {
         userDefaults.removeObject(forKey: slackTokenStorageKey)
+        userDefaults.removeObject(forKey: slackTargetKindKey)
+        userDefaults.removeObject(forKey: slackSelectedUserKey)
+        userDefaults.removeObject(forKey: slackSelectedChannelKey)
         slackTokens = nil
         slackChannels = []
         slackUsers = []
@@ -177,7 +338,7 @@ final class CaptureViewModel: ObservableObject {
 
     func refreshSlackTargets() async {
         guard let token = slackTokens?.accessToken else {
-            statusMessage = "Connect Slack first."
+            log("Connect Slack first.", level: .error)
             return
         }
         isSlackRefreshing = true
@@ -199,26 +360,38 @@ final class CaptureViewModel: ObservableObject {
                 var reordered = userList
                 let currentUser = reordered.remove(at: index)
                 slackUsers = [currentUser] + reordered
-                selectedSlackUserID = currentUser.id
             } else {
                 slackUsers = userList
-                selectedSlackUserID = userList.first?.id
+            }
+            if let savedUserID = selectedSlackUserID,
+               slackUsers.contains(where: { $0.id == savedUserID }) {
+                selectedSlackUserID = savedUserID
+            } else if let currentUserID, slackUsers.contains(where: { $0.id == currentUserID }) {
+                selectedSlackUserID = currentUserID
+            } else {
+                selectedSlackUserID = slackUsers.first?.id
             }
 
-            selectedSlackChannelID = channelList.first?.id
-            statusMessage = "Slack targets refreshed."
+            if let savedChannelID = selectedSlackChannelID,
+               channelList.contains(where: { $0.id == savedChannelID }) {
+                selectedSlackChannelID = savedChannelID
+            } else {
+                selectedSlackChannelID = channelList.first?.id
+            }
+            persistSlackCachedTargets()
+            log("Slack targets refreshed.")
         } catch {
-            statusMessage = "Slack refresh failed: \(error.localizedDescription)"
+            log("Slack refresh failed: \(error.localizedDescription)", level: .error)
         }
     }
 
     func uploadLastRecordingToSlack() async {
         guard let fileURL = resolveRecordingURL() else {
-            statusMessage = "Record something first."
+            log("Record something first.", level: .error)
             return
         }
         guard let token = slackTokens?.accessToken else {
-            statusMessage = "Connect Slack first."
+            log("Connect Slack first.", level: .error)
             return
         }
         isSlackUploading = true
@@ -226,7 +399,7 @@ final class CaptureViewModel: ObservableObject {
 
         do {
             let size = try fileSize(for: fileURL)
-            statusMessage = "Slack upload starting: \(fileURL.path) (\(size) bytes)"
+            log("Slack upload starting: \(fileURL.path) (\(size) bytes)")
             if size == 0 {
                 throw URLError(.zeroByteResource)
             }
@@ -251,9 +424,9 @@ final class CaptureViewModel: ObservableObject {
                 filename: filename,
                 channelID: channelID
             )
-            statusMessage = "Uploaded to Slack."
+            log("Uploaded to Slack.")
         } catch {
-            statusMessage = "Slack upload failed: \(error.localizedDescription)"
+            log("Slack upload failed: \(error.localizedDescription)", level: .error)
         }
     }
 
@@ -264,6 +437,10 @@ final class CaptureViewModel: ObservableObject {
 
     func startRecording() async {
         guard !isRecording else { return }
+        guard hasScreenRecordingPermission else {
+            log("Enable Screen Recording permission and restart the app.", level: .error)
+            return
+        }
 
         do {
             let filter = try selectedFilter()
@@ -277,9 +454,9 @@ final class CaptureViewModel: ObservableObject {
             )
             isRecording = true
             lastRecordingURL = outputURL
-            statusMessage = "Recording started."
+            log("Recording started.")
         } catch {
-            statusMessage = "Recording failed: \(error.localizedDescription)"
+            log("Recording failed: \(error.localizedDescription)", level: .error)
         }
     }
 
@@ -288,15 +465,15 @@ final class CaptureViewModel: ObservableObject {
         do {
             try await recorder.stop()
             isRecording = false
-            statusMessage = "Recording stopped."
+            log("Recording stopped.")
         } catch {
-            statusMessage = "Stop failed: \(error.localizedDescription)"
+            log("Stop failed: \(error.localizedDescription)", level: .error)
         }
     }
 
     func uploadLastRecording() async {
         guard let fileURL = resolveRecordingURL() else {
-            statusMessage = "Record something first."
+            log("Record something first.", level: .error)
             return
         }
 
@@ -306,9 +483,37 @@ final class CaptureViewModel: ObservableObject {
         do {
             let accessToken = try await validAccessToken()
             let result = try await uploader.upload(fileURL: fileURL, accessToken: accessToken)
-            statusMessage = "Uploaded to Drive: \(result.name)"
+            log("Uploaded to Drive: \(result.name)")
         } catch {
-            statusMessage = "Upload failed: \(error.localizedDescription)"
+            log("Upload failed: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    private func log(_ message: String, level: LogLevel = .info) {
+        let entry = LogEntry(date: Date(), message: message, level: level)
+        statusMessage = message
+        logs.append(entry)
+        appendLogToFile(entry)
+    }
+
+    private func appendLogToFile(_ entry: LogEntry) {
+        let formatter = ISO8601DateFormatter()
+        let timestamp = formatter.string(from: entry.date)
+        let levelLabel = entry.level == .error ? "ERROR" : "INFO"
+        let line = "[\(timestamp)] [\(levelLabel)] \(entry.message)\n"
+        do {
+            if FileManager.default.fileExists(atPath: logFileURL.path) {
+                let handle = try FileHandle(forWritingTo: logFileURL)
+                try handle.seekToEnd()
+                if let data = line.data(using: .utf8) {
+                    try handle.write(contentsOf: data)
+                }
+                try handle.close()
+            } else {
+                try line.write(to: logFileURL, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            // Avoid recursive logging loops.
         }
     }
 
@@ -389,7 +594,14 @@ final class CaptureViewModel: ObservableObject {
             configuration.width = pixelSize(clamped.width)
             configuration.height = pixelSize(clamped.height)
             if #available(macOS 14.0, *) {
-                configuration.sourceRect = clamped
+                let localX = clamped.minX - displayFrame.minX
+                let localY = displayFrame.maxY - clamped.maxY
+                configuration.sourceRect = CGRect(
+                    x: localX,
+                    y: localY,
+                    width: clamped.width,
+                    height: clamped.height
+                )
             } else {
                 configuration.width = pixelSize(filter.contentRect.width)
                 configuration.height = pixelSize(filter.contentRect.height)
@@ -488,6 +700,14 @@ final class CaptureViewModel: ObservableObject {
     private func fileSize(for url: URL) throws -> Int {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    private func selectedDisplayFrame() -> CGRect? {
+        guard let id = selectedDisplayID,
+              let display = displays.first(where: { $0.id == id }) else {
+            return nil
+        }
+        return display.display.frame
     }
 
     private func persistSlackTokens() {

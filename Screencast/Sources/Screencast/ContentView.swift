@@ -22,6 +22,7 @@ struct ContentView: View {
         .onAppear {
             model.loadTokens()
             model.loadSlackTokens()
+            model.requestScreenRecordingPermission()
             Task { await model.refreshSources() }
         }
         .onOpenURL { url in
@@ -33,7 +34,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Screencast")
                 .font(.largeTitle.bold())
-            Text("Record a window, display, or area and upload to Google Drive.")
+            Text("Record a window, display, or area and upload to Google Drive or Slack.")
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -42,50 +43,70 @@ struct ContentView: View {
     private var sourceSection: some View {
         GroupBox("Capture Source") {
             VStack(alignment: .leading, spacing: 12) {
-                Picker("Source", selection: $model.captureKind) {
-                    ForEach(CaptureSourceKind.allCases) { kind in
-                        Text(kind.rawValue).tag(kind)
+                if model.hasScreenRecordingPermission {
+                    Picker("Source", selection: $model.captureKind) {
+                        ForEach(CaptureSourceKind.allCases) { kind in
+                            Text(kind.rawValue).tag(kind)
+                        }
                     }
-                }
-                .pickerStyle(.segmented)
+                    .pickerStyle(.segmented)
 
                 if model.captureKind == .window {
-                    Picker("Window", selection: $model.selectedWindowID) {
-                        ForEach(model.windows) { window in
-                            Text(window.displayName)
-                                .tag(Optional(window.id))
-                        }
-                    }
-                    Text("Only on-screen windows are shown. Bring the window forward and")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("click Refresh Sources if you do not see it.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if model.captureKind == .display || model.captureKind == .area {
-                    Picker("Display", selection: $model.selectedDisplayID) {
-                        ForEach(model.displays) { display in
-                            Text(display.name).tag(Optional(display.id))
-                        }
-                    }
-                }
-
-                if model.captureKind == .area {
                     HStack(spacing: 12) {
-                        LabeledField(title: "X", value: $model.area.x)
-                        LabeledField(title: "Y", value: $model.area.y)
-                        LabeledField(title: "Width", value: $model.area.width)
-                        LabeledField(title: "Height", value: $model.area.height)
+                        Button("Pick Window…") {
+                            Task { await model.selectWindow() }
+                        }
+                        if let selected = model.selectedWindow {
+                            Text("Selected: \(selected.displayName)")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No window selected.")
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                    Text("Click a window to select it. Only on-screen windows are selectable.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Bring the window forward and click Refresh Sources if needed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
-                HStack {
-                    Button("Refresh Sources") {
-                        Task { await model.refreshSources() }
+                    if model.captureKind == .display || model.captureKind == .area {
+                        Picker("Display", selection: $model.selectedDisplayID) {
+                            ForEach(model.displays) { display in
+                                Text(display.name).tag(Optional(display.id))
+                            }
+                        }
                     }
-                    Spacer()
+
+                    if model.captureKind == .area {
+                        HStack(spacing: 12) {
+                            Button("Select Area…") {
+                                Task { await model.selectArea() }
+                            }
+                            Text(
+                                "Selected: \(Int(model.area.width))×\(Int(model.area.height)) " +
+                                "at \(Int(model.area.x)), \(Int(model.area.y))"
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    HStack {
+                        Button("Refresh Sources") {
+                            Task { await model.refreshSources() }
+                        }
+                        Spacer()
+                    }
+                } else {
+                    Text("Screen recording permission is required.")
+                        .font(.headline)
+                    Text(
+                        "Open System Settings > Privacy & Security > Screen Recording, " +
+                        "enable Screencast, then restart the app."
+                    )
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(.vertical, 4)
@@ -96,18 +117,20 @@ struct ContentView: View {
         GroupBox("Google Drive") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
-                    Button(model.isAuthorized ? "Re-authorize" : "Authorize") {
-                        Task { await model.authorize() }
+                    if model.isAuthorized {
+                        Text("Signed in")
+                            .foregroundStyle(.green)
+                        Button("Sign Out") {
+                            model.signOut()
+                        }
+                    } else {
+                        Button("Authorize") {
+                            Task { await model.authorize() }
+                        }
+                        Text("Not signed in")
+                            .foregroundStyle(.secondary)
                     }
-
-                    Button("Sign Out") {
-                        model.signOut()
-                    }
-                    .disabled(!model.isAuthorized)
-
                     Spacer()
-                    Text(model.isAuthorized ? "Signed in" : "Not signed in")
-                        .foregroundStyle(model.isAuthorized ? .green : .secondary)
                 }
 
             }
@@ -119,23 +142,20 @@ struct ContentView: View {
         GroupBox("Slack") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
-                    Button(model.isSlackAuthorized ? "Reconnect" : "Connect Slack") {
-                        Task { await model.connectSlack() }
+                    if model.isSlackAuthorized {
+                        Text("Connected")
+                            .foregroundStyle(.green)
+                        Button("Sign Out") {
+                            model.signOutSlack()
+                        }
+                    } else {
+                        Button("Connect Slack") {
+                            Task { await model.connectSlack() }
+                        }
+                        Text("Not connected")
+                            .foregroundStyle(.secondary)
                     }
-
-                    Button("Sign Out") {
-                        model.signOutSlack()
-                    }
-                    .disabled(!model.isSlackAuthorized)
-
-                    Button("Refresh Targets") {
-                        Task { await model.refreshSlackTargets() }
-                    }
-                    .disabled(!model.isSlackAuthorized)
-
                     Spacer()
-                    Text(model.isSlackAuthorized ? "Connected" : "Not connected")
-                        .foregroundStyle(model.isSlackAuthorized ? .green : .secondary)
                 }
 
                 Picker("Target", selection: $model.slackTargetKind) {
@@ -155,8 +175,8 @@ struct ContentView: View {
                             Text(label).tag(Optional(channel.id))
                         }
                     }
-                    .disabled(isEmpty || model.isSlackRefreshing)
-                    .opacity(isEmpty || model.isSlackRefreshing ? 0.5 : 1.0)
+                    .disabled(isEmpty)
+                    .opacity(isEmpty ? 0.5 : 1.0)
                 }
 
                 if model.slackTargetKind == .person {
@@ -166,8 +186,8 @@ struct ContentView: View {
                             Text(user.label).tag(Optional(user.id))
                         }
                     }
-                    .disabled(isEmpty || model.isSlackRefreshing)
-                    .opacity(isEmpty || model.isSlackRefreshing ? 0.5 : 1.0)
+                    .disabled(isEmpty)
+                    .opacity(isEmpty ? 0.5 : 1.0)
                 }
 
             }
@@ -177,17 +197,32 @@ struct ContentView: View {
 
     private var controls: some View {
         HStack(spacing: 16) {
-            Button(model.isRecording ? "Recording…" : "Start Recording") {
-                Task { await model.startRecording() }
+            Button {
+                if model.isRecording {
+                    Task { await model.stopRecording() }
+                } else {
+                    Task { await model.startRecording() }
+                }
+            } label: {
+                if model.isRecording {
+                    HStack(spacing: 6) {
+                        Image(systemName: "stop.fill")
+                            .foregroundStyle(.primary)
+                        Text("Stop Recording")
+                            .foregroundStyle(.primary)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: "record.circle.fill")
+                            .foregroundStyle(.red)
+                        Text("Start Recording")
+                            .foregroundStyle(.primary)
+                    }
+                }
             }
-            .disabled(model.isRecording)
+            .disabled(!model.hasScreenRecordingPermission)
 
-            Button("Stop Recording") {
-                Task { await model.stopRecording() }
-            }
-            .disabled(!model.isRecording)
-
-            Button("Upload Last Recording") {
+            Button("Upload to Google Drive") {
                 Task { await model.uploadLastRecording() }
             }
             .disabled(model.isUploading || !model.isAuthorized)
@@ -202,10 +237,33 @@ struct ContentView: View {
     }
 
     private var status: some View {
-        Text(model.statusMessage)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .foregroundStyle(.secondary)
-            .lineLimit(2)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Status")
+                .font(.headline)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.logs) { entry in
+                            Text("\(timestamp(entry.date))  \(entry.message)")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(entry.level == .error ? .red : .primary)
+                                .font(.caption)
+                                .id(entry.id)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 160)
+                .background(Color(.textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .onChange(of: model.logs.count) { _, _ in
+                    guard let last = model.logs.last else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
     }
 
     private var versionLabel: some View {
@@ -219,6 +277,13 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .font(.caption)
             .foregroundStyle(.secondary)
+    }
+
+    private func timestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: date)
     }
 }
 

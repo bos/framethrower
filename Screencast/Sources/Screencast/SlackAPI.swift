@@ -396,7 +396,7 @@ struct SlackTeam: Decodable {
     let id: String?
 }
 
-struct SlackChannel: Identifiable, Hashable, Decodable {
+struct SlackChannel: Identifiable, Hashable, Codable {
     let id: String
     let name: String
     let isPrivate: Bool
@@ -408,7 +408,7 @@ struct SlackChannel: Identifiable, Hashable, Decodable {
     }
 }
 
-struct SlackUser: Identifiable, Hashable, Decodable {
+struct SlackUser: Identifiable, Hashable, Codable {
     let id: String
     let name: String
     let realName: String?
@@ -445,7 +445,7 @@ struct SlackUser: Identifiable, Hashable, Decodable {
     }
 }
 
-struct SlackUserProfile: Decodable, Hashable {
+struct SlackUserProfile: Codable, Hashable {
     let displayName: String?
 
     private enum CodingKeys: String, CodingKey {

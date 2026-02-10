@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import CoreGraphics
 @preconcurrency import ScreenCaptureKit
@@ -73,6 +74,12 @@ final class CaptureViewModel: ObservableObject {
     private let userDefaults = UserDefaults.standard
     private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Screencast.log")
+    private let clipboardTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter
+    }()
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -494,6 +501,18 @@ final class CaptureViewModel: ObservableObject {
         statusMessage = message
         logs.append(entry)
         appendLogToFile(entry)
+    }
+
+    func copyLogsToPasteboard() {
+        let lines = logs.map { entry in
+            let level = entry.level == .error ? "ERROR" : "INFO"
+            let timestamp = clipboardTimestampFormatter.string(from: entry.date)
+            return "\(timestamp)  [\(level)]  \(entry.message)"
+        }
+        let text = lines.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        log("Copied \(logs.count) log entries to clipboard.")
     }
 
     private func appendLogToFile(_ entry: LogEntry) {

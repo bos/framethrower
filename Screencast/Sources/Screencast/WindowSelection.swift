@@ -68,16 +68,24 @@ final class WindowSelectionCoordinator: NSObject {
 
         window = overlay
         logger("Window selection overlay shown.")
+        if excludedBundleID != nil {
+            logger("Screencast windows are ignored during selection.")
+        }
         startEventMonitoring()
     }
 
     private func handleHover(at point: CGPoint) {
         guard let view = window?.contentView as? WindowSelectionView else { return }
-        let hit = windowHit(at: point, excludingBundleID: excludedBundleID)
+        let candidates = windowCandidates(at: point, excludingBundleID: excludedBundleID)
+        let hit = candidates.first
         if hit?.id != lastHoverID {
             lastHoverID = hit?.id
             if let hit {
-                logger("Hover window id \(hit.id) at \(format(point)) frame \(format(hit.frame)).")
+                logger(
+                    "Hover window \(hit.describe) at \(format(point)) frame \(format(hit.frame))."
+                )
+                let list = candidates.prefix(8).map { $0.describe }.joined(separator: " | ")
+                logger("Hover candidates (native order): \(list)")
             } else {
                 logger("Hover: no window at \(format(point)).")
             }
@@ -86,12 +94,15 @@ final class WindowSelectionCoordinator: NSObject {
     }
 
     private func handleClick(at point: CGPoint) {
-        guard let hit = windowHit(at: point, excludingBundleID: excludedBundleID) else {
+        let candidates = windowCandidates(at: point, excludingBundleID: excludedBundleID)
+        guard let hit = candidates.first else {
             logger("Click: no window at \(format(point)).")
             finish(.failure(WindowSelectionError.noWindow))
             return
         }
-        logger("Click: selected window id \(hit.id) frame \(format(hit.frame)).")
+        let list = candidates.prefix(8).map { $0.describe }.joined(separator: " | ")
+        logger("Click candidates (native order): \(list)")
+        logger("Click: selected window \(hit.describe) frame \(format(hit.frame)).")
         finish(.success(hit.id))
     }
 
@@ -412,25 +423,48 @@ private final class WindowSelectionWindow: NSWindow {
 
 private struct WindowHit {
     let id: CGWindowID
+    let pid: pid_t
     let frame: CGRect
+    let ownerName: String
+    let windowTitle: String
+    let layer: Int
+    let order: Int
+
+    var describe: String {
+        let title = windowTitle.isEmpty ? "Untitled" : windowTitle
+        return "\(ownerName) — \(title) [id \(id) pid \(pid) layer \(layer) order \(order)]"
+    }
 }
 
-private func windowHit(at point: CGPoint, excludingBundleID: String?) -> WindowHit? {
-    guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+private func windowCandidates(at point: CGPoint, excludingBundleID: String?) -> [WindowHit] {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
         as? [[String: Any]] else {
-        return nil
+        return []
     }
+    let quartzPoint = quartzPoint(fromCocoaPoint: point)
 
-    for window in info {
+    var candidates: [WindowHit] = []
+    for (index, window) in info.enumerated() {
         guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0 else {
+            continue
+        }
+        if let onScreen = window[kCGWindowIsOnscreen as String] as? NSNumber,
+           onScreen.intValue == 0 {
+            continue
+        }
+        if let alpha = window[kCGWindowAlpha as String] as? NSNumber,
+           alpha.doubleValue < 0.01 {
             continue
         }
         guard let boundsDict = window[kCGWindowBounds as String] as? [String: Any],
               let rawBounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
             continue
         }
-        let bounds = normalizeWindowBounds(rawBounds)
-        if !bounds.contains(point) {
+        if rawBounds.width < 2 || rawBounds.height < 2 {
+            continue
+        }
+        if !rawBounds.contains(quartzPoint) {
             continue
         }
         if let pid = window[kCGWindowOwnerPID as String] as? pid_t, pid == getpid() {
@@ -442,12 +476,24 @@ private func windowHit(at point: CGPoint, excludingBundleID: String?) -> WindowH
                 continue
             }
         }
+        guard let pid = window[kCGWindowOwnerPID as String] as? pid_t else {
+            continue
+        }
         guard let id = window[kCGWindowNumber as String] as? CGWindowID else {
             continue
         }
-        return WindowHit(id: id, frame: bounds)
+        let bounds = normalizeWindowBounds(rawBounds)
+        let ownerName = window[kCGWindowOwnerName as String] as? String ?? "Unknown"
+        let windowTitle = window[kCGWindowName as String] as? String ?? ""
+        candidates.append(WindowHit(id: id,
+                                    pid: pid,
+                                    frame: bounds,
+                                    ownerName: ownerName,
+                                    windowTitle: windowTitle,
+                                    layer: layer,
+                                    order: index))
     }
-    return nil
+    return candidates
 }
 
 private func normalizeWindowBounds(_ bounds: CGRect) -> CGRect {
@@ -462,6 +508,13 @@ private func normalizeWindowBounds(_ bounds: CGRect) -> CGRect {
         width: bounds.size.width,
         height: bounds.size.height
     )
+}
+
+private func quartzPoint(fromCocoaPoint point: CGPoint) -> CGPoint {
+    guard let desktopBounds = unifiedDesktopBounds() else {
+        return point
+    }
+    return CGPoint(x: point.x, y: desktopBounds.maxY - point.y)
 }
 
 private func unifiedDesktopBounds() -> CGRect? {

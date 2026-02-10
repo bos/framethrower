@@ -238,8 +238,15 @@ struct ContentView: View {
 
     private var status: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Status")
-                .font(.headline)
+            HStack {
+                Text("Status")
+                    .font(.headline)
+                Spacer()
+                Button("Copy Log") {
+                    model.copyLogsToPasteboard()
+                }
+                .disabled(model.logs.isEmpty)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 6) {

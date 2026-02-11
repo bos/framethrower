@@ -84,10 +84,6 @@ final class WindowSelectionCoordinator: NSObject {
                 logger(
                     "Hover window \(hit.describe) at \(format(point)) frame \(format(hit.frame))."
                 )
-                let list = candidates.prefix(8).map { $0.describe }.joined(separator: " | ")
-                logger("Hover candidates (native order): \(list)")
-            } else {
-                logger("Hover: no window at \(format(point)).")
             }
         }
         view.highlightedFrame = hit?.frame
@@ -100,8 +96,6 @@ final class WindowSelectionCoordinator: NSObject {
             finish(.failure(WindowSelectionError.noWindow))
             return
         }
-        let list = candidates.prefix(8).map { $0.describe }.joined(separator: " | ")
-        logger("Click candidates (native order): \(list)")
         logger("Click: selected window \(hit.describe) frame \(format(hit.frame)).")
         finish(.success(hit.id))
     }

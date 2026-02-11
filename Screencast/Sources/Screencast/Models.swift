@@ -69,6 +69,11 @@ enum SlackTargetKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+struct MicrophoneDevice: Identifiable, Hashable {
+    let id: String
+    let name: String
+}
+
 struct CaptureArea: Hashable {
     var x: Double = 0
     var y: Double = 0

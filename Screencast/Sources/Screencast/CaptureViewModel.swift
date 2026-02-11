@@ -1,6 +1,7 @@
 import AppKit
-import Foundation
+import AVFoundation
 import CoreGraphics
+import Foundation
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
 
@@ -45,6 +46,16 @@ final class CaptureViewModel: ObservableObject {
     @Published var isSlackUploading = false
     @Published var isSlackRefreshing = false
     @Published var hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+    @Published var microphones: [MicrophoneDevice] = []
+    @Published var selectedMicrophoneID: String? {
+        didSet { persistAudioSettings() }
+    }
+    @Published var recordMicrophoneAudio = false {
+        didSet { persistAudioSettings() }
+    }
+    @Published var hasMicrophonePermission = (
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    )
 
     private var clientID: String {
         Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
@@ -71,6 +82,8 @@ final class CaptureViewModel: ObservableObject {
     private let slackSelectedChannelKey = "slack.selectedChannelID"
     private let slackCachedUsersKey = "slack.cachedUsers"
     private let slackCachedChannelsKey = "slack.cachedChannels"
+    private let recordMicrophoneAudioKey = "audio.recordMicrophone"
+    private let selectedMicrophoneIDKey = "audio.selectedMicrophoneID"
     private let userDefaults = UserDefaults.standard
     private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Screencast.log")
@@ -215,6 +228,13 @@ final class CaptureViewModel: ObservableObject {
             return
         }
         tokens = try? JSONDecoder().decode(OAuthTokens.self, from: data)
+    }
+
+    func loadAudioSettings() {
+        recordMicrophoneAudio = userDefaults.bool(forKey: recordMicrophoneAudioKey)
+        selectedMicrophoneID = userDefaults.string(forKey: selectedMicrophoneIDKey)
+        refreshMicrophonePermissionState()
+        refreshMicrophones()
     }
 
     func loadSlackTokens() {
@@ -448,6 +468,11 @@ final class CaptureViewModel: ObservableObject {
             log("Enable Screen Recording permission and restart the app.", level: .error)
             return
         }
+        refreshMicrophones()
+        if recordMicrophoneAudio {
+            let granted = await ensureMicrophonePermission()
+            guard granted else { return }
+        }
 
         do {
             let filter = try selectedFilter()
@@ -461,7 +486,14 @@ final class CaptureViewModel: ObservableObject {
             )
             isRecording = true
             lastRecordingURL = outputURL
-            log("Recording started.")
+            if recordMicrophoneAudio {
+                let microphoneName = microphones
+                    .first(where: { $0.id == selectedMicrophoneID })?.name
+                    ?? "System Default Microphone"
+                log("Recording started with voiceover: \(microphoneName).")
+            } else {
+                log("Recording started.")
+            }
         } catch {
             log("Recording failed: \(error.localizedDescription)", level: .error)
         }
@@ -576,6 +608,10 @@ final class CaptureViewModel: ObservableObject {
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = true
         configuration.capturesAudio = false
+        configuration.captureMicrophone = recordMicrophoneAudio
+        configuration.microphoneCaptureDeviceID = recordMicrophoneAudio
+            ? selectedMicrophoneID
+            : nil
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.queueDepth = 6
         let scale = Double(filter.pointPixelScale)
@@ -679,6 +715,71 @@ final class CaptureViewModel: ObservableObject {
         guard let tokens else { return }
         let data = try? JSONEncoder().encode(tokens)
         userDefaults.set(data, forKey: tokenStorageKey)
+    }
+
+    private func refreshMicrophonePermissionState() {
+        hasMicrophonePermission = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+
+    private func ensureMicrophonePermission() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            hasMicrophonePermission = true
+            return true
+        case .notDetermined:
+            let granted = await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+            hasMicrophonePermission = granted
+            if granted {
+                log("Microphone permission granted.")
+            } else {
+                log("Microphone permission denied.", level: .error)
+            }
+            return granted
+        case .denied, .restricted:
+            hasMicrophonePermission = false
+            log(
+                "Microphone permission is required for voiceover. " +
+                "Enable it in System Settings > Privacy & Security > Microphone.",
+                level: .error
+            )
+            return false
+        @unknown default:
+            hasMicrophonePermission = false
+            return false
+        }
+    }
+
+    private func refreshMicrophones() {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        let devices = discovery.devices
+        var seen = Set<String>()
+        var list: [MicrophoneDevice] = []
+        for device in devices {
+            guard seen.insert(device.uniqueID).inserted else { continue }
+            list.append(MicrophoneDevice(id: device.uniqueID, name: device.localizedName))
+        }
+        list.sort { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+        microphones = list
+        if let selectedMicrophoneID,
+           list.contains(where: { $0.id == selectedMicrophoneID }) {
+            return
+        }
+        selectedMicrophoneID = list.first?.id
+    }
+
+    private func persistAudioSettings() {
+        userDefaults.set(recordMicrophoneAudio, forKey: recordMicrophoneAudioKey)
+        userDefaults.set(selectedMicrophoneID, forKey: selectedMicrophoneIDKey)
     }
 
     private func resolveRecordingURL() -> URL? {

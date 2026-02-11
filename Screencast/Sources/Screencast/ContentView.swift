@@ -22,6 +22,7 @@ struct ContentView: View {
         .onAppear {
             model.loadTokens()
             model.loadSlackTokens()
+            model.loadAudioSettings()
             model.requestScreenRecordingPermission()
             Task { await model.refreshSources() }
         }
@@ -98,6 +99,33 @@ struct ContentView: View {
                             Task { await model.refreshSources() }
                         }
                         Spacer()
+                    }
+
+                    Divider()
+
+                    Toggle("Record microphone voiceover", isOn: $model.recordMicrophoneAudio)
+                    if model.recordMicrophoneAudio {
+                        if model.microphones.isEmpty {
+                            Text(
+                                "No microphone devices found. Connect a microphone and retry."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        } else {
+                            Picker("Microphone", selection: $model.selectedMicrophoneID) {
+                                ForEach(model.microphones) { microphone in
+                                    Text(microphone.name).tag(Optional(microphone.id))
+                                }
+                            }
+                        }
+                        if !model.hasMicrophonePermission {
+                            Text(
+                                "Microphone access is not granted. " +
+                                "Allow it in System Settings > Privacy & Security > Microphone."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     Text("Screen recording permission is required.")

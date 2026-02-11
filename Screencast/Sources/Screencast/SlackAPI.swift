@@ -207,7 +207,7 @@ final class SlackAPI {
         fileURL: URL,
         filename: String,
         channelID: String
-    ) async throws {
+    ) async throws -> SlackUploadResult {
         guard fileURL.isFileURL else {
             throw URLError(.badURL)
         }
@@ -222,7 +222,7 @@ final class SlackAPI {
 
         let uploadInfo = try await requestUploadURL(filename: filename, length: size)
         try await uploadBytes(fileURL: fileURL, uploadURL: uploadInfo.uploadURL)
-        try await completeUpload(fileID: uploadInfo.fileID, channelID: channelID)
+        return try await completeUpload(fileID: uploadInfo.fileID, channelID: channelID)
     }
 
     private func requestUploadURL(
@@ -259,7 +259,10 @@ final class SlackAPI {
         }
     }
 
-    private func completeUpload(fileID: String, channelID: String) async throws {
+    private func completeUpload(
+        fileID: String,
+        channelID: String
+    ) async throws -> SlackUploadResult {
         let url = URL(string: "https://slack.com/api/files.completeUploadExternal")!
         let filePayload = "[{\"id\":\"\(fileID)\"}]"
         let response: SlackCompleteUploadResponse = try await postForm(
@@ -272,6 +275,10 @@ final class SlackAPI {
         guard response.ok else {
             throw SlackClientError.serverError(message: response.error ?? "Upload failed.")
         }
+        let file = response.files?.first
+        let linkString = file?.permalinkPublic ?? file?.permalink
+        let permalink = linkString.flatMap(URL.init(string:))
+        return SlackUploadResult(fileID: file?.id ?? fileID, permalink: permalink)
     }
 
     private func get<T: Decodable & SlackOkResponse>(_ url: URL) async throws -> T {
@@ -523,7 +530,25 @@ extension SlackUploadURLResponse: SlackOkResponse {}
 
 struct SlackCompleteUploadResponse: Decodable {
     let ok: Bool
+    let files: [SlackUploadedFile]?
     let error: String?
 }
 
 extension SlackCompleteUploadResponse: SlackOkResponse {}
+
+struct SlackUploadedFile: Decodable {
+    let id: String?
+    let permalink: String?
+    let permalinkPublic: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case permalink
+        case permalinkPublic = "permalink_public"
+    }
+}
+
+struct SlackUploadResult {
+    let fileID: String
+    let permalink: URL?
+}

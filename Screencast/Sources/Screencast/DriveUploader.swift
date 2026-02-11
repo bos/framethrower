@@ -5,11 +5,20 @@ struct DriveUploadResult: Decodable {
     let id: String
     let name: String
     let mimeType: String
+    let webViewLink: URL?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case mimeType
+        case webViewLink
+    }
 }
 
 final class DriveUploader: @unchecked Sendable {
     private let uploadURL = URL(
-        string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+        string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart" +
+        "&fields=id,name,mimeType,webViewLink"
     )!
 
     func upload(fileURL: URL, accessToken: String) async throws -> DriveUploadResult {

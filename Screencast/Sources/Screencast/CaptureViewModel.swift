@@ -31,6 +31,8 @@ final class CaptureViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var logs: [LogEntry] = []
     @Published var lastRecordingURL: URL?
+    @Published var lastDriveFileURL: URL?
+    @Published var lastSlackFileURL: URL?
 
     @Published var slackTargetKind: SlackTargetKind = .person {
         didSet { persistSlackSelection() }
@@ -48,6 +50,9 @@ final class CaptureViewModel: ObservableObject {
     @Published var hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
     @Published var microphones: [MicrophoneDevice] = []
     @Published var selectedMicrophoneID: String? {
+        didSet { persistAudioSettings() }
+    }
+    @Published var recordSystemAudio = false {
         didSet { persistAudioSettings() }
     }
     @Published var recordMicrophoneAudio = false {
@@ -82,6 +87,7 @@ final class CaptureViewModel: ObservableObject {
     private let slackSelectedChannelKey = "slack.selectedChannelID"
     private let slackCachedUsersKey = "slack.cachedUsers"
     private let slackCachedChannelsKey = "slack.cachedChannels"
+    private let recordSystemAudioKey = "audio.recordSystem"
     private let recordMicrophoneAudioKey = "audio.recordMicrophone"
     private let selectedMicrophoneIDKey = "audio.selectedMicrophoneID"
     private let userDefaults = UserDefaults.standard
@@ -231,6 +237,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func loadAudioSettings() {
+        recordSystemAudio = userDefaults.bool(forKey: recordSystemAudioKey)
         recordMicrophoneAudio = userDefaults.bool(forKey: recordMicrophoneAudioKey)
         selectedMicrophoneID = userDefaults.string(forKey: selectedMicrophoneIDKey)
         refreshMicrophonePermissionState()
@@ -361,6 +368,7 @@ final class CaptureViewModel: ObservableObject {
         slackUsers = []
         selectedSlackChannelID = nil
         selectedSlackUserID = nil
+        lastSlackFileURL = nil
     }
 
     func refreshSlackTargets() async {
@@ -446,15 +454,30 @@ final class CaptureViewModel: ObservableObject {
             }
 
             let filename = fileURL.lastPathComponent
-            try await api.uploadFile(
+            let result = try await api.uploadFile(
                 fileURL: fileURL,
                 filename: filename,
                 channelID: channelID
             )
-            log("Uploaded to Slack.")
+            lastSlackFileURL = result.permalink
+            if let url = result.permalink {
+                copyTextToPasteboard(url.absoluteString)
+                log("Uploaded to Slack. Slack URL copied to clipboard.")
+            } else {
+                log("Uploaded to Slack. No permalink returned by Slack.")
+            }
         } catch {
             log("Slack upload failed: \(error.localizedDescription)", level: .error)
         }
+    }
+
+    func copyLastSlackURLToPasteboard() {
+        guard let lastSlackFileURL else {
+            log("No Slack URL available yet.", level: .error)
+            return
+        }
+        copyTextToPasteboard(lastSlackFileURL.absoluteString)
+        log("Copied Slack URL to clipboard.")
     }
 
     func signOut() {
@@ -486,14 +509,23 @@ final class CaptureViewModel: ObservableObject {
             )
             isRecording = true
             lastRecordingURL = outputURL
-            if recordMicrophoneAudio {
+            let systemAudioEnabled = recordSystemAudio
+            let microphoneEnabled = recordMicrophoneAudio
+            if !systemAudioEnabled && !microphoneEnabled {
+                log("Recording started.")
+                return
+            }
+            var inputs: [String] = []
+            if systemAudioEnabled {
+                inputs.append("system audio")
+            }
+            if microphoneEnabled {
                 let microphoneName = microphones
                     .first(where: { $0.id == selectedMicrophoneID })?.name
                     ?? "System Default Microphone"
-                log("Recording started with voiceover: \(microphoneName).")
-            } else {
-                log("Recording started.")
+                inputs.append("voiceover: \(microphoneName)")
             }
+            log("Recording started with \(inputs.joined(separator: " + ")).")
         } catch {
             log("Recording failed: \(error.localizedDescription)", level: .error)
         }
@@ -522,10 +554,28 @@ final class CaptureViewModel: ObservableObject {
         do {
             let accessToken = try await validAccessToken()
             let result = try await uploader.upload(fileURL: fileURL, accessToken: accessToken)
-            log("Uploaded to Drive: \(result.name)")
+            let driveURL = result.webViewLink ?? URL(
+                string: "https://drive.google.com/file/d/\(result.id)/view"
+            )
+            lastDriveFileURL = driveURL
+            if let driveURL {
+                copyTextToPasteboard(driveURL.absoluteString)
+                log("Uploaded to Drive: \(result.name). Drive URL copied to clipboard.")
+            } else {
+                log("Uploaded to Drive: \(result.name)")
+            }
         } catch {
             log("Upload failed: \(error.localizedDescription)", level: .error)
         }
+    }
+
+    func copyLastDriveURLToPasteboard() {
+        guard let lastDriveFileURL else {
+            log("No Google Drive URL available yet.", level: .error)
+            return
+        }
+        copyTextToPasteboard(lastDriveFileURL.absoluteString)
+        log("Copied Google Drive URL to clipboard.")
     }
 
     private func log(_ message: String, level: LogLevel = .info) {
@@ -542,9 +592,13 @@ final class CaptureViewModel: ObservableObject {
             return "\(timestamp)  [\(level)]  \(entry.message)"
         }
         let text = lines.joined(separator: "\n")
+        copyTextToPasteboard(text)
+        log("Copied \(logs.count) log entries to clipboard.")
+    }
+
+    private func copyTextToPasteboard(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        log("Copied \(logs.count) log entries to clipboard.")
     }
 
     private func appendLogToFile(_ entry: LogEntry) {
@@ -607,7 +661,7 @@ final class CaptureViewModel: ObservableObject {
     private func makeConfiguration(filter: SCContentFilter) throws -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = true
-        configuration.capturesAudio = false
+        configuration.capturesAudio = recordSystemAudio
         configuration.captureMicrophone = recordMicrophoneAudio
         configuration.microphoneCaptureDeviceID = recordMicrophoneAudio
             ? selectedMicrophoneID
@@ -778,6 +832,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func persistAudioSettings() {
+        userDefaults.set(recordSystemAudio, forKey: recordSystemAudioKey)
         userDefaults.set(recordMicrophoneAudio, forKey: recordMicrophoneAudioKey)
         userDefaults.set(selectedMicrophoneID, forKey: selectedMicrophoneIDKey)
     }

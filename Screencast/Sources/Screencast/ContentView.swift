@@ -103,6 +103,7 @@ struct ContentView: View {
 
                     Divider()
 
+                    Toggle("Record system audio", isOn: $model.recordSystemAudio)
                     Toggle("Record microphone voiceover", isOn: $model.recordMicrophoneAudio)
                     if model.recordMicrophoneAudio {
                         if model.microphones.isEmpty {
@@ -255,10 +256,20 @@ struct ContentView: View {
             }
             .disabled(model.isUploading || !model.isAuthorized)
 
+            Button("Copy Drive URL") {
+                model.copyLastDriveURLToPasteboard()
+            }
+            .disabled(model.lastDriveFileURL == nil)
+
             Button("Upload to Slack") {
                 Task { await model.uploadLastRecordingToSlack() }
             }
             .disabled(model.isSlackUploading || !model.isSlackAuthorized)
+
+            Button("Copy Slack URL") {
+                model.copyLastSlackURLToPasteboard()
+            }
+            .disabled(model.lastSlackFileURL == nil)
 
             Spacer()
         }

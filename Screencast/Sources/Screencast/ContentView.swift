@@ -2,6 +2,9 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = CaptureViewModel()
+    private static let linkDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue
+    )
 
     var body: some View {
         VStack(spacing: 16) {
@@ -24,7 +27,11 @@ struct ContentView: View {
             model.loadSlackTokens()
             model.loadAudioSettings()
             model.requestScreenRecordingPermission()
+            model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
+        }
+        .onDisappear {
+            model.stopSourceAutoRefresh()
         }
         .onOpenURL { url in
             SlackCallbackRouter.shared.handle(url: url)
@@ -57,18 +64,19 @@ struct ContentView: View {
                         Button("Pick Window…") {
                             Task { await model.selectWindow() }
                         }
-                        if let selected = model.selectedWindow {
-                            Text("Selected: \(selected.displayName)")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("No window selected.")
-                                .foregroundStyle(.secondary)
+                        Picker("Window", selection: $model.selectedWindowID) {
+                            ForEach(model.windows) { window in
+                                Text(window.displayName).tag(Optional(window.id))
+                            }
                         }
+                        .disabled(model.windows.isEmpty)
+                    }
+                    if model.windows.isEmpty {
+                        Text("No on-screen windows are currently available.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     Text("Click a window to select it. Only on-screen windows are selectable.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Bring the window forward and click Refresh Sources if needed.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -92,13 +100,6 @@ struct ContentView: View {
                             )
                             .foregroundStyle(.secondary)
                         }
-                    }
-
-                    HStack {
-                        Button("Refresh Sources") {
-                            Task { await model.refreshSources() }
-                        }
-                        Spacer()
                     }
 
                     Divider()
@@ -254,7 +255,7 @@ struct ContentView: View {
             Button("Upload to Google Drive") {
                 Task { await model.uploadLastRecording() }
             }
-            .disabled(model.isUploading || !model.isAuthorized)
+            .disabled(model.isUploading || !model.isAuthorized || !model.hasRecordingToUpload)
 
             Button("Copy Drive URL") {
                 model.copyLastDriveURLToPasteboard()
@@ -264,7 +265,9 @@ struct ContentView: View {
             Button("Upload to Slack") {
                 Task { await model.uploadLastRecordingToSlack() }
             }
-            .disabled(model.isSlackUploading || !model.isSlackAuthorized)
+            .disabled(
+                model.isSlackUploading || !model.isSlackAuthorized || !model.hasRecordingToUpload
+            )
 
             Button("Copy Slack URL") {
                 model.copyLastSlackURLToPasteboard()
@@ -290,7 +293,12 @@ struct ContentView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(model.logs) { entry in
-                            Text("\(timestamp(entry.date))  \(entry.message)")
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(timestamp(entry.date))
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                Text(linkedMessage(entry.message))
+                            }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(entry.level == .error ? .red : .primary)
                                 .font(.caption)
@@ -302,6 +310,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 160)
                 .background(Color(.textBackgroundColor))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
+                .textSelection(.enabled)
                 .onChange(of: model.logs.count) { _, _ in
                     guard let last = model.logs.last else { return }
                     withAnimation(.easeOut(duration: 0.2)) {
@@ -330,6 +339,58 @@ struct ContentView: View {
         formatter.dateStyle = .none
         formatter.timeStyle = .medium
         return formatter.string(from: date)
+    }
+
+    private func linkedMessage(_ message: String) -> AttributedString {
+        let markdown = markdownLinkedMessage(message)
+        if let attributed = try? AttributedString(
+            markdown: markdown,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace
+            )
+        ) {
+            return attributed
+        }
+        return AttributedString(message)
+    }
+
+    private func markdownLinkedMessage(_ message: String) -> String {
+        guard let detector = Self.linkDetector else {
+            return escapeMarkdown(message)
+        }
+        let fullRange = NSRange(message.startIndex..<message.endIndex, in: message)
+        let matches = detector.matches(in: message, options: [], range: fullRange)
+        guard !matches.isEmpty else {
+            return escapeMarkdown(message)
+        }
+
+        var result = ""
+        var cursor = message.startIndex
+        for match in matches {
+            guard let url = match.url,
+                  let range = Range(match.range, in: message) else {
+                continue
+            }
+            if cursor < range.lowerBound {
+                result += escapeMarkdown(String(message[cursor..<range.lowerBound]))
+            }
+            let label = escapeMarkdown(String(message[range]))
+            result += "[\(label)](\(url.absoluteString))"
+            cursor = range.upperBound
+        }
+        if cursor < message.endIndex {
+            result += escapeMarkdown(String(message[cursor...]))
+        }
+        return result
+    }
+
+    private func escapeMarkdown(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "[", with: "\\[")
+            .replacingOccurrences(of: "]", with: "\\]")
+            .replacingOccurrences(of: "(", with: "\\(")
+            .replacingOccurrences(of: ")", with: "\\)")
     }
 }
 

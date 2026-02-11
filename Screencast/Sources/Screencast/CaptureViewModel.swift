@@ -19,18 +19,25 @@ final class CaptureViewModel: ObservableObject {
         let level: LogLevel
     }
 
-    @Published var captureKind: CaptureSourceKind = .window
+    @Published var captureKind: CaptureSourceKind = .window {
+        didSet { handleCaptureKindChanged() }
+    }
     @Published var windows: [ShareableWindow] = []
     @Published var displays: [ShareableDisplay] = []
     @Published var selectedWindowID: CGWindowID?
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var area = CaptureArea()
 
-    @Published var isRecording = false
+    @Published var isRecording = false {
+        didSet { updateSourceRefreshScheduling() }
+    }
     @Published var isUploading = false
     @Published var statusMessage = ""
     @Published var logs: [LogEntry] = []
-    @Published var lastRecordingURL: URL?
+    @Published var lastRecordingURL: URL? {
+        didSet { updateRecordingAvailability() }
+    }
+    @Published private(set) var hasRecordingToUpload = false
     @Published var lastDriveFileURL: URL?
     @Published var lastSlackFileURL: URL?
 
@@ -99,6 +106,12 @@ final class CaptureViewModel: ObservableObject {
         formatter.timeStyle = .medium
         return formatter
     }()
+    private var activeRecordingURL: URL?
+    private var sourceRefreshObservers: [any NSObjectProtocol] = []
+    private var sourceRefreshTimer: Timer?
+    private var isSourceRefreshConfigured = false
+    private var isSourceRefreshing = false
+    private var isAppActive = false
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -136,16 +149,45 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    func refreshSources() async {
+    func startSourceAutoRefresh() {
+        guard !isSourceRefreshConfigured else { return }
+        isSourceRefreshConfigured = true
+        isAppActive = NSApp.isActive
+        registerSourceRefreshObservers()
+        updateSourceRefreshScheduling()
+    }
+
+    func stopSourceAutoRefresh() {
+        guard isSourceRefreshConfigured else { return }
+        isSourceRefreshConfigured = false
+        sourceRefreshTimer?.invalidate()
+        sourceRefreshTimer = nil
+        for observer in sourceRefreshObservers {
+            NotificationCenter.default.removeObserver(observer)
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        sourceRefreshObservers.removeAll()
+    }
+
+    func refreshSources(logSuccess: Bool = true, logErrors: Bool = true) async {
+        guard !isSourceRefreshing else { return }
+        isSourceRefreshing = true
+        defer { isSourceRefreshing = false }
+
         hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
         guard hasScreenRecordingPermission else {
             windows = []
             displays = []
             selectedWindowID = nil
             selectedDisplayID = nil
-            log("Screen recording permission is required.", level: .error)
+            if logErrors {
+                log("Screen recording permission is required.", level: .error)
+            }
             return
         }
+
+        let previousWindowID = selectedWindowID
+        let previousDisplayID = selectedDisplayID
         do {
             let content = try await shareableContent()
             let allWindows = content.windows.map(ShareableWindow.init)
@@ -166,11 +208,150 @@ final class CaptureViewModel: ObservableObject {
                     return lhs.id < rhs.id
                 }
             displays = content.displays.map(ShareableDisplay.init)
-            selectedWindowID = windows.first?.id
-            selectedDisplayID = displays.first?.id
-            log("Sources refreshed. Showing \(windows.count) windows.")
+            if let previousWindowID,
+               windows.contains(where: { $0.id == previousWindowID }) {
+                selectedWindowID = previousWindowID
+            } else {
+                selectedWindowID = windows.first?.id
+            }
+            if let previousDisplayID,
+               displays.contains(where: { $0.id == previousDisplayID }) {
+                selectedDisplayID = previousDisplayID
+            } else {
+                selectedDisplayID = displays.first?.id
+            }
+            if logSuccess {
+                log("Sources refreshed. Showing \(windows.count) windows.")
+            }
         } catch {
-            log("Failed to load sources: \(error.localizedDescription)", level: .error)
+            if logErrors {
+                log("Failed to load sources: \(error.localizedDescription)", level: .error)
+            }
+        }
+    }
+
+    private func handleCaptureKindChanged() {
+        updateSourceRefreshScheduling()
+        sourceRefreshTriggered(force: true)
+    }
+
+    private func registerSourceRefreshObservers() {
+        let center = NotificationCenter.default
+        sourceRefreshObservers.append(
+            center.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isAppActive = true
+                    self.updateSourceRefreshScheduling()
+                    self.sourceRefreshTriggered(force: true)
+                }
+            }
+        )
+        sourceRefreshObservers.append(
+            center.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isAppActive = false
+                    self.updateSourceRefreshScheduling()
+                }
+            }
+        )
+        sourceRefreshObservers.append(
+            center.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.sourceRefreshTriggered(force: true)
+                }
+            }
+        )
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        sourceRefreshObservers.append(
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didLaunchApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.sourceRefreshTriggered(force: true)
+                }
+            }
+        )
+        sourceRefreshObservers.append(
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didTerminateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.sourceRefreshTriggered(force: true)
+                }
+            }
+        )
+        sourceRefreshObservers.append(
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.sourceRefreshTriggered(force: true)
+                }
+            }
+        )
+    }
+
+    private func updateSourceRefreshScheduling() {
+        let shouldRunTimer = isSourceRefreshConfigured &&
+            isAppActive &&
+            !isRecording &&
+            captureKind == .window
+
+        if !shouldRunTimer {
+            sourceRefreshTimer?.invalidate()
+            sourceRefreshTimer = nil
+            return
+        }
+        if sourceRefreshTimer != nil {
+            return
+        }
+        let timer = Timer(
+            timeInterval: 2.0,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.sourceRefreshTriggered(force: false)
+            }
+        }
+        timer.tolerance = 0.4
+        RunLoop.main.add(timer, forMode: .common)
+        sourceRefreshTimer = timer
+    }
+
+    private func sourceRefreshTriggered(force: Bool) {
+        if !force {
+            guard isSourceRefreshConfigured,
+                  isAppActive,
+                  !isRecording,
+                  captureKind == .window else {
+                return
+            }
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.refreshSources(logSuccess: false, logErrors: false)
         }
     }
 
@@ -181,6 +362,8 @@ final class CaptureViewModel: ObservableObject {
             log("No display available for area selection.", level: .error)
             return
         }
+        let hiddenWindows = hideMainWindowsForSelection()
+        defer { restoreMainWindowsAfterSelection(hiddenWindows) }
         do {
             let selected = try await AreaSelectionCoordinator.selectArea(in: frame)
             area = CaptureArea(
@@ -203,6 +386,9 @@ final class CaptureViewModel: ObservableObject {
             log("Enable Screen Recording permission and restart the app.", level: .error)
             return
         }
+        await refreshSources(logSuccess: false, logErrors: false)
+        let hiddenWindows = hideMainWindowsForSelection()
+        defer { restoreMainWindowsAfterSelection(hiddenWindows) }
 
         do {
             let bundleID = Bundle.main.bundleIdentifier
@@ -226,6 +412,27 @@ final class CaptureViewModel: ObservableObject {
         } catch {
             log("Window selection failed: \(error.localizedDescription)", level: .error)
         }
+    }
+
+    private func hideMainWindowsForSelection() -> [NSWindow] {
+        let windowsToHide = NSApp.windows.filter { window in
+            guard window.isVisible else { return false }
+            guard window.level == .normal else { return false }
+            return window.styleMask.contains(.titled)
+        }
+        for window in windowsToHide {
+            window.orderOut(nil)
+        }
+        return windowsToHide
+    }
+
+    private func restoreMainWindowsAfterSelection(_ windows: [NSWindow]) {
+        guard !windows.isEmpty else { return }
+        for window in windows {
+            window.orderFront(nil)
+        }
+        windows.first?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func loadTokens() {
@@ -462,7 +669,8 @@ final class CaptureViewModel: ObservableObject {
             lastSlackFileURL = result.permalink
             if let url = result.permalink {
                 copyTextToPasteboard(url.absoluteString)
-                log("Uploaded to Slack. Slack URL copied to clipboard.")
+                log("Uploaded to Slack: \(filename). Slack URL copied to clipboard.")
+                log("Slack URL: \(url.absoluteString)")
             } else {
                 log("Uploaded to Slack. No permalink returned by Slack.")
             }
@@ -501,6 +709,7 @@ final class CaptureViewModel: ObservableObject {
             let filter = try selectedFilter()
             let configuration = try makeConfiguration(filter: filter)
             let outputURL = try makeOutputURL()
+            activeRecordingURL = outputURL
 
             try await recorder.start(
                 filter: filter,
@@ -527,6 +736,7 @@ final class CaptureViewModel: ObservableObject {
             }
             log("Recording started with \(inputs.joined(separator: " + ")).")
         } catch {
+            activeRecordingURL = nil
             log("Recording failed: \(error.localizedDescription)", level: .error)
         }
     }
@@ -536,7 +746,21 @@ final class CaptureViewModel: ObservableObject {
         do {
             try await recorder.stop()
             isRecording = false
-            log("Recording stopped.")
+            let outputURL = activeRecordingURL ?? lastRecordingURL
+            activeRecordingURL = nil
+            if let outputURL,
+               FileManager.default.fileExists(atPath: outputURL.path) {
+                lastRecordingURL = outputURL
+                let size = (try? fileSize(for: outputURL)) ?? 0
+                log(
+                    "Recording stopped. Saved \(outputURL.lastPathComponent) " +
+                    "(\(size) bytes)."
+                )
+                log("Local file URL: \(outputURL.absoluteString)")
+            } else {
+                updateRecordingAvailability()
+                log("Recording stopped, but no output file was found.", level: .error)
+            }
         } catch {
             log("Stop failed: \(error.localizedDescription)", level: .error)
         }
@@ -561,6 +785,7 @@ final class CaptureViewModel: ObservableObject {
             if let driveURL {
                 copyTextToPasteboard(driveURL.absoluteString)
                 log("Uploaded to Drive: \(result.name). Drive URL copied to clipboard.")
+                log("Drive URL: \(driveURL.absoluteString)")
             } else {
                 log("Uploaded to Drive: \(result.name)")
             }
@@ -840,36 +1065,19 @@ final class CaptureViewModel: ObservableObject {
     private func resolveRecordingURL() -> URL? {
         if let fileURL = lastRecordingURL,
            FileManager.default.fileExists(atPath: fileURL.path) {
+            hasRecordingToUpload = true
             return fileURL
         }
-        if let latest = findLatestRecording() {
-            lastRecordingURL = latest
-            return latest
-        }
+        hasRecordingToUpload = false
         return nil
     }
 
-    private func findLatestRecording() -> URL? {
-        let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.temporaryDirectory
-        guard let items = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.creationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
+    private func updateRecordingAvailability() {
+        guard let fileURL = lastRecordingURL else {
+            hasRecordingToUpload = false
+            return
         }
-        let candidates = items.filter { url in
-            url.lastPathComponent.hasPrefix("Screencast-") && url.pathExtension == "mp4"
-        }
-        let sorted = candidates.sorted { lhs, rhs in
-            let ldate = (try? lhs.resourceValues(forKeys: [.creationDateKey]).creationDate)
-                ?? .distantPast
-            let rdate = (try? rhs.resourceValues(forKeys: [.creationDateKey]).creationDate)
-                ?? .distantPast
-            return ldate > rdate
-        }
-        return sorted.first
+        hasRecordingToUpload = FileManager.default.fileExists(atPath: fileURL.path)
     }
 
     private func fileSize(for url: URL) throws -> Int {

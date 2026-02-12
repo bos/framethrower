@@ -5,6 +5,9 @@ struct ContentView: View {
     @StateObject private var model = CaptureViewModel()
     @State private var delayedStartAnchorView: NSView?
     @State private var delayedStartMenuHandler: DelayedStartMenuActionHandler?
+    private static let recordingControlWidth: CGFloat = 236
+    private static let recordingControlHeight: CGFloat = 36
+    private static let delayedStartCaretWidth: CGFloat = 40
     private static let linkDetector = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )
@@ -262,32 +265,61 @@ struct ContentView: View {
     @ViewBuilder
     private var recordingControl: some View {
         if model.isRecording {
-            Button {
+            recordingActionButton(
+                iconSystemName: "stop.fill",
+                title: "Stop Recording",
+                useMonospacedDigits: false,
+                isDisabled: !model.hasScreenRecordingPermission
+            ) {
                 Task { await model.stopRecording() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "stop.fill")
-                        .foregroundStyle(.primary)
-                    Text("Stop Recording")
-                        .foregroundStyle(.primary)
-                }
             }
-            .disabled(!model.hasScreenRecordingPermission)
         } else if let remaining = model.countdownRemainingSeconds {
-            Button {
+            recordingActionButton(
+                iconSystemName: "hourglass",
+                title: "Starting in \(remaining)s...",
+                useMonospacedDigits: true,
+                isDisabled: !model.hasScreenRecordingPermission
+            ) {
                 model.cancelRecordingCountdown()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "hourglass")
-                        .foregroundStyle(.primary)
-                    Text("Starting in \(remaining)s...")
-                        .foregroundStyle(.primary)
-                }
             }
-            .disabled(!model.hasScreenRecordingPermission)
         } else {
             delayedStartControl
         }
+    }
+
+    private func recordingActionButton(
+        iconSystemName: String,
+        title: String,
+        useMonospacedDigits: Bool,
+        isDisabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: iconSystemName)
+                    .foregroundStyle(.primary)
+                Text(title)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .applyIf(useMonospacedDigits) { view in
+                        view.monospacedDigit()
+                    }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(width: Self.recordingControlWidth, height: Self.recordingControlHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.secondary.opacity(0.32), lineWidth: 1)
+        )
+        .opacity(isDisabled ? 0.55 : 1.0)
+        .allowsHitTesting(!isDisabled)
     }
 
     private var delayedStartControl: some View {
@@ -302,7 +334,7 @@ struct ContentView: View {
                     .lineLimit(1)
             }
             .padding(.horizontal, 16)
-            .frame(height: 36)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .contentShape(Rectangle())
             .onTapGesture {
                 guard !isDisabled else { return }
@@ -315,7 +347,10 @@ struct ContentView: View {
 
             Image(systemName: "chevron.down")
                 .foregroundStyle(.primary)
-                .frame(width: 40, height: 36)
+                .frame(
+                    width: Self.delayedStartCaretWidth,
+                    height: Self.recordingControlHeight
+                )
                 .contentShape(Rectangle())
                 .onTapGesture {
                     guard !isDisabled else { return }
@@ -332,7 +367,10 @@ struct ContentView: View {
         )
         .opacity(isDisabled ? 0.55 : 1.0)
         .allowsHitTesting(!isDisabled)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(
+            width: Self.recordingControlWidth,
+            height: Self.recordingControlHeight
+        )
         .background(
             DelayedStartAnchorReader { anchor in
                 delayedStartAnchorView = anchor
@@ -486,6 +524,20 @@ struct ContentView: View {
             .replacingOccurrences(of: "]", with: "\\]")
             .replacingOccurrences(of: "(", with: "\\(")
             .replacingOccurrences(of: ")", with: "\\)")
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func applyIf<Transformed: View>(
+        _ condition: Bool,
+        transform: (Self) -> Transformed
+    ) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
     }
 }
 

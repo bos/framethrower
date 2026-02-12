@@ -1,7 +1,10 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = CaptureViewModel()
+    @State private var delayedStartAnchorView: NSView?
+    @State private var delayedStartMenuHandler: DelayedStartMenuActionHandler?
     private static let linkDetector = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )
@@ -17,6 +20,7 @@ struct ContentView: View {
             slackSection
             Divider()
             controls
+                .zIndex(20)
             status
             versionLabel
         }
@@ -26,7 +30,7 @@ struct ContentView: View {
             model.loadTokens()
             model.loadSlackTokens()
             model.loadAudioSettings()
-            model.requestScreenRecordingPermission()
+            _ = model.requestScreenRecordingPermission()
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
         }
@@ -227,30 +231,7 @@ struct ContentView: View {
 
     private var controls: some View {
         HStack(spacing: 16) {
-            Button {
-                if model.isRecording {
-                    Task { await model.stopRecording() }
-                } else {
-                    Task { await model.startRecording() }
-                }
-            } label: {
-                if model.isRecording {
-                    HStack(spacing: 6) {
-                        Image(systemName: "stop.fill")
-                            .foregroundStyle(.primary)
-                        Text("Stop Recording")
-                            .foregroundStyle(.primary)
-                    }
-                } else {
-                    HStack(spacing: 6) {
-                        Image(systemName: "record.circle.fill")
-                            .foregroundStyle(.red)
-                        Text("Start Recording")
-                            .foregroundStyle(.primary)
-                    }
-                }
-            }
-            .disabled(!model.hasScreenRecordingPermission)
+            recordingControl
 
             Button("Upload to Google Drive") {
                 Task { await model.uploadLastRecording() }
@@ -276,6 +257,120 @@ struct ContentView: View {
 
             Spacer()
         }
+    }
+
+    @ViewBuilder
+    private var recordingControl: some View {
+        if model.isRecording {
+            Button {
+                Task { await model.stopRecording() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "stop.fill")
+                        .foregroundStyle(.primary)
+                    Text("Stop Recording")
+                        .foregroundStyle(.primary)
+                }
+            }
+            .disabled(!model.hasScreenRecordingPermission)
+        } else if let remaining = model.countdownRemainingSeconds {
+            Button {
+                model.cancelRecordingCountdown()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(.primary)
+                    Text("Starting in \(remaining)s...")
+                        .foregroundStyle(.primary)
+                }
+            }
+            .disabled(!model.hasScreenRecordingPermission)
+        } else {
+            delayedStartControl
+        }
+    }
+
+    private var delayedStartControl: some View {
+        let isDisabled = !model.hasScreenRecordingPermission || model.isCountdownActive
+
+        return HStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "record.circle.fill")
+                    .foregroundStyle(.red)
+                Text("Start Recording")
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 36)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard !isDisabled else { return }
+                Task { await model.startRecording() }
+            }
+
+            Rectangle()
+                .fill(Color.secondary.opacity(0.28))
+                .frame(width: 1, height: 20)
+
+            Image(systemName: "chevron.down")
+                .foregroundStyle(.primary)
+                .frame(width: 40, height: 36)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard !isDisabled else { return }
+                    showDelayedStartMenu()
+                }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.secondary.opacity(0.32), lineWidth: 1)
+        )
+        .opacity(isDisabled ? 0.55 : 1.0)
+        .allowsHitTesting(!isDisabled)
+        .fixedSize(horizontal: true, vertical: false)
+        .background(
+            DelayedStartAnchorReader { anchor in
+                delayedStartAnchorView = anchor
+            }
+        )
+    }
+
+    private func showDelayedStartMenu() {
+        guard let anchorView = delayedStartAnchorView else { return }
+        let handler = DelayedStartMenuActionHandler(
+            startInFive: {
+                Task { await model.startRecordingAfterDelay(seconds: 5) }
+            },
+            startInTen: {
+                Task { await model.startRecordingAfterDelay(seconds: 10) }
+            }
+        )
+        delayedStartMenuHandler = handler
+
+        let menu = NSMenu()
+        let startInFive = NSMenuItem(
+            title: "Start in 5 Seconds",
+            action: #selector(DelayedStartMenuActionHandler.startInFiveAction),
+            keyEquivalent: ""
+        )
+        startInFive.target = handler
+
+        let startInTen = NSMenuItem(
+            title: "Start in 10 Seconds",
+            action: #selector(DelayedStartMenuActionHandler.startInTenAction),
+            keyEquivalent: ""
+        )
+        startInTen.target = handler
+
+        menu.addItem(startInFive)
+        menu.addItem(startInTen)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: anchorView)
+        delayedStartMenuHandler = nil
     }
 
     private var status: some View {
@@ -391,6 +486,45 @@ struct ContentView: View {
             .replacingOccurrences(of: "]", with: "\\]")
             .replacingOccurrences(of: "(", with: "\\(")
             .replacingOccurrences(of: ")", with: "\\)")
+    }
+}
+
+private struct DelayedStartAnchorReader: NSViewRepresentable {
+    let onResolve: (NSView) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            onResolve(view)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            onResolve(nsView)
+        }
+    }
+}
+
+@MainActor
+private final class DelayedStartMenuActionHandler: NSObject {
+    private let startInFive: () -> Void
+    private let startInTen: () -> Void
+
+    init(startInFive: @escaping () -> Void, startInTen: @escaping () -> Void) {
+        self.startInFive = startInFive
+        self.startInTen = startInTen
+    }
+
+    @objc
+    func startInFiveAction() {
+        startInFive()
+    }
+
+    @objc
+    func startInTenAction() {
+        startInTen()
     }
 }
 

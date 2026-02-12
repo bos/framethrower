@@ -34,6 +34,7 @@ final class CaptureViewModel: ObservableObject {
     @Published var isUploading = false
     @Published var statusMessage = ""
     @Published var logs: [LogEntry] = []
+    @Published var countdownRemainingSeconds: Int?
     @Published var lastRecordingURL: URL? {
         didSet { updateRecordingAvailability() }
     }
@@ -112,6 +113,7 @@ final class CaptureViewModel: ObservableObject {
     private var isSourceRefreshConfigured = false
     private var isSourceRefreshing = false
     private var isAppActive = false
+    private var didAttemptScreenPermissionRequest = false
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -134,12 +136,24 @@ final class CaptureViewModel: ObservableObject {
         return windows.first(where: { $0.id == id })
     }
 
-    func requestScreenRecordingPermission() {
-        let preflight = CGPreflightScreenCaptureAccess()
-        if preflight {
-            hasScreenRecordingPermission = true
-            return
+    var isCountdownActive: Bool {
+        countdownRemainingSeconds != nil
+    }
+
+    func refreshScreenRecordingPermissionState() {
+        hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+    }
+
+    @discardableResult
+    func requestScreenRecordingPermission() -> Bool {
+        refreshScreenRecordingPermissionState()
+        if hasScreenRecordingPermission {
+            return true
         }
+        guard !didAttemptScreenPermissionRequest else {
+            return false
+        }
+        didAttemptScreenPermissionRequest = true
         let granted = CGRequestScreenCaptureAccess()
         hasScreenRecordingPermission = granted
         if granted {
@@ -147,6 +161,7 @@ final class CaptureViewModel: ObservableObject {
         } else {
             log("Screen recording permission denied.", level: .error)
         }
+        return granted
     }
 
     func startSourceAutoRefresh() {
@@ -174,7 +189,7 @@ final class CaptureViewModel: ObservableObject {
         isSourceRefreshing = true
         defer { isSourceRefreshing = false }
 
-        hasScreenRecordingPermission = CGPreflightScreenCaptureAccess()
+        refreshScreenRecordingPermissionState()
         guard hasScreenRecordingPermission else {
             windows = []
             displays = []
@@ -357,6 +372,7 @@ final class CaptureViewModel: ObservableObject {
 
     func selectArea() async {
         guard captureKind == .area else { return }
+        guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         let frame = selectedDisplayFrame() ?? NSScreen.main?.frame ?? .zero
         guard frame.width >= 2, frame.height >= 2 else {
             log("No display available for area selection.", level: .error)
@@ -382,10 +398,7 @@ final class CaptureViewModel: ObservableObject {
 
     func selectWindow() async {
         guard captureKind == .window else { return }
-        guard hasScreenRecordingPermission else {
-            log("Enable Screen Recording permission and restart the app.", level: .error)
-            return
-        }
+        guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         await refreshSources(logSuccess: false, logErrors: false)
         let hiddenWindows = hideMainWindowsForSelection()
         defer { restoreMainWindowsAfterSelection(hiddenWindows) }
@@ -695,10 +708,8 @@ final class CaptureViewModel: ObservableObject {
 
     func startRecording() async {
         guard !isRecording else { return }
-        guard hasScreenRecordingPermission else {
-            log("Enable Screen Recording permission and restart the app.", level: .error)
-            return
-        }
+        guard countdownRemainingSeconds == nil else { return }
+        guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         refreshMicrophones()
         if recordMicrophoneAudio {
             let granted = await ensureMicrophonePermission()
@@ -764,6 +775,65 @@ final class CaptureViewModel: ObservableObject {
         } catch {
             log("Stop failed: \(error.localizedDescription)", level: .error)
         }
+    }
+
+    func startRecordingAfterDelay(seconds: Int) async {
+        guard !isRecording else { return }
+        guard countdownRemainingSeconds == nil else { return }
+        guard ensureScreenRecordingPermissionForCaptureAction() else { return }
+        let countdownSeconds = max(1, seconds)
+        countdownRemainingSeconds = countdownSeconds
+        log("Countdown started: \(countdownSeconds)s.")
+        do {
+            try await RecordingCountdownCoordinator.run(seconds: countdownSeconds) { [weak self]
+                remaining in
+                self?.countdownRemainingSeconds = remaining
+            }
+            countdownRemainingSeconds = nil
+            log("Countdown finished. Recording started.")
+            await startRecordingAfterCountdownHandoff()
+        } catch RecordingCountdownError.cancelled {
+            countdownRemainingSeconds = nil
+            log("Countdown cancelled.")
+        } catch {
+            countdownRemainingSeconds = nil
+            log("Countdown failed: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    func cancelRecordingCountdown() {
+        guard countdownRemainingSeconds != nil else { return }
+        RecordingCountdownCoordinator.cancelCurrent()
+    }
+
+    private func startRecordingAfterCountdownHandoff() async {
+        // Start from a fresh main-queue turn after overlay teardown to avoid lifetime issues.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        continuation.resume()
+                        return
+                    }
+                    await self.startRecording()
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private func ensureScreenRecordingPermissionForCaptureAction() -> Bool {
+        refreshScreenRecordingPermissionState()
+        if hasScreenRecordingPermission {
+            return true
+        }
+        let granted = requestScreenRecordingPermission()
+        guard granted else {
+            log("Enable Screen Recording permission in System Settings, then restart the app.",
+                level: .error)
+            return false
+        }
+        return true
     }
 
     func uploadLastRecording() async {

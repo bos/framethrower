@@ -1,3 +1,4 @@
+import AppKit
 import ScreenCaptureKit
 import SwiftUI
 
@@ -44,13 +45,39 @@ struct ShareableWindow: Identifiable, Hashable {
 
 struct ShareableDisplay: Identifiable, Hashable {
     let id: CGDirectDisplayID
+    let index: Int
     let name: String
     let display: SCDisplay
 
-    init(display: SCDisplay) {
+    init(display: SCDisplay, index: Int) {
         id = display.displayID
-        name = "Display \(display.displayID)"
+        self.index = index
+        let indexLabel = "Display \(index)"
+        if let localized = ShareableDisplay.localizedDisplayName(for: id) {
+            name = "\(localized) (\(indexLabel))"
+        } else {
+            name = indexLabel
+        }
         self.display = display
+    }
+
+    private static func localizedDisplayName(for id: CGDirectDisplayID) -> String? {
+        for screen in NSScreen.screens {
+            guard let screenID = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber
+            else {
+                continue
+            }
+            if CGDirectDisplayID(screenID.uint32Value) == id {
+                let label = screen.localizedName.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                if !label.isEmpty {
+                    return label
+                }
+                return nil
+            }
+        }
+        return nil
     }
 }
 

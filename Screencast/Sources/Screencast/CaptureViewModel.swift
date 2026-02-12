@@ -222,7 +222,9 @@ final class CaptureViewModel: ObservableObject {
                     }
                     return lhs.id < rhs.id
                 }
-            displays = content.displays.map(ShareableDisplay.init)
+            displays = content.displays.enumerated().map { offset, display in
+                ShareableDisplay(display: display, index: offset + 1)
+            }
             if let previousWindowID,
                windows.contains(where: { $0.id == previousWindowID }) {
                 selectedWindowID = previousWindowID
@@ -381,7 +383,15 @@ final class CaptureViewModel: ObservableObject {
         let hiddenWindows = hideMainWindowsForSelection()
         defer { restoreMainWindowsAfterSelection(hiddenWindows) }
         do {
-            let selected = try await AreaSelectionCoordinator.selectArea(in: frame)
+            let initialSelection: CGRect? = {
+                let rect = area.rect
+                guard rect.width >= 2, rect.height >= 2 else { return nil }
+                return rect
+            }()
+            let selected = try await AreaSelectionCoordinator.selectArea(
+                in: frame,
+                initialSelection: initialSelection
+            )
             area = CaptureArea(
                 x: selected.origin.x,
                 y: selected.origin.y,

@@ -10,6 +10,7 @@
 		04E2EA36A84771AA5E48F425 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1F0D5A7FFA04CF326AAFE35 /* Models.swift */; };
 		0CA6022EF547775F1CDDFC5C /* CaptureViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 513C299CFB03E309B20F65CE /* CaptureViewModel.swift */; };
 		0EB09C3A4ABE203143AC5CB7 /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDEDC850C7B9317F0FABEC34 /* OAuth.swift */; };
+		1D98A5CDDB6B9E4E0A778D67 /* AccountsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ED0BA4044CE79750BC77BAC /* AccountsSettingsView.swift */; };
 		3B477FD958254DA0E388A67C /* DriveUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A23FE0AC16B5C41640849E5A /* DriveUploader.swift */; };
 		405015E54EAF2402823A0CC2 /* Resources in Resources */ = {isa = PBXBuildFile; fileRef = 2329B6263736F287B1A53B5B /* Resources */; };
 		47EB473873E4685E1FA64EB6 /* SlackAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 112973BBA8EF9E7A1222B3F2 /* SlackAPI.swift */; };
@@ -18,6 +19,7 @@
 		B1339F914F35AF5BF610B9DC /* AreaSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEBD93E5326FFE169B2B6621 /* AreaSelection.swift */; };
 		BEA98A35CBA8ECFCA7F74450 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C233D1C7036A2ED7625437 /* KeychainStore.swift */; };
 		C4BA39FF79B5785B59F411C1 /* WindowSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD333F26085752DA6385E525 /* WindowSelection.swift */; };
+		CBB2C905A3B8CA9105E5D344 /* StatusChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1592CC8A416E07FDD407A5C /* StatusChip.swift */; };
 		D9298B0DE17BE699BFD294C8 /* ScreenRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFF3B13582E15A4F53C00D3 /* ScreenRecorder.swift */; };
 /* End PBXBuildFile section */
 
@@ -28,6 +30,7 @@
 		513C299CFB03E309B20F65CE /* CaptureViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureViewModel.swift; sourceTree = "<group>"; };
 		51C233D1C7036A2ED7625437 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		7DC682BC73AF2D966E564C57 /* ScreencastApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreencastApp.swift; sourceTree = "<group>"; };
+		8ED0BA4044CE79750BC77BAC /* AccountsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountsSettingsView.swift; sourceTree = "<group>"; };
 		7E584E0C7AE18B6EBCFAA317 /* Screencast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Screencast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1F0D5A7FFA04CF326AAFE35 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		A23FE0AC16B5C41640849E5A /* DriveUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveUploader.swift; sourceTree = "<group>"; };
@@ -35,6 +38,7 @@
 		BDEDC850C7B9317F0FABEC34 /* OAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuth.swift; sourceTree = "<group>"; };
 		CAFF3B13582E15A4F53C00D3 /* ScreenRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenRecorder.swift; sourceTree = "<group>"; };
 		CD333F26085752DA6385E525 /* WindowSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowSelection.swift; sourceTree = "<group>"; };
+		E1592CC8A416E07FDD407A5C /* StatusChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusChip.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -57,6 +61,7 @@
 		7333EC675C5AA369E7BE143F /* Screencast */ = {
 			isa = PBXGroup;
 			children = (
+				8ED0BA4044CE79750BC77BAC /* AccountsSettingsView.swift */,
 				AEBD93E5326FFE169B2B6621 /* AreaSelection.swift */,
 				513C299CFB03E309B20F65CE /* CaptureViewModel.swift */,
 				2FCB73CFE645BED7380A1920 /* ContentView.swift */,
@@ -67,6 +72,7 @@
 				7DC682BC73AF2D966E564C57 /* ScreencastApp.swift */,
 				CAFF3B13582E15A4F53C00D3 /* ScreenRecorder.swift */,
 				112973BBA8EF9E7A1222B3F2 /* SlackAPI.swift */,
+				E1592CC8A416E07FDD407A5C /* StatusChip.swift */,
 				CD333F26085752DA6385E525 /* WindowSelection.swift */,
 			);
 			path = Screencast;
@@ -150,6 +156,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1D98A5CDDB6B9E4E0A778D67 /* AccountsSettingsView.swift in Sources */,
 				B1339F914F35AF5BF610B9DC /* AreaSelection.swift in Sources */,
 				0CA6022EF547775F1CDDFC5C /* CaptureViewModel.swift in Sources */,
 				9D1AA911C42541BEF301361E /* ContentView.swift in Sources */,
@@ -160,6 +167,7 @@
 				D9298B0DE17BE699BFD294C8 /* ScreenRecorder.swift in Sources */,
 				98AFF27A0CBEC5F2D1604498 /* ScreencastApp.swift in Sources */,
 				47EB473873E4685E1FA64EB6 /* SlackAPI.swift in Sources */,
+				CBB2C905A3B8CA9105E5D344 /* StatusChip.swift in Sources */,
 				C4BA39FF79B5785B59F411C1 /* WindowSelection.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

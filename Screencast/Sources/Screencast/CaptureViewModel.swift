@@ -26,7 +26,9 @@ final class CaptureViewModel: ObservableObject {
     @Published var displays: [ShareableDisplay] = []
     @Published var selectedWindowID: CGWindowID?
     @Published var selectedDisplayID: CGDirectDisplayID?
-    @Published var area = CaptureArea()
+    @Published var area = CaptureArea() {
+        didSet { persistAreaSettings() }
+    }
 
     @Published var isRecording = false {
         didSet { updateSourceRefreshScheduling() }
@@ -34,6 +36,7 @@ final class CaptureViewModel: ObservableObject {
     @Published var isUploading = false
     @Published var statusMessage = ""
     @Published var logs: [LogEntry] = []
+    @Published var isLogExpanded = false
     @Published var countdownRemainingSeconds: Int?
     @Published var lastRecordingURL: URL? {
         didSet { updateRecordingAvailability() }
@@ -98,6 +101,10 @@ final class CaptureViewModel: ObservableObject {
     private let recordSystemAudioKey = "audio.recordSystem"
     private let recordMicrophoneAudioKey = "audio.recordMicrophone"
     private let selectedMicrophoneIDKey = "audio.selectedMicrophoneID"
+    private let areaXKey = "capture.area.x"
+    private let areaYKey = "capture.area.y"
+    private let areaWidthKey = "capture.area.width"
+    private let areaHeightKey = "capture.area.height"
     private let userDefaults = UserDefaults.standard
     private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Screencast.log")
@@ -129,6 +136,34 @@ final class CaptureViewModel: ObservableObject {
 
     var isSlackAuthorized: Bool {
         slackTokens != nil
+    }
+
+    var latestLogEntry: LogEntry? {
+        logs.last
+    }
+
+    var latestStatusLine: String {
+        if let latestLogEntry {
+            return latestLogEntry.message
+        }
+        return "Ready."
+    }
+
+    var driveAccountStatusText: String {
+        isAuthorized ? "Signed in" : "Needs setup"
+    }
+
+    var slackAccountStatusText: String {
+        isSlackAuthorized ? "Connected" : "Needs setup"
+    }
+
+    var slackAccountDetailText: String {
+        guard let tokens = slackTokens else {
+            return "No Slack workspace connected."
+        }
+        let teamText = tokens.teamID.isEmpty ? "Unknown team" : "Team ID: \(tokens.teamID)"
+        let userText = tokens.userID.isEmpty ? "Unknown user" : "User ID: \(tokens.userID)"
+        return "\(teamText), \(userText)"
     }
 
     var selectedWindow: ShareableWindow? {
@@ -375,7 +410,7 @@ final class CaptureViewModel: ObservableObject {
     func selectArea() async {
         guard captureKind == .area else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
-        let frame = selectedDisplayFrame() ?? NSScreen.main?.frame ?? .zero
+        let frame = selectableScreensUnionFrame() ?? NSScreen.main?.frame ?? .zero
         guard frame.width >= 2, frame.height >= 2 else {
             log("No display available for area selection.", level: .error)
             return
@@ -398,6 +433,9 @@ final class CaptureViewModel: ObservableObject {
                 width: selected.width,
                 height: selected.height
             )
+            if let displayID = displayIDContainingLargestIntersection(with: selected) {
+                selectedDisplayID = displayID
+            }
             log("Area selected.")
         } catch AreaSelectionError.cancelled {
             log("Area selection cancelled.")
@@ -472,6 +510,23 @@ final class CaptureViewModel: ObservableObject {
         selectedMicrophoneID = userDefaults.string(forKey: selectedMicrophoneIDKey)
         refreshMicrophonePermissionState()
         refreshMicrophones()
+    }
+
+    func loadAreaSettings() {
+        guard userDefaults.object(forKey: areaWidthKey) != nil,
+              userDefaults.object(forKey: areaHeightKey) != nil else {
+            return
+        }
+        let saved = CaptureArea(
+            x: userDefaults.double(forKey: areaXKey),
+            y: userDefaults.double(forKey: areaYKey),
+            width: userDefaults.double(forKey: areaWidthKey),
+            height: userDefaults.double(forKey: areaHeightKey)
+        )
+        guard saved.width >= 2, saved.height >= 2 else {
+            return
+        }
+        area = saved
     }
 
     func loadSlackTokens() {
@@ -1142,6 +1197,13 @@ final class CaptureViewModel: ObservableObject {
         userDefaults.set(selectedMicrophoneID, forKey: selectedMicrophoneIDKey)
     }
 
+    private func persistAreaSettings() {
+        userDefaults.set(area.x, forKey: areaXKey)
+        userDefaults.set(area.y, forKey: areaYKey)
+        userDefaults.set(area.width, forKey: areaWidthKey)
+        userDefaults.set(area.height, forKey: areaHeightKey)
+    }
+
     private func resolveRecordingURL() -> URL? {
         if let fileURL = lastRecordingURL,
            FileManager.default.fileExists(atPath: fileURL.path) {
@@ -1171,6 +1233,35 @@ final class CaptureViewModel: ObservableObject {
             return nil
         }
         return display.display.frame
+    }
+
+    private func selectableScreensUnionFrame() -> CGRect? {
+        var union: CGRect?
+        for screen in NSScreen.screens {
+            if let existing = union {
+                union = existing.union(screen.frame)
+            } else {
+                union = screen.frame
+            }
+        }
+        return union
+    }
+
+    private func displayIDContainingLargestIntersection(with rect: CGRect) -> CGDirectDisplayID? {
+        let validArea = rect.standardized
+        guard validArea.width > 0, validArea.height > 0 else { return nil }
+
+        var bestDisplay: CGDirectDisplayID?
+        var bestIntersectionArea = CGFloat(0)
+        for display in displays {
+            let intersection = display.display.frame.intersection(validArea)
+            let area = intersection.width * intersection.height
+            if area > bestIntersectionArea {
+                bestIntersectionArea = area
+                bestDisplay = display.id
+            }
+        }
+        return bestDisplay
     }
 
     private func persistSlackTokens() {

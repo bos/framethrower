@@ -134,6 +134,9 @@ private final class AreaSelectionView: NSView {
     ) {
         self.completion = completion
         self.selection = initialSelection
+        if let initialSelection, initialSelection.width >= 2, initialSelection.height >= 2 {
+            hasFinishedDragSincePresentation = true
+        }
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -203,16 +206,21 @@ private final class AreaSelectionView: NSView {
             return
         }
         if let corner = cornerHandle(at: point), let selection {
+            hasFinishedDragSincePresentation = false
+            hoveredActionButton = nil
             dragMode = .resizing(
                 corner: corner,
                 opposite: oppositeCorner(for: corner, in: selection)
             )
+            needsDisplay = true
             return
         }
         if let selection, selection.contains(point) {
             dragMode = nil
             return
         }
+        hasFinishedDragSincePresentation = false
+        hoveredActionButton = nil
         dragMode = .creating(anchor: point)
         selection = CGRect(origin: point, size: .zero)
         needsDisplay = true

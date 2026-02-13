@@ -27,12 +27,9 @@ struct ShareableWindow: Identifiable, Hashable {
 
     var displayName: String {
         let sizeText = "\(Int(frame.width))x\(Int(frame.height))"
-        var details = ["id \(id)", sizeText]
+        var details = [sizeText]
         if !onScreen {
             details.append("off-screen")
-        }
-        if windowLayer != 0 {
-            details.append("layer \(windowLayer)")
         }
         let suffix = details.joined(separator: ", ")
         return "\(owningApplication) - \(title) (\(suffix))"

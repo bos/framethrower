@@ -2,37 +2,34 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var model = CaptureViewModel()
+    @ObservedObject var model: CaptureViewModel
     @State private var delayedStartAnchorView: NSView?
     @State private var delayedStartMenuHandler: DelayedStartMenuActionHandler?
-    private static let recordingControlWidth: CGFloat = 236
+
+    private static let recordingControlWidth: CGFloat = 240
     private static let recordingControlHeight: CGFloat = 36
     private static let delayedStartCaretWidth: CGFloat = 40
+    private static let maxContentWidth: CGFloat = 860
     private static let linkDetector = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )
 
     var body: some View {
-        VStack(spacing: 16) {
-            header
-            Divider()
-            sourceSection
-            Divider()
-            driveSection
-            Divider()
-            slackSection
-            Divider()
-            controls
+        VStack(spacing: 14) {
+            captureCard
+            destinationCard
+            actionRow
                 .zIndex(20)
-            status
-            versionLabel
+            statusSection
         }
-        .padding(20)
-        .frame(minWidth: 720, minHeight: 560)
+        .padding(16)
+        .frame(minWidth: 740, minHeight: 470)
+        .frame(maxWidth: Self.maxContentWidth, alignment: .leading)
         .onAppear {
             model.loadTokens()
             model.loadSlackTokens()
             model.loadAudioSettings()
+            model.loadAreaSettings()
             _ = model.requestScreenRecordingPermission()
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
@@ -45,206 +42,204 @@ struct ContentView: View {
         }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Screencast")
-                .font(.largeTitle.bold())
-            Text("Record a window, display, or area and upload to Google Drive or Slack.")
-                .foregroundStyle(.secondary)
+    private var captureCard: some View {
+        GroupBox("Capture") {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.hasScreenRecordingPermission {
+                    HStack(alignment: .top, spacing: 12) {
+                        Picker("Source", selection: $model.captureKind) {
+                            ForEach(CaptureSourceKind.allCases) { kind in
+                                Text(kind.rawValue).tag(kind)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 340)
+
+                        Spacer(minLength: 0)
+
+                        audioMenu
+                    }
+
+                    sourceDetails
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Screen recording permission is required.")
+                            .font(.headline)
+                        Text(
+                            "Enable Screencast in System Settings > Privacy & Security > " +
+                            "Screen Recording, then restart the app."
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var sourceSection: some View {
-        GroupBox("Capture Source") {
-            VStack(alignment: .leading, spacing: 12) {
-                if model.hasScreenRecordingPermission {
-                    Picker("Source", selection: $model.captureKind) {
-                        ForEach(CaptureSourceKind.allCases) { kind in
+    @ViewBuilder
+    private var sourceDetails: some View {
+        switch model.captureKind {
+        case .window:
+            HStack(spacing: 10) {
+                Button("Pick Window…") {
+                    Task { await model.selectWindow() }
+                }
+
+                Picker("Window", selection: $model.selectedWindowID) {
+                    ForEach(model.windows) { window in
+                        Text(window.displayName).tag(Optional(window.id))
+                    }
+                }
+                .disabled(model.windows.isEmpty)
+            }
+
+        case .display:
+            Picker("Display", selection: $model.selectedDisplayID) {
+                ForEach(model.displays) { display in
+                    Text(display.name).tag(Optional(display.id))
+                }
+            }
+
+        case .area:
+            HStack(spacing: 10) {
+                Button("Select Area…") {
+                    Task { await model.selectArea() }
+                }
+                Text(areaSelectionSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var areaSelectionSummary: String {
+        "Selected: \(Int(model.area.width))×\(Int(model.area.height)) at " +
+        "\(Int(model.area.x)), \(Int(model.area.y))"
+    }
+
+    private var audioMenu: some View {
+        Menu {
+            Toggle("Record system audio", isOn: $model.recordSystemAudio)
+            Toggle("Record microphone", isOn: $model.recordMicrophoneAudio)
+
+            if model.recordMicrophoneAudio {
+                Divider()
+                if model.microphones.isEmpty {
+                    Text("No microphone devices found.")
+                } else {
+                    Menu("Microphone: \(selectedMicrophoneName)") {
+                        ForEach(model.microphones) { microphone in
+                            Button {
+                                model.selectedMicrophoneID = microphone.id
+                            } label: {
+                                if model.selectedMicrophoneID == microphone.id {
+                                    Label(microphone.name, systemImage: "checkmark")
+                                } else {
+                                    Text(microphone.name)
+                                }
+                            }
+                        }
+                    }
+                }
+                if !model.hasMicrophonePermission {
+                    Divider()
+                    Text("Microphone permission is not granted.")
+                }
+            }
+        } label: {
+            Label("Audio", systemImage: "waveform")
+        }
+        .help("Audio capture options")
+    }
+
+    private var selectedMicrophoneName: String {
+        if let selectedID = model.selectedMicrophoneID,
+           let selected = model.microphones.first(where: { $0.id == selectedID }) {
+            return selected.name
+        }
+        return "System Default"
+    }
+
+    private var destinationCard: some View {
+        GroupBox("Destination") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 14) {
+                    HStack(spacing: 8) {
+                        Text("Google Drive")
+                            .foregroundStyle(.secondary)
+                        StatusChip(
+                            text: model.driveAccountStatusText,
+                            tone: model.isAuthorized ? .good : .warning
+                        )
+                    }
+
+                    HStack(spacing: 8) {
+                        Text("Slack")
+                            .foregroundStyle(.secondary)
+                        StatusChip(
+                            text: model.slackAccountStatusText,
+                            tone: model.isSlackAuthorized ? .good : .warning
+                        )
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Button("Manage Accounts…") {
+                        openSettingsWindow()
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Picker("Slack Target", selection: $model.slackTargetKind) {
+                        ForEach(SlackTargetKind.allCases) { kind in
                             Text(kind.rawValue).tag(kind)
                         }
                     }
                     .pickerStyle(.segmented)
+                    .frame(maxWidth: 220)
+                    .disabled(!model.isSlackAuthorized)
+                    .opacity(model.isSlackAuthorized ? 1.0 : 0.6)
 
-                if model.captureKind == .window {
-                    HStack(spacing: 12) {
-                        Button("Pick Window…") {
-                            Task { await model.selectWindow() }
-                        }
-                        Picker("Window", selection: $model.selectedWindowID) {
-                            ForEach(model.windows) { window in
-                                Text(window.displayName).tag(Optional(window.id))
+                    if model.slackTargetKind == .channel {
+                        let isEmpty = model.slackChannels.isEmpty || !model.isSlackAuthorized
+                        Picker("Channel", selection: $model.selectedSlackChannelID) {
+                            ForEach(model.slackChannels) { channel in
+                                let label = channel.isPrivate
+                                    ? "[private] #\(channel.name)"
+                                    : "#\(channel.name)"
+                                Text(label).tag(Optional(channel.id))
                             }
                         }
-                        .disabled(model.windows.isEmpty)
-                    }
-                    if model.windows.isEmpty {
-                        Text("No on-screen windows are currently available.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Click a window to select it. Only on-screen windows are selectable.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                    if model.captureKind == .display || model.captureKind == .area {
-                        Picker("Display", selection: $model.selectedDisplayID) {
-                            ForEach(model.displays) { display in
-                                Text(display.name).tag(Optional(display.id))
-                            }
-                        }
-                    }
-
-                    if model.captureKind == .area {
-                        HStack(spacing: 12) {
-                            Button("Select Area…") {
-                                Task { await model.selectArea() }
-                            }
-                            Text(
-                                "Selected: \(Int(model.area.width))×\(Int(model.area.height)) " +
-                                "at \(Int(model.area.x)), \(Int(model.area.y))"
-                            )
-                            .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    Divider()
-
-                    Toggle("Record system audio", isOn: $model.recordSystemAudio)
-                    Toggle("Record microphone voiceover", isOn: $model.recordMicrophoneAudio)
-                    if model.recordMicrophoneAudio {
-                        if model.microphones.isEmpty {
-                            Text(
-                                "No microphone devices found. Connect a microphone and retry."
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        } else {
-                            Picker("Microphone", selection: $model.selectedMicrophoneID) {
-                                ForEach(model.microphones) { microphone in
-                                    Text(microphone.name).tag(Optional(microphone.id))
-                                }
-                            }
-                        }
-                        if !model.hasMicrophonePermission {
-                            Text(
-                                "Microphone access is not granted. " +
-                                "Allow it in System Settings > Privacy & Security > Microphone."
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                    }
-                } else {
-                    Text("Screen recording permission is required.")
-                        .font(.headline)
-                    Text(
-                        "Open System Settings > Privacy & Security > Screen Recording, " +
-                        "enable Screencast, then restart the app."
-                    )
-                    .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.vertical, 4)
-        }
-    }
-
-    private var driveSection: some View {
-        GroupBox("Google Drive") {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    if model.isAuthorized {
-                        Text("Signed in")
-                            .foregroundStyle(.green)
-                        Button("Sign Out") {
-                            model.signOut()
-                        }
+                        .disabled(isEmpty)
+                        .opacity(isEmpty ? 0.6 : 1.0)
                     } else {
-                        Button("Authorize") {
-                            Task { await model.authorize() }
+                        let isEmpty = model.slackUsers.isEmpty || !model.isSlackAuthorized
+                        Picker("Person", selection: $model.selectedSlackUserID) {
+                            ForEach(model.slackUsers) { user in
+                                Text(user.label).tag(Optional(user.id))
+                            }
                         }
-                        Text("Not signed in")
-                            .foregroundStyle(.secondary)
+                        .disabled(isEmpty)
+                        .opacity(isEmpty ? 0.6 : 1.0)
                     }
-                    Spacer()
                 }
-
             }
             .padding(.vertical, 4)
         }
     }
 
-    private var slackSection: some View {
-        GroupBox("Slack") {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    if model.isSlackAuthorized {
-                        Text("Connected")
-                            .foregroundStyle(.green)
-                        Button("Sign Out") {
-                            model.signOutSlack()
-                        }
-                    } else {
-                        Button("Connect Slack") {
-                            Task { await model.connectSlack() }
-                        }
-                        Text("Not connected")
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-
-                Picker("Target", selection: $model.slackTargetKind) {
-                    ForEach(SlackTargetKind.allCases) { kind in
-                        Text(kind.rawValue).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                if model.slackTargetKind == .channel {
-                    let isEmpty = model.slackChannels.isEmpty
-                    Picker("Channel", selection: $model.selectedSlackChannelID) {
-                        ForEach(model.slackChannels) { channel in
-                            let label = channel.isPrivate
-                                ? "[private] #\(channel.name)"
-                                : "#\(channel.name)"
-                            Text(label).tag(Optional(channel.id))
-                        }
-                    }
-                    .disabled(isEmpty)
-                    .opacity(isEmpty ? 0.5 : 1.0)
-                }
-
-                if model.slackTargetKind == .person {
-                    let isEmpty = model.slackUsers.isEmpty
-                    Picker("Person", selection: $model.selectedSlackUserID) {
-                        ForEach(model.slackUsers) { user in
-                            Text(user.label).tag(Optional(user.id))
-                        }
-                    }
-                    .disabled(isEmpty)
-                    .opacity(isEmpty ? 0.5 : 1.0)
-                }
-
-            }
-            .padding(.vertical, 4)
-        }
-    }
-
-    private var controls: some View {
-        HStack(spacing: 16) {
+    private var actionRow: some View {
+        HStack(spacing: 10) {
             recordingControl
+
+            Divider()
+                .frame(height: 24)
 
             Button("Upload to Google Drive") {
                 Task { await model.uploadLastRecording() }
             }
             .disabled(model.isUploading || !model.isAuthorized || !model.hasRecordingToUpload)
-
-            Button("Copy Drive URL") {
-                model.copyLastDriveURLToPasteboard()
-            }
-            .disabled(model.lastDriveFileURL == nil)
 
             Button("Upload to Slack") {
                 Task { await model.uploadLastRecordingToSlack() }
@@ -253,13 +248,19 @@ struct ContentView: View {
                 model.isSlackUploading || !model.isSlackAuthorized || !model.hasRecordingToUpload
             )
 
+            Button("Copy Drive URL") {
+                model.copyLastDriveURLToPasteboard()
+            }
+            .disabled(model.lastDriveFileURL == nil)
+
             Button("Copy Slack URL") {
                 model.copyLastSlackURLToPasteboard()
             }
             .disabled(model.lastSlackFileURL == nil)
 
-            Spacer()
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -267,18 +268,22 @@ struct ContentView: View {
         if model.isRecording {
             recordingActionButton(
                 iconSystemName: "stop.fill",
+                iconColor: .primary,
                 title: "Stop Recording",
                 useMonospacedDigits: false,
-                isDisabled: !model.hasScreenRecordingPermission
+                isDisabled: !model.hasScreenRecordingPermission,
+                shortcut: "r"
             ) {
                 Task { await model.stopRecording() }
             }
         } else if let remaining = model.countdownRemainingSeconds {
             recordingActionButton(
                 iconSystemName: "hourglass",
+                iconColor: .primary,
                 title: "Starting in \(remaining)s...",
                 useMonospacedDigits: true,
-                isDisabled: !model.hasScreenRecordingPermission
+                isDisabled: !model.hasScreenRecordingPermission,
+                shortcut: nil
             ) {
                 model.cancelRecordingCountdown()
             }
@@ -289,17 +294,18 @@ struct ContentView: View {
 
     private func recordingActionButton(
         iconSystemName: String,
+        iconColor: Color,
         title: String,
         useMonospacedDigits: Bool,
         isDisabled: Bool,
+        shortcut: Character?,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: iconSystemName)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(iconColor)
                 Text(title)
-                    .foregroundStyle(.primary)
                     .lineLimit(1)
                     .applyIf(useMonospacedDigits) { view in
                         view.monospacedDigit()
@@ -309,6 +315,9 @@ struct ContentView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .applyIf(shortcut != nil) { view in
+            view.keyboardShortcut(KeyEquivalent(shortcut!), modifiers: [.command])
+        }
         .frame(width: Self.recordingControlWidth, height: Self.recordingControlHeight)
         .background(
             RoundedRectangle(cornerRadius: 10)
@@ -326,36 +335,38 @@ struct ContentView: View {
         let isDisabled = !model.hasScreenRecordingPermission || model.isCountdownActive
 
         return HStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: "record.circle.fill")
-                    .foregroundStyle(.red)
-                Text("Start Recording")
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 16)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isDisabled else { return }
+            Button {
                 Task { await model.startRecording() }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "record.circle.fill")
+                        .foregroundStyle(.red)
+                    Text("Start Recording")
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .keyboardShortcut("r", modifiers: [.command])
+            .disabled(isDisabled)
 
             Rectangle()
                 .fill(Color.secondary.opacity(0.28))
                 .frame(width: 1, height: 20)
 
-            Image(systemName: "chevron.down")
-                .foregroundStyle(.primary)
-                .frame(
-                    width: Self.delayedStartCaretWidth,
-                    height: Self.recordingControlHeight
-                )
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    guard !isDisabled else { return }
-                    showDelayedStartMenu()
-                }
+            Button {
+                showDelayedStartMenu()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .frame(
+                        width: Self.delayedStartCaretWidth,
+                        height: Self.recordingControlHeight
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isDisabled)
         }
         .background(
             RoundedRectangle(cornerRadius: 10)
@@ -366,11 +377,7 @@ struct ContentView: View {
                 .stroke(Color.secondary.opacity(0.32), lineWidth: 1)
         )
         .opacity(isDisabled ? 0.55 : 1.0)
-        .allowsHitTesting(!isDisabled)
-        .frame(
-            width: Self.recordingControlWidth,
-            height: Self.recordingControlHeight
-        )
+        .frame(width: Self.recordingControlWidth, height: Self.recordingControlHeight)
         .background(
             DelayedStartAnchorReader { anchor in
                 delayedStartAnchorView = anchor
@@ -407,64 +414,91 @@ struct ContentView: View {
 
         menu.addItem(startInFive)
         menu.addItem(startInTen)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: anchorView)
+        let menuOrigin = NSPoint(x: Self.recordingControlWidth - Self.delayedStartCaretWidth, y: 0)
+        menu.popUp(positioning: nil, at: menuOrigin, in: anchorView)
         delayedStartMenuHandler = nil
     }
 
-    private var status: some View {
+    private var statusSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(spacing: 10) {
                 Text("Status")
                     .font(.headline)
-                Spacer()
-                Button("Copy Log") {
-                    model.copyLogsToPasteboard()
+
+                if let latest = model.latestLogEntry {
+                    Text(timestamp(latest.date))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
-                .disabled(model.logs.isEmpty)
+
+                Text(model.latestStatusLine)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(statusTextColor)
+
+                Spacer(minLength: 0)
+
+                Button(model.isLogExpanded ? "Hide Log" : "Show Log") {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        model.isLogExpanded.toggle()
+                    }
+                }
+                .keyboardShortcut("l", modifiers: [.command])
+
+                if model.isLogExpanded {
+                    Button("Copy Log") {
+                        model.copyLogsToPasteboard()
+                    }
+                    .disabled(model.logs.isEmpty)
+                }
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(model.logs) { entry in
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(timestamp(entry.date))
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
-                                Text(linkedMessage(entry.message))
-                            }
+
+            if model.isLogExpanded {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(model.logs) { entry in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(timestamp(entry.date))
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                    Text(linkedMessage(entry.message))
+                                }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .foregroundStyle(entry.level == .error ? .red : .primary)
                                 .font(.caption)
                                 .id(entry.id)
+                            }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 160)
-                .background(Color(.textBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .textSelection(.enabled)
-                .onChange(of: model.logs.count) { _, _ in
-                    guard let last = model.logs.last else { return }
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                    .frame(maxWidth: .infinity, minHeight: 110, maxHeight: 160)
+                    .background(Color(.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .textSelection(.enabled)
+                    .onChange(of: model.logs.count) { _, _ in
+                        guard let last = model.logs.last else { return }
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
                     }
                 }
             }
         }
     }
 
-    private var versionLabel: some View {
-        let bundle = Bundle.main
-        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            ?? "0.0.0"
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-            ?? "0"
+    private var statusTextColor: Color {
+        if model.latestLogEntry?.level == .error {
+            return .red
+        }
+        return .primary
+    }
 
-        return Text("Version \(version) (Build \(build))")
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .font(.caption)
-            .foregroundStyle(.secondary)
+    private func openSettingsWindow() {
+        let selector = Selector(("showSettingsWindow:"))
+        _ = NSApp.sendAction(selector, to: nil, from: nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func timestamp(_ date: Date) -> String {
@@ -500,8 +534,7 @@ struct ContentView: View {
         var result = ""
         var cursor = message.startIndex
         for match in matches {
-            guard let url = match.url,
-                  let range = Range(match.range, in: message) else {
+            guard let url = match.url, let range = Range(match.range, in: message) else {
                 continue
             }
             if cursor < range.lowerBound {
@@ -577,21 +610,5 @@ private final class DelayedStartMenuActionHandler: NSObject {
     @objc
     func startInTenAction() {
         startInTen()
-    }
-}
-
-private struct LabeledField: View {
-    let title: String
-    @Binding var value: Double
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            TextField(title, value: $value, format: .number)
-                .frame(width: 120)
-                .textFieldStyle(.roundedBorder)
-        }
     }
 }

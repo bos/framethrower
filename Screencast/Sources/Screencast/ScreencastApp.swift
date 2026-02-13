@@ -8,6 +8,7 @@ struct ScreencastApp: App {
         WindowGroup {
             ContentView(model: model)
         }
+        .defaultSize(width: 980, height: 380)
 
         Settings {
             TabView {

@@ -23,8 +23,9 @@ struct ContentView: View {
             statusSection
         }
         .padding(16)
-        .frame(minWidth: 740, minHeight: 470)
         .frame(maxWidth: Self.maxContentWidth, alignment: .leading)
+        .frame(minWidth: 740, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .onAppear {
             model.loadTokens()
             model.loadSlackTokens()
@@ -419,6 +420,11 @@ struct ContentView: View {
         delayedStartMenuHandler = nil
     }
 
+    private func openSettingsWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
+
     private var statusSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
@@ -493,12 +499,6 @@ struct ContentView: View {
             return .red
         }
         return .primary
-    }
-
-    private func openSettingsWindow() {
-        let selector = Selector(("showSettingsWindow:"))
-        _ = NSApp.sendAction(selector, to: nil, from: nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func timestamp(_ date: Date) -> String {

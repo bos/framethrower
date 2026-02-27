@@ -20,6 +20,9 @@ struct ContentView: View {
             destinationCard
             actionRow
                 .zIndex(20)
+            if model.isUploadProgressVisible {
+                uploadProgressRow
+            }
             statusSection
         }
         .padding(16)
@@ -149,9 +152,22 @@ struct ContentView: View {
                 }
             }
         } label: {
-            Label("Audio", systemImage: "waveform")
+            Label(audioMenuTitle, systemImage: "waveform")
         }
         .help("Audio capture options")
+    }
+
+    private var audioMenuTitle: String {
+        switch (model.recordSystemAudio, model.recordMicrophoneAudio) {
+        case (false, false):
+            return "Audio"
+        case (true, false):
+            return "Audio (System)"
+        case (false, true):
+            return "Audio (Mic)"
+        case (true, true):
+            return "Audio (System, Mic)"
+        }
     }
 
     private var selectedMicrophoneName: String {
@@ -491,6 +507,22 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var uploadProgressRow: some View {
+        HStack(spacing: 10) {
+            let percent = Int((model.uploadProgressFraction * 100).rounded())
+            Text("Uploading")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ProgressView(value: model.uploadProgressFraction)
+                .progressViewStyle(.linear)
+                .frame(maxWidth: .infinity)
+            Text("\(percent)%")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 44, alignment: .trailing)
         }
     }
 

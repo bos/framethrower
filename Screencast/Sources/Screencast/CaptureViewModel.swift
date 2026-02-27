@@ -34,6 +34,8 @@ final class CaptureViewModel: ObservableObject {
         didSet { updateSourceRefreshScheduling() }
     }
     @Published var isUploading = false
+    @Published private(set) var uploadProgressFraction = 0.0
+    @Published private(set) var isUploadProgressVisible = false
     @Published var statusMessage = ""
     @Published var logs: [LogEntry] = []
     @Published var isLogExpanded = false
@@ -121,6 +123,7 @@ final class CaptureViewModel: ObservableObject {
     private var isSourceRefreshing = false
     private var isAppActive = false
     private var didAttemptScreenPermissionRequest = false
+    private var uploadProgressRevealTask: Task<Void, Never>?
 
     private var tokens: OAuthTokens? {
         didSet { persistTokens() }
@@ -136,6 +139,10 @@ final class CaptureViewModel: ObservableObject {
 
     var isSlackAuthorized: Bool {
         slackTokens != nil
+    }
+
+    var isAnyUploadActive: Bool {
+        isUploading || isSlackUploading
     }
 
     var latestLogEntry: LogEntry? {
@@ -715,7 +722,11 @@ final class CaptureViewModel: ObservableObject {
             return
         }
         isSlackUploading = true
-        defer { isSlackUploading = false }
+        beginUploadProgress()
+        defer {
+            isSlackUploading = false
+            endUploadProgress()
+        }
 
         do {
             let size = try fileSize(for: fileURL)
@@ -743,7 +754,11 @@ final class CaptureViewModel: ObservableObject {
                 fileURL: fileURL,
                 filename: filename,
                 channelID: channelID
-            )
+            ) { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    self?.updateUploadProgress(progress)
+                }
+            }
             lastSlackFileURL = result.permalink
             if let url = result.permalink {
                 copyTextToPasteboard(url.absoluteString)
@@ -908,11 +923,22 @@ final class CaptureViewModel: ObservableObject {
         }
 
         isUploading = true
-        defer { isUploading = false }
+        beginUploadProgress()
+        defer {
+            isUploading = false
+            endUploadProgress()
+        }
 
         do {
             let accessToken = try await validAccessToken()
-            let result = try await uploader.upload(fileURL: fileURL, accessToken: accessToken)
+            let result = try await uploader.upload(
+                fileURL: fileURL,
+                accessToken: accessToken
+            ) { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    self?.updateUploadProgress(progress)
+                }
+            }
             let driveURL = result.webViewLink ?? URL(
                 string: "https://drive.google.com/file/d/\(result.id)/view"
             )
@@ -927,6 +953,28 @@ final class CaptureViewModel: ObservableObject {
         } catch {
             log("Upload failed: \(error.localizedDescription)", level: .error)
         }
+    }
+
+    private func beginUploadProgress() {
+        uploadProgressFraction = 0
+        isUploadProgressVisible = false
+        uploadProgressRevealTask?.cancel()
+        uploadProgressRevealTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !Task.isCancelled, self.isAnyUploadActive else { return }
+            self.isUploadProgressVisible = true
+        }
+    }
+
+    private func updateUploadProgress(_ progress: Double) {
+        uploadProgressFraction = min(max(progress, 0), 1)
+    }
+
+    private func endUploadProgress() {
+        uploadProgressRevealTask?.cancel()
+        uploadProgressRevealTask = nil
+        isUploadProgressVisible = false
+        uploadProgressFraction = 0
     }
 
     func copyLastDriveURLToPasteboard() {

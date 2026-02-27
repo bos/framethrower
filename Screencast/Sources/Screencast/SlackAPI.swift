@@ -206,7 +206,8 @@ final class SlackAPI {
     func uploadFile(
         fileURL: URL,
         filename: String,
-        channelID: String
+        channelID: String,
+        onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> SlackUploadResult {
         guard fileURL.isFileURL else {
             throw URLError(.badURL)
@@ -221,7 +222,9 @@ final class SlackAPI {
         }
 
         let uploadInfo = try await requestUploadURL(filename: filename, length: size)
-        try await uploadBytes(fileURL: fileURL, uploadURL: uploadInfo.uploadURL)
+        try await uploadBytes(fileURL: fileURL, uploadURL: uploadInfo.uploadURL) { progress in
+            onProgress?(progress)
+        }
         return try await completeUpload(fileID: uploadInfo.fileID, channelID: channelID)
     }
 
@@ -239,12 +242,20 @@ final class SlackAPI {
         )
     }
 
-    private func uploadBytes(fileURL: URL, uploadURL: URL) async throws {
+    private func uploadBytes(
+        fileURL: URL,
+        uploadURL: URL,
+        onProgress: (@Sendable (Double) -> Void)? = nil
+    ) async throws {
         var request = URLRequest(url: uploadURL)
         request.httpMethod = "POST"
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await URLSession.shared.upload(
-            for: request,
+        let progressSession = UploadProgressSession { sent, expected in
+            let fraction = min(max(Double(sent) / Double(expected), 0), 1)
+            onProgress?(fraction)
+        }
+        let (data, response) = try await progressSession.upload(
+            request: request,
             fromFile: fileURL
         )
         guard let http = response as? HTTPURLResponse else {

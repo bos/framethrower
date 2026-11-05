@@ -53,7 +53,7 @@ final class OAuthClient {
     private let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
     private lazy var userAgent: String = {
         let bundle = Bundle.main
-        let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Screencast"
+        let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "FrameThrower"
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "0.1.0"
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"

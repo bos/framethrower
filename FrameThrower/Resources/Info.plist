@@ -42,6 +42,6 @@
 	<key>SlackClientSecret</key>
 	<string></string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Screencast uses your microphone to add voiceover to recordings.</string>
+	<string>FrameThrower uses your microphone to add voiceover to recordings.</string>
 </dict>
 </plist>

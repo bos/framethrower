@@ -69,7 +69,7 @@ final class WindowSelectionCoordinator: NSObject {
         window = overlay
         logger("Window selection overlay shown.")
         if excludedBundleID != nil {
-            logger("Screencast windows are ignored during selection.")
+            logger("FrameThrower windows are ignored during selection.")
         }
         startEventMonitoring()
     }

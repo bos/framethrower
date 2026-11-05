@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ShareableWindow: Identifiable, Hashable {
     let id: CGWindowID
+    let rawTitle: String
     let title: String
     let owningApplication: String
     let bundleIdentifier: String?
@@ -14,7 +15,7 @@ struct ShareableWindow: Identifiable, Hashable {
 
     init(window: SCWindow) {
         id = window.windowID
-        let rawTitle = window.title?
+        rawTitle = window.title?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         title = rawTitle.isEmpty ? "Untitled" : rawTitle
         owningApplication = window.owningApplication?.applicationName ?? "Unknown App"
@@ -32,11 +33,25 @@ struct ShareableWindow: Identifiable, Hashable {
             details.append("off-screen")
         }
         let suffix = details.joined(separator: ", ")
-        return "\(owningApplication) - \(title) (\(suffix))"
+        return "\(primaryLabel) (\(suffix))"
     }
 
     var isSelectable: Bool {
         onScreen && frame.width >= 64 && frame.height >= 64
+    }
+
+    var normalizedRawTitle: String {
+        rawTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var primaryLabel: String {
+        if rawTitle.isEmpty || title.caseInsensitiveCompare(owningApplication) == .orderedSame {
+            return owningApplication
+        }
+        if title.lowercased().hasPrefix(owningApplication.lowercased()) {
+            return title
+        }
+        return "\(owningApplication) - \(title)"
     }
 }
 

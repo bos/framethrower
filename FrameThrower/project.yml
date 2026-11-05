@@ -1,4 +1,4 @@
-name: Screencast
+name: FrameThrower
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
@@ -35,7 +35,7 @@ configs:
   Release: release
 
 targets:
-  Screencast:
+  FrameThrower:
     type: application
     platform: macOS
     sources:
@@ -43,12 +43,14 @@ targets:
       - path: Resources
         type: folder
     entitlements:
-      path: Resources/Screencast.entitlements
+      path: Resources/FrameThrower.entitlements
     info:
       path: Resources/Info.plist
       properties:
-        CFBundleDisplayName: Screencast
-        CFBundleName: Screencast
+        CFBundleDisplayName: FrameThrower
+        CFBundleName: FrameThrower
+        CFBundleIconFile: Resources/FrameThrower.icns
+        NSMicrophoneUsageDescription: FrameThrower uses your microphone to add voiceover to recordings.
         CFBundleShortVersionString: "0.1.7"
         CFBundleVersion: "8"
         GDriveClientID: ""
@@ -62,6 +64,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.screencast
+        PRODUCT_NAME: FrameThrower
+        DEVELOPMENT_TEAM: P7EW9T546Z
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
         MACOSX_DEPLOYMENT_TARGET: '15.0'

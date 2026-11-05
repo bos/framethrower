@@ -19,6 +19,12 @@ final class CaptureViewModel: ObservableObject {
         let level: LogLevel
     }
 
+    private struct WindowServerAttributes {
+        let layer: Int
+        let alpha: Double
+        let sharingState: Int?
+    }
+
     @Published var captureKind: CaptureSourceKind = .window {
         didSet { handleCaptureKindChanged() }
     }
@@ -248,9 +254,16 @@ final class CaptureViewModel: ObservableObject {
         do {
             let content = try await shareableContent()
             let allWindows = content.windows.map(ShareableWindow.init)
+            let windowServerAttributes = windowServerAttributesByID()
             let appBundleID = Bundle.main.bundleIdentifier
             windows = allWindows
                 .filter { $0.isSelectable }
+                .filter { window in
+                    isHumanVisibleCandidate(
+                        window,
+                        attributes: windowServerAttributes[window.id]
+                    )
+                }
                 .filter { window in
                     guard let appBundleID else { return true }
                     return window.bundleIdentifier != appBundleID
@@ -271,7 +284,8 @@ final class CaptureViewModel: ObservableObject {
                windows.contains(where: { $0.id == previousWindowID }) {
                 selectedWindowID = previousWindowID
             } else {
-                selectedWindowID = windows.first?.id
+                // A disappearing window must not silently switch the recording to another app.
+                selectedWindowID = nil
             }
             if let previousDisplayID,
                displays.contains(where: { $0.id == previousDisplayID }) {
@@ -287,6 +301,83 @@ final class CaptureViewModel: ObservableObject {
                 log("Failed to load sources: \(error.localizedDescription)", level: .error)
             }
         }
+    }
+
+    private func windowServerAttributesByID() -> [CGWindowID: WindowServerAttributes] {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+            as? [[String: Any]] else {
+            return [:]
+        }
+
+        var attributesByID: [CGWindowID: WindowServerAttributes] = [:]
+        for windowInfo in info {
+            guard let windowNumber = windowInfo[kCGWindowNumber as String] as? NSNumber else {
+                continue
+            }
+            let windowID = CGWindowID(windowNumber.uint32Value)
+            let layer = (windowInfo[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+            let alpha = (windowInfo[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            let sharingState = (
+                windowInfo[kCGWindowSharingState as String] as? NSNumber
+            )?.intValue
+            attributesByID[windowID] = WindowServerAttributes(
+                layer: layer,
+                alpha: alpha,
+                sharingState: sharingState
+            )
+        }
+        return attributesByID
+    }
+
+    private func isHumanVisibleCandidate(
+        _ window: ShareableWindow,
+        attributes: WindowServerAttributes?
+    ) -> Bool {
+        if let attributes {
+            if attributes.layer != 0 {
+                return false
+            }
+            if attributes.alpha <= 0.03 {
+                return false
+            }
+            if attributes.sharingState == 0 {
+                return false
+            }
+        } else if window.windowLayer != 0 {
+            return false
+        }
+
+        if window.bundleIdentifier == "com.apple.dock" {
+            return false
+        }
+
+        let rawTitle = window.normalizedRawTitle
+        let title = window.title.lowercased()
+        let ownerName = window.owningApplication.lowercased()
+        let bundleID = window.bundleIdentifier?.lowercased() ?? ""
+        let searchableTitle = "\(rawTitle) \(title)"
+        let isBetterDisplayRelated =
+            ownerName.contains("betterdisplay") ||
+            bundleID.contains("betterdisplay") ||
+            searchableTitle.contains("betterdisplay")
+
+        if rawTitle == "tracking" || rawTitle.hasPrefix("- tracking") {
+            return false
+        }
+        if searchableTitle.contains("tracking") && isBetterDisplayRelated {
+            return false
+        }
+        if searchableTitle.contains("betterdisplay overlay") {
+            return false
+        }
+        if searchableTitle.contains("overlay for display") && isBetterDisplayRelated {
+            return false
+        }
+        if searchableTitle.contains("overlay") && isBetterDisplayRelated {
+            return false
+        }
+        return true
     }
 
     private func handleCaptureKindChanged() {
@@ -678,12 +769,14 @@ final class CaptureViewModel: ObservableObject {
                 $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             }
             let userList = users.sorted {
-                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) ==
+                    .orderedAscending
             }
             slackChannels = channelList
 
             let currentUserID = slackTokens?.userID
-            if let currentUserID, let index = userList.firstIndex(where: { $0.id == currentUserID }) {
+            if let currentUserID,
+               let index = userList.firstIndex(where: { $0.id == currentUserID }) {
                 var reordered = userList
                 let currentUser = reordered.remove(at: index)
                 slackUsers = [currentUser] + reordered
@@ -807,6 +900,8 @@ final class CaptureViewModel: ObservableObject {
                 configuration: configuration,
                 outputURL: outputURL
             )
+            lastDriveFileURL = nil
+            lastSlackFileURL = nil
             isRecording = true
             lastRecordingURL = outputURL
             let systemAudioEnabled = recordSystemAudio

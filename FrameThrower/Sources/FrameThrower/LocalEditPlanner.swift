@@ -24,12 +24,14 @@ enum LocalEditPlanner {
         }
         // An ordinal is not an interval. In particular, never guess whether a
         // recognition error such as '12nd from now' meant one or twelve seconds.
-        if let range = request.range(of: "\\b[0-9]+(?:st|nd|rd|th)\\s+from\\s+now\\b",
+        if let range = request.range(of: "\\b[0-9]+(?:st|nd|rd|th)\\s+from\\s+now\\b|\\b(?:over|for|during)\\s+(?:the\\s+)?next\\s+[0-9]+(?:st|nd|rd|th)\\b",
                                      options: [.regularExpression, .caseInsensitive]) {
             throw EditorCommandError.invalid("“\(request[range])” isn’t a time interval. Replace it with the delay you meant, such as “one second from now”.")
         }
-        if request.range(of: "(?:[-−]\\s*[0-9]+(?:\\.[0-9]+)?|\\b(?:minus|negative)\\s+(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3}))\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\s+from\\s+now\\b",
-                         options: [.regularExpression, .caseInsensitive]) != nil {
+        let negative = "(?:[-−]\\s*[0-9]+(?:\\.[0-9]+)?|\\b(?:minus|negative)\\s+(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3}))"
+        let units = "\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
+        let negativeTiming = negative + units + "\\s+from\\s+now\\b|\\b(?:over|for|during)\\s+(?:the\\s+)?next\\s+" + negative + units
+        if request.range(of: negativeTiming, options: [.regularExpression, .caseInsensitive]) != nil {
             throw EditorCommandError.invalid("Use a delay of zero or more seconds after the playhead. To start earlier, move the playhead to that time.")
         }
     }
@@ -188,7 +190,7 @@ enum LocalEditPlanner {
             let start = context.playhead + delay
             let end = (origin == "playhead" ? context.playhead : start) + arrival
             let duration = end - start
-            if let instruction, let expectedDelay = delayFromPlayhead(in: instruction), abs(delay - expectedDelay) > 0.000_001 {
+            if let instruction, let expectedDelay = relativeStartDelay(in: instruction, context: context), abs(delay - expectedDelay) > 0.000_001 {
                 return .clarification("The plan used a different start delay. Should the movement start \(timeLabel(expectedDelay)) after the playhead?")
             }
             if let instruction, let expectedArrival = arrivalDelayFromPlayhead(in: instruction),
@@ -425,10 +427,17 @@ enum LocalEditPlanner {
 
     private static func delayFromPlayhead(in request: String) -> Double? {
         let pattern = "\\b([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\s+from\\s+now\\b"
+        if let explicit = timeInterval(in: request, pattern: pattern) { return explicit }
+        return nextWindowSeconds(in: request) == nil ? nil : 0
+    }
+
+    private static func nextWindowSeconds(in request: String) -> Double? {
+        let pattern = "\\b(?:over|for|during)\\s+(?:the\\s+)?next\\s+([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
         return timeInterval(in: request, pattern: pattern)
     }
 
     private static func arrivalDelayFromPlayhead(in request: String) -> Double? {
+        if let next = nextWindowSeconds(in: request) { return next }
         // Explicit movement-relative timing has a different origin and must
         // remain with the planner rather than being treated as playhead-relative.
         if request.range(of: "\\bafter\\s+(?:the\\s+)?(?:movement|pan|zoom)\\s+(?:starts?|begins?)\\b|\\bseconds?\\s+after\\s+(?:it|the\\s+movement)\\b",
@@ -696,6 +705,11 @@ enum LocalEditPlanner {
         the SAME playhead. 'One second from now ... into Box 2 after 3 seconds'
         means start_delay_seconds=1, arrival_seconds=3, arrival_origin=playhead.
         That leaves TWO seconds for the movement. Never turn arrival time into a hold.
+        'Over the next three seconds' starts NOW: start_delay_seconds=0,
+        arrival_seconds=3, arrival_origin=playhead. Explicit box names are enough;
+        neither a box nor an edit needs to be selected. Use direct for a plain pan.
+        With no edit selected or named, 'over three seconds' also starts now:
+        start_delay_seconds=0, arrival_seconds=3, arrival_origin=movement_start.
         If the WHOLE movement takes three seconds, use arrival_seconds=3 and
         arrival_origin=movement_start. A named or selected edit never overrides now.
         path=via_full_frame means zoom out then into the destination; the app divides
@@ -734,7 +748,7 @@ enum LocalEditPlanner {
         }
     }
     private static func usesDurationMove(_ request: String, context: LocalEditContext) -> Bool {
-        guard delayFromPlayhead(in: request) == nil else { return false }
+        guard relativeStartDelay(in: request, context: context) == nil else { return false }
         let hasDuration = request.range(of: "\\b(?:over|for|lasting|takes?|in)(?:\\s+|(?=[0-9]))(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         let hasMovement = request.range(of: "\\b(?:pan|zoom|move|transition)\\b", options: [.regularExpression, .caseInsensitive]) != nil
@@ -752,7 +766,7 @@ enum LocalEditPlanner {
     }
 
     private static func usesRelativeBoxMove(_ request: String, context: LocalEditContext) -> Bool {
-        guard delayFromPlayhead(in: request) != nil,
+        guard relativeStartDelay(in: request, context: context) != nil,
               request.range(of: "\\b(?:pan|zoom|move)\\b", options: [.regularExpression, .caseInsensitive]) != nil else { return false }
         // The box list in context is authoritative. Ask rather than invent a
         // missing target; the model receives only this action and clarification.
@@ -766,6 +780,15 @@ enum LocalEditPlanner {
                   let words = formatter.string(from: NSNumber(value: number)) else { return false }
             return mentions("Box " + words, in: request)
         }.count >= 2
+    }
+
+    private static func relativeStartDelay(in request: String, context: LocalEditContext) -> Double? {
+        if let delay = delayFromPlayhead(in: request) { return delay }
+        guard context.selectedEditID == nil, !usesNamedReferences(request, context: context),
+              requestedDuration(in: request) != nil,
+              timeInterval(in: request, pattern: "\\bat\\s+([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b") == nil,
+              request.range(of: "\\b(?:after|before)\\b", options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        return 0
     }
 
     private static func box(_ region: EditorRegion, isMentionedAfter prefix: String,

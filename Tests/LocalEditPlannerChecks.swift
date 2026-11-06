@@ -16,6 +16,8 @@ private struct LocalEditPlannerChecks {
         if CommandLine.arguments.contains("--model") {
             try await checkNativeModel()
             try await checkNativeRelativeMoves()
+        } else if CommandLine.arguments.contains("--relative-model") {
+            try await checkNativeRelativeMoves()
         }
         print("Local edit planner checks passed (movement/hold timing, labels, revisions, strict scope and numbers, clarifications, collision preservation; fake local replies, no model or media).")
     }
@@ -194,6 +196,10 @@ private struct LocalEditPlannerChecks {
             try rejects({ _ = try LocalEditPlanner.payload(request: negative + ", zoom into Box 1", context: fixture.context) },
                         "negative relative times must never be converted into positive delays")
         }
+        for invalid in ["over the next -3 seconds", "over the next minus three seconds", "over the next 12nd"] {
+            try rejects({ _ = try LocalEditPlanner.payload(request: "Pan from Box 1 to Box 2 " + invalid, context: fixture.context) },
+                        "invalid next-duration timing must not be converted to a positive interval")
+        }
         func response(start: Double, steps: [[String: Any]]) throws -> Data {
             try reply("plan_sequence", fixture.scope.merging(["start_seconds": start, "steps": steps]) { _, b in b })
         }
@@ -270,6 +276,23 @@ private struct LocalEditPlannerChecks {
         let payload = try JSONSerialization.jsonObject(with: LocalEditPlanner.payload(request: instruction, context: fixture.context)) as! [String: Any]
         let names = (payload["tools"] as! [[String: Any]]).compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
         try require(Set(names) == ["move_relative", "ask_clarification"], "relative box moves use a focused action without hold fields")
+        fixture.context.selectedRegionID = nil
+        fixture.context.selectedEditID = nil
+        for text in ["Pan from box 1 to box 2 over the next 3 seconds.", "Pan from box one to box two over the next three seconds.", "Pan from Box 1 to Box 2 over three seconds."] {
+            let immediate = arguments.merging(["start_delay_seconds": 0, "path": "direct"]) { _, b in b }
+            let direct = try batch(LocalEditPlanner.result(reply("move_relative", immediate), context: fixture.context, instruction: text))
+            try require(direct.commands == [
+                .frameRegion(regionID: fixture.a.id, time: 9.6, motion: EditorCommandMotion(transition: .jump)),
+                .frameRegion(regionID: fixture.b.id, time: 12.6, motion: EditorCommandMotion(transition: .smooth, duration: 3))
+            ], "explicit box names and next-three-seconds timing need no manual selection")
+            let payload = try JSONSerialization.jsonObject(with: LocalEditPlanner.payload(request: text, context: fixture.context)) as! [String: Any]
+            let names = (payload["tools"] as! [[String: Any]]).compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+            try require(Set(names) == ["move_relative", "ask_clarification"], "next-three-seconds language uses the playhead route")
+            let late = immediate.merging(["start_delay_seconds": 1]) { _, b in b }
+            guard case .clarification = try LocalEditPlanner.result(reply("move_relative", late), context: fixture.context, instruction: text) else {
+                throw CheckError.failed("a next-three-seconds request must begin at the playhead")
+            }
+        }
     }
 
     @MainActor
@@ -342,9 +365,12 @@ private struct LocalEditPlannerChecks {
     /// All source files remain absent: this exercises only text and metadata.
     @MainActor
     private static func checkNativeRelativeMoves() async throws {
-        let requests: [(text: String, arrivalOffset: Double)] = [
-            ("One second from now, I want you to pan from Box one, zoom out, and into box 2 after 3 seconds.", 3),
-            ("One second from now, start at Box 1, smoothly zoom out to the full frame, and zoom into Box 2. The entire movement takes three seconds.", 4)
+        let requests: [(text: String, startDelay: Double, arrivalOffset: Double, fullFrame: Bool)] = [
+            ("One second from now, I want you to pan from Box one, zoom out, and into box 2 after 3 seconds.", 1, 3, true),
+            ("One second from now, start at Box 1, smoothly zoom out to the full frame, and zoom into Box 2. The entire movement takes three seconds.", 1, 4, true),
+            ("Pan from box 1 to box 2 over the next 3 seconds.", 0, 3, false),
+            ("Pan from box one to box two over the next three seconds.", 0, 3, false),
+            ("Pan from Box 1 to Box 2 over three seconds.", 0, 3, false)
         ]
         for (index, request) in requests.enumerated() {
             for playhead in [0.0, 9.6] {
@@ -353,6 +379,8 @@ private struct LocalEditPlannerChecks {
                 fixture.context.recording.duration = fixture.project.duration
                 fixture.context.recording.revision = try EditorCommandDispatcher.revision(for: fixture.project)
                 fixture.context.playhead = playhead
+                fixture.context.selectedRegionID = nil
+                fixture.context.selectedEditID = nil
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-native-relative-" + UUID().uuidString)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 defer { try? FileManager.default.removeItem(at: directory) }
@@ -361,19 +389,19 @@ private struct LocalEditPlannerChecks {
                 let payload = try LocalEditPlanner.payload(request: request.text, context: fixture.context)
                 let response = try await LocalModelRuntime.shared.chat(payload: payload)
                 let proposed = try batch(LocalEditPlanner.result(response, context: fixture.context, instruction: request.text))
-                let start = playhead + 1
+                let start = playhead + request.startDelay
                 let end = playhead + request.arrivalOffset
                 let midpoint = (start + end) / 2
                 let halfDuration = (end - start) / 2
-                try require(proposed.commands == [
-                    .frameRegion(regionID: fixture.a.id, time: start, motion: EditorCommandMotion(transition: .jump)),
-                    .fullFrame(time: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: halfDuration)),
-                    .frameRegion(regionID: fixture.b.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: halfDuration))
-                ], "native relative move retains exact source, zoom-out, destination, and requested timing")
+                var expected: [EditorCommand] = [.frameRegion(regionID: fixture.a.id, time: start, motion: EditorCommandMotion(transition: .jump))]
+                if request.fullFrame { expected.append(.fullFrame(time: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: halfDuration))) }
+                expected.append(.frameRegion(regionID: fixture.b.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: request.fullFrame ? halfDuration : end - start)))
+                try require(proposed.commands == expected,
+                            "native relative move retains exact source, path, destination, and timing with no selection")
                 try EditorCommandDispatcher.apply(proposed, to: editor, projectID: fixture.projectID)
                 let applied = editor.project.state
                 try require(applied.zoom(at: start) == fixture.a.rect.framing() &&
-                            applied.zoom(at: midpoint).scale == 1 &&
+                            (!request.fullFrame || applied.zoom(at: midpoint).scale == 1) &&
                             applied.zoom(at: end) == fixture.b.rect.framing() &&
                             editor.project.undoHistory.count == 1,
                             "native relative move applies the complete path as one history entry")

@@ -582,6 +582,14 @@ struct EditorHistoryState: Codable, Equatable, Sendable {
     var redo: [String] = []
 }
 
+/// The action publishing a saved project, with names in execution order.
+/// This describes the current notification only and is not project data.
+struct ProjectHistoryOperation: Equatable, Sendable {
+    enum Kind: String, Sendable { case edit, undo, redo }
+    var kind: Kind
+    var names: [String]
+}
+
 /// Media filenames are relative to the project. Source media is never opened
 /// for writing by the editor, and history survives saving and reopening.
 struct RecordingProject: Codable, Equatable, Sendable {
@@ -822,6 +830,8 @@ enum ProjectError: LocalizedError {
 @MainActor
 final class ProjectEditor: ObservableObject {
     @Published private(set) var project: RecordingProject
+    /// Read inside a synchronous `$project` subscriber; nil outside publication.
+    private(set) var publishingHistoryOperation: ProjectHistoryOperation?
     @Published private(set) var references: EditorReferences
     @Published private(set) var errorMessage: String?
     @Published private(set) var draftState: EditState?
@@ -926,7 +936,7 @@ final class ProjectEditor: ObservableObject {
         next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
         next.redoHistory.removeAll()
         next.state = draftState
-        guard persist(next) else { return false }
+        guard persist(next, operation: ProjectHistoryOperation(kind: .edit, names: [name])) else { return false }
         self.draftState = nil
         draftTime = nil
         recoveryRestored = false
@@ -952,7 +962,7 @@ final class ProjectEditor: ObservableObject {
         next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
         next.redoHistory.removeAll()
         next.state = state
-        return persist(next)
+        return persist(next, operation: ProjectHistoryOperation(kind: .edit, names: [name]))
     }
 
     @discardableResult
@@ -969,7 +979,7 @@ final class ProjectEditor: ObservableObject {
         next.undoHistory.append(NamedEditSnapshot(name: "Rename recording", state: project.state, title: project.title))
         next.redoHistory.removeAll()
         next.title = title
-        return persist(next)
+        return persist(next, operation: ProjectHistoryOperation(kind: .edit, names: ["Rename recording"]))
     }
 
     @discardableResult
@@ -978,20 +988,23 @@ final class ProjectEditor: ObservableObject {
         var next = project
         let previous = editingState
         var remaining = count
+        var names: [String] = []
         if let draftState {
             // The unfinished gesture is the next stack entry, just as with
             // Command-Z. A failed write retains it and both history branches.
             next.redoHistory = [NamedEditSnapshot(name: "Edit", state: draftState, title: project.title)]
+            names.append("Edit")
             remaining -= 1
         }
         for _ in 0..<remaining {
             guard let snapshot = next.undoHistory.popLast() else { return false }
+            names.append(snapshot.name)
             next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: next.state, title: next.title))
             next.state = snapshot.state
             next.title = snapshot.title
         }
         let preferredTime = draftState != nil && count == 1 ? draftTime : nil
-        guard persist(next) else { return false }
+        guard persist(next, operation: ProjectHistoryOperation(kind: .undo, names: names)) else { return false }
         draftState = nil
         draftTime = nil
         recoveryRestored = false
@@ -1004,13 +1017,15 @@ final class ProjectEditor: ObservableObject {
         guard draftState == nil, count > 0, count <= project.redoHistory.count else { return false }
         var next = project
         let previous = project.state
+        var names: [String] = []
         for _ in 0..<count {
             guard let snapshot = next.redoHistory.popLast() else { return false }
+            names.append(snapshot.name)
             next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: next.state, title: next.title))
             next.state = snapshot.state
             next.title = snapshot.title
         }
-        guard persist(next) else { return false }
+        guard persist(next, operation: ProjectHistoryOperation(kind: .redo, names: names)) else { return false }
         navigateHistory(from: previous, to: next.state)
         return true
     }
@@ -1159,7 +1174,7 @@ final class ProjectEditor: ObservableObject {
         if historyNavigationTime != nil { historyNavigationToken = UUID() }
     }
 
-    private func persist(_ candidate: RecordingProject) -> Bool {
+    private func persist(_ candidate: RecordingProject, operation: ProjectHistoryOperation? = nil) -> Bool {
         var candidate = candidate
         do {
             try candidate.references.merge(references)
@@ -1175,7 +1190,11 @@ final class ProjectEditor: ObservableObject {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(candidate)
             try data.write(to: url, options: .atomic)
-            project = candidate
+            do {
+                publishingHistoryOperation = operation
+                defer { publishingHistoryOperation = nil }
+                project = candidate
+            }
             references = candidate.references
             savedProjectDigest = Self.digest(data)
             errorMessage = clearRecovery() ?? protectedRecoveryNotice

@@ -41,7 +41,7 @@ final class EditorAssistantSession: ObservableObject {
         // erase the very redo branch the user asked to restore.
         if performHistoryShortcut(text, editor: editor) { return }
         if editor.draftState != nil,
-           text.range(of: "\\bredo\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+           EditorAgentControls.historyAction(in: text) == .redo {
             cancel()
             notice = "Finish or undo the current edit before using Redo."
             errorMessage = nil

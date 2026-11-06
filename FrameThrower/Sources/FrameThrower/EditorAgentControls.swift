@@ -39,8 +39,20 @@ enum EditorHistoryDispatcher {
 /// Tools for managing reference marks and traversing shared edit history.
 /// They contain no media, file, executable, network, or selective-undo actions.
 enum EditorAgentControls {
+    /// A history command starts with the requested action. Mentioning history
+    /// inside a framing instruction must not hide all framing tools. Follow-up
+    /// clarification payloads retain the original command on their first line.
+    static func historyAction(in request: String) -> EditorHistoryAction? {
+        let prefix = "Earlier instruction: "
+        let command = request.hasPrefix(prefix) ? String(request.dropFirst(prefix.count)) : request
+        let pattern = "^\\s*(?:(?:please|can you|could you|would you|will you|i want you to|i would like you to|i'd like you to)\\s+)*(undo|redo)\\b"
+        guard let range = command.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let start = command[range].lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return start.hasSuffix("undo") ? .undo : .redo
+    }
+
     static func tools(for request: String) -> [[String: Any]]? {
-        if request.range(of: "\\b(?:undo|redo)\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+        if historyAction(in: request) != nil {
             return [historyTool, clarificationTool]
         }
         let hasOperation = request.range(of: "\\b(?:create|add|insert|move|retime|delete|remove)\\b",

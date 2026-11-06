@@ -21,6 +21,12 @@ struct EditorAgentControlChecks {
     }
     static func checkTools() throws {
         try require(names("Undo that").contains("change_history") && names("Redo the last two changes").contains("change_history"), "ordinary history requests have one dedicated tool")
+        for request in ["Please undo the last zoom", "Could you redo your last change?", "Earlier instruction: Undo your last change.\nQuestion: Undo 2 changes?\nAnswer: Yes"] {
+            try require(names(request).contains("change_history"), "polite history commands and their clarification answers retain history tools")
+        }
+        for request in ["Zoom into Box 1; do not undo earlier edits", "Zoom into Box 1 and preserve the redo history", "Don't undo anything; zoom into Box 2", "At Edit A, zoom into Box 1 without undoing previous edits"] {
+            try require(names(request).isEmpty, "mentioning history must not replace framing tools")
+        }
         try require(names("Create an edit five seconds after Edit A").contains("manage_edits"), "named mark request routed to mark tools")
         try require(names("Move Edit B two seconds after Edit A").contains("manage_edits"), "retiming uses mark management")
         try require(names("Zoom into Box 1 at Edit A").isEmpty && names("Move camera at Edit B").isEmpty, "framing requests retain their normal tool route")

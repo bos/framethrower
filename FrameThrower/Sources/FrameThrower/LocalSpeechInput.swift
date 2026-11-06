@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 @preconcurrency import AVFoundation
 import Speech
+import OSLog
 
 /// Recognition results replace earlier hypotheses for the same audio range.
 /// Consumers only receive the finished transcript, never individual hypotheses.
@@ -46,7 +47,7 @@ protocol LocalSpeechSession: AnyObject, Sendable {
 }
 
 enum LocalSpeechError: LocalizedError {
-    case unavailable, unsupportedLocale, microphoneDenied, noMicrophone, missingAssets, invalidAudio
+    case unavailable, unsupportedLocale, microphoneDenied, noMicrophone, assetsPreparing, unsupportedConfiguration, invalidAudio
 
     var errorDescription: String? {
         switch self {
@@ -54,9 +55,68 @@ enum LocalSpeechError: LocalizedError {
         case .unsupportedLocale: "On-device dictation is unavailable for your current language."
         case .microphoneDenied: "Allow microphone access for FrameThrower in System Settings to dictate edits."
         case .noMicrophone: "No microphone is available."
-        case .missingAssets: "The speech model could not be installed. Connect to the internet to download it, then try again."
+        case .assetsPreparing: "Apple is still preparing on-device dictation for your language. Try again shortly."
+        case .unsupportedConfiguration: "Apple's on-device dictation is unavailable for this language on this Mac."
         case .invalidAudio: "The microphone's audio format is not supported."
         }
+    }
+}
+
+/// Installation requests are optional because existing system assets may only
+/// need to be reserved for this app. In that case requesting installation can
+/// return nil while changing readiness from supported to installed.
+enum SpeechAssetReadiness: String, Sendable {
+    case installed, supported, downloading, unsupported
+
+    @MainActor
+    static func prepare(status: () async -> SpeechAssetReadiness,
+                        installation: () async throws -> (@MainActor () async throws -> Void)?) async throws {
+        try Task.checkCancellation()
+        let initial = await status()
+        if initial == .installed { return }
+        if initial == .unsupported { throw LocalSpeechError.unsupportedConfiguration }
+        if let install = try await installation() {
+            try Task.checkCancellation()
+            try await install()
+        }
+        try Task.checkCancellation()
+        switch await status() {
+        case .installed: return
+        case .downloading: throw LocalSpeechError.assetsPreparing
+        case .unsupported: throw LocalSpeechError.unsupportedConfiguration
+        case .supported:
+            // A nil request is not a connectivity error. Readiness metadata
+            // may lag; SpeechAnalyzer.prepareToAnalyze is the final authority
+            // and will report its real system error if assets cannot be used.
+            return
+        }
+    }
+}
+
+@available(macOS 26, *)
+@MainActor
+enum AppleSpeechAssetPreparation {
+    private static let logger = Logger(subsystem: "com.example.screencast", category: "speech-setup")
+
+    static func prepare(_ transcriber: SpeechTranscriber, locale: Locale) async throws {
+        try await SpeechAssetReadiness.prepare(status: {
+            let state = await AssetInventory.status(forModules: [transcriber])
+            let mapped: SpeechAssetReadiness
+            switch state {
+            case .installed: mapped = .installed
+            case .supported: mapped = .supported
+            case .downloading: mapped = .downloading
+            case .unsupported: mapped = .unsupported
+            @unknown default: mapped = .unsupported
+            }
+            logger.info("On-device dictation locale=\(locale.identifier, privacy: .public), asset status=\(mapped.rawValue, privacy: .public)")
+            return mapped
+        }, installation: {
+            let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber])
+            logger.info("On-device dictation installation request available=\(request != nil, privacy: .public)")
+            guard let request else { return nil }
+            return { try await request.downloadAndInstall() }
+        })
     }
 }
 
@@ -221,6 +281,10 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
             throw LocalSpeechError.unsupportedLocale
         }
         try Task.checkCancellation()
+        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
+        try Task.checkCancellation()
+        guard !stopped else { throw CancellationError() }
         let allowed: Bool
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: allowed = true
@@ -229,15 +293,6 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
         }
         guard allowed else { throw LocalSpeechError.microphoneDenied }
         try Task.checkCancellation()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
-        if await AssetInventory.status(forModules: [transcriber]) != .installed {
-            guard let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else {
-                throw LocalSpeechError.missingAssets
-            }
-            try await request.downloadAndInstall()
-        }
-        try Task.checkCancellation()
-        guard !stopped else { throw CancellationError() }
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let naturalFormat = input.outputFormat(forBus: 0)
@@ -336,7 +391,7 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
 /// cursor are protected while the owning session flushes or cancels the feed.
 /// AsyncStream's continuation carries owned converted buffers to the analyzer.
 @available(macOS 26, *)
-private final class SpeechAudioFeed: @unchecked Sendable {
+final class SpeechAudioFeed: @unchecked Sendable {
     let converter: AVAudioConverter
     let outputFormat: AVAudioFormat
     let continuation: AsyncStream<AnalyzerInput>.Continuation

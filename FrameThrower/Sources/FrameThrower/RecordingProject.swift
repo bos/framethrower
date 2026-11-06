@@ -1,5 +1,6 @@
 import Combine
 import CoreGraphics
+import CryptoKit
 import Foundation
 
 enum PIPTransition: String, Codable, CaseIterable, Sendable {
@@ -698,8 +699,25 @@ final class ProjectEditor: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var draftState: EditState?
     @Published private(set) var draftTime: Double?
+    @Published private(set) var recoveryRestored = false
+    @Published private(set) var historyNavigationTime: Double?
+    @Published private(set) var historyNavigationToken: UUID?
     let url: URL
     private let defaultName: String
+    private var savedProjectDigest: String?
+    private var recoveryTask: Task<Void, Never>?
+    private var ownsRecoveryJournal = false
+    private var protectedRecoveryNotice: String?
+    private static let maximumRecoveryBytes = 2 * 1024 * 1024
+
+    private struct RecoveryJournal: Codable {
+        var version = 1
+        let baseSHA256: String
+        let state: EditState
+        let time: Double
+    }
+
+    var recoveryURL: URL { url.appendingPathExtension("recovery") }
 
     var editingState: EditState { draftState ?? project.state }
     var canUndo: Bool { draftState != nil || !project.undoHistory.isEmpty }
@@ -714,10 +732,16 @@ final class ProjectEditor: ObservableObject {
         defaultName = RecordingProject.defaultTitle(screenFilename: project.screenFilename, projectURL: url)
     }
 
+    deinit { recoveryTask?.cancel() }
+
     static func open(url: URL) throws -> ProjectEditor {
-        let project = try JSONDecoder().decode(RecordingProject.self, from: Data(contentsOf: url))
+        let data = try Data(contentsOf: url)
+        let project = try JSONDecoder().decode(RecordingProject.self, from: data)
         try project.validate()
-        return ProjectEditor(project: project, url: url)
+        let editor = ProjectEditor(project: project, url: url)
+        editor.savedProjectDigest = digest(data)
+        editor.restoreRecovery()
+        return editor
     }
 
     func mediaURL(for filename: String) -> URL {
@@ -742,13 +766,14 @@ final class ProjectEditor: ObservableObject {
             return false
         }
         guard state != project.state else {
-            _ = cancelDraft()
-            errorMessage = nil
+            if draftState != nil, !cancelDraft() { return false }
+            errorMessage = protectedRecoveryNotice
             return true
         }
         draftTime = time
         draftState = state
-        errorMessage = nil
+        errorMessage = protectedRecoveryNotice
+        scheduleRecovery()
         return true
     }
 
@@ -764,15 +789,18 @@ final class ProjectEditor: ObservableObject {
         guard persist(next) else { return false }
         self.draftState = nil
         draftTime = nil
+        recoveryRestored = false
         return true
     }
 
     @discardableResult
     func cancelDraft() -> Bool {
         guard draftState != nil else { return false }
+        if let message = clearRecovery() { errorMessage = message; return false }
         draftState = nil
         draftTime = nil
-        errorMessage = nil
+        recoveryRestored = false
+        errorMessage = protectedRecoveryNotice
         return true
     }
 
@@ -811,9 +839,12 @@ final class ProjectEditor: ObservableObject {
             // on a new redo branch without adding an intermediate undo entry.
             var next = project
             next.redoHistory = [NamedEditSnapshot(name: "Edit", state: draftState, title: project.title)]
+            let time = draftTime
             guard persist(next) else { return false }
+            navigateHistory(from: draftState, to: project.state, preferredTime: time)
             self.draftState = nil
             draftTime = nil
+            recoveryRestored = false
             return true
         }
         guard let snapshot = project.undoHistory.last else { return false }
@@ -822,7 +853,10 @@ final class ProjectEditor: ObservableObject {
         next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
         next.state = snapshot.state
         next.title = snapshot.title
-        return persist(next)
+        let previous = project.state
+        guard persist(next) else { return false }
+        navigateHistory(from: previous, to: next.state)
+        return true
     }
 
     @discardableResult
@@ -834,7 +868,10 @@ final class ProjectEditor: ObservableObject {
         next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
         next.state = snapshot.state
         next.title = snapshot.title
-        return persist(next)
+        let previous = project.state
+        guard persist(next) else { return false }
+        navigateHistory(from: previous, to: next.state)
+        return true
     }
 
     @discardableResult
@@ -844,6 +881,132 @@ final class ProjectEditor: ObservableObject {
     }
 
     func dismissError() { errorMessage = nil }
+
+    /// Coalesce samples without postponing protection throughout a long drag.
+    /// There is at most one pending write and no more than four writes/second.
+    private func scheduleRecovery() {
+        guard recoveryTask == nil, protectedRecoveryNotice == nil else { return }
+        recoveryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.recoveryTask = nil
+            _ = self.flushRecovery()
+        }
+    }
+
+    /// Publish the most recent pending edit without changing saved history.
+    /// Called explicitly before termination and by the coalesced background job.
+    @discardableResult
+    func flushRecovery() -> Bool {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        guard let draftState, let draftTime else { return true }
+        guard protectedRecoveryNotice == nil else { errorMessage = protectedRecoveryNotice; return false }
+        do {
+            try validateRecoveryTarget()
+            guard let savedProjectDigest else {
+                throw ProjectError.invalid("Save the recording before preserving an unfinished edit.")
+            }
+            if !ownsRecoveryJournal, FileManager.default.fileExists(atPath: recoveryURL.path) {
+                let message = "An existing recovery file was kept at \(recoveryURL.path). It was not replaced by this edit."
+                protectedRecoveryNotice = message
+                throw ProjectError.invalid(message)
+            }
+            let journal = RecoveryJournal(baseSHA256: savedProjectDigest, state: draftState, time: draftTime)
+            let data = try JSONEncoder().encode(journal)
+            guard data.count <= Self.maximumRecoveryBytes else {
+                throw ProjectError.invalid("The unfinished edit is too large for its recovery file. Save the recording to preserve it.")
+            }
+            try data.write(to: recoveryURL, options: .atomic)
+            ownsRecoveryJournal = true
+            return true
+        } catch {
+            errorMessage = "Couldn't preserve the unfinished edit. " + error.localizedDescription
+            return false
+        }
+    }
+
+    private func restoreRecovery() {
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
+        do {
+            try validateRecoveryTarget()
+            let attributes = try FileManager.default.attributesOfItem(atPath: recoveryURL.path)
+            guard let count = attributes[.size] as? NSNumber, count.intValue <= Self.maximumRecoveryBytes else {
+                throw ProjectError.invalid("The recovery file is too large to restore.")
+            }
+            let journal = try JSONDecoder().decode(RecoveryJournal.self, from: Data(contentsOf: recoveryURL))
+            guard journal.version == 1 else { throw ProjectError.invalid("The recovery file has an unsupported version.") }
+            guard journal.baseSHA256 == savedProjectDigest else {
+                throw ProjectError.invalid("The unfinished edit belongs to a different saved version of this recording.")
+            }
+            guard journal.time.isFinite, (0...project.duration).contains(journal.time) else {
+                throw ProjectError.invalid("The unfinished edit has an invalid time.")
+            }
+            var candidate = project
+            candidate.state = journal.state
+            try candidate.validate()
+            ownsRecoveryJournal = true
+            guard journal.state != project.state else {
+                errorMessage = clearRecovery()
+                return
+            }
+            draftTime = journal.time
+            draftState = journal.state
+            recoveryRestored = true
+        } catch {
+            let message = "Couldn't restore an unfinished edit. " + error.localizedDescription +
+                " The recovery file was kept at \(recoveryURL.path)."
+            protectedRecoveryNotice = message
+            errorMessage = message
+        }
+    }
+
+    /// Never treat an original source or the saved project as a recovery file,
+    /// even if an adjacent filename or symlink happens to collide with it.
+    private func validateRecoveryTarget() throws {
+        let target = recoveryURL.standardizedFileURL.resolvingSymlinksInPath()
+        let originals = [url] + [project.screenFilename, project.cameraFilename, project.cursorFilename]
+            .compactMap { $0 }.map { mediaURL(for: $0) }
+        guard !originals.contains(where: { $0.standardizedFileURL.resolvingSymlinksInPath() == target }) else {
+            throw ProjectError.invalid("The recovery file cannot replace original media or the saved project.")
+        }
+    }
+
+    private func clearRecovery() -> String? {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        // A stale or corrupt journal can contain unrelated work. Keep it until
+        // the person explicitly decides what to do with that separate file.
+        guard protectedRecoveryNotice == nil, ownsRecoveryJournal else { return nil }
+        do {
+            try validateRecoveryTarget()
+            if FileManager.default.fileExists(atPath: recoveryURL.path) { try FileManager.default.removeItem(at: recoveryURL) }
+            ownsRecoveryJournal = false
+            return nil
+        } catch { return "The recovery file could not be removed. " + error.localizedDescription }
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func navigateHistory(from previous: EditState, to next: EditState, preferredTime: Double? = nil) {
+        var times: [Double] = []
+        let oldZoom = Dictionary(uniqueKeysWithValues: previous.zoomKeyframes.map { ($0.id, $0) })
+        let newZoom = Dictionary(uniqueKeysWithValues: next.zoomKeyframes.map { ($0.id, $0) })
+        for id in Set(oldZoom.keys).union(newZoom.keys) where oldZoom[id] != newZoom[id] {
+            if let old = oldZoom[id] { times.append(old.time) }
+            if let new = newZoom[id] { times.append(new.time) }
+        }
+        let oldCamera = Dictionary(uniqueKeysWithValues: previous.pipKeyframes.map { ($0.id, $0) })
+        let newCamera = Dictionary(uniqueKeysWithValues: next.pipKeyframes.map { ($0.id, $0) })
+        for id in Set(oldCamera.keys).union(newCamera.keys) where oldCamera[id] != newCamera[id] {
+            if let old = oldCamera[id] { times.append(old.time) }
+            if let new = newCamera[id] { times.append(new.time) }
+        }
+        historyNavigationTime = preferredTime ?? times.min()
+        if historyNavigationTime != nil { historyNavigationToken = UUID() }
+    }
 
     private func persist(_ candidate: RecordingProject) -> Bool {
         do {
@@ -856,12 +1019,16 @@ final class ProjectEditor: ObservableObject {
             }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(candidate).write(to: url, options: .atomic)
+            let data = try encoder.encode(candidate)
+            try data.write(to: url, options: .atomic)
             project = candidate
-            errorMessage = nil
+            savedProjectDigest = Self.digest(data)
+            errorMessage = clearRecovery() ?? protectedRecoveryNotice
             return true
         } catch {
-            errorMessage = error.localizedDescription
+            let message = error.localizedDescription
+            if draftState != nil { _ = flushRecovery() }
+            errorMessage = message
             return false
         }
     }

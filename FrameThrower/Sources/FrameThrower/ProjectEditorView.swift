@@ -62,7 +62,14 @@ struct ProjectEditorView: View {
         .background(.background)
         .background(EditorDraftLifecycle(editor: editor).frame(width: 0, height: 0))
         .navigationTitle(editor.displayName)
-        .task { await playback.rebuild(editor: editor) }
+        .task {
+            await playback.rebuild(editor: editor)
+            if let time = editor.draftTime, let draft = editor.draftState {
+                playback.seek(time)
+                selectedEditID = edits.first(where: { abs($0.time - time) < 0.000001 })?.id
+                playback.preview(draft)
+            }
+        }
         .onChange(of: editor.project.state) { _, _ in
             Task {
                 await playback.rebuild(editor: editor)
@@ -73,6 +80,12 @@ struct ProjectEditorView: View {
         .onChange(of: editor.draftState) { old, next in
             if let next { playback.preview(next) }
             else if let old, old != editor.project.state { playback.cancelPreview() }
+        }
+        .onChange(of: editor.historyNavigationToken) { _, _ in
+            guard let time = editor.historyNavigationTime else { return }
+            selectedEditID = edits.first(where: { abs($0.time - time) < 0.000001 })?.id
+            playback.pause()
+            playback.seek(time)
         }
         .onDisappear { _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in

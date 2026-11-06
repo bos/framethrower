@@ -6,6 +6,7 @@ trap 'rm -rf "$check_dir"' EXIT
 sources="$repo_dir/FrameThrower/Sources/FrameThrower"
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   -target "$(uname -m)-apple-macos15.0" \
+  "$sources/EditorRegion.swift" \
   "$sources/MediaProcessing.swift" "$sources/RecordingProject.swift" \
   "$sources/ProjectRenderer.swift" "$sources/PIPVideoCompositor.swift" "$sources/CursorRecording.swift" \
   "$sources/EditorPlayback.swift" "$sources/ScreenMasterWriter.swift" "$sources/RecordingQuality.swift" \

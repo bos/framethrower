@@ -387,20 +387,22 @@ struct EditState: Codable, Equatable, Sendable {
     var zoomKeyframes: [ZoomKeyframe] = []
     var cursorStyle: CursorStyle = CursorStyle()
     var presentation: CanvasPresentation = CanvasPresentation()
+    var regions: [EditorRegion] = []
 
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
-         presentation: CanvasPresentation = CanvasPresentation()) {
+         presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = []) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
         self.zoomKeyframes = zoomKeyframes
         self.cursorStyle = cursorStyle
         self.presentation = presentation
+        self.regions = regions
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -413,6 +415,7 @@ struct EditState: Codable, Equatable, Sendable {
         zoomKeyframes = try values.decodeIfPresent([ZoomKeyframe].self, forKey: .zoomKeyframes) ?? []
         cursorStyle = try values.decodeIfPresent(CursorStyle.self, forKey: .cursorStyle) ?? CursorStyle()
         presentation = try values.decodeIfPresent(CanvasPresentation.self, forKey: .presentation) ?? CanvasPresentation()
+        regions = try values.decodeIfPresent([EditorRegion].self, forKey: .regions) ?? []
     }
 
     func zoom(at time: Double) -> ZoomPlacement {
@@ -638,6 +641,10 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        guard state.regions.count <= 256, Set(state.regions.map(\.id)).count == state.regions.count else {
+            throw ProjectError.invalid("Scribbles must have unique identities; keep at most 256 per recording.")
+        }
+        for region in state.regions { try region.validate(duration: duration) }
         let presentation = state.presentation
         guard presentation.padding.isFinite, (0...0.2).contains(presentation.padding),
               presentation.cornerRadius.isFinite, (0...0.2).contains(presentation.cornerRadius),

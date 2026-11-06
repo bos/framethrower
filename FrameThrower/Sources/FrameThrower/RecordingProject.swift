@@ -367,6 +367,7 @@ struct EditState: Codable, Equatable, Sendable {
 struct NamedEditSnapshot: Codable, Equatable, Sendable {
     var name: String
     var state: EditState
+    var title: String? = nil
 }
 
 /// Media filenames are relative to the project. Source media is never opened
@@ -376,6 +377,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var screenFilename: String
     var cameraFilename: String?
     var cursorFilename: String?
+    var title: String?
     /// Camera start relative to the first screen frame; negative means the
     /// camera started earlier. This is independent of the editable trim.
     var cameraOffset: Double = 0
@@ -386,17 +388,38 @@ struct RecordingProject: Codable, Equatable, Sendable {
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
-         undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = []) {
+         undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
         self.cursorFilename = cursorFilename
+        self.title = title
         self.cameraOffset = cameraOffset
         self.duration = duration
         self.state = state ?? EditState(trimStart: 0, trimEnd: duration,
                                        pipKeyframes: [PIPKeyframe(time: 0, placement: PIPPlacement())])
         self.undoHistory = undoHistory
         self.redoHistory = redoHistory
+    }
+
+    func displayName(projectURL: URL) -> String {
+        title ?? Self.defaultTitle(screenFilename: screenFilename, projectURL: projectURL)
+    }
+
+    static func defaultTitle(screenFilename: String, projectURL: URL) -> String {
+        let prefix = "Screencast-"
+        if screenFilename.hasPrefix(prefix) {
+            let timestamp = String(screenFilename.dropFirst(prefix.count).prefix(15))
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            formatter.isLenient = false
+            if timestamp.count == 15, let date = formatter.date(from: timestamp) {
+                return "Recording " + date.formatted(date: .abbreviated, time: .standard)
+            }
+        }
+        return projectURL.deletingPathExtension().lastPathComponent
     }
 
     /// Geometry edits belong to the source frame visible at the playhead. In
@@ -421,6 +444,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {
             throw ProjectError.invalid("The recording has an invalid duration or camera offset.")
         }
+        try Self.validateTitle(title)
         for filename in [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }) {
             guard !filename.isEmpty, filename != ".", filename != "..",
                   !filename.contains("/"), !filename.contains("\\"), !filename.contains("\0") else {
@@ -434,7 +458,20 @@ struct RecordingProject: Codable, Equatable, Sendable {
             throw ProjectError.invalid("Cursor metadata must use a separate source file.")
         }
         try validate(state)
-        for snapshot in undoHistory + redoHistory { try validate(snapshot.state) }
+        for snapshot in undoHistory + redoHistory {
+            try validate(snapshot.state)
+            try Self.validateTitle(snapshot.title)
+        }
+    }
+
+    fileprivate static func validateTitle(_ title: String?) throws {
+        guard let title else { return }
+        guard !title.isEmpty, title.count <= 256,
+              title == title.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.contains(where: \.isNewline),
+              !title.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else {
+            throw ProjectError.invalid("Use a recording name of 1–256 characters without control characters.")
+        }
     }
 
     private func validate(_ state: EditState) throws {
@@ -499,15 +536,18 @@ final class ProjectEditor: ObservableObject {
     @Published private(set) var project: RecordingProject
     @Published private(set) var errorMessage: String?
     let url: URL
+    private let defaultName: String
 
     var canUndo: Bool { !project.undoHistory.isEmpty }
     var canRedo: Bool { !project.redoHistory.isEmpty }
     var undoName: String { project.undoHistory.last?.name ?? "" }
     var redoName: String { project.redoHistory.last?.name ?? "" }
+    var displayName: String { project.title ?? defaultName }
 
     init(project: RecordingProject, url: URL) {
         self.project = project
         self.url = url
+        defaultName = RecordingProject.defaultTitle(screenFilename: project.screenFilename, projectURL: url)
     }
 
     static func open(url: URL) throws -> ProjectEditor {
@@ -524,9 +564,25 @@ final class ProjectEditor: ObservableObject {
     func commit(_ state: EditState, name: String) -> Bool {
         guard state != project.state else { return true }
         var next = project
-        next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state))
+        next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
         next.redoHistory.removeAll()
         next.state = state
+        return persist(next)
+    }
+
+    @discardableResult
+    func rename(to proposedName: String) -> Bool {
+        let title = proposedName.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        do { try RecordingProject.validateTitle(title) }
+        catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+        guard title != displayName else { errorMessage = nil; return true }
+        var next = project
+        next.undoHistory.append(NamedEditSnapshot(name: "Rename recording", state: project.state, title: project.title))
+        next.redoHistory.removeAll()
+        next.title = title
         return persist(next)
     }
 
@@ -535,8 +591,9 @@ final class ProjectEditor: ObservableObject {
         guard let snapshot = project.undoHistory.last else { return false }
         var next = project
         next.undoHistory.removeLast()
-        next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state))
+        next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
         next.state = snapshot.state
+        next.title = snapshot.title
         return persist(next)
     }
 
@@ -545,8 +602,9 @@ final class ProjectEditor: ObservableObject {
         guard let snapshot = project.redoHistory.last else { return false }
         var next = project
         next.redoHistory.removeLast()
-        next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state))
+        next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
         next.state = snapshot.state
+        next.title = snapshot.title
         return persist(next)
     }
 

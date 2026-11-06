@@ -7,6 +7,55 @@ enum PIPTransition: String, Codable, CaseIterable, Sendable {
     case smooth
 }
 
+enum MotionInterpolation {
+    /// All camera and screen movement arrives at the target timestamp. The
+    /// preceding point bounds the start, so smooth transitions never overlap.
+    static func progress(at time: Double, from previousTime: Double, to targetTime: Double,
+                         duration: Double, transition: PIPTransition) -> Double {
+        guard time.isFinite, previousTime.isFinite, targetTime.isFinite else { return 0 }
+        if time >= targetTime { return 1 }
+        guard transition == .smooth, duration.isFinite, duration > 0 else { return 0 }
+        let beginning = max(previousTime, targetTime - duration)
+        guard time > beginning, targetTime > beginning else { return 0 }
+        let fraction = min(1, max(0, (time - beginning) / (targetTime - beginning)))
+        return fraction * fraction * (3 - 2 * fraction)
+    }
+
+    static func blend(_ start: Double, _ end: Double, progress: Double) -> Double {
+        let fraction = progress.isFinite ? min(1, max(0, progress)) : 0
+        return start + (end - start) * fraction
+    }
+}
+
+/// Shared source-viewport geometry for screen zooms, camera crops, and PIP
+/// frames. Travel anchors are converted to source focal points at this boundary
+/// so existing PIP project coordinates retain their exact meaning.
+enum ViewportGeometry {
+    static func rect(in source: CGSize, size: CGSize, center: CGPoint) -> CGRect {
+        guard let size = boundedSize(size, in: source) else { return .zero }
+        let x = center.x.isFinite ? min(1, max(0, center.x)) : 0.5
+        let y = center.y.isFinite ? min(1, max(0, center.y)) : 0.5
+        return CGRect(x: min(source.width - size.width, max(0, source.width * x - size.width / 2)),
+                      y: min(source.height - size.height, max(0, source.height * y - size.height / 2)),
+                      width: size.width, height: size.height)
+    }
+
+    static func rect(in source: CGSize, size: CGSize, travelAnchor: CGPoint) -> CGRect {
+        guard let size = boundedSize(size, in: source) else { return .zero }
+        let x = travelAnchor.x.isFinite ? min(1, max(0, travelAnchor.x)) : 0.5
+        let y = travelAnchor.y.isFinite ? min(1, max(0, travelAnchor.y)) : 0.5
+        let center = CGPoint(x: (size.width / 2 + (source.width - size.width) * x) / source.width,
+                             y: (size.height / 2 + (source.height - size.height) * y) / source.height)
+        return rect(in: source, size: size, center: center)
+    }
+
+    private static func boundedSize(_ size: CGSize, in source: CGSize) -> CGSize? {
+        guard source.width.isFinite, source.height.isFinite, source.width > 0, source.height > 0,
+              size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return nil }
+        return CGSize(width: min(source.width, size.width), height: min(source.height, size.height))
+    }
+}
+
 enum PIPShape: String, Codable, CaseIterable, Sendable {
     case original
     case rectangle
@@ -28,26 +77,25 @@ struct PIPCrop: Codable, Equatable, Sendable {
     var x: Double = 0.5
     var y: Double = 0.5
 
-    func rect(in source: CGSize, shape: PIPShape, aspectRatio: Double = 1) -> CGRect {
+    func rect(in source: CGSize, shape: PIPShape, aspectRatio: Double = 1, zoom: Double = 1) -> CGRect {
         guard source.width.isFinite, source.height.isFinite,
               source.width > 0, source.height > 0 else { return .zero }
-        guard shape != .original else { return CGRect(origin: .zero, size: source) }
+        let magnification = zoom.isFinite ? min(3, max(1, zoom)) : 1
         let ratio = shape == .rectangle && aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 1
-        let width = min(source.width, source.height * ratio)
-        let height = width / ratio
+        let width = (shape == .original ? source.width : min(source.width, source.height * ratio)) / magnification
+        let height = (shape == .original ? source.height : min(source.width, source.height * ratio) / ratio) / magnification
         let horizontal = x.isFinite ? min(1, max(0, x)) : 0.5
         let vertical = y.isFinite ? min(1, max(0, y)) : 0.5
-        return CGRect(x: (source.width - width) * horizontal,
-                      y: (source.height - height) * vertical,
-                      width: width, height: height)
+        return ViewportGeometry.rect(in: source, size: CGSize(width: width, height: height),
+                                     travelAnchor: CGPoint(x: horizontal, y: vertical))
     }
 
     /// Move the crop window in oriented source coordinates. UI gestures that
     /// move the image itself should negate their translation before calling.
     func moved(by translation: CGSize, in source: CGSize, shape: PIPShape,
-               aspectRatio: Double = 1) -> PIPCrop {
+               aspectRatio: Double = 1, zoom: Double = 1) -> PIPCrop {
         guard translation.width.isFinite, translation.height.isFinite else { return self }
-        let bounds = rect(in: source, shape: shape, aspectRatio: aspectRatio)
+        let bounds = rect(in: source, shape: shape, aspectRatio: aspectRatio, zoom: zoom)
         guard bounds.width > 0, bounds.height > 0 else { return self }
         var next = self
         let horizontalTravel = source.width - bounds.width
@@ -72,9 +120,10 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     var shape: PIPShape = .original
     var aspectRatio: Double = 16.0 / 9.0
     var crop: PIPCrop = PIPCrop()
+    var sourceZoom: Double = 1
 
     init(x: Double = 0.95, y: Double = 0.95, scale: Double = 0.25, visible: Bool = true,
-         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop()) {
+         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1) {
         self.x = x
         self.y = y
         self.scale = scale
@@ -82,10 +131,11 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         self.shape = shape
         self.aspectRatio = aspectRatio
         self.crop = crop
+        self.sourceZoom = sourceZoom
     }
 
     private enum CodingKeys: String, CodingKey {
-        case x, y, scale, visible, shape, aspectRatio, crop
+        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom
     }
 
     /// Decode defaults on each placement so old projects and every old undo/redo
@@ -99,6 +149,7 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         shape = try values.decodeIfPresent(PIPShape.self, forKey: .shape) ?? .original
         aspectRatio = try values.decodeIfPresent(Double.self, forKey: .aspectRatio) ?? 16.0 / 9.0
         crop = try values.decodeIfPresent(PIPCrop.self, forKey: .crop) ?? PIPCrop()
+        sourceZoom = try values.decodeIfPresent(Double.self, forKey: .sourceZoom) ?? 1
     }
 
     func frame(in canvas: CGSize, cameraAspect: Double) -> CGRect {
@@ -116,9 +167,8 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         let height = width / aspect
         let horizontal = x.isFinite ? min(1, max(0, x)) : 0.95
         let vertical = y.isFinite ? min(1, max(0, y)) : 0.95
-        return CGRect(x: (canvas.width - width) * horizontal,
-                      y: (canvas.height - height) * vertical,
-                      width: width, height: height)
+        return ViewportGeometry.rect(in: canvas, size: CGSize(width: width, height: height),
+                                     travelAnchor: CGPoint(x: horizontal, y: vertical))
     }
 
     /// Resize from any corner while retaining its opposite corner whenever
@@ -179,10 +229,98 @@ struct PIPKeyframe: Codable, Equatable, Identifiable, Sendable {
     var duration: Double = 0.4
 }
 
+struct ZoomPlacement: Codable, Equatable, Sendable {
+    var scale: Double = 1
+    /// Normalized source focal point, with a top-left origin.
+    var x: Double = 0.5
+    var y: Double = 0.5
+
+    var clamped: ZoomPlacement {
+        let scale = scale.isFinite ? min(3, max(1, scale)) : 1
+        let viewport = ViewportGeometry.rect(in: CGSize(width: 1, height: 1),
+            size: CGSize(width: 1 / scale, height: 1 / scale), center: CGPoint(x: x, y: y))
+        return ZoomPlacement(scale: scale, x: viewport.midX, y: viewport.midY)
+    }
+
+    func viewport(in source: CGSize) -> CGRect {
+        let placement = clamped
+        return ViewportGeometry.rect(in: source,
+            size: CGSize(width: source.width / placement.scale, height: source.height / placement.scale),
+            center: CGPoint(x: placement.x, y: placement.y))
+    }
+}
+
+struct ZoomKeyframe: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+    var scale: Double = 1
+    var x: Double = 0.5
+    var y: Double = 0.5
+    var transition: PIPTransition = .jump
+    /// Smooth transitions arrive at `time`, beginning no earlier than the
+    /// previous zoom point or the start of the source recording.
+    var duration: Double = 0.4
+
+    var placement: ZoomPlacement { ZoomPlacement(scale: scale, x: x, y: y) }
+}
+
+struct CursorStyle: Codable, Equatable, Sendable {
+    var visible: Bool = true
+    var size: Double = 1.5
+    var smoothing: Double = 0.4
+    var clickHighlight: Bool = true
+}
+
 struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
     var pipKeyframes: [PIPKeyframe]
+    var zoomKeyframes: [ZoomKeyframe] = []
+    var cursorStyle: CursorStyle = CursorStyle()
+
+    init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
+         zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle()) {
+        self.trimStart = trimStart
+        self.trimEnd = trimEnd
+        self.pipKeyframes = pipKeyframes
+        self.zoomKeyframes = zoomKeyframes
+        self.cursorStyle = cursorStyle
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle
+    }
+
+    /// Migration lives on each state so prior undo/redo snapshots also gain
+    /// identity zooms and default styling without losing any existing edits.
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        trimStart = try values.decode(Double.self, forKey: .trimStart)
+        trimEnd = try values.decode(Double.self, forKey: .trimEnd)
+        pipKeyframes = try values.decode([PIPKeyframe].self, forKey: .pipKeyframes)
+        zoomKeyframes = try values.decodeIfPresent([ZoomKeyframe].self, forKey: .zoomKeyframes) ?? []
+        cursorStyle = try values.decodeIfPresent(CursorStyle.self, forKey: .cursorStyle) ?? CursorStyle()
+    }
+
+    func zoom(at time: Double) -> ZoomPlacement {
+        guard time.isFinite, time >= 0 else { return ZoomPlacement() }
+        var previous = ZoomPlacement()
+        var previousTime = 0.0
+        for point in zoomKeyframes.sorted(by: { $0.time < $1.time }) {
+            if time >= point.time {
+                previous = point.placement.clamped
+                previousTime = point.time
+                continue
+            }
+            let progress = MotionInterpolation.progress(at: time, from: previousTime, to: point.time,
+                                                        duration: point.duration, transition: point.transition)
+            let target = point.placement.clamped
+            return ZoomPlacement(scale: MotionInterpolation.blend(previous.scale, target.scale, progress: progress),
+                x: MotionInterpolation.blend(previous.x, target.x, progress: progress),
+                y: MotionInterpolation.blend(previous.y, target.y, progress: progress)).clamped
+        }
+        return previous.clamped
+    }
 
     func placement(at time: Double) -> PIPPlacement {
         let points = pipKeyframes.sorted { $0.time < $1.time }
@@ -193,13 +331,10 @@ struct EditState: Codable, Equatable, Sendable {
                 previous = point
                 continue
             }
-            guard point.transition == .smooth else { return previous.placement }
-            let beginning = max(previous.time, point.time - point.duration)
-            guard time > beginning, point.time > beginning else { return previous.placement }
-            let progress = min(1, max(0, (time - beginning) / (point.time - beginning)))
-            let eased = progress * progress * (3 - 2 * progress)
+            let progress = MotionInterpolation.progress(at: time, from: previous.time, to: point.time,
+                                                        duration: point.duration, transition: point.transition)
             func blend(_ start: Double, _ end: Double) -> Double {
-                start + (end - start) * eased
+                MotionInterpolation.blend(start, end, progress: progress)
             }
             return PIPPlacement(x: blend(previous.placement.x, point.placement.x),
                                 y: blend(previous.placement.y, point.placement.y),
@@ -208,7 +343,8 @@ struct EditState: Codable, Equatable, Sendable {
                                 shape: previous.placement.shape,
                                 aspectRatio: blend(previous.placement.aspectRatio, point.placement.aspectRatio),
                                 crop: PIPCrop(x: blend(previous.placement.crop.x, point.placement.crop.x),
-                                              y: blend(previous.placement.crop.y, point.placement.crop.y)))
+                                              y: blend(previous.placement.crop.y, point.placement.crop.y)),
+                                sourceZoom: blend(previous.placement.sourceZoom, point.placement.sourceZoom))
         }
         return previous.placement
     }
@@ -239,6 +375,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var version: Int = 1
     var screenFilename: String
     var cameraFilename: String?
+    var cursorFilename: String?
     /// Camera start relative to the first screen frame; negative means the
     /// camera started earlier. This is independent of the editable trim.
     var cameraOffset: Double = 0
@@ -247,12 +384,13 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var undoHistory: [NamedEditSnapshot] = []
     var redoHistory: [NamedEditSnapshot] = []
 
-    init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil,
+    init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = []) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
+        self.cursorFilename = cursorFilename
         self.cameraOffset = cameraOffset
         self.duration = duration
         self.state = state ?? EditState(trimStart: 0, trimEnd: duration,
@@ -283,7 +421,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {
             throw ProjectError.invalid("The recording has an invalid duration or camera offset.")
         }
-        for filename in [screenFilename, cameraFilename].compactMap({ $0 }) {
+        for filename in [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }) {
             guard !filename.isEmpty, filename != ".", filename != "..",
                   !filename.contains("/"), !filename.contains("\\"), !filename.contains("\0") else {
                 throw ProjectError.invalid("Project media must be adjacent files with relative filenames.")
@@ -292,11 +430,18 @@ struct RecordingProject: Codable, Equatable, Sendable {
         guard cameraFilename != screenFilename else {
             throw ProjectError.invalid("Screen and camera must use separate source files.")
         }
+        if let cursorFilename, cursorFilename == screenFilename || cursorFilename == cameraFilename {
+            throw ProjectError.invalid("Cursor metadata must use a separate source file.")
+        }
         try validate(state)
         for snapshot in undoHistory + redoHistory { try validate(snapshot.state) }
     }
 
     private func validate(_ state: EditState) throws {
+        guard state.cursorStyle.size.isFinite, (1...4).contains(state.cursorStyle.size),
+              state.cursorStyle.smoothing.isFinite, (0...1).contains(state.cursorStyle.smoothing) else {
+            throw ProjectError.invalid("Cursor size and smoothing must stay within their supported ranges.")
+        }
         guard state.trimStart.isFinite, state.trimEnd.isFinite,
               state.trimStart >= 0, state.trimEnd <= duration,
               state.trimStart < state.trimEnd else {
@@ -317,8 +462,22 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   placement.scale.isFinite, (0.12...0.5).contains(placement.scale),
                   placement.aspectRatio.isFinite, (0.2...5).contains(placement.aspectRatio),
                   placement.crop.x.isFinite, (0...1).contains(placement.crop.x),
-                  placement.crop.y.isFinite, (0...1).contains(placement.crop.y) else {
+                  placement.crop.y.isFinite, (0...1).contains(placement.crop.y),
+                  placement.sourceZoom.isFinite, (1...3).contains(placement.sourceZoom) else {
                 throw ProjectError.invalid("Camera placements must have unique, ordered times and valid positions and sizes.")
+            }
+            priorTime = point.time
+        }
+        priorTime = -Double.infinity
+        identities.removeAll()
+        for point in state.zoomKeyframes {
+            guard point.time.isFinite, point.time >= 0, point.time <= duration,
+                  point.time > priorTime, identities.insert(point.id).inserted,
+                  point.scale.isFinite, (1...3).contains(point.scale),
+                  point.x.isFinite, (0...1).contains(point.x),
+                  point.y.isFinite, (0...1).contains(point.y),
+                  point.duration.isFinite, point.duration > 0 else {
+                throw ProjectError.invalid("Zoom points must have unique, ordered times and valid focal positions, scales, and durations.")
             }
             priorTime = point.time
         }
@@ -398,7 +557,7 @@ final class ProjectEditor: ObservableObject {
         do {
             try candidate.validate()
             let target = url.standardizedFileURL.resolvingSymlinksInPath()
-            for filename in [candidate.screenFilename, candidate.cameraFilename].compactMap({ $0 }) {
+            for filename in [candidate.screenFilename, candidate.cameraFilename, candidate.cursorFilename].compactMap({ $0 }) {
                 guard mediaURL(for: filename).standardizedFileURL.resolvingSymlinksInPath() != target else {
                     throw ProjectError.invalid("The project file cannot replace original media.")
                 }

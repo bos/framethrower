@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */; };
 		06C6B97302EC176D7B91C1BB /* EditorAssistantPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25140E53F9721D6FCF5C0BA5 /* EditorAssistantPanel.swift */; };
 		0DA60B5ECB363F697D65472B /* RecordingTitleEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B7A08447970D31081CF851F /* RecordingTitleEditor.swift */; };
 		0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */; };
@@ -43,6 +44,7 @@
 		848FD112E1F7A0DD8E2CA642 /* EditorCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF59B425C2CA2FD4384FB63F /* EditorCommands.swift */; };
 		87E56BD98D43F6A1C4675DFE /* CaptureRecordingSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B9A54B3BD8A1E232A6B025A /* CaptureRecordingSetup.swift */; };
 		93FD4B1A3FADBB93FB80D31D /* AccountsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E7B3A94E84742A9D86BA53B /* AccountsSettingsView.swift */; };
+		9AFD8FED94BF5747ADCFF2F0 /* WhisperSpeechSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */; };
 		A45F8859120761D8FF141387 /* LocalModelRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2B331C11DFA046948898644 /* LocalModelRuntime.swift */; };
 		A464395CCA3C53791F36D320 /* NewRecordingTitleEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE950809DC1CB6BFA752F80D /* NewRecordingTitleEditor.swift */; };
 		AF039CF0776CB6A6602A67B9 /* RecorderStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5A7848536A44F91C389E05 /* RecorderStyle.swift */; };
@@ -72,6 +74,7 @@
 		086715F7B7342A4708FCB9F7 /* CaptureSourcePreviews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureSourcePreviews.swift; sourceTree = "<group>"; };
 		0ACE1582163A047FCAEB2E0A /* ProjectRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectRenderer.swift; sourceTree = "<group>"; };
 		0E7B3A94E84742A9D86BA53B /* AccountsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountsSettingsView.swift; sourceTree = "<group>"; };
+		0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhisperSpeechRuntime.swift; sourceTree = "<group>"; };
 		11FDA535B37F616831BD83FD /* LocalEditPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalEditPlanner.swift; sourceTree = "<group>"; };
 		195ED7EEA588C1534E5375CA /* PIPGeometryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PIPGeometryViews.swift; sourceTree = "<group>"; };
 		2016F2D08E0C6CE9E12C0FC2 /* EditorDraftLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorDraftLifecycle.swift; sourceTree = "<group>"; };
@@ -120,6 +123,7 @@
 		DB5CFC6F84DBC5F3A292EE02 /* CapturePreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePreview.swift; sourceTree = "<group>"; };
 		DC79B38B140B8C1AE5A79FB1 /* EditorAgentControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorAgentControls.swift; sourceTree = "<group>"; };
 		DD643FF7C65778C3D5A01A54 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhisperSpeechSession.swift; sourceTree = "<group>"; };
 		EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoExportUI.swift; sourceTree = "<group>"; };
 		EDCA470BF5B6AAE4C6F8DF07 /* PresentationControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresentationControls.swift; sourceTree = "<group>"; };
 		F658B134CC765957233533CB /* FrameThrowerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameThrowerApp.swift; sourceTree = "<group>"; };
@@ -195,6 +199,8 @@
 				4B02FAC8C4CE33A644C90D03 /* SlackAPI.swift */,
 				CD520E85E319DD599528423A /* StatusChip.swift */,
 				EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */,
+				0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */,
+				DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */,
 				010F10320038E81B6F92F45A /* WindowSelection.swift */,
 			);
 			path = FrameThrower;
@@ -225,6 +231,7 @@
 			buildPhases = (
 				4D108048C726FE4DB3C91694 /* Sources */,
 				86F9E23CB04346D55DA70545 /* Resources */,
+				E870E86AA152BD494C936DAE /* Bundle local Metal speech runtime */,
 			);
 			buildRules = (
 			);
@@ -281,6 +288,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		E870E86AA152BD494C936DAE /* Bundle local Metal speech runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../Tools/build-local-speech-runtime.sh",
+				"$(SRCROOT)/../Tools/LocalSpeech/main.cpp",
+			);
+			name = "Bundle local Metal speech runtime";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/LocalSpeech/FrameThrowerSpeech",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/../Tools/build-local-speech-runtime.sh\" \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/LocalSpeech\"";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		4D108048C726FE4DB3C91694 /* Sources */ = {
@@ -342,6 +373,8 @@
 				20038457D5FA2C5D0E037802 /* SlackAPI.swift in Sources */,
 				323105BF10991A94F95A197F /* StatusChip.swift in Sources */,
 				FE7F22F290D9756FD5EAA0DF /* VideoExportUI.swift in Sources */,
+				05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */,
+				9AFD8FED94BF5747ADCFF2F0 /* WhisperSpeechSession.swift in Sources */,
 				5DE6C50872135C1523F17FB9 /* WindowSelection.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

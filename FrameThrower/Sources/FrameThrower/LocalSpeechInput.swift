@@ -166,6 +166,7 @@ final class LocalSpeechInput: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var transcript = ""
+    @Published private(set) var recognizerIdentifier = "unselected"
     @Published private(set) var errorMessage: String?
     @Published private(set) var statusMessage: String?
     var contextualStrings: [String] = []
@@ -197,16 +198,24 @@ final class LocalSpeechInput: ObservableObject {
         do {
             let next: any LocalSpeechSession
             if let makeSession { next = try makeSession() }
-            else if #available(macOS 26, *) { next = AppleLocalSpeechSession(contextualStrings: contextualStrings) }
-            else { throw LocalSpeechError.unavailable }
+            else {
+                let words = contextualStrings
+                next = try LocalSpeechBackendFactory.make {
+                    if #available(macOS 26, *) { return AppleLocalSpeechSession(contextualStrings: words) }
+                    throw LocalSpeechError.unavailable
+                }
+            }
             session = next
+            recognizerIdentifier = (next as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
             do {
                 try await next.start(onResult: { [weak self] result in
                     guard let self, self.generation == current, self.phase != .idle else { return }
+                    self.recognizerIdentifier = (self.session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
                     self.hypothesis.receive(result)
                     self.transcript = self.hypothesis.text
                 }, onFailure: { [weak self] message in
                     guard let self, self.generation == current else { return }
+                    self.recognizerIdentifier = (self.session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
                     self.generation = UUID()
                     self.errorMessage = message
                     self.statusMessage = nil
@@ -218,11 +227,14 @@ final class LocalSpeechInput: ObservableObject {
                 throw error
             }
             guard generation == current else { await next.cancel(); return }
+            recognizerIdentifier = (next as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
             statusMessage = nil
             phase = .listening
         } catch {
             guard generation == current else { return }
+            recognizerIdentifier = (session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
             await session?.cancel()
+            guard generation == current else { return }
             session = nil
             phase = .idle
             statusMessage = nil
@@ -250,6 +262,7 @@ final class LocalSpeechInput: ObservableObject {
         } catch {
             guard generation == current else { return nil }
             await session.cancel()
+            guard generation == current else { return nil }
             self.session = nil
             phase = .idle
             statusMessage = nil
@@ -305,7 +318,8 @@ struct LocalVoiceButton: View {
 
 @available(macOS 26, *)
 @MainActor
-private final class AppleLocalSpeechSession: LocalSpeechSession {
+private final class AppleLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendIdentifying {
+    let recognizerIdentifier = "Apple DictationTranscriber"
     private let contextualStrings: [String]
     private var engine: AVAudioEngine?
     private var analyzer: SpeechAnalyzer?

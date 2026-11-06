@@ -18,6 +18,35 @@ exit status 77; fixture creation also checks the interlock. Do not re-enable
 those paths on this machine without explicit approval. The feature descriptions
 below document the implementation behind this temporary interlock.
 
+## Local speech recognition
+
+English dictation uses the bundled Metal Whisper runtime when the verified
+large-v3-turbo Q5_0 model is installed. Otherwise it uses Apple's on-device
+dictation. Recognition stays on this Mac. Whisper returns the final utterance
+when you press Stop; it does not display tentative words while recording.
+Dictation is limited to two minutes per utterance.
+
+The app build bundles and signs a helper plus its tensor libraries. The first
+build needs CMake and internet access to fetch the pinned official source;
+subsequent builds reuse the native runtime cache. The runtime source commit and
+archive checksum are pinned in `Tools/build-local-speech-runtime.sh`. End users
+receive compiled binaries and never need a compiler or Homebrew.
+
+Install already downloaded weights with `python3 Tools/local_speech_model.py`,
+or explicitly download the official 547 MiB model with
+`python3 Tools/local_speech_model.py --download`. Both paths verify the exact
+size and SHA-256 before atomic installation in
+`~/Library/Caches/FrameThrower/LocalSpeech/models/`. Weights are never committed.
+An existing verified ASR benchmark cache is also imported during preparation.
+An interrupted or invalid installation cannot replace a valid model.
+
+Run `Tests/check-whisper-speech.sh` for asset/protocol/cancellation checks.
+`Tests/check-whisper-speech.sh --native` additionally synthesizes 18 utterances
+in memory and tests the actual Metal helper through `LocalSpeechInput.finish`.
+Neither check opens a microphone, plays audio, writes an audio file, or runs a
+video operation. These synthetic checks measure command fidelity, not human
+microphone accuracy.
+
 ## Requirements
 
 - macOS 15 or later.

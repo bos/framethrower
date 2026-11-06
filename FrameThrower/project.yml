@@ -74,4 +74,13 @@ targets:
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
         MACOSX_DEPLOYMENT_TARGET: '15.0'
+    postBuildScripts:
+      - name: Bundle local Metal speech runtime
+        script: '"$SRCROOT/../Tools/build-local-speech-runtime.sh" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/LocalSpeech"'
+        inputFiles:
+          - $(SRCROOT)/../Tools/build-local-speech-runtime.sh
+          - $(SRCROOT)/../Tools/LocalSpeech/main.cpp
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/LocalSpeech/FrameThrowerSpeech
+        basedOnDependencyAnalysis: true
     dependencies: []

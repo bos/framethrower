@@ -150,6 +150,8 @@ Automated checks run without camera hardware or connected accounts:
   negative display origins, fitted PIP bounds, and screenshot cache invalidation.
 - `Tests/check-editor-canvas.sh`: native image orientation, letterboxing, resize
   handle alignment, and Escape cancellation without an edit.
+- `Tests/check-windowgroup-layout.sh`: the actual SwiftUI editor scene, repeated
+  play, trim-handle grabs and scrubbing at normal/minimum widths without reflow.
 - `Tests/check-live-editor-layout.sh`: real 1080p video, changing scrub and live
   camera pixels, stable canvas/window geometry, and one undo per drag.
 - `Tests/check-editor-windows.sh`: shared project identity, independent window

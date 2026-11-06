@@ -27,7 +27,11 @@ struct ProjectEditorView: View {
             }
             player
             timeline
-            if editor.project.cameraFilename != nil { cameraControls }
+            if editor.project.cameraFilename != nil {
+                // Native control rows keep their content height during scene
+                // updates, leaving only the preview to absorb vertical space.
+                cameraControls.fixedSize(horizontal: false, vertical: true)
+            }
             if let message = editor.errorMessage ?? playback.errorMessage ?? exportError {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
@@ -107,6 +111,7 @@ struct ProjectEditorView: View {
                 })).toggleStyle(.checkbox)
                 Spacer()
             }
+            .frame(height: 24)
             HStack(spacing: 12) {
                 Picker("Shape", selection: Binding(get: { placement.shape }, set: { shape in
                     var next = placement
@@ -141,6 +146,7 @@ struct ProjectEditorView: View {
                     Text("Drag the corner to resize freely.").font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .frame(height: 24)
             HStack(spacing: 12) {
                 ForEach(0..<4) { index in
                     Button {
@@ -177,6 +183,7 @@ struct ProjectEditorView: View {
                     .disabled((point?.transition ?? transition) != .smooth)
                     .accessibilityHidden((point?.transition ?? transition) != .smooth)
             }
+            .frame(height: 24)
             ScrollView(.horizontal) {
                 HStack {
                     ForEach(state.pipKeyframes) { keyframe in

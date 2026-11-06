@@ -115,6 +115,64 @@ enum ProjectRenderer {
         )
     }
 
+    /// Applies a transient edit snapshot without reopening media or replacing
+    /// the source composition. Draft frames and saved/exported edits therefore
+    /// run through the same compositor, with the original screen beneath PIP.
+    static func preview(_ rendered: RenderedProject, applying state: EditState) -> RenderedProject {
+        // AVVideoComposition's NSMutableCopying contract returns its mutable
+        // counterpart and preserves frame timing, color, and render settings.
+        let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
+        videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
+            if let pip = instruction as? PIPCompositionInstruction { return pip.applying(state) }
+            return instruction
+        }
+        return RenderedProject(asset: rendered.asset, videoComposition: videoComposition,
+                               screenSize: rendered.screenSize, cameraAspect: rendered.cameraAspect)
+    }
+
+    /// Decode the current screen/camera source pair once for a frozen playhead.
+    /// The cache belongs to this preparation, never to exports or other times.
+    static func prepareLiveSources(_ rendered: RenderedProject, at time: CMTime) async throws -> LivePreviewSources {
+        try Task.checkCancellation()
+        guard time.seconds.isFinite, time >= .zero, time < rendered.asset.duration else {
+            throw RenderError.invalidTrim
+        }
+        let capture = FocusedFrameCapture(target: time, frameDuration: rendered.videoComposition.frameDuration)
+        let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
+        videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
+            if let pip = instruction as? PIPCompositionInstruction {
+                return pip.applying(pip.state, focusedCapture: capture)
+            }
+            return instruction
+        }
+        let generator = AVAssetImageGenerator(asset: rendered.asset)
+        generator.videoComposition = videoComposition
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        generator.maximumSize = CGSize(width: 1, height: 1)
+        let preparation = LiveSourcePreparation(generator: generator, capture: capture)
+        return try await withTaskCancellationHandler {
+            do {
+                _ = try await generator.image(at: time)
+                try Task.checkCancellation()
+                guard let sources = capture.finish() else { throw RenderError.cannotExport }
+                return sources
+            } catch {
+                preparation.cancel()
+                throw error
+            }
+        } onCancel: {
+            preparation.cancel()
+        }
+    }
+
+    /// Recompose retained raw source pixels with transient edits. No media is
+    /// reopened or decoded, and the original screen is exposed as PIP moves.
+    static func renderLivePreview(_ sources: LivePreviewSources, applying state: EditState,
+                                  maximumSize: CGSize = CGSize(width: 1920, height: 1080)) async throws -> CGImage {
+        try await sources.render(applying: state, maximumSize: maximumSize)
+    }
+
     /// A raw, oriented source frame for repositioning the nondestructive crop.
     /// `at` is in screen-source seconds, independent of the editable trim.
     static func cameraFrame(project: RecordingProject, directory: URL, at seconds: Double) async throws -> CGImage? {
@@ -173,5 +231,22 @@ enum ProjectRenderer {
 
     private static func time(_ seconds: Double) -> CMTime {
         CMTime(seconds: seconds, preferredTimescale: 60_000)
+    }
+}
+
+/// AVAssetImageGenerator permits asynchronous cancellation; this wrapper keeps
+/// that operation and the capture sink together across cancellation callbacks.
+private final class LiveSourcePreparation: @unchecked Sendable {
+    let generator: AVAssetImageGenerator
+    let capture: FocusedFrameCapture
+
+    init(generator: AVAssetImageGenerator, capture: FocusedFrameCapture) {
+        self.generator = generator
+        self.capture = capture
+    }
+
+    func cancel() {
+        capture.invalidate()
+        generator.cancelAllCGImageGeneration()
     }
 }

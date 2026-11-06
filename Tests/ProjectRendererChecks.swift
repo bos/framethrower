@@ -77,6 +77,7 @@ struct ProjectRendererChecks {
         _ = try await ProjectRenderer.makePreview(project: tinyOverlap, directory: directory)
 
         try await geometryChecks(project: project, directory: directory)
+        try await draftChecks(project: project, directory: directory)
 
         project.state.trimStart = 1
         project.state.trimEnd = 3.5
@@ -105,6 +106,161 @@ struct ProjectRendererChecks {
         try require(try Data(contentsOf: screen) == originalScreen, "screen source remains byte-identical")
         try require(try Data(contentsOf: camera) == originalCamera, "camera source remains byte-identical")
         print("Project renderer checks passed (jump, easing, timed shapes, repositionable crops, circle alpha, orientation, sync offsets, independent audio tracks, trim, preview/export parity, source preservation).")
+    }
+
+    private static func draftChecks(project: RecordingProject, directory: URL) async throws {
+        var baseProject = project
+        baseProject.state.pipKeyframes = [PIPKeyframe(time: 0, placement: PIPPlacement(x: 0, y: 0, scale: 0.25))]
+        let base = try await ProjectRenderer.makePreview(project: baseProject, directory: directory)
+        var state = baseProject.state
+        state.pipKeyframes[0].placement = PIPPlacement(x: 1, y: 1, scale: 0.4, shape: .circle)
+        let draft = ProjectRenderer.preview(base, applying: state)
+        try require(draft.asset === base.asset, "live draft reuses loaded source composition")
+        try require(draft.screenSize == base.screenSize && draft.cameraAspect == base.cameraAspect,
+                    "draft preserves source canvas and camera metadata")
+        try require(draft.videoComposition.frameDuration == base.videoComposition.frameDuration &&
+                    draft.videoComposition.renderSize == base.videoComposition.renderSize &&
+                    draft.videoComposition.colorPrimaries == base.videoComposition.colorPrimaries &&
+                    draft.videoComposition.colorTransferFunction == base.videoComposition.colorTransferFunction &&
+                    draft.videoComposition.colorYCbCrMatrix == base.videoComposition.colorYCbCrMatrix,
+                    "draft preserves frame timing and color settings")
+        let draftImage = try await image(draft, at: 0.5)
+        try checkCircle(draftImage, frame: CGRect(x: 96, y: 56, width: 64, height: 64), color: [0, 255, 0])
+        try pixel(draftImage, x: 20, y: 10, equals: [0, 0, 255])
+        var savedProject = baseProject
+        savedProject.state = state
+        let savedImage = try await image(savedProject, directory: directory, at: 0.5)
+        try require(try rgba(draftImage) == rgba(savedImage), "live draft pixels equal a fully rebuilt saved edit")
+        var hidden = state
+        hidden.pipKeyframes[0].placement.visible = false
+        let hiddenImage = try await image(ProjectRenderer.preview(base, applying: hidden), at: 0.5)
+        try checkBounds(hiddenImage, expected: nil)
+        let baseImage = try await image(base, at: 0.5)
+        try checkBounds(baseImage, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        try require((base.videoComposition.instructions.first as? PIPCompositionInstruction)?.state == baseProject.state,
+                    "draft updates never mutate the saved render snapshot")
+        try require((draft.videoComposition.instructions.first as? PIPCompositionInstruction)?.state == state,
+                    "a later draft never mutates an earlier in-flight render snapshot")
+
+        // Moving the source crop uses the same loaded source frames and exact
+        // renderer as a persisted edit, rather than stretching a cached PIP.
+        var croppedProject = baseProject
+        croppedProject.cameraFilename = "patterned.mov"
+        croppedProject.state.pipKeyframes[0].placement.shape = .square
+        croppedProject.state.pipKeyframes[0].placement.crop = PIPCrop(x: 0, y: 0.5)
+        let croppedBase = try await ProjectRenderer.makePreview(project: croppedProject, directory: directory)
+        var cropDraft = croppedProject.state
+        cropDraft.pipKeyframes[0].placement.shape = .rectangle
+        cropDraft.pipKeyframes[0].placement.aspectRatio = 0.5
+        cropDraft.pipKeyframes[0].placement.crop.x = 1
+        let cropPreview = ProjectRenderer.preview(croppedBase, applying: cropDraft)
+        let cropImage = try await image(cropPreview, at: 0.5)
+        try pixel(cropImage, x: 20, y: 20, equals: [0, 255, 0])
+        try pixel(cropImage, x: 20, y: 60, equals: [255, 0, 255])
+        croppedProject.state = cropDraft
+        let cropSaved = try await image(croppedProject, directory: directory, at: 0.5)
+        try require(try rgba(cropImage) == rgba(cropSaved), "draft crop and aspect pixels equal the saved edit")
+
+        let frozenTime = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let liveSources = try await ProjectRenderer.prepareLiveSources(base, at: frozenTime)
+        try require(liveSources.time == frozenTime, "live source pair remains tied to its frozen playhead")
+        let liveImage = try await ProjectRenderer.renderLivePreview(liveSources, applying: savedProject.state)
+        try require(try rgba(liveImage) == rgba(savedImage), "cached source move/resize/circle pixels equal saved composition")
+        try pixel(liveImage, x: 20, y: 10, equals: [0, 0, 255])
+        let liveHidden = try await ProjectRenderer.renderLivePreview(liveSources, applying: hidden)
+        try checkBounds(liveHidden, expected: nil)
+        let smallLive = try await ProjectRenderer.renderLivePreview(liveSources, applying: savedProject.state,
+                                                                   maximumSize: CGSize(width: 80, height: 60))
+        try require(smallLive.width == 80 && smallLive.height == 60, "cached source drafts respect bounded output size")
+        try checkCircle(smallLive, frame: CGRect(x: 48, y: 28, width: 32, height: 32), color: [0, 255, 0])
+
+        let liveCropSources = try await ProjectRenderer.prepareLiveSources(croppedBase, at: frozenTime)
+        let liveCrop = try await ProjectRenderer.renderLivePreview(liveCropSources, applying: cropDraft)
+        try require(try rgba(liveCrop) == rgba(cropSaved), "cached raw source crop/aspect pixels equal saved composition")
+        let laterSources = try await ProjectRenderer.prepareLiveSources(base, at: CMTime(seconds: 2.5, preferredTimescale: 600))
+        let laterImage = try await ProjectRenderer.renderLivePreview(laterSources, applying: savedProject.state)
+        try checkCircle(laterImage, frame: CGRect(x: 96, y: 56, width: 64, height: 64), color: [255, 255, 0])
+        let earlierAgain = try await ProjectRenderer.renderLivePreview(liveSources, applying: savedProject.state)
+        try require(try rgba(earlierAgain) == rgba(liveImage), "another playhead never replaces frozen source buffers")
+
+        var delayed = baseProject
+        delayed.cameraOffset = 1
+        let delayedRender = try await ProjectRenderer.makePreview(project: delayed, directory: directory)
+        let beforeCamera = try await ProjectRenderer.prepareLiveSources(delayedRender, at: frozenTime)
+        let beforeImage = try await ProjectRenderer.renderLivePreview(beforeCamera, applying: savedProject.state)
+        try checkBounds(beforeImage, expected: nil)
+        var ended = baseProject
+        ended.cameraOffset = -2
+        let endedRender = try await ProjectRenderer.makePreview(project: ended, directory: directory)
+        let afterCamera = try await ProjectRenderer.prepareLiveSources(endedRender, at: CMTime(seconds: 3.5, preferredTimescale: 600))
+        let afterImage = try await ProjectRenderer.renderLivePreview(afterCamera, applying: savedProject.state)
+        try checkBounds(afterImage, expected: nil)
+
+        // Preparation captures raw camera independently of its current visibility.
+        var initiallyHidden = baseProject
+        initiallyHidden.state.pipKeyframes[0].placement.visible = false
+        let hiddenRender = try await ProjectRenderer.makePreview(project: initiallyHidden, directory: directory)
+        let hiddenSources = try await ProjectRenderer.prepareLiveSources(hiddenRender, at: frozenTime)
+        let revealed = try await ProjectRenderer.renderLivePreview(hiddenSources, applying: savedProject.state)
+        try require(try rgba(revealed) == rgba(liveImage), "hidden source camera can be revealed without another decode")
+
+        // A paused playhead need not fall on a nominal 30 fps boundary.
+        var betweenFrames = baseProject
+        betweenFrames.state.pipKeyframes.append(PIPKeyframe(time: 0.75,
+            placement: PIPPlacement(x: 1, y: 1, scale: 0.4), transition: .smooth, duration: 0.75))
+        let arbitraryTime = CMTime(seconds: 0.5173, preferredTimescale: 1_000_000)
+        let arbitrarySources = try await ProjectRenderer.prepareLiveSources(base, at: arbitraryTime)
+        let arbitraryLive = try await ProjectRenderer.renderLivePreview(arbitrarySources, applying: betweenFrames.state)
+        let arbitrarySaved = try await image(betweenFrames, directory: directory, at: arbitraryTime.seconds)
+        try require(try rgba(arbitraryLive) == rgba(arbitrarySaved), "cached source edits preserve sub-frame frozen playhead timing")
+
+        let cancelledPreparation = Task { @MainActor in
+            try await ProjectRenderer.prepareLiveSources(base, at: frozenTime)
+        }
+        cancelledPreparation.cancel()
+        do {
+            _ = try await cancelledPreparation.value
+            throw CheckError.failed("cancelled source preparation returned a stale pair")
+        } catch is CancellationError { }
+        try focusedCaptureChecks(base, at: frozenTime)
+
+        let clock = ContinuousClock()
+        let beginning = clock.now
+        for index in 0..<1_000 {
+            state.pipKeyframes[0].placement.x = Double(index % 100) / 100
+            let next = ProjectRenderer.preview(base, applying: state)
+            try require(next.asset === base.asset, "every transient edit reuses loaded media")
+        }
+        print("Draft compositor check: 1000 source-reusing snapshots in \(beginning.duration(to: clock.now)).")
+    }
+
+    private static func focusedCaptureChecks(_ rendered: RenderedProject, at time: CMTime) throws {
+        guard let instruction = rendered.videoComposition.instructions.first as? PIPCompositionInstruction else {
+            throw CheckError.failed("source capture instruction")
+        }
+        var dummy: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA, nil, &dummy) == kCVReturnSuccess,
+              let dummy else { throw CheckError.failed("source capture test buffer") }
+        let wrongTime = FocusedFrameCapture(target: time, frameDuration: rendered.videoComposition.frameDuration)
+        wrongTime.capture(screen: dummy, camera: nil, at: .zero, instruction: instruction)
+        try require(wrongTime.finish() == nil, "prefetched frames from another playhead are never retained")
+        let cancelled = FocusedFrameCapture(target: time, frameDuration: rendered.videoComposition.frameDuration)
+        cancelled.invalidate()
+        cancelled.capture(screen: dummy, camera: dummy, at: time, instruction: instruction)
+        try require(cancelled.finish() == nil, "late decoder frames cannot repopulate a cancelled source cache")
+        let completed = FocusedFrameCapture(target: time, frameDuration: rendered.videoComposition.frameDuration)
+        completed.capture(screen: dummy, camera: nil, at: time, instruction: instruction)
+        try require(completed.finish() != nil && completed.finish() == nil, "focused source ownership transfers only once")
+        completed.capture(screen: dummy, camera: dummy, at: time, instruction: instruction)
+        try require(completed.finish() == nil, "completed source preparation rejects late callbacks")
+    }
+
+    private static func image(_ rendered: RenderedProject, at seconds: Double) async throws -> CGImage {
+        let generator = AVAssetImageGenerator(asset: rendered.asset)
+        generator.videoComposition = rendered.videoComposition
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)).image
     }
 
     private static func geometryChecks(project: RecordingProject, directory: URL) async throws {
@@ -225,7 +381,7 @@ struct ProjectRendererChecks {
         generator.videoComposition = rendered.videoComposition
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
+        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)).image
     }
 
     private static func rgba(_ image: CGImage) throws -> [UInt8] {
@@ -273,7 +429,7 @@ struct ProjectRendererChecks {
         generator.videoComposition = rendered.videoComposition
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        let (image, _) = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600))
+        let (image, _) = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000))
         try checkBounds(image, expected: expected, yellow: yellow)
     }
 

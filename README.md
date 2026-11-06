@@ -62,13 +62,40 @@ for normal use so macOS can recognize its recording permissions.
    Preview capture and permission requests do not run automatically on launch.
 3. Use the audio checkboxes to enable system audio and/or a microphone. Microphone
    capture needs its own macOS permission.
-4. Click **Record**, or use its arrow for a 5- or 10-second countdown.
+4. Optionally choose a **Camera**. Its live preview lets you set the initial PIP
+   position and size; camera and microphone selection are independent. Camera
+   access is requested only when you select a camera. Choose **Off** to stop it.
+5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
-   The saved clip appears below the preview with playback and Finder shortcuts.
+   The review editor opens when capture finishes; use **Edit…** to reopen it.
 
-Recordings are H.264 MP4 files saved as `~/Movies/Screencast-<UTC timestamp>.mp4`.
-The legacy filename prefix is retained for compatibility with the upload helper.
-Local recording does not require connecting Google Drive or Slack.
+Screen originals are H.264 MP4 files saved as
+`~/Movies/Screencast-<UTC timestamp>-<unique suffix>.mp4`. Camera video is saved
+separately beside the screen original as `.camera.mov`, with a `.framethrower`
+project that stores edits and undo history. Keep these files together. The legacy
+filename prefix is retained for compatibility with the upload helper. Local
+recording and editing do not require connecting Google Drive or Slack.
+
+## Editing
+
+Use the single timeline to scrub and drag its blue handles to trim. Arrow keys
+seek by 0.1 seconds; Shift-arrow seeks by one second. Trimming keeps every original
+frame available, and **Restore full recording** restores the full range.
+
+Camera edits create placement points at the playhead. Move the PIP by dragging or
+using a corner button; resize with **Size** or its bottom-right handle. **Original**
+preserves the camera aspect, **Rectangle** allows independent width and height,
+and **Square** and **Circle** crop without stretching. **Framing…** lets you move
+the crop within the full camera image. Shape, framing, size, position, and visibility
+can all change over time. **Jump** changes placement instantly; **Smooth** eases
+position, size, aspect, and framing toward the point. Shape and visibility switch
+at the point's timestamp.
+
+Every edit, including trim, supports Command-Z and Shift-Command-Z. Each drag is
+one undo step. Edits and history save automatically and survive reopening through
+**Open…**. Editing never overwrites source media. **Export…**, Slack, and Drive all
+render the current edit using the same composition as the preview, creating a
+separate MP4. Export encoding is independent of nondestructive editing.
 
 ## Accounts and sharing
 
@@ -92,8 +119,23 @@ UserDefaults preferences, not the Keychain.
 
 ## Troubleshooting
 
-Run `Tests/check-area-preview.sh` to check the area editor's coordinate mapping,
-native drag interactions, keyboard nudges, and recording lock using offscreen views.
+Use `Tools/build-debug.sh` for an incremental Debug build without terminal
+indexing; append `CODE_SIGNING_ALLOWED=NO` for a compile-only check. Regenerate the
+Xcode project after adding source files or changing `project.yml`.
+
+Automated checks run without camera hardware or connected accounts:
+
+- `Tests/check-recording-project.sh`: edit persistence, legacy compatibility,
+  undo/redo, resize and crop geometry, and source preservation.
+- `Tests/check-project-renderer.sh`: pixel-level composition, shape and crop
+  transitions, synchronization, audio preservation, and preview/export parity.
+- `Tests/check-editor-playback.sh`: bounded still-frame work during rapid scrubbing,
+  cancellation, stale-result suppression, and end-exclusive seeking.
+- `Tests/check-recording-timeline.sh`: native scrub and trim gestures, overlapping
+  hit targets, undo grouping, bounds, and keyboard seeking.
+- `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
+- `Tests/check-area-preview.sh`: area coordinate mapping, native drag interactions,
+  keyboard nudges, and recording lock using offscreen views.
 
 Open **Activity** in the footer for errors, or read
 `~/Library/Logs/Screencast.log`. If the app opens but recording is disabled, check

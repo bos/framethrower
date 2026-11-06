@@ -10,6 +10,11 @@ struct ProjectEditorView: View {
     @State private var dragOrigin: PIPPlacement?
     @State private var dragPlacement: PIPPlacement?
     @State private var dragTime = 0.0
+    @State private var resizeOrigin: PIPPlacement?
+    @State private var isFramingPresented = false
+    @State private var framingTime = 0.0
+    @State private var cameraFrame: CGImage?
+    @State private var cameraFrameError: String?
     @State private var exportError: String?
     @State private var isExporting = false
 
@@ -67,17 +72,22 @@ struct ProjectEditorView: View {
                     .overlay(alignment: .topLeading) {
                         if editor.project.cameraFilename != nil, placement.visible {
                             let rect = placement.frame(in: canvas, cameraAspect: playback.cameraAspect)
-                            RoundedRectangle(cornerRadius: 3)
+                            PIPWindowShape(shape: placement.shape)
                                 .strokeBorder(.white.opacity(0.9), style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
-                                .background(Color.white.opacity(dragPlacement == nil ? 0.001 : 0.12))
+                                .background(PIPWindowShape(shape: placement.shape)
+                                    .fill(Color.white.opacity(dragPlacement == nil ? 0.001 : 0.12)))
                                 .overlay(alignment: .topLeading) {
                                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                                         .font(.caption2).padding(4).background(.black.opacity(0.7))
                                 }
                                 .frame(width: rect.width, height: rect.height)
+                                .overlay(alignment: .bottomTrailing) {
+                                    resizeHandle(canvas: canvas)
+                                }
                                 .offset(x: rect.minX, y: rect.minY)
                                 .gesture(DragGesture(minimumDistance: 2)
                                     .onChanged { value in
+                                        guard resizeOrigin == nil else { return }
                                         if dragOrigin == nil {
                                             playback.pause()
                                             dragOrigin = state.placement(at: playback.time)
@@ -91,6 +101,7 @@ struct ProjectEditorView: View {
                                         dragPlacement = next
                                     }
                                     .onEnded { _ in
+                                        guard resizeOrigin == nil else { return }
                                         if let dragPlacement { setPlacement(dragPlacement, at: dragTime, name: "Move camera") }
                                         dragOrigin = nil
                                         dragPlacement = nil
@@ -158,8 +169,38 @@ struct ProjectEditorView: View {
                     setPlacement(next, at: playback.time, name: value ? "Show camera" : "Hide camera")
                 })).toggleStyle(.checkbox)
                 Spacer()
-                Text("Move the camera at the playhead to add a placement point.")
+                Text("Camera edits apply at the playhead.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
+                Picker("Shape", selection: Binding(get: { placement.shape }, set: { shape in
+                    var next = placement
+                    if shape == .rectangle {
+                        let frame = placement.frame(in: playback.screenSize, cameraAspect: playback.cameraAspect)
+                        next.aspectRatio = min(5, max(0.2, frame.width / frame.height))
+                    }
+                    next.shape = shape
+                    setPlacement(next, at: playback.time, name: "Change camera shape")
+                })) {
+                    ForEach(PIPShape.allCases, id: \.rawValue) { shape in Text(shape.title).tag(shape) }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 340)
+                if placement.shape != .original {
+                    Button("Framing…") { openFraming() }
+                        .popover(isPresented: $isFramingPresented) {
+                            CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
+                                placement: state.placement(at: framingTime)) { crop in
+                                    var next = state.placement(at: framingTime)
+                                    next.crop = crop
+                                    setPlacement(next, at: framingTime, name: "Frame camera")
+                            }
+                        }
+                }
+                Spacer()
+                if placement.shape == .rectangle {
+                    Text("Drag the corner to resize freely.").font(.caption).foregroundStyle(.secondary)
+                }
             }
             HStack(spacing: 12) {
                 ForEach(0..<4) { index in
@@ -201,7 +242,7 @@ struct ProjectEditorView: View {
                             transitionDuration = keyframe.duration
                             playback.pause(); playback.seek(keyframe.time)
                         } label: {
-                            Text("\(keyframe.time, specifier: "%.2f")s · \(keyframe.time == 0 ? "Initial" : keyframe.transition.rawValue.capitalized)")
+                            Text("\(keyframe.time, specifier: "%.2f")s · \(keyframe.placement.shape.title) · \(keyframe.time == 0 ? "Initial" : keyframe.transition.rawValue.capitalized)")
                                 .font(.caption).padding(.horizontal, 9).padding(.vertical, 6)
                                 .background(selectedPoint == keyframe.id ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.05),
                                             in: Capsule())
@@ -228,6 +269,46 @@ struct ProjectEditorView: View {
         }
         .padding(14)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func resizeHandle(canvas: CGSize) -> some View {
+        Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
+            .frame(width: 22, height: 22)
+            .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+            .offset(x: 7, y: 7)
+            .help(placement.shape == .rectangle ? "Drag to change camera width and height" : "Drag to resize camera")
+            .accessibilityLabel("Resize camera")
+            .highPriorityGesture(DragGesture(minimumDistance: 1).onChanged { value in
+                if resizeOrigin == nil {
+                    playback.pause()
+                    resizeOrigin = state.placement(at: playback.time)
+                    dragTime = playback.time
+                }
+                guard let origin = resizeOrigin else { return }
+                dragPlacement = origin.resized(by: value.translation, in: canvas, cameraAspect: playback.cameraAspect)
+            }.onEnded { _ in
+                if let dragPlacement { setPlacement(dragPlacement, at: dragTime, name: "Resize camera") }
+                resizeOrigin = nil
+                dragPlacement = nil
+            })
+    }
+
+    private func openFraming() {
+        playback.pause()
+        framingTime = playback.time
+        cameraFrame = nil
+        cameraFrameError = nil
+        isFramingPresented = true
+        let snapshot = editor.project
+        let time = framingTime
+        Task {
+            do {
+                cameraFrame = try await ProjectRenderer.cameraFrame(project: snapshot,
+                    directory: editor.url.deletingLastPathComponent(), at: time)
+                if cameraFrame == nil { cameraFrameError = "No camera frame is available at this time." }
+            } catch { cameraFrameError = error.localizedDescription }
+        }
     }
 
     private func setPlacement(_ next: PIPPlacement, at time: Double, name: String) {

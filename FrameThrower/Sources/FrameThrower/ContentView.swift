@@ -43,20 +43,7 @@ struct ContentView: View {
             RecorderWorkspace {
                 captureCard
             } recordingControls: {
-                recordingBar
-                VStack(alignment: .leading, spacing: 4) {
-                    Picker("Originals", selection: $model.recordingQuality) {
-                        Text("High quality").tag(RecordingQuality.highQuality)
-                        Text("Smaller files").tag(RecordingQuality.compact)
-                    }
-                    .pickerStyle(.menu)
-                    .disabled(captureLocked)
-                    .help("High quality saves ProRes video and uncompressed audio for editing. Smaller files saves H.264 video. Export creates a separate compressed copy.")
-                    if let estimate = model.recordingStorageEstimate {
-                        Text(estimate).font(.system(size: 10)).foregroundStyle(.secondary)
-                            .help("Estimated screen-video storage at the selected resolution; camera and audio use additional space. Static screens may use less.")
-                    }
-                }
+                recordingSetup
             } recordings: {
                 if showRecording { recordingSummary }
             }
@@ -69,8 +56,10 @@ struct ContentView: View {
         .background(colorScheme == .dark ? Color(white: 0.105) : Color(red: 0.965, green: 0.960, blue: 0.949))
         .tint(RecorderStyle.accent)
         .frame(minWidth: 1000, minHeight: 780)
-        .navigationTitle("New Recording")
+        .navigationTitle(model.nextRecordingName.displayName)
+        .toolbar(removing: .title)
         .toolbar {
+            recordingTitleToolbar
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { model.chooseProject() } label: { Label("Open Recording", systemImage: "folder") }
                     .labelStyle(.iconOnly)
@@ -105,6 +94,22 @@ struct ContentView: View {
         .task(id: "\(model.lastRecordingURL?.path ?? ""):\(model.isRecording)") {
             await loadClipDetails()
         }
+    }
+
+    @ToolbarContentBuilder
+    private var recordingTitleToolbar: some ToolbarContent {
+        if #available(macOS 26, *) {
+            ToolbarItem(placement: .principal) { recordingTitle }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .principal) { recordingTitle }
+        }
+    }
+
+    private var recordingTitle: some View {
+        NewRecordingTitleEditor(model: model)
+            .frame(minWidth: 140, idealWidth: 240, maxWidth: 320, minHeight: 24, maxHeight: 24)
+            .disabled(captureLocked)
     }
 
     private var captureCard: some View {
@@ -304,31 +309,10 @@ struct ContentView: View {
         .frame(height: 24)
     }
 
-    private var recordingBar: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            recordingControl
-            HStack(spacing: 8) {
-                if let recordingStatus {
-                    HStack(spacing: 7) {
-                        if model.isRecording {
-                            Circle().fill(RecorderStyle.accent).frame(width: 6, height: 6)
-                        }
-                        Text(recordingStatus)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(MediaProcessing.isSuspended ? .secondary : .primary)
-                            .lineLimit(2)
-                    }
-                }
-                if let started = recordingStartedAt, model.isRecording {
-                    Text(started, style: .timer)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .padding(.horizontal, 3)
-        .padding(.vertical, 2)
+    private var recordingSetup: some View {
+        CaptureRecordingSetup(quality: $model.recordingQuality, details: model.recordingDetails,
+            status: recordingStatus, isRecording: model.isRecording, isLocked: captureLocked,
+            recordingStartedAt: recordingStartedAt) { recordingControl }
     }
 
     @ViewBuilder
@@ -338,7 +322,7 @@ struct ContentView: View {
                 Task { await model.stopRecording() }
             } label: {
                 Label("Stop recording", systemImage: "stop.fill")
-                    .frame(width: 150)
+                    .frame(maxWidth: .infinity)
             }
             .buttonStyle(RecordButtonStyle())
             .keyboardShortcut("r", modifiers: [.command])
@@ -351,7 +335,7 @@ struct ContentView: View {
                     Text("Cancel")
                     Text("\(remaining)s").monospacedDigit().opacity(0.7)
                 }
-                .frame(width: 150)
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(RecordButtonStyle())
         } else {
@@ -366,7 +350,8 @@ struct ContentView: View {
                             .font(.system(size: 11))
                             .opacity(0.55)
                     }
-                    .frame(width: 140, height: 48)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -704,7 +689,7 @@ struct RecorderWorkspace<Capture: View, Controls: View, Recordings: View>: View 
     var body: some View {
         HStack(alignment: .top, spacing: 20) {
             capture.frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
-            VStack(spacing: 16) {
+            VStack(spacing: 20) {
                 recordingControls.fixedSize(horizontal: false, vertical: true)
                 recordings.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }

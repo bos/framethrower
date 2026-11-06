@@ -57,6 +57,8 @@ final class CaptureViewModel: ObservableObject {
     @Published var recordingQuality: RecordingQuality = .highQuality {
         didSet { userDefaults.set(recordingQuality.rawValue, forKey: "capture.quality") }
     }
+    @Published private(set) var nextRecordingName = PendingRecordingName()
+    @Published private(set) var nextRecordingNameError: String?
     @Published var isUploading = false
     @Published private(set) var uploadProgressFraction = 0.0
     @Published private(set) var isUploadProgressVisible = false
@@ -140,21 +142,35 @@ final class CaptureViewModel: ObservableObject {
     var isCameraReadyForCapture: Bool {
         !camera.isPreparing && (camera.selectedDeviceID == nil || camera.isReady)
     }
-    var recordingStorageEstimate: String? {
-        guard recordingQuality == .highQuality else { return nil }
+    @discardableResult
+    func renameNextRecording(to proposedName: String) -> Bool {
+        guard !isRecording, !isCountdownActive, !isCaptureBusy else { return false }
+        do {
+            try nextRecordingName.rename(to: proposedName)
+            nextRecordingNameError = nil
+            return true
+        } catch {
+            nextRecordingNameError = error.localizedDescription
+            return false
+        }
+    }
+
+    func dismissNextRecordingNameError() { nextRecordingNameError = nil }
+
+    var recordingDetails: CaptureRecordingDetails {
         let frame: CGRect
         switch captureKind {
         case .window:
-            guard let selectedWindow else { return nil }
+            guard let selectedWindow else { return CaptureRecordingDetails(quality: recordingQuality) }
             frame = selectedWindow.frame
         case .display:
-            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return nil }
+            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return CaptureRecordingDetails(quality: recordingQuality) }
             frame = display.display.frame
         case .area:
-            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return nil }
+            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return CaptureRecordingDetails(quality: recordingQuality) }
             frame = area.rect.intersection(display.display.frame)
         }
-        guard !frame.isNull, frame.width.isFinite, frame.height.isFinite, frame.width > 0, frame.height > 0 else { return nil }
+        guard !frame.isNull, frame.width.isFinite, frame.height.isFinite, frame.width > 0, frame.height > 0 else { return CaptureRecordingDetails(quality: recordingQuality) }
         let screen = NSScreen.screens.max { left, right in
             func coverage(_ screen: NSScreen) -> CGFloat {
                 guard let id = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber else { return 0 }
@@ -164,14 +180,11 @@ final class CaptureViewModel: ObservableObject {
             return coverage(left) < coverage(right)
         }
         let scale = screen?.backingScaleFactor ?? 1
-        let width = max(2, Int(frame.width * scale))
-        let height = max(2, Int(frame.height * scale))
-        // ProRes LT is variable bitrate; 1.64 bits/pixel/frame is its typical
-        // 1080p rate, scaled to the selected source's backing resolution.
-        let bytes = Int64(Double(width) * Double(height) * 60 * 1.64 / 8 * 60)
-        let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-        return "About \(size)/min · \(width) × \(height), 60 fps"
+        let width = CaptureRecordingDetails.pixelDimension(points: frame.width, scale: scale)
+        let height = CaptureRecordingDetails.pixelDimension(points: frame.height, scale: scale)
+        return CaptureRecordingDetails(quality: recordingQuality, width: width, height: height)
     }
+
     @Published var initialCameraPlacement = PIPPlacement()
     @Published var projectEditor: ProjectEditor?
     struct EditorOpenRequest: Equatable {
@@ -221,6 +234,7 @@ final class CaptureViewModel: ObservableObject {
         return formatter
     }()
     private var activeRecordingURL: URL?
+    private var activeRecordingTitle: String?
     private var sourceRefreshObservers: [any NSObjectProtocol] = []
     private var sourceRefreshTimer: Timer?
     private var isSourceRefreshConfigured = false
@@ -1029,6 +1043,7 @@ final class CaptureViewModel: ObservableObject {
             let configuration = try makeConfiguration(filter: filter)
             let outputURL = try makeOutputURL(quality: quality)
             activeRecordingURL = outputURL
+            activeRecordingTitle = nextRecordingName.title
             activeCameraURL = nil
             activeCameraOffset = 0
             activeCursorCapture = false
@@ -1064,6 +1079,7 @@ final class CaptureViewModel: ObservableObject {
             try? await camera.stopRecording()
             if let activeRecordingURL { log("Captured sources kept beside \(activeRecordingURL.path)") }
             activeRecordingURL = nil
+            activeRecordingTitle = nil
             activeCameraURL = nil
             log("Recording failed: \(error.localizedDescription)", level: .error)
         }
@@ -1093,6 +1109,7 @@ final class CaptureViewModel: ObservableObject {
         let outputURL = activeRecordingURL
         activeRecordingURL = nil
         defer {
+            activeRecordingTitle = nil
             activeCameraURL = nil
             activeCursorCapture = false
             activeScreenStartHostTime = nil
@@ -1130,11 +1147,12 @@ final class CaptureViewModel: ObservableObject {
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
                 cameraFilename: cameraFilename, cursorFilename: cursorFilename,
                 cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration,
-                captureFrameDuration: 1.0 / 60)
+                title: activeRecordingTitle, captureFrameDuration: 1.0 / 60)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
             let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")
             let editor = ProjectEditor(project: project, url: url)
             guard editor.save() else { throw ProjectError.invalid(editor.errorMessage ?? "Could not save the project.") }
+            nextRecordingName.didSave(capturedTitle: activeRecordingTitle)
             projectEditor = editor
             registerProjectEditor(editor)
             recordingLibrary.register(project: editor.project, at: editor.url, restoreRemoved: true)

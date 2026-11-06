@@ -13,21 +13,6 @@ struct CameraSetupView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "video")
-                Picker("Camera", selection: Binding(get: { camera.selectedDeviceID }, set: { id in
-                    Task { await camera.selectDevice(id) }
-                })) {
-                    Text("Off").tag(Optional<String>.none)
-                    ForEach(camera.devices) { device in Text(device.name).tag(Optional(device.id)) }
-                    if let id = camera.selectedDeviceID, !camera.devices.contains(where: { $0.id == id }) {
-                        Text("Camera disconnected").tag(Optional(id))
-                    }
-                }
-                .disabled(locked || camera.isPreparing)
-                if camera.isPreparing { ProgressView().controlSize(.small) }
-                Spacer()
-            }
             if camera.selectedDeviceID != nil { cameraLayout }
             if let message = camera.errorMessage {
                 Text(message).font(.caption).foregroundStyle(.red)
@@ -96,5 +81,28 @@ struct CameraSetupView: View {
                 Slider(value: $placement.scale, in: 0.12...0.5) { Text("Camera size") }
             }.disabled(locked)
         }
+    }
+}
+
+/// Camera selection shares the recorder's input row; its layout stays beneath.
+struct CameraInputPicker: View {
+    @ObservedObject var camera: CameraRecorder
+    let locked: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Picker("Camera", selection: Binding(get: { camera.selectedDeviceID }, set: { id in
+                Task { await camera.selectDevice(id) }
+            })) {
+                Text("Off").tag(Optional<String>.none)
+                ForEach(camera.devices) { device in Text(device.name).tag(Optional(device.id)) }
+                if let id = camera.selectedDeviceID, !camera.devices.contains(where: { $0.id == id }) {
+                    Text("Camera disconnected").tag(Optional(id))
+                }
+            }
+            .disabled(locked || camera.isPreparing)
+            if camera.isPreparing { ProgressView().controlSize(.small) }
+        }
+        .lineLimit(1)
     }
 }

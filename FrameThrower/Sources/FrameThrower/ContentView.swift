@@ -2,6 +2,10 @@ import AppKit
 import AVFoundation
 import SwiftUI
 
+private enum MicrophoneInputChoice: Hashable {
+    case off, systemDefault, device(String)
+}
+
 struct ContentView: View {
     @ObservedObject var model: CaptureViewModel
     @Environment(\.colorScheme) private var colorScheme
@@ -166,12 +170,13 @@ struct ContentView: View {
             }
 
             Divider().opacity(0.6)
-            audioControls
+            inputControls
                 .disabled(captureLocked)
-            Divider().opacity(0.6)
-            CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked,
-                sourcePreviews: sourcePreviews, source: selectedPreviewSource,
-                area: model.captureKind == .area ? model.area.rect : nil)
+            if model.camera.selectedDeviceID != nil || model.camera.errorMessage != nil {
+                CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked,
+                    sourcePreviews: sourcePreviews, source: selectedPreviewSource,
+                    area: model.captureKind == .area ? model.area.rect : nil)
+            }
         }
         .padding(18)
         .modifier(RecorderCard())
@@ -261,41 +266,44 @@ struct ContentView: View {
         }
     }
 
-    private var audioControls: some View {
-        HStack(spacing: 16) {
-            Toggle(isOn: $model.recordMicrophoneAudio) {
-                Label("Microphone", systemImage: model.recordMicrophoneAudio ? "mic" : "mic.slash")
-            }
-            .help(model.recordMicrophoneAudio ? "Record microphone audio" : "Microphone is off")
-            Toggle(isOn: $model.recordSystemAudio) {
-                Label("System audio", systemImage: model.recordSystemAudio ? "speaker.wave.2" : "speaker.slash")
-            }
-            .help(model.recordSystemAudio ? "Record audio from apps" : "System audio is off")
-            Spacer(minLength: 0)
-            if model.recordMicrophoneAudio {
-                Menu {
-                    ForEach(model.microphones) { microphone in
-                        Button {
-                            model.selectedMicrophoneID = microphone.id
-                        } label: {
-                            if model.selectedMicrophoneID == microphone.id {
-                                Label(microphone.name, systemImage: "checkmark")
-                            } else { Text(microphone.name) }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
+    private var inputControls: some View {
+        HStack(spacing: 14) {
+            Picker("Microphone", selection: Binding<MicrophoneInputChoice>(get: {
+                guard model.recordMicrophoneAudio else { return .off }
+                return model.selectedMicrophoneID.map { .device($0) } ?? .systemDefault
+            }, set: { choice in
+                switch choice {
+                case .off: model.recordMicrophoneAudio = false
+                case .systemDefault:
+                    model.selectedMicrophoneID = nil
+                    model.recordMicrophoneAudio = true
+                case let .device(id):
+                    model.selectedMicrophoneID = id
+                    model.recordMicrophoneAudio = true
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Choose microphone")
-                .accessibilityLabel("Choose microphone")
+            })) {
+                Text("Off").tag(MicrophoneInputChoice.off)
+                if model.selectedMicrophoneID == nil, model.recordMicrophoneAudio {
+                    Text("Default").tag(MicrophoneInputChoice.systemDefault)
+                }
+                ForEach(model.microphones) { microphone in
+                    Text(microphone.name).tag(MicrophoneInputChoice.device(microphone.id))
+                }
+                if let id = model.selectedMicrophoneID, !model.microphones.contains(where: { $0.id == id }) {
+                    Text("Microphone unavailable").tag(MicrophoneInputChoice.device(id)).disabled(true)
+                }
             }
+            .frame(minWidth: 150, maxWidth: .infinity)
+            Toggle("System audio", isOn: $model.recordSystemAudio)
+                .toggleStyle(.checkbox)
+                .fixedSize()
+                .help(model.recordSystemAudio ? "Record audio from apps" : "System audio is off")
+            CameraInputPicker(camera: model.camera, locked: captureLocked)
+                .frame(minWidth: 190, maxWidth: .infinity)
         }
         .font(.system(size: 11))
-        .toggleStyle(.checkbox)
-        .foregroundStyle(.secondary)
-        .frame(minHeight: 20)
+        .lineLimit(1)
+        .frame(height: 24)
     }
 
     private var recordingBar: some View {

@@ -136,6 +136,7 @@ struct EditorAssistantPanel: View {
     var onShowOriginalFrame: (UUID) -> Void = { _ in }
     let onSubmit: () -> Void
     var onVoiceBegin: () -> Void = {}
+    var onCancel: () -> Void = {}
     @StateObject private var instructionSpeech = LocalSpeechInput()
     @State private var namingRegionID: UUID?
     @State private var nameDraft = ""
@@ -203,8 +204,10 @@ struct EditorAssistantPanel: View {
         }
         .padding(16)
         .onExitCommand {
-            session.cancel()
-            Task { await instructionSpeech.cancel() }
+            if instructionSpeech.isActive || session.isBusy || session.awaitsClarification {
+                session.cancel()
+                Task { await instructionSpeech.cancel() }
+            } else { onCancel() }
         }
         .onDisappear {
             session.cancel()
@@ -248,7 +251,9 @@ struct EditorAssistantPanel: View {
     private func regionSelectButton(_ region: EditorRegion, label: String, editLabel: String?, association: String?, selected: Bool) -> some View {
         let accessibilityName: String = label + (editLabel.map { ", drawn at " + $0 } ?? "")
         let time: String = String(format: "%.2f", region.time)
-        let tooltip: String = "Use \(label) as a reference without moving the playhead. Its original frame (\(time) s) is available from the context menu."
+        let tooltip: String = selected
+            ? "Click again or press Escape to deselect \(label)."
+            : "Use \(label) as a reference without moving the playhead. Its original frame (\(time) s) is available from the context menu."
         return Button(action: { onSelectRegion(region.id) }, label: {
             regionButtonLabel(region, label: label, association: association, selected: selected)
         })

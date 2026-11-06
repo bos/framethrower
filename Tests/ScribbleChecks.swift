@@ -95,6 +95,12 @@ struct ScribbleChecks {
         canvas.mouseDown(with: mouse(.leftMouseDown, at: inside, canvas: canvas, window: window))
         canvas.mouseUp(with: mouse(.leftMouseUp, at: inside, canvas: canvas, window: window))
         try require(selected == guide.id && drawn.count == 1, "clicking a guide selects rather than duplicates it")
+        let beginsBeforeEmptyClick = referenceBegins
+        let empty = CGPoint(x: canvas.contentRect.minX - 10, y: canvas.contentRect.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, at: empty, canvas: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, at: empty, canvas: canvas, window: window))
+        try require(selected == nil && drawn.count == 1 && referenceBegins == beginsBeforeEmptyClick,
+                    "Empty preview margins deselect without beginning a drawing or editing footage")
         canvas.mouseDown(with: mouse(.leftMouseDown, at: start, canvas: canvas, window: window))
         canvas.mouseDragged(with: mouse(.leftMouseDragged, at: end, canvas: canvas, window: window))
         canvas.cancelOperation(nil)

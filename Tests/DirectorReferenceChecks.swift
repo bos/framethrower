@@ -65,6 +65,11 @@ struct DirectorReferenceChecks {
                             "Reference selection highlights the matching preview badge")
                 try require(canvas.playerLayer.player == nil && canvas.stillLayer.contents == nil,
                             "Reference UI must not access suspended video")
+                canvas.onSelectRegion?(second.id)
+                try await settle(host)
+                try require(canvas.selectedRegionID == nil && canvas.scribbleMode &&
+                            timeline.selectedEditID == edit.id && abs(timeline.playhead - edit.time) < 1e-8,
+                            "Clicking the selected reference again clears only box selection")
             }
         }
         try require(editor.project == original && editor.draftState == nil, "Navigating references cannot edit the project")
@@ -86,6 +91,18 @@ struct DirectorReferenceChecks {
         timeline.onSelectEdit?(a.id)
         try await settle(host)
         canvas.onSelectRegion?(second.id)
+        try await settle(host)
+        canvas.cancelOperation(nil)
+        try await settle(host)
+        try require(canvas.selectedRegionID == nil && canvas.scribbleMode &&
+                    timeline.selectedEditID == a.id && abs(timeline.playhead - a.time) < 1e-8 && editor.project == original,
+                    "Escape deselects the box without leaving Director, seeking, or changing edits")
+        canvas.onSelectRegion?(second.id)
+        try await settle(host)
+        canvas.onSelectRegion?(nil)
+        try await settle(host)
+        try require(canvas.selectedRegionID == nil && canvas.scribbleMode && editor.project == original,
+                    "An empty preview click clears the reference without changing project history")
         let newRect = EditorRegionRect(x: 0.4, y: 0.2, width: 0.2, height: 0.2)
         canvas.onDrawRegion?(newRect)
         try await settle(host)

@@ -344,8 +344,8 @@ final class EditorCanvasView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if scribbleMode {
-            guard scribbleGeometry.sourcePoint(point) != nil else { return }
             window?.makeFirstResponder(self)
+            guard scribbleGeometry.sourcePoint(point) != nil else { onSelectRegion?(nil); return }
             if let badge = guideBadges.reversed().first(where: { $0.frame.contains(point) }) {
                 guidePressID = badge.regionID
                 return

@@ -103,7 +103,7 @@ struct ProjectEditorView: View {
             LocalModelRuntime.terminateOwnedProcess()
             _ = editor.finishDraft()
         }
-        .onExitCommand { if movingEditState != nil { cancelMove() } else { cancelDraft() } }
+        .onExitCommand { cancelEditorInteraction() }
         .toolbarRole(.editor)
         .toolbar(removing: .title)
         .toolbar {
@@ -133,7 +133,7 @@ struct ProjectEditorView: View {
                     playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
                         regionID: selectedRegionID, editID: selectedEditID)
-                }, onVoiceBegin: { playback.pause() })
+                }, onVoiceBegin: { playback.pause() }, onCancel: { cancelEditorInteraction() })
                 .inspectorColumnWidth(min: 280, ideal: 300, max: 360)
         }
         .onChange(of: directorMode) { _, active in
@@ -172,11 +172,7 @@ struct ProjectEditorView: View {
             onBegin: { assistant.cancel(); playback.pause(); dragTime = editTime; selectedInspector = .camera },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
             onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
-            onCancel: {
-                if editor.draftState != nil { cancelDraft() }
-                else if directorMode { directorMode = false }
-                else { cancelDraft() }
-            },
+            onCancel: { cancelEditorInteraction() },
             zoom: zoom, allowsZoomEditing: !playback.isLoading && !playback.isScrubbing,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
@@ -189,7 +185,7 @@ struct ProjectEditorView: View {
             }),
             selectedRegionID: selectedRegionID,
             onReferenceBegin: { assistant.cancel() },
-            onDrawRegion: { addRegion($0) }, onSelectRegion: { selectedRegionID = $0 })
+            onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) })
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay {
                 if MediaProcessing.isSuspended {
@@ -235,11 +231,19 @@ struct ProjectEditorView: View {
         }
     }
 
-    private func selectRegion(_ id: UUID) {
-        guard state.regions.contains(where: { $0.id == id }) else { return }
+    private func selectRegion(_ id: UUID?) {
+        guard id == nil || state.regions.contains(where: { $0.id == id }) else { return }
         playback.pause()
-        selectedRegionID = id
+        selectedRegionID = selectedRegionID == id ? nil : id
         directorMode = true
+    }
+
+    private func cancelEditorInteraction() {
+        if movingEditState != nil { cancelMove() }
+        else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
+        else if selectedRegionID != nil { selectedRegionID = nil }
+        else if directorMode { directorMode = false }
+        else { cancelDraft() }
     }
 
     private func showOriginalFrame(_ id: UUID) {

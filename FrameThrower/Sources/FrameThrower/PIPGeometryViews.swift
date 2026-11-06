@@ -32,6 +32,7 @@ struct CameraFramingPopover: View {
     let image: CGImage?
     let errorMessage: String?
     let placement: PIPPlacement
+    var preview: (PIPCrop) -> Void = { _ in }
     var commit: (PIPCrop) -> Void
     @State private var dragOrigin: PIPCrop?
     @State private var draft: PIPCrop?
@@ -58,6 +59,7 @@ struct CameraFramingPopover: View {
                                 draft = origin.moved(
                                     by: CGSize(width: value.translation.width / scale, height: value.translation.height / scale),
                                     in: source, shape: placement.shape, aspectRatio: placement.aspectRatio)
+                                if let draft { preview(draft) }
                             }.onEnded { _ in
                                 if let draft { commit(draft) }
                                 draft = nil
@@ -75,13 +77,17 @@ struct CameraFramingPopover: View {
                 }
                 // These controls also make framing available without dragging.
                 if source.width > crop.width + 0.01 {
-                    CommitSlider(title: "Horizontal", value: placement.crop.x, range: 0...1) { value in
-                        var next = placement.crop; next.x = value; commit(next)
+                    CommitSlider(title: "Horizontal", value: placement.crop.x, range: 0...1, preview: { value in
+                        var next = placement.crop; next.x = value; draft = next; preview(next)
+                    }) { value in
+                        var next = placement.crop; next.x = value; commit(next); draft = nil
                     }
                 }
                 if source.height > crop.height + 0.01 {
-                    CommitSlider(title: "Vertical", value: placement.crop.y, range: 0...1) { value in
-                        var next = placement.crop; next.y = value; commit(next)
+                    CommitSlider(title: "Vertical", value: placement.crop.y, range: 0...1, preview: { value in
+                        var next = placement.crop; next.y = value; draft = next; preview(next)
+                    }) { value in
+                        var next = placement.crop; next.y = value; commit(next); draft = nil
                     }
                 }
             } else if let errorMessage {

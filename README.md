@@ -87,11 +87,12 @@ seek by 0.1 seconds; Shift-arrow seeks by one second. Trimming keeps every origi
 frame available, and **Restore full recording** restores the full range.
 
 Camera edits create placement points at the playhead. Move the PIP by dragging or
-using a corner button; resize with **Size** or its bottom-right handle. **Original**
+using a corner button; resize with **Size** or any of its four corner handles. **Original**
 preserves the camera aspect, **Rectangle** allows independent width and height,
 and **Square** and **Circle** crop without stretching. **Framing…** lets you move
 the crop within the full camera image. Shape, framing, size, position, and visibility
-can all change over time. **Jump** changes placement instantly; **Smooth** eases
+can all change over time. Dragging updates the PIP picture live and commits one
+undo step when released. **Jump** changes placement instantly; **Smooth** eases
 position, size, aspect, and framing toward the point. Shape and visibility switch
 at the point's timestamp.
 

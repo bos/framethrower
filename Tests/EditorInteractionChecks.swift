@@ -36,23 +36,31 @@ struct EditorInteractionChecks {
         let canvas = host.convert(surface.bounds, from: surface)
         let initial = project.state.pipKeyframes[0].placement
         let originalFrame = initial.frame(in: canvas.size, cameraAspect: 16.0 / 9.0)
-        let resizeStart = CGPoint(x: canvas.minX + originalFrame.maxX - 4,
-                                  y: canvas.minY + originalFrame.maxY - 4)
-        let resizeDelta = CGSize(width: 40, height: 10)
-        try await drag(in: window, host: host, from: resizeStart, by: resizeDelta)
-        try require(editor.project.undoHistory.count == 1 && editor.undoName == "Resize camera",
-                    "resize must produce one undo entry, without also moving the camera")
-        let expectedResize = initial.resized(by: resizeDelta, in: canvas.size, cameraAspect: 16.0 / 9.0)
-        try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedResize,
-                      "resize must use the entire pointer delta in stationary canvas coordinates")
-        let reopened = try ProjectEditor.open(url: editor.url)
-        try require(reopened.project == editor.project, "native resize and its undo history must survive reopen")
-        try require(editor.undo(), "undo native resize")
-        try placement(editor.project.state.pipKeyframes[0].placement, equals: initial, "undo restores initial framing")
-        try require(editor.redo(), "redo native resize")
-        try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedResize, "redo restores resize")
-        try require(editor.undo(), "restore initial geometry before move")
-        await settle()
+        let baselineFittingSize = host.fittingSize
+        let baselineWindowSize = window.frame.size
+        for corner in PIPResizeCorner.allCases {
+            let isRight = corner == .topRight || corner == .bottomRight
+            let isBottom = corner == .bottomLeft || corner == .bottomRight
+            let resizeStart = CGPoint(x: canvas.minX + (isRight ? originalFrame.maxX : originalFrame.minX),
+                                      y: canvas.minY + (isBottom ? originalFrame.maxY : originalFrame.minY))
+            let resizeDelta = CGSize(width: isRight ? 40 : -40, height: isBottom ? 10 : -10)
+            try await drag(in: window, host: host, from: resizeStart, by: resizeDelta)
+            try require(editor.project.undoHistory.count == 1 && editor.undoName == "Resize camera",
+                        "each corner resize must produce one undo entry, without also moving the camera")
+            let expectedResize = initial.resized(by: resizeDelta, corner: corner, in: canvas.size, cameraAspect: 16.0 / 9.0)
+            try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedResize,
+                          "every resize handle must use the full pointer delta")
+            let reopened = try ProjectEditor.open(url: editor.url)
+            try require(reopened.project == editor.project, "native resize and its undo history must survive reopen")
+            try require(editor.undo(), "undo native resize")
+            try placement(editor.project.state.pipKeyframes[0].placement, equals: initial, "undo restores initial framing")
+            try require(editor.redo(), "redo native resize")
+            try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedResize, "redo restores resize")
+            try require(editor.undo(), "restore initial geometry before next corner resize")
+            await settle()
+            try size(host.fittingSize, equals: baselineFittingSize, "resize must not rearrange editor fitting size")
+            try size(window.frame.size, equals: baselineWindowSize, "resize must not resize its native window")
+        }
 
         let moveStart = CGPoint(x: canvas.minX + originalFrame.midX, y: canvas.minY + originalFrame.midY)
         let moveDelta = CGSize(width: 40, height: -20)
@@ -96,6 +104,27 @@ struct EditorInteractionChecks {
         try near(trimmedReopen.project.state.trimStart, 0, "reopened trim undo restores discarded source range")
         try require(trimmedReopen.redo(), "redo native trim after reopening")
         try near(trimmedReopen.project.state.trimStart, 1, "reopened redo restores trim")
+
+        var withPoint = editor.project.state
+        withPoint.pipKeyframes.append(PIPKeyframe(time: 5, placement: initial))
+        try require(editor.commit(withPoint, name: "Add camera point"), "add first nonzero point for layout check")
+        await settle()
+        try size(host.fittingSize, equals: baselineFittingSize, "first nonzero point must not grow the editor")
+        guard let pointList: NSScrollView = find(in: host) else {
+            throw InteractionCheckError.failed("production editor did not create its camera point list")
+        }
+        let listRect = host.convert(pointList.bounds, from: pointList)
+        // The first and second point buttons are each approximately 150pt wide.
+        // Select the second to exercise the additional point-time controls.
+        try await drag(in: window, host: host,
+                       from: CGPoint(x: listRect.minX + 210, y: listRect.midY), by: .zero)
+        try size(host.fittingSize, equals: baselineFittingSize, "selecting a nonzero point must keep stable controls height")
+        var smoothPoint = editor.project.state
+        smoothPoint.pipKeyframes[1].transition = .smooth
+        try require(editor.commit(smoothPoint, name: "Smooth camera point"), "set Smooth transition for layout check")
+        await settle()
+        try size(host.fittingSize, equals: baselineFittingSize, "showing Smooth duration must not rearrange the editor")
+        try size(window.frame.size, equals: baselineWindowSize, "point details and duration must not resize the editor window")
 
         try await checkCrop(in: directory)
         let screenAfter = try Data(contentsOf: screen)
@@ -197,6 +226,11 @@ struct EditorInteractionChecks {
         // pixel-aligned player surface. This tolerance is under a tenth of a
         // preview pixel and still catches gesture-delta feedback decisively.
         try require(abs(actual - expected) < 0.000_1, "\(message): \(actual) != \(expected)")
+    }
+
+    private static func size(_ actual: CGSize, equals expected: CGSize, _ message: String) throws {
+        try require(abs(actual.width - expected.width) < 0.5 && abs(actual.height - expected.height) < 0.5,
+                    "\(message): \(actual) != \(expected)")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

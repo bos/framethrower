@@ -37,10 +37,11 @@ struct ProjectEditorView: View {
             if let message = editor.errorMessage ?? playback.errorMessage ?? exportError {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
-            if isExporting { ProgressView("Exporting your edit…") }
+            if isExporting { ProgressView("Exporting…") }
         }
         .padding(24)
-        .frame(minWidth: 820, idealWidth: 940, minHeight: 680)
+        .frame(minWidth: 820, idealWidth: 940, minHeight: 760, idealHeight: 780)
+        .presentationSizing(.fitted)
         .background(.background)
         .task { await playback.rebuild(editor: editor) }
         .onChange(of: editor.project.state) { _, _ in
@@ -68,18 +69,17 @@ struct ProjectEditorView: View {
                     .overlay(alignment: .topLeading) {
                         if editor.project.cameraFilename != nil, placement.visible {
                             let rect = placement.frame(in: canvas, cameraAspect: playback.cameraAspect)
-                            PIPWindowShape(shape: placement.shape)
-                                .strokeBorder(.white.opacity(0.9), style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
-                                .background(PIPWindowShape(shape: placement.shape)
-                                    .fill(Color.white.opacity(dragPlacement == nil ? 0.001 : 0.12)))
-                                .overlay(alignment: .topLeading) {
-                                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                        .font(.caption2).padding(4).background(.black.opacity(0.7))
+                            ZStack(alignment: .topLeading) {
+                                PIPWindowShape(shape: placement.shape)
+                                    .strokeBorder(.white.opacity(0.9), lineWidth: 1)
+                                    .background(PIPWindowShape(shape: placement.shape).fill(.white.opacity(0.001)))
+                                ForEach(PIPResizeCorner.allCases, id: \.self) { corner in
+                                    resizeHandle(corner: corner, canvas: canvas)
+                                        .position(x: isLeft(corner) ? 0 : rect.width,
+                                                  y: isTop(corner) ? 0 : rect.height)
                                 }
+                            }
                                 .frame(width: rect.width, height: rect.height)
-                                .overlay(alignment: .bottomTrailing) {
-                                    resizeHandle(canvas: canvas)
-                                }
                                 .offset(x: rect.minX, y: rect.minY)
                                 .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("recordingCanvas"))
                                     .onChanged { value in
@@ -94,7 +94,7 @@ struct ProjectEditorView: View {
                                         next.y += value.translation.height / max(1, canvas.height - rect.height)
                                         next.x = snap(next.x)
                                         next.y = snap(next.y)
-                                        dragPlacement = next
+                                        previewPlacement(next, at: dragTime)
                                     }
                                     .onEnded { _ in
                                         guard resizeOrigin == nil else { return }
@@ -185,7 +185,11 @@ struct ProjectEditorView: View {
                     Button("Framing…") { openFraming() }
                         .popover(isPresented: $isFramingPresented) {
                             CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
-                                placement: state.placement(at: framingTime)) { crop in
+                                placement: state.placement(at: framingTime), preview: { crop in
+                                    var next = state.placement(at: framingTime)
+                                    next.crop = crop
+                                    playback.preview(applying(next, at: framingTime))
+                                }) { crop in
                                     var next = state.placement(at: framingTime)
                                     next.crop = crop
                                     setPlacement(next, at: framingTime, name: "Frame camera")
@@ -210,7 +214,10 @@ struct ProjectEditorView: View {
                     .help(["Top left", "Top right", "Bottom left", "Bottom right"][index])
                     .accessibilityLabel(["Camera top left", "Camera top right", "Camera bottom left", "Camera bottom right"][index])
                 }
-                CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { playback.pause() }) { value in
+                CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { playback.pause() }, preview: { value in
+                    var next = placement; next.scale = value
+                    playback.preview(applying(next, at: playback.editingTime))
+                }) { value in
                     var next = placement; next.scale = value
                     setPlacement(next, at: playback.time, name: "Resize camera")
                 }.frame(width: 180)
@@ -221,12 +228,14 @@ struct ProjectEditorView: View {
                     Text("Jump").tag(PIPTransition.jump)
                     Text("Smooth").tag(PIPTransition.smooth)
                 }.frame(width: 155)
-                if (point?.transition ?? transition) == .smooth {
-                    CommitSlider(title: "Duration", value: point?.duration ?? transitionDuration, range: 0.1...3, begin: { playback.pause() }) { value in
-                        transitionDuration = value
-                        updateSelected { $0.duration = value }
-                    }.frame(width: 170)
+                CommitSlider(title: "Duration", value: point?.duration ?? transitionDuration, range: 0.1...3, begin: { playback.pause() }) { value in
+                    transitionDuration = value
+                    updateSelected { $0.duration = value }
                 }
+                    .frame(width: 170)
+                    .opacity((point?.transition ?? transition) == .smooth ? 1 : 0)
+                    .disabled((point?.transition ?? transition) != .smooth)
+                    .accessibilityHidden((point?.transition ?? transition) != .smooth)
             }
             ScrollView(.horizontal) {
                 HStack {
@@ -252,28 +261,41 @@ struct ProjectEditorView: View {
                     }
                 }
             }
-            if let point, point.time > 0 {
-                HStack {
+            .frame(height: 32)
+            HStack {
+                if let point, point.time > 0 {
                     Text("Point time: \(point.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
                     Button("Move point to playhead") {
                         updateSelected { $0.time = playback.editingTime }
                     }.font(.caption).disabled(playback.editingTime <= 0 || abs(playback.editingTime - point.time) < 0.001)
-                    Text("Smooth movement ends at this point.").font(.caption).foregroundStyle(.secondary)
+                    if point.transition == .smooth {
+                        Text("Smooth movement ends at this point.").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
+                Spacer(minLength: 0)
             }
+            .frame(height: 24)
         }
         .padding(14)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func resizeHandle(canvas: CGSize) -> some View {
-        Image(systemName: "arrow.up.left.and.arrow.down.right")
-            .font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
-            .frame(width: 22, height: 22)
-            .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
-            .offset(x: 7, y: 7)
-            .help(placement.shape == .rectangle ? "Drag to change camera width and height" : "Drag to resize camera")
-            .accessibilityLabel("Resize camera")
+    private func isLeft(_ corner: PIPResizeCorner) -> Bool {
+        corner == .topLeft || corner == .bottomLeft
+    }
+
+    private func isTop(_ corner: PIPResizeCorner) -> Bool {
+        corner == .topLeft || corner == .topRight
+    }
+
+    private func resizeHandle(corner: PIPResizeCorner, canvas: CGSize) -> some View {
+        Circle().fill(.white)
+            .overlay { Circle().strokeBorder(.black.opacity(0.55), lineWidth: 1) }
+            .frame(width: 9, height: 9)
+            .frame(width: 24, height: 24)
+            .contentShape(Rectangle())
+            .help("Resize camera")
+            .accessibilityLabel("Resize camera " + (isTop(corner) ? "top " : "bottom ") + (isLeft(corner) ? "left" : "right"))
             .highPriorityGesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("recordingCanvas")).onChanged { value in
                 if resizeOrigin == nil {
                     playback.pause()
@@ -281,12 +303,31 @@ struct ProjectEditorView: View {
                     dragTime = playback.editingTime
                 }
                 guard let origin = resizeOrigin else { return }
-                dragPlacement = origin.resized(by: value.translation, in: canvas, cameraAspect: playback.cameraAspect)
+                previewPlacement(origin.resized(by: value.translation, corner: corner,
+                    in: canvas, cameraAspect: playback.cameraAspect), at: dragTime)
             }.onEnded { _ in
                 if let dragPlacement { setPlacement(dragPlacement, at: dragTime, name: "Resize camera") }
                 resizeOrigin = nil
                 dragPlacement = nil
             })
+    }
+
+    private func previewPlacement(_ next: PIPPlacement, at time: Double) {
+        dragPlacement = next
+        playback.preview(applying(next, at: time))
+    }
+
+    private func applying(_ next: PIPPlacement, at time: Double) -> EditState {
+        var edited = state
+        let time = editor.project.editingTime(at: time,
+            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+        let existing = edited.pipKeyframes.first { abs($0.time - time) < 0.001 }
+        let keyframe = PIPKeyframe(id: existing?.id ?? UUID(), time: existing?.time ?? time, placement: next,
+            transition: existing?.transition ?? transition, duration: existing?.duration ?? transitionDuration)
+        edited.pipKeyframes.removeAll { abs($0.time - time) < 0.001 }
+        edited.pipKeyframes.append(keyframe)
+        edited.pipKeyframes.sort { $0.time < $1.time }
+        return edited
     }
 
     private func openFraming() {
@@ -308,16 +349,13 @@ struct ProjectEditorView: View {
 
     private func setPlacement(_ next: PIPPlacement, at time: Double, name: String) {
         playback.pause()
-        var edited = state
-        let time = editor.project.editingTime(at: time,
-            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
-        let existing = edited.pipKeyframes.first { abs($0.time - time) < 0.001 }
-        let keyframe = PIPKeyframe(id: existing?.id ?? UUID(), time: existing?.time ?? time, placement: next,
-            transition: existing?.transition ?? transition, duration: existing?.duration ?? transitionDuration)
-        edited.pipKeyframes.removeAll { abs($0.time - time) < 0.001 }
-        edited.pipKeyframes.append(keyframe)
-        edited.pipKeyframes.sort { $0.time < $1.time }
-        if editor.commit(edited, name: name) { selectedPoint = keyframe.id }
+        let edited = applying(next, at: time)
+        guard edited != state else { playback.cancelPreview(); return }
+        if editor.commit(edited, name: name) {
+            let normalized = editor.project.editingTime(at: time,
+                frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+            selectedPoint = edited.pipKeyframes.first { abs($0.time - normalized) < 0.001 }?.id
+        } else { playback.cancelPreview() }
     }
 
     private func updateSelected(_ update: (inout PIPKeyframe) -> Void) {
@@ -375,6 +413,7 @@ struct CommitSlider: View {
     let value: Double
     let range: ClosedRange<Double>
     var begin: () -> Void = {}
+    var preview: ((Double) -> Void)? = nil
     var commit: (Double) -> Void
     @State private var draft = 0.0
     @State private var editing = false
@@ -386,6 +425,7 @@ struct CommitSlider: View {
                 if active { begin() } else { commit(draft) }
             }.accessibilityLabel(title)
         }
+        .onChange(of: draft) { _, next in if editing { preview?(next) } }
         .onAppear { draft = min(max(value, range.lowerBound), range.upperBound) }
         .onChange(of: value) { _, next in if !editing { draft = min(max(next, range.lowerBound), range.upperBound) } }
     }

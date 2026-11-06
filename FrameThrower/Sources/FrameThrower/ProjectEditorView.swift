@@ -79,25 +79,15 @@ struct ProjectEditorView: View {
                     onTrim: { start, end in setTrim(start, end) })
                     .frame(height: 36)
                     .help("Click or drag to scrub. Drag the blue handles to trim.")
+                    .contextMenu {
+                        Button("Reset trim") { setTrim(0, editor.project.duration) }
+                            .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
+                    }
                 Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
                     .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
             }
-            HStack {
-                Text("Keep \(state.trimStart, specifier: "%.2f")–\(state.trimEnd, specifier: "%.2f") s")
-                    .font(.caption).monospacedDigit()
-                Spacer()
-                Button("Start here") {
-                    setTrim(min(playback.time, state.trimEnd - minimumTrimLength), state.trimEnd)
-                }
-                Button("End here") {
-                    setTrim(state.trimStart, max(playback.time, state.trimStart + minimumTrimLength))
-                }
-                Button("Restore full recording") { setTrim(0, editor.project.duration) }
-            }.controlSize(.small)
         }
     }
-
-    private var minimumTrimLength: Double { min(0.1, editor.project.duration) }
 
     private func setTrim(_ start: Double, _ end: Double) {
         playback.pause()

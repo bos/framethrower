@@ -208,6 +208,41 @@ Projects stay in the list if their media is missing. Open one and use **Locateâ€
 to copy the original file back into its project folder. The chosen source is left
 unchanged, and existing files are never overwritten by this recovery action.
 
+## Local command-model experiments
+
+`llama.cpp` can run the optional Qwen3-4B Q4_K_M GGUF locally. The installer pins
+an official Qwen release and verifies its SHA-256 before using it. The 2.50 GB
+model stays in `~/Library/Caches/FrameThrower/LocalModel/models`, outside the
+repository. Model weights use Apache-2.0; see the linked model card in the saved
+manifest. Install `llama.cpp` first if `llama-server` is unavailable.
+
+```sh
+python3 -B Tools/local_model.py install
+Tests/check-local-agent.sh
+python3 -B Tests/LocalModelClientChecks.py
+```
+
+Installation downloads weights. Inference uses an offline server bound to numeric
+loopback with a per-run local key, proxies disabled, redirects rejected, and no configured
+remote tools or cloud fallback. Metal on Apple Silicon is the default; use
+`Tests/check-local-agent.sh --backend cpu` only for diagnostics. Text inference
+uses a different pipeline from video decoding/scaling and leaves the media
+interlock enabled. The runner stops its model process when the check finishes.
+
+The six synthetic tool-call checks cover movement/hold timing, selected scribble
+references, voice labels, revising existing edits, ambiguous targets, and the
+video interlock. This is a proposed command-contract experiment; it does not yet
+connect to the running editor, transcribe speech, inspect images, or apply edits.
+Prompts and model responses stay in private local run directories under
+`~/Library/Caches/FrameThrower/LocalModel/runs`. Console output contains only case
+names, pass/fail results and timings. Network-boundary unit checks use a temporary
+loopback HTTP server and require no model.
+
+To keep a model server open for development, run
+`python3 -B Tools/local_model.py serve`. It prints its loopback address and the
+local key/log directory; Control-C stops it. Model and runtime choices are
+isolated from the editor's project model and future tool API.
+
 ## Accounts and sharing
 
 Open **Accounts** to connect Google Drive or Slack in your browser. After recording,

@@ -22,3 +22,7 @@ compositing, scaling, or the blocked media test scripts. Do not remove or bypass
 the source and test interlocks without Bryan explicitly authorizing it. Compile
 builds and tests of models, files, text controls, and the suspended editor are
 permitted. Use empty or vector previews for UI work.
+
+This is a video/media restriction, not a general GPU restriction. Native Metal
+compute for text-only local language models is allowed. Use Metal by default for
+local model interaction tests; CPU mode is an explicit diagnostic option.

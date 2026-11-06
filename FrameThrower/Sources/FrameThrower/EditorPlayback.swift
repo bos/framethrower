@@ -14,13 +14,20 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var stillFrame: CGImage?
     private var renderedProject: RenderedProject?
     private let stillRequests = LatestStillFrameQueue<CGImage>()
-    private var imageGenerator: AVAssetImageGenerator?
+    private var committedState: EditState?
+    private var liveSources: LiveStillFrameCache?
     private var isClosed = false
     private var observer: Any?
     private var generation = 0
     private var bounds = 0.0...1.0
     private var sourceDuration = 0.0
     private var editFrameDuration = 1.0 / 30.0
+    private var draftState: EditState?
+    private var draftGeneration: UInt64 = 0
+    private var committedStillFrame: CGImage?
+    private var committedStillTime: Double?
+
+    var isPreviewing: Bool { draftState != nil }
 
     var editingTime: Double {
         RecordingProject.editingTime(at: time, duration: sourceDuration, frameDuration: editFrameDuration)
@@ -30,7 +37,7 @@ final class EditorPlayback: ObservableObject {
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
                                                    queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
-                guard let self, !self.isClosed else { return }
+                guard let self, !self.isClosed, self.draftState == nil else { return }
                 self.time = time.seconds.isFinite ? time.seconds : 0
                 self.isPlaying = self.player.rate > 0
                 if self.time >= self.bounds.upperBound {
@@ -49,7 +56,12 @@ final class EditorPlayback: ObservableObject {
         let position = min(max(time, snapshot.state.trimStart), snapshot.state.trimEnd)
         player.pause()
         isPlaying = false
+        // A successful gesture commits this exact draft next. Keep its last
+        // displayed pixels across the rebuild so release never flashes back to
+        // the old player's camera position; pending draft work is invalidated.
+        let retainedDraftFrame = draftState == nil ? nil : stillFrame
         invalidateStillFrames()
+        stillFrame = retainedDraftFrame
         renderedProject = nil
         isLoading = true
         errorMessage = nil
@@ -66,12 +78,7 @@ final class EditorPlayback: ObservableObject {
             bounds = snapshot.state.trimStart...snapshot.state.trimEnd
             renderedProject = rendered
             editFrameDuration = rendered.videoComposition.frameDuration.seconds
-            let generator = AVAssetImageGenerator(asset: rendered.asset)
-            generator.videoComposition = rendered.videoComposition
-            generator.requestedTimeToleranceBefore = .zero
-            generator.requestedTimeToleranceAfter = .zero
-            generator.maximumSize = CGSize(width: 1920, height: 1080)
-            imageGenerator = generator
+            committedState = snapshot.state
             isLoading = false
             seek(position)
         } catch {
@@ -86,6 +93,7 @@ final class EditorPlayback: ObservableObject {
 
     func seek(_ position: Double) {
         guard !isClosed, !isLoading || renderedProject != nil else { return }
+        discardPreview(restoringFrame: false)
         time = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : bounds.lowerBound
         player.currentItem?.cancelPendingSeeks()
         player.seek(to: Self.frameTime(at: time, bounds: bounds), toleranceBefore: .zero, toleranceAfter: .zero)
@@ -96,9 +104,10 @@ final class EditorPlayback: ObservableObject {
         guard !isClosed, !isLoading, renderedProject != nil else { return }
         if player.rate > 0 { pause() }
         else {
+            discardPreview(restoringFrame: false)
             if time >= bounds.upperBound - 0.03 { seek(bounds.lowerBound) }
             stillRequests.invalidate()
-            imageGenerator?.cancelAllCGImageGeneration()
+            liveSources = nil
             stillFrame = nil
             player.play()
             isPlaying = true
@@ -110,6 +119,57 @@ final class EditorPlayback: ObservableObject {
         player.pause()
         isPlaying = false
         if wasPlaying { updateStillFrame() }
+    }
+
+    /// Transient paused composition used while a gesture is in progress. The
+    /// durable project, AVPlayerItem, playhead, and source geometry stay intact.
+    func preview(_ state: EditState) {
+        guard !isClosed, !isLoading, let renderedProject, draftState != state else { return }
+        if draftState == nil {
+            player.pause()
+            isPlaying = false
+            stillRequests.invalidate()
+            committedStillFrame = stillFrame
+            committedStillTime = time
+            draftGeneration &+= 1
+        }
+        draftState = state
+        let request = draftGeneration
+        let position = Self.frameTime(at: time, bounds: bounds)
+        let source = sourceCache(for: renderedProject, at: position)
+        stillRequests.request(
+            generate: { try await source.image(applying: state) },
+            cancel: {},
+            receive: { [weak self] image in
+                guard let self, self.draftGeneration == request, self.draftState != nil,
+                      !self.isClosed, !self.isPlaying else { return }
+                self.stillFrame = image
+            },
+            failure: { [weak self] in
+                guard let self, self.draftGeneration == request else { return }
+                self.stillFrame = nil
+            },
+            policy: .coalesced
+        )
+    }
+
+    /// Restore the committed frame immediately when available, then refresh it
+    /// through the same renderer. Any in-flight draft becomes ineligible.
+    func cancelPreview() {
+        guard !isClosed, draftState != nil else { return }
+        discardPreview(restoringFrame: true)
+        updateStillFrame()
+    }
+
+    private func discardPreview(restoringFrame: Bool) {
+        guard draftState != nil else { return }
+        draftState = nil
+        draftGeneration &+= 1
+        stillRequests.invalidate()
+        if restoringFrame, committedStillTime == time { stillFrame = committedStillFrame }
+        else { stillFrame = nil }
+        committedStillFrame = nil
+        committedStillTime = nil
     }
 
     /// CMTime's nanosecond scale keeps the seek strictly inside the retained
@@ -125,11 +185,13 @@ final class EditorPlayback: ObservableObject {
     }
 
     private func updateStillFrame() {
-        guard !isClosed, !isPlaying, let imageGenerator else { return }
+        guard !isClosed, !isPlaying, draftState == nil,
+              let renderedProject, let committedState else { return }
         let position = Self.frameTime(at: time, bounds: bounds)
+        let source = sourceCache(for: renderedProject, at: position)
         stillRequests.request(
-            generate: { try await imageGenerator.image(at: position).image },
-            cancel: { imageGenerator.cancelAllCGImageGeneration() },
+            generate: { try await source.image(applying: committedState) },
+            cancel: {},
             receive: { [weak self] image in
                 guard let self, !self.isClosed, !self.isPlaying else { return }
                 self.stillFrame = image
@@ -138,10 +200,22 @@ final class EditorPlayback: ObservableObject {
         )
     }
 
+    private func sourceCache(for rendered: RenderedProject, at position: CMTime) -> LiveStillFrameCache {
+        if let liveSources, liveSources.rendered.asset === rendered.asset,
+           CMTimeCompare(liveSources.position, position) == 0 { return liveSources }
+        let source = LiveStillFrameCache(rendered: rendered, position: position)
+        liveSources = source
+        return source
+    }
+
     private func invalidateStillFrames() {
+        draftState = nil
+        draftGeneration &+= 1
+        committedStillFrame = nil
+        committedStillTime = nil
         stillRequests.invalidate()
-        imageGenerator?.cancelAllCGImageGeneration()
-        imageGenerator = nil
+        liveSources = nil
+        committedState = nil
         stillFrame = nil
     }
 
@@ -163,8 +237,18 @@ final class EditorPlayback: ObservableObject {
 /// only after the active one actually returns. Invalidated results never arrive.
 @MainActor
 final class LatestStillFrameQueue<Output> {
+    enum Policy {
+        /// Scrubbing must show only the newest requested time.
+        case latestOnly
+        /// During a stationary-playhead gesture, show completed intermediate
+        /// positions in order while replacing the next pending position.
+        case coalesced
+    }
+
     private struct Request {
         let generation: UInt64
+        let epoch: UInt64
+        let policy: Policy
         let generate: @MainActor () async throws -> Output
         let cancel: @MainActor () -> Void
         let receive: @MainActor (Output) -> Void
@@ -172,6 +256,7 @@ final class LatestStillFrameQueue<Output> {
     }
 
     private var generation: UInt64 = 0
+    private var epoch: UInt64 = 0
     private var pending: Request?
     private var worker: Task<Void, Never>?
     private var cancelActive: (@MainActor () -> Void)?
@@ -179,17 +264,20 @@ final class LatestStillFrameQueue<Output> {
     func request(generate: @escaping @MainActor () async throws -> Output,
                  cancel: @escaping @MainActor () -> Void,
                  receive: @escaping @MainActor (Output) -> Void,
-                 failure: @escaping @MainActor () -> Void = {}) {
+                 failure: @escaping @MainActor () -> Void = {},
+                 policy: Policy = .latestOnly) {
         generation &+= 1
-        pending = Request(generation: generation, generate: generate, cancel: cancel,
-                          receive: receive, failure: failure)
-        cancelCurrentOperation()
+        if policy == .latestOnly { epoch &+= 1 }
+        pending = Request(generation: generation, epoch: epoch, policy: policy,
+                          generate: generate, cancel: cancel, receive: receive, failure: failure)
+        if policy == .latestOnly { cancelCurrentOperation() }
         guard worker == nil else { return }
         worker = Task { [weak self] in await self?.run() }
     }
 
     func invalidate() {
         generation &+= 1
+        epoch &+= 1
         pending = nil
         cancelCurrentOperation()
     }
@@ -208,14 +296,41 @@ final class LatestStillFrameQueue<Output> {
             do {
                 let output = try await request.generate()
                 cancelActive = nil
-                if request.generation == generation { request.receive(output) }
+                if request.epoch == epoch,
+                   request.policy == .coalesced || request.generation == generation {
+                    request.receive(output)
+                }
             } catch {
                 cancelActive = nil
                 // Remove an obsolete overlay if the current frame cannot be
                 // decoded, leaving AVPlayer visible as the fallback.
-                if request.generation == generation { request.failure() }
+                if request.epoch == epoch, request.generation == generation { request.failure() }
             }
         }
+    }
+}
+
+/// The fixed playhead's source pair is decoded once. Both committed paused
+/// frames and live gestures reuse it, with the same compositor graph as export.
+/// The bounded worker serializes access; invalidation discards results without
+/// reopening a decoder for each mouse event.
+@MainActor
+private final class LiveStillFrameCache {
+    let rendered: RenderedProject
+    let position: CMTime
+    private var sources: LivePreviewSources?
+
+    init(rendered: RenderedProject, position: CMTime) {
+        self.rendered = rendered
+        self.position = position
+    }
+
+    func image(applying state: EditState) async throws -> CGImage {
+        if sources == nil {
+            sources = try await ProjectRenderer.prepareLiveSources(rendered, at: position)
+        }
+        guard let sources else { throw ProjectRenderer.RenderError.cannotExport }
+        return try await ProjectRenderer.renderLivePreview(sources, applying: state)
     }
 }
 

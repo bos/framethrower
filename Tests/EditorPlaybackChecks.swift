@@ -35,11 +35,11 @@ private final class DecoderProbe {
         else { continuation.resume(returning: id) }
     }
 
-    func submit(_ id: Int, to queue: LatestStillFrameQueue<Int>) {
+    func submit(_ id: Int, to queue: LatestStillFrameQueue<Int>, policy: LatestStillFrameQueue<Int>.Policy = .latestOnly) {
         queue.request(generate: { try await self.generate(id) },
                       cancel: { self.cancelled.append(id) },
                       receive: { self.delivered.append($0) },
-                      failure: { self.failed.append(id) })
+                      failure: { self.failed.append(id) }, policy: policy)
     }
 }
 
@@ -102,6 +102,30 @@ struct EditorPlaybackChecks {
         await settle()
         try require(decoder.failed == [1006], "current decode error did not clear the stale preview")
 
+        let liveQueue = LatestStillFrameQueue<Int>()
+        let live = DecoderProbe()
+        live.submit(1, to: liveQueue, policy: .coalesced)
+        await settle()
+        for id in 2...1000 { live.submit(id, to: liveQueue, policy: .coalesced) }
+        try require(live.cancelled.isEmpty, "continuous draft gestures cancelled every active frame")
+        try live.finish(1)
+        await settle()
+        try require(live.delivered == [1] && live.started == [1, 1000],
+                    "live gesture did not display progress while coalescing pending work")
+        live.submit(1001, to: liveQueue)
+        try live.finish(1000)
+        await settle()
+        try require(live.delivered == [1], "stale draft survived a newer committed/seek request")
+        try live.finish(1001)
+        await settle()
+        live.submit(1002, to: liveQueue, policy: .coalesced)
+        await settle()
+        liveQueue.invalidate()
+        try live.finish(1002)
+        await settle()
+        try require(live.delivered == [1, 1001] && live.maximumActive == 1,
+                    "draft cancellation leaked stale frames or overlapping decoders")
+
         let range = 1.0...1.01 // Shorter than a 30 fps frame, with a nonzero in point.
         let end = EditorPlayback.frameTime(at: range.upperBound, bounds: range).seconds
         try require(end >= range.lowerBound && end < range.upperBound,
@@ -117,6 +141,8 @@ struct EditorPlaybackChecks {
         try require(fractionalEnd >= 0 && fractionalEnd < 1.0 / 30,
                     "fractional media end must remain exclusive")
 
+        try await draftPreviewChecks()
+
         let playback = EditorPlayback()
         playback.close()
         playback.seek(10)
@@ -124,6 +150,177 @@ struct EditorPlaybackChecks {
         playback.close()
         try require(playback.stillFrame == nil && !playback.isPlaying && !playback.isLoading,
                     "closed player accepted new playback work")
-        print("Editor playback checks passed (1000 coalesced seeks, cancellation, stale results, recovery, and exclusive bounds).")
+        print("Editor playback checks passed (bounded scrubbing/drafts, live camera pixels, cancel/commit, lifecycle invalidation, and exclusive bounds).")
     }
+
+    @MainActor
+    private static func draftPreviewChecks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-draft-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let screen = directory.appendingPathComponent("screen.mov")
+        let camera = directory.appendingPathComponent("camera.mov")
+        try await movie(to: screen, width: 160, height: 120, camera: false)
+        try await movie(to: camera, width: 80, height: 40, camera: true)
+        let originalScreen = try Data(contentsOf: screen)
+        let originalCamera = try Data(contentsOf: camera)
+        var project = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 2)
+        project.state.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 0, scale: 0.25)
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("recording.framethrower"))
+        try require(editor.save(), "test project save")
+        let originalProject = try Data(contentsOf: editor.url)
+        let playback = EditorPlayback()
+        defer { playback.close() }
+        await playback.rebuild(editor: editor)
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        let item = playback.player.currentItem
+        let position = playback.time
+        let size = playback.screenSize
+        let aspect = playback.cameraAspect
+        var draft = project.state
+        // Simulate a burst of changed events. Only accepted worker items create
+        // decoders, while the latest event must eventually move the actual PIP.
+        for step in 0..<100 {
+            draft.pipKeyframes[0].placement.x = Double(step) / 99
+            draft.pipKeyframes[0].placement.y = Double(step) / 99
+            playback.preview(draft)
+        }
+        _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+        try require(playback.isPreviewing && !playback.isLoading && !playback.isPlaying,
+                    "live gesture entered durable/loading playback state")
+        try require(playback.player.currentItem === item && playback.time == position,
+                    "live gesture replaced the player or moved its playhead")
+        try require(playback.screenSize == size && playback.cameraAspect == aspect,
+                    "live gesture changed source geometry")
+        let unchangedProject = try Data(contentsOf: editor.url)
+        try require(unchangedProject == originalProject && editor.project == project,
+                    "draft gesture mutated the durable edit or undo history")
+        playback.cancelPreview()
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        try require(!playback.isPreviewing, "cancel did not leave draft mode")
+
+        draft.pipKeyframes[0].placement.scale = 0.4
+        draft.pipKeyframes[0].placement.shape = .square
+        playback.preview(draft)
+        let displayedDraft = try await waitForFrame(playback, expected: CGRect(x: 96, y: 56, width: 64, height: 64))
+        try require(editor.commit(draft, name: "Move and resize camera"), "commit of draft gesture failed")
+        let rebuilding = Task { @MainActor in await playback.rebuild(editor: editor) }
+        await settle()
+        try require(playback.stillFrame != nil, "release flashed away the displayed draft during rebuild")
+        if playback.isLoading {
+            try require(playback.stillFrame === displayedDraft, "release replaced the live draft with an obsolete frame")
+        }
+        await rebuilding.value
+        _ = try await waitForFrame(playback, expected: CGRect(x: 96, y: 56, width: 64, height: 64))
+        try require(!playback.isPreviewing && editor.project.undoHistory.count == 1,
+                    "gesture did not become exactly one durable edit")
+
+        var rejected = draft
+        rejected.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 0, scale: 0.25)
+        playback.preview(rejected)
+        playback.cancelPreview()
+        _ = try await waitForFrame(playback, expected: CGRect(x: 96, y: 56, width: 64, height: 64))
+        playback.preview(rejected)
+        playback.togglePlayback()
+        try require(!playback.isPreviewing && playback.stillFrame == nil,
+                    "stale draft overlay survived playback")
+        playback.pause()
+        _ = try await waitForFrame(playback, expected: CGRect(x: 96, y: 56, width: 64, height: 64))
+        playback.preview(rejected)
+        playback.close()
+        try await Task.sleep(for: .milliseconds(100))
+        try require(!playback.isPreviewing && playback.stillFrame == nil,
+                    "in-flight draft survived close")
+        let screenAfter = try Data(contentsOf: screen)
+        let cameraAfter = try Data(contentsOf: camera)
+        try require(screenAfter == originalScreen && cameraAfter == originalCamera,
+                    "draft preview changed original captured media")
+    }
+
+    @MainActor
+    private static func waitForFrame(_ playback: EditorPlayback, expected: CGRect) async throws -> CGImage {
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if let frame = playback.stillFrame, let bounds = try cameraBounds(frame),
+               abs(bounds.minX - expected.minX) <= 2 && abs(bounds.minY - expected.minY) <= 2,
+               abs(bounds.width - expected.width) <= 3 && abs(bounds.height - expected.height) <= 3 {
+                return frame
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw PlaybackCheckError.failed("live camera pixels did not reach \(expected); error: \(playback.errorMessage ?? "none")")
+    }
+
+    private static func cameraBounds(_ image: CGImage) throws -> CGRect? {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let context = CGContext(data: &bytes, width: image.width, height: image.height,
+                                      bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw PlaybackCheckError.failed("pixel context")
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        var minX = image.width, minY = image.height, maxX = -1, maxY = -1
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                let index = (y * image.width + x) * 4
+                if (bytes[index] > 150 || bytes[index + 1] > 150) && bytes[index + 2] < 100 {
+                    minX = min(minX, x); minY = min(minY, y)
+                    maxX = max(maxX, x); maxY = max(maxY, y)
+                }
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    @MainActor
+    private static func movie(to url: URL, width: Int, height: Int, camera: Bool) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height
+        ])
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? PlaybackCheckError.failed("fixture writer") }
+        writer.startSession(atSourceTime: .zero)
+        for index in 0..<60 {
+            let deadline = Date().addingTimeInterval(5)
+            while !input.isReadyForMoreMediaData {
+                guard writer.status == .writing, Date() < deadline else {
+                    throw writer.error ?? PlaybackCheckError.failed("fixture encoder stalled")
+                }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            var buffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                      nil, &buffer) == kCVReturnSuccess, let buffer else {
+                throw PlaybackCheckError.failed("fixture pixel buffer")
+            }
+            CVPixelBufferLockBaseAddress(buffer, [])
+            let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+            let row = CVPixelBufferGetBytesPerRow(buffer)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let offset = y * row + x * 4
+                    bytes[offset] = camera ? 0 : 255
+                    bytes[offset + 1] = camera && x < width / 2 ? 255 : 0
+                    bytes[offset + 2] = camera && x >= width / 2 ? 255 : 0
+                    bytes[offset + 3] = 255
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            guard adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index), timescale: 30)) else {
+                throw writer.error ?? PlaybackCheckError.failed("fixture frame append")
+            }
+        }
+        input.markAsFinished()
+        writer.endSession(atSourceTime: CMTime(value: 2, timescale: 1))
+        await writer.finishWriting()
+        guard writer.status == .completed else { throw writer.error ?? PlaybackCheckError.failed("fixture finalization") }
+    }
+
 }

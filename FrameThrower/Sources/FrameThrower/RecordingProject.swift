@@ -710,6 +710,7 @@ final class ProjectEditor: ObservableObject {
     @Published private(set) var draftState: EditState?
     @Published private(set) var draftTime: Double?
     @Published private(set) var recoveryRestored = false
+    @Published private(set) var mediaRevision = 0
     @Published private(set) var historyNavigationTime: Double?
     @Published private(set) var historyNavigationToken: UUID?
     let url: URL
@@ -757,6 +758,8 @@ final class ProjectEditor: ObservableObject {
     func mediaURL(for filename: String) -> URL {
         url.deletingLastPathComponent().appendingPathComponent(filename)
     }
+
+    func mediaRestored() { mediaRevision &+= 1 }
 
     /// Finger movements and controls at one source time refine a shared draft.
     /// Original media, the saved project, and its history remain untouched.

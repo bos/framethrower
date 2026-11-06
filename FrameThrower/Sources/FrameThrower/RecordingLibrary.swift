@@ -9,6 +9,7 @@ struct RecordingLibraryEntry: Identifiable, Equatable, Sendable {
     let duration: Double
     let fileSize: Int64?
     let createdAt: Date
+    var mediaUnavailable = false
 
     fileprivate static func make(project: RecordingProject, at url: URL) -> Self? {
         guard (try? project.validate()) != nil else { return nil }
@@ -16,15 +17,21 @@ struct RecordingLibraryEntry: Identifiable, Equatable, Sendable {
         let sourceURL = projectURL.deletingLastPathComponent()
             .appendingPathComponent(project.screenFilename).standardizedFileURL.resolvingSymlinksInPath()
         guard let projectAttributes = try? FileManager.default.attributesOfItem(atPath: projectURL.path),
-              projectAttributes[.type] as? FileAttributeType == .typeRegular,
-              let source = try? FileManager.default.attributesOfItem(atPath: sourceURL.path),
-              source[.type] as? FileAttributeType == .typeRegular else { return nil }
+              projectAttributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+        let files = Set([project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }.map {
+            projectURL.deletingLastPathComponent().appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()
+        })
+        let attributes = files.compactMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
+            .filter { $0[.type] as? FileAttributeType == .typeRegular }
+        let bytes = attributes.reduce(Int64(0)) { $0 + (($1[.size] as? NSNumber)?.int64Value ?? 0) }
+        let source = (try? FileManager.default.attributesOfItem(atPath: sourceURL.path)) ?? [:]
         let createdAt = source[.creationDate] as? Date
             ?? projectAttributes[.creationDate] as? Date
             ?? source[.modificationDate] as? Date ?? .distantPast
         return Self(projectURL: projectURL, sourceURL: sourceURL,
-                    displayName: project.displayName(projectURL: projectURL), duration: project.duration,
-                    fileSize: (source[.size] as? NSNumber)?.int64Value, createdAt: createdAt)
+                    displayName: project.displayName(projectURL: projectURL), duration: project.state.trimEnd - project.state.trimStart,
+                    fileSize: attributes.isEmpty ? nil : bytes, createdAt: createdAt,
+                    mediaUnavailable: attributes.count != files.count)
     }
 }
 

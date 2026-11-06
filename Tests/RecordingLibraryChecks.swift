@@ -52,8 +52,10 @@ struct RecordingLibraryChecks {
 
         let library = RecordingLibrary(defaults: defaults, directories: [movies])
         await library.refresh()
-        try require(library.entries.count == 2, "discover every valid top-level recording, deduplicate aliases, skip invalid/missing/nested projects")
-        try require(Set(library.entries.map(\.projectURL)) == Set([first.url, second.url]), "discovery returned the wrong projects")
+        try require(library.entries.count == 3, "discover valid projects including repairable missing media, deduplicate aliases, skip invalid/nested projects")
+        try require(Set(library.entries.map(\.projectURL)) == Set([first.url, second.url, movies.appendingPathComponent("missing.framethrower").standardizedFileURL.resolvingSymlinksInPath()]), "discovery returned the wrong projects")
+        try require(library.entries.first(where: { $0.projectURL.lastPathComponent == "missing.framethrower" })?.mediaUnavailable == true,
+                    "missing originals stay visible with a repairable status")
         let fallback = ProjectEditor(project: second.project, url: second.url).displayName
         try require(library.entries.first(where: { $0.id == second.url })?.displayName == fallback,
                     "an unnamed library row must use the same name as its editor")
@@ -62,7 +64,7 @@ struct RecordingLibraryChecks {
 
         library.register(project: outside.project, at: outside.url)
         library.register(project: first.project, at: movies.appendingPathComponent("alias.framethrower"))
-        try require(library.entries.count == 3, "same-named projects in different folders remain separate, canonical aliases do not duplicate")
+        try require(library.entries.count == 4, "same-named projects in different folders remain separate, canonical aliases do not duplicate")
         let reopened = RecordingLibrary(defaults: defaults, directories: [movies])
         await reopened.refresh()
         try require(Set(reopened.entries.map(\.id)) == Set(library.entries.map(\.id)), "explicitly opened recording outside Movies survives restart")
@@ -96,7 +98,7 @@ struct RecordingLibraryChecks {
         cancelled.cancel()
         await gate.finish(1, with: [])
         await cancelled.value
-        try require(racing.entries.count == 3, "cancelled scan published its obsolete result")
+        try require(racing.entries.count == 4, "cancelled scan published its obsolete result")
 
         let newerEntries = racing.entries
         let olderScan = Task { await racing.refresh() }
@@ -113,7 +115,7 @@ struct RecordingLibraryChecks {
         let dismissed = RecordingLibrary(defaults: defaults, directories: [movies])
         await dismissed.refresh()
         dismissed.remove(at: first.url)
-        try require(dismissed.entries.count == 2 && dismissed.canUndoRemoval, "remove must dismiss only its row and offer undo")
+        try require(dismissed.entries.count == 3 && dismissed.canUndoRemoval, "remove must dismiss only its row and offer undo")
         try require(try Data(contentsOf: first.url) == projectBytes, "removing a row changed its project file")
         dismissed.register(project: editor.project, at: editor.url)
         try require(!dismissed.entries.contains(where: { $0.id == first.url }), "an existing editor update resurrected a removed row")
@@ -121,14 +123,14 @@ struct RecordingLibraryChecks {
         try require(!dismissed.entries.contains(where: { $0.id == first.url }), "Movies discovery resurrected a removed row")
         let afterRemovalRestart = RecordingLibrary(defaults: defaults, directories: [movies])
         await afterRemovalRestart.refresh()
-        try require(afterRemovalRestart.entries.count == 2 && afterRemovalRestart.canUndoRemoval,
+        try require(afterRemovalRestart.entries.count == 3 && afterRemovalRestart.canUndoRemoval,
                     "dismissal and its undo must survive app restart")
         try require(afterRemovalRestart.restoreLastRemoved(), "undo removal after restarting")
-        try require(afterRemovalRestart.entries.count == 3 && !afterRemovalRestart.canUndoRemoval,
+        try require(afterRemovalRestart.entries.count == 4 && !afterRemovalRestart.canUndoRemoval,
                     "undo must restore the row without duplicating it")
         afterRemovalRestart.remove(at: first.url)
         afterRemovalRestart.register(project: editor.project, at: editor.url, restoreRemoved: true)
-        try require(afterRemovalRestart.entries.count == 3 && !afterRemovalRestart.canUndoRemoval,
+        try require(afterRemovalRestart.entries.count == 4 && !afterRemovalRestart.canUndoRemoval,
                     "explicitly opening a removed project must restore it and clear its pending removal")
 
         let dismissalGate = ScanGate()
@@ -151,6 +153,21 @@ struct RecordingLibraryChecks {
                     "an unavailable project should not lose its removal history")
         try FileManager.default.moveItem(at: first.url.appendingPathExtension("temporary"), to: first.url)
         try require(dismissalRace.restoreLastRemoved(), "undo should work after a removed project becomes available again")
+        var sized = editor.project
+        sized.cameraFilename = "camera.mov"
+        sized.cursorFilename = "pointer.json"
+        sized.state.trimStart = 2
+        sized.state.trimEnd = 9
+        let cameraBytes = Data("independent camera original".utf8)
+        let pointerBytes = Data("independent pointer original".utf8)
+        try cameraBytes.write(to: movies.appendingPathComponent("camera.mov"))
+        try pointerBytes.write(to: movies.appendingPathComponent("pointer.json"))
+        let sizedEditor = ProjectEditor(project: sized, url: editor.url)
+        try require(sizedEditor.save(), "save multi-source size fixture")
+        dismissed.register(project: sizedEditor.project, at: sizedEditor.url, restoreRemoved: true)
+        let sizedEntry = dismissed.entries.first { $0.id == sizedEditor.url }
+        try require(sizedEntry?.duration == 7 && sizedEntry?.fileSize == Int64(sourceBytes[0].count + cameraBytes.count + pointerBytes.count),
+                    "list shows kept duration and combined original-media storage")
         for (url, original) in zip(sources, sourceBytes) {
             try require(try Data(contentsOf: url) == original, "library operations modified original source bytes")
         }

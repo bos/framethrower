@@ -92,6 +92,20 @@ struct EditorWindowChecks {
 
         try require(model.recordingLibrary.entries.count == 2,
                     "resolving multiple saved recordings must retain every library row")
+        let movedCamera = directory.appendingPathComponent("temporarily-moved-camera.mov")
+        let cameraURL = first.mediaURL(for: first.project.cameraFilename!)
+        try FileManager.default.moveItem(at: cameraURL, to: movedCamera)
+        first.mediaRestored()
+        try require(model.recordingLibrary.entries.first(where: { $0.projectURL == firstURL })?.mediaUnavailable == true,
+                    "an unavailable original remains visible in the recording library")
+        model.openRecording(at: firstURL)
+        try require(model.projectEditor === first, "a missing-media project still opens for repair")
+        try FileManager.default.moveItem(at: movedCamera, to: cameraURL)
+        let historyBeforeRepair = first.project
+        first.mediaRestored()
+        try require(model.recordingLibrary.entries.first(where: { $0.projectURL == firstURL })?.mediaUnavailable == false,
+                    "restoring media immediately refreshes the library without reopening or changing edits")
+        try require(first.project == historyBeforeRepair, "media restoration does not create an edit or rewrite history")
         try require(first.rename(to: "First demonstration"), "rename through shared editor")
         try require(model.recordingLibrary.entries.first(where: { $0.projectURL == firstURL })?.displayName == first.displayName,
                     "renaming an open editor must immediately update its library row")

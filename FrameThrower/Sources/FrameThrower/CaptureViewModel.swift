@@ -1182,7 +1182,7 @@ final class CaptureViewModel: ObservableObject {
         let url = canonicalProjectURL(editor.url)
         if projectEditors[url] === editor, projectChanges[url] != nil { return }
         projectEditors[url] = editor
-        projectChanges[url] = editor.$project.sink { [weak self] project in
+        projectChanges[url] = editor.$project.combineLatest(editor.$mediaRevision).sink { [weak self] project, _ in
             self?.recordingLibrary.register(project: project, at: url)
         }
     }
@@ -1214,9 +1214,6 @@ final class CaptureViewModel: ObservableObject {
         do {
             let editor = try self.editor(for: url)
             let screenURL = editor.mediaURL(for: editor.project.screenFilename)
-            guard FileManager.default.fileExists(atPath: screenURL.path) else {
-                throw ProjectError.invalid("Keep the project and its original media files together.")
-            }
             projectEditor = editor
             recordingLibrary.register(project: editor.project, at: editor.url, restoreRemoved: restoreRemoved)
             lastRecordingURL = screenURL

@@ -110,6 +110,14 @@ struct ProjectEditorView: View {
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) })
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay { if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) } }
+            .overlay {
+                if playback.errorMessage != nil {
+                    MissingMediaRecoveryView(editor: editor) {
+                        editor.mediaRestored()
+                        Task { await playback.rebuild(editor: editor) }
+                    }
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 

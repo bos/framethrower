@@ -61,9 +61,10 @@ available source selection. A window that has closed requires choosing a new one
    outside the region to draw a new one, drag inside to move it, or drag a corner
    to resize it. Arrow keys move the focused region by one point (Shift: ten).
    **Choose…** still opens the full-screen selector for precise adjustments.
-   Display thumbnails load at startup when recording access is already granted;
-   use refresh to update them. Window/area previews load when requested or when
-   positioning a selected camera. Permission requests do not run automatically on launch.
+   Display and Area previews update about twice a second with existing recording
+   access. Updates pause while the recorder is hidden, fully covered, minimized,
+   or recording. Window previews load when requested or when positioning a camera.
+   Permission requests do not run automatically on launch.
 3. Choose a microphone or **Off**, and enable **System audio** as needed. Microphone,
    system audio, and camera selection share one row. Microphone capture needs its
    own macOS permission.
@@ -182,7 +183,8 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-editor-interactions.sh`: production editor mouse gestures, exact
   drag deltas, persisted undo/redo, and trim integration.
 - `Tests/check-capture-source-previews.sh`: source identity, area crop pixels,
-  negative display origins, fitted PIP bounds, and screenshot cache invalidation.
+  negative display origins, fitted PIP bounds, cache invalidation, automatic
+  refresh, cancellation, nonoverlapping screenshots, and retry backoff.
 - `Tests/check-display-carousel.sh`: aspect-fitted display thumbnails, selection
   borders, compact unavailable states, and clickable image/name/dimensions.
 - `Tests/check-editor-canvas.sh`: native image orientation, letterboxing, resize

@@ -11,7 +11,7 @@ private func require(_ value: @autoclosure () throws -> Bool, _ message: String)
 @main
 @MainActor
 struct CaptureSourcePreviewChecks {
-    static func main() throws {
+    static func main() async throws {
         let image = try quadrants()
         let display = CapturePreviewSource.display(id: 12, frame: CGRect(x: -100, y: 50, width: 200, height: 100))
         let cache = CaptureSourcePreviews()
@@ -75,7 +75,74 @@ struct CaptureSourcePreviewChecks {
         cache.clear()
         try require(cache.preview(for: .display(id: 109, frame: display.frame)) == nil,
                     "permission reset did not clear screenshot cache")
-        print("Capture source preview checks passed (source identity, area crop pixels, negative origins, fitted placement, and bounded cache).")
+        try await refreshChecks()
+        print("Capture source preview checks passed (source identity, area crop pixels, fitted placement, bounded cache, automatic refresh, cancellation, backpressure, and retry delay).")
+    }
+
+    private static func refreshChecks() async throws {
+        let refreshes = CapturePreviewRefreshes()
+        var count = 0
+        let periodic = Task { @MainActor in
+            await refreshes.run(interval: .milliseconds(15)) { count += 1; return true }
+        }
+        try await wait { count >= 3 }
+        periodic.cancel()
+        await periodic.value
+        let stopped = count
+        try await Task.sleep(for: .milliseconds(40))
+        try require(count == stopped, "cancelled/hidden preview kept refreshing")
+
+        // Model an SDK screenshot that ignores cancellation until its callback.
+        // Changing source and cancelling a queued view cannot overlap that work.
+        var finish: CheckedContinuation<Void, Never>?
+        var oldStarted = false
+        var cancelledStarted = false
+        var replacementStarted = false
+        let old = Task { @MainActor in
+            await refreshes.run(repeating: false) {
+                oldStarted = true
+                await withCheckedContinuation { finish = $0 }
+                return true
+            }
+        }
+        try await wait { oldStarted }
+        let cancelled = Task { @MainActor in
+            await refreshes.run(repeating: false) { cancelledStarted = true; return true }
+        }
+        let replacement = Task { @MainActor in
+            await refreshes.run(repeating: false) { replacementStarted = true; return true }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        old.cancel()
+        cancelled.cancel()
+        for _ in 0..<10 { await Task.yield() }
+        try require(!cancelledStarted && !replacementStarted,
+                    "source change started a second screenshot before the old SDK callback finished")
+        finish?.resume()
+        await old.value
+        await cancelled.value
+        await replacement.value
+        try require(!cancelledStarted && replacementStarted, "queued source cancellation lost the replacement refresh")
+
+        var attempts: [ContinuousClock.Instant] = []
+        let retrying = Task { @MainActor in
+            await refreshes.run(interval: .milliseconds(10), retryInterval: .milliseconds(100)) {
+                attempts.append(.now)
+                return attempts.count > 1
+            }
+        }
+        try await wait { attempts.count >= 2 }
+        retrying.cancel()
+        await retrying.value
+        try require(attempts[1] - attempts[0] >= .milliseconds(100), "failed screenshots retried at full capture rate")
+    }
+
+    private static func wait(until condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !condition() {
+            guard ContinuousClock.now < deadline else { throw SourcePreviewCheckError.failed("refresh test timed out") }
+            try await Task.sleep(for: .milliseconds(2))
+        }
     }
 
     private static func quadrants() throws -> CGImage {

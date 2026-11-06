@@ -2,7 +2,7 @@ import AppKit
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
 
-/// A still preview, refreshed when the capture selection changes or on request.
+/// The area preview updates automatically; window previews can be requested explicitly.
 struct CapturePreview: View {
     @ObservedObject var model: CaptureViewModel
     var isEnabled: Bool
@@ -14,6 +14,9 @@ struct CapturePreview: View {
     @State private var failed = false
     @State private var refreshID = 0
     @State private var previewRequested = false
+    @State private var previewVisible = false
+
+    private var automaticallyUpdates: Bool { model.captureKind != .window }
 
     private var hasSource: Bool {
         model.captureKind == .window ? model.selectedWindow != nil : model.selectedDisplayID != nil
@@ -35,12 +38,13 @@ struct CapturePreview: View {
         var enabled: Bool
         var requested: Bool
         var locked: Bool
+        var visible: Bool
     }
 
     private var refreshKey: RefreshKey {
         RefreshKey(source: source, kind: model.captureKind.rawValue, refreshID: refreshID,
                    hasPermission: model.hasScreenRecordingPermission, enabled: isEnabled,
-                   requested: previewRequested, locked: captureLocked)
+                   requested: previewRequested, locked: captureLocked, visible: previewVisible)
     }
 
     private var currentImage: NSImage? { imageSource == source ? image : nil }
@@ -80,7 +84,7 @@ struct CapturePreview: View {
                     Text(placeholder)
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.55))
-                    if model.hasScreenRecordingPermission && hasSource && !isEnabled && !previewRequested {
+                    if model.hasScreenRecordingPermission && hasSource && !automaticallyUpdates && !isEnabled && !previewRequested {
                         Button { previewRequested = true } label: {
                             Text("Show preview")
                                 .font(.system(size: 11, weight: .medium))
@@ -114,7 +118,7 @@ struct CapturePreview: View {
             .padding(12)
         }
         .overlay(alignment: .topTrailing) {
-            if model.hasScreenRecordingPermission && hasSource && !captureLocked {
+            if !automaticallyUpdates && model.hasScreenRecordingPermission && hasSource && !captureLocked {
                 Button {
                     previewRequested = true
                     refreshID += 1
@@ -132,6 +136,7 @@ struct CapturePreview: View {
                 .padding(12)
             }
         }
+        .background(CapturePreviewVisibility(isVisible: $previewVisible))
         .task(id: refreshKey) {
             await refreshPreview()
         }
@@ -139,8 +144,8 @@ struct CapturePreview: View {
 
     private var placeholder: String {
         if !model.hasScreenRecordingPermission { return "Allow screen recording to see a preview" }
-        if !hasSource { return "Choose a window" }
-        if !isEnabled && !previewRequested { return "Preview not loaded" }
+        if !hasSource { return model.captureKind == .window ? "Choose a window" : "Choose a display" }
+        if !automaticallyUpdates && !isEnabled && !previewRequested { return "Preview not loaded" }
         if isLoading { return "Loading preview…" }
         if failed { return "Preview unavailable" }
         return "Select a source"
@@ -148,73 +153,69 @@ struct CapturePreview: View {
 
     @MainActor
     private func refreshPreview() async {
-        guard !captureLocked else { return }
-        guard isEnabled || previewRequested else { return }
-        image = nil
-        imageSource = nil
-        imageDisplayFrame = nil
-        failed = false
         guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess(), let requestedSource = source else {
+            image = nil
+            imageSource = nil
+            imageDisplayFrame = nil
             if !model.hasScreenRecordingPermission { sourcePreviews.clear() }
             return
         }
-        isLoading = true
-        defer { isLoading = false }
-
-        let filter: SCContentFilter
-        var displayFrame: CGRect?
-        switch model.captureKind {
-        case .window:
-            guard let window = model.selectedWindow else { return }
-            filter = SCContentFilter(desktopIndependentWindow: window.window)
-        case .display, .area:
-            guard let display = model.displays.first(where: { $0.id == model.selectedDisplayID }) else {
-                return
-            }
-            // Deferred or closed AppKit windows can have a window number of -1.
-            let ownWindows = NSApp.windows.compactMap { CGWindowID(exactly: $0.windowNumber) }
-            let content: SCShareableContent
-            do {
-                content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-                try Task.checkCancellation()
-                guard !captureLocked, model.hasScreenRecordingPermission,
-                      CGPreflightScreenCaptureAccess(), source == requestedSource else { return }
-            } catch {
-                failed = true
-                return
-            }
-            let excluded = content.windows.filter { ownWindows.contains($0.windowID) }
-            filter = SCContentFilter(display: display.display, excludingWindows: excluded)
-            displayFrame = display.display.frame
+        if imageSource != requestedSource {
+            image = nil
+            imageSource = nil
+            imageDisplayFrame = nil
         }
-
-        let configuration = SCStreamConfiguration()
-        let size = filter.contentRect.size
-        let scale = min(2, 1200 / max(size.width, size.height, 1))
-        configuration.width = max(2, Int(size.width * scale))
-        configuration.height = max(2, Int(size.height * scale))
-        configuration.showsCursor = false
-        do {
-            try Task.checkCancellation()
-            guard !captureLocked, model.hasScreenRecordingPermission,
-                  CGPreflightScreenCaptureAccess(), source == requestedSource else { return }
-            let capture = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            try Task.checkCancellation()
-            guard source == requestedSource, !captureLocked, model.hasScreenRecordingPermission,
-                  CGPreflightScreenCaptureAccess() else { return }
-            sourcePreviews.store(capture, contentSize: size, for: requestedSource)
-            imageDisplayFrame = displayFrame
-            imageSource = requestedSource
-            image = NSImage(cgImage: capture, size: size)
-        } catch is CancellationError {
-            return
-        } catch {
-            guard source == requestedSource else { return }
-            sourcePreviews.remove(requestedSource)
-            failed = true
+        failed = false
+        guard previewVisible, !captureLocked, automaticallyUpdates || isEnabled || previewRequested else { return }
+        var cachedFilter: SCContentFilter?
+        var displayFrame: CGRect?
+        await sourcePreviews.refreshes.run(repeating: automaticallyUpdates) {
+            isLoading = true
+            defer { isLoading = false }
+            do {
+                if cachedFilter == nil {
+                    switch model.captureKind {
+                    case .window:
+                        guard let window = model.selectedWindow else { return false }
+                        cachedFilter = SCContentFilter(desktopIndependentWindow: window.window)
+                    case .display, .area:
+                        guard let display = model.displays.first(where: { $0.id == model.selectedDisplayID }) else { return false }
+                        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                        try Task.checkCancellation()
+                        let ownApp = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+                        cachedFilter = SCContentFilter(display: display.display,
+                            excludingApplications: ownApp, exceptingWindows: [])
+                        displayFrame = display.display.frame
+                    }
+                }
+                try Task.checkCancellation()
+                guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                      CGPreflightScreenCaptureAccess(), source == requestedSource,
+                      let filter = cachedFilter else { return false }
+                let configuration = SCStreamConfiguration()
+                let size = filter.contentRect.size
+                let scale = min(2, 1200 / max(size.width, size.height, 1))
+                configuration.width = max(2, Int(size.width * scale))
+                configuration.height = max(2, Int(size.height * scale))
+                configuration.showsCursor = false
+                let capture = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+                try Task.checkCancellation()
+                guard previewVisible, source == requestedSource, !captureLocked, model.hasScreenRecordingPermission,
+                      CGPreflightScreenCaptureAccess() else { return false }
+                sourcePreviews.store(capture, contentSize: size, for: requestedSource)
+                imageDisplayFrame = displayFrame
+                imageSource = requestedSource
+                image = NSImage(cgImage: capture, size: size)
+                failed = false
+                return true
+            } catch is CancellationError {
+                return false
+            } catch {
+                guard source == requestedSource else { return false }
+                cachedFilter = nil
+                failed = true
+                return false
+            }
         }
     }
 }

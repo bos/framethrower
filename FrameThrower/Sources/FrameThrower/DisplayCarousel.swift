@@ -2,7 +2,7 @@ import AppKit
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
 
-/// Still thumbnails make every display recognizable before choosing what to record.
+/// Low-resolution snapshots keep display selection current without a recording stream.
 struct DisplayCarousel: View {
     @ObservedObject var model: CaptureViewModel
     var isEnabled: Bool
@@ -12,7 +12,7 @@ struct DisplayCarousel: View {
     @State private var images: [CGDirectDisplayID: NSImage] = [:]
     @State private var failedDisplays: Set<CGDirectDisplayID> = []
     @State private var isLoading = false
-    @State private var refreshID = 0
+    @State private var previewVisible = false
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var displayKey: String {
@@ -32,19 +32,6 @@ struct DisplayCarousel: View {
                         .font(.system(size: 9, weight: .medium))
                         .tracking(1.4)
                     Spacer()
-                    Button {
-                        onSelect()
-                        refreshID += 1
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 11, weight: .medium))
-                            .frame(width: 26, height: 26)
-                            .background(.white.opacity(0.08), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Refresh display previews")
-                    .accessibilityLabel("Refresh display previews")
-                    .disabled(captureLocked || isLoading || model.displays.isEmpty)
                 }
                 .foregroundStyle(.white.opacity(0.65))
                 .padding(.horizontal, 16)
@@ -104,7 +91,8 @@ struct DisplayCarousel: View {
                 }
         }
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .task(id: "\(displayKey):\(refreshID):\(isEnabled):\(model.hasScreenRecordingPermission):\(captureLocked)") {
+        .background(CapturePreviewVisibility(isVisible: $previewVisible))
+        .task(id: "\(displayKey):\(previewVisible):\(model.hasScreenRecordingPermission):\(captureLocked)") {
             await refreshPreviews()
         }
     }
@@ -122,52 +110,60 @@ struct DisplayCarousel: View {
         failedDisplays = []
         // Display thumbnails are part of choosing a source, so they load with
         // existing permission even before a user clicks a capture control.
-        guard !captureLocked, !displays.isEmpty else { return }
-        isLoading = true
-        defer { isLoading = false }
-
-        do {
-            // Exclude this app, so the chooser never appears recursively in its own thumbnails.
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                true, onScreenWindowsOnly: true
-            )
-            try Task.checkCancellation()
-            guard !captureLocked, model.hasScreenRecordingPermission,
-                  CGPreflightScreenCaptureAccess() else { return }
-            // Deferred or closed AppKit windows can have a window number of -1.
-            let ownWindows = Set(NSApp.windows.compactMap { CGWindowID(exactly: $0.windowNumber) })
-            let excluded = content.windows.filter { ownWindows.contains($0.windowID) }
-            for display in displays {
-                try Task.checkCancellation()
-                guard !captureLocked, model.hasScreenRecordingPermission,
-                      CGPreflightScreenCaptureAccess() else { return }
-                let filter = SCContentFilter(display: display.display, excludingWindows: excluded)
-                let size = filter.contentRect.size
-                let scale = min(1, 640 / max(size.width, size.height, 1))
-                let configuration = SCStreamConfiguration()
-                configuration.width = max(2, Int(size.width * scale))
-                configuration.height = max(2, Int(size.height * scale))
-                configuration.showsCursor = false
-                do {
-                    let capture = try await SCScreenshotManager.captureImage(
-                        contentFilter: filter, configuration: configuration
-                    )
+        guard previewVisible, !captureLocked, !displays.isEmpty else { return }
+        var filters: [CGDirectDisplayID: SCContentFilter] = [:]
+        await sourcePreviews.refreshes.run {
+            isLoading = true
+            defer { isLoading = false }
+            do {
+                if filters.isEmpty {
+                    let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
                     try Task.checkCancellation()
-                    guard !captureLocked, model.hasScreenRecordingPermission,
-                          CGPreflightScreenCaptureAccess() else { return }
-                    let source = CapturePreviewSource.display(id: display.id, frame: display.display.frame)
-                    sourcePreviews.store(capture, contentSize: size, for: source)
-                    images[display.id] = NSImage(cgImage: capture, size: size)
-                } catch {
-                    try Task.checkCancellation()
-                    images[display.id] = nil
-                    sourcePreviews.remove(.display(id: display.id, frame: display.display.frame))
-                    failedDisplays.insert(display.id)
+                    // Exclude the application, including windows opened after
+                    // this filter was built. Reuse filters between snapshots.
+                    let ownApp = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+                    for display in displays {
+                        filters[display.id] = SCContentFilter(display: display.display,
+                            excludingApplications: ownApp, exceptingWindows: [])
+                    }
                 }
+                var succeeded = true
+                for display in displays {
+                    try Task.checkCancellation()
+                    guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                          CGPreflightScreenCaptureAccess(), let filter = filters[display.id] else { return false }
+                    let size = filter.contentRect.size
+                    let scale = min(1, 640 / max(size.width, size.height, 1))
+                    let configuration = SCStreamConfiguration()
+                    configuration.width = max(2, Int(size.width * scale))
+                    configuration.height = max(2, Int(size.height * scale))
+                    configuration.showsCursor = false
+                    do {
+                        let capture = try await SCScreenshotManager.captureImage(
+                            contentFilter: filter, configuration: configuration
+                        )
+                        try Task.checkCancellation()
+                        guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                              CGPreflightScreenCaptureAccess() else { return false }
+                        let source = CapturePreviewSource.display(id: display.id, frame: display.display.frame)
+                        sourcePreviews.store(capture, contentSize: size, for: source)
+                        images[display.id] = NSImage(cgImage: capture, size: size)
+                        failedDisplays.remove(display.id)
+                    } catch {
+                        try Task.checkCancellation()
+                        failedDisplays.insert(display.id)
+                        succeeded = false
+                        // Keep the last good image through a transient failure.
+                    }
+                }
+                if !succeeded { filters = [:] }
+                return succeeded
+            } catch {
+                guard !Task.isCancelled else { return false }
+                filters = [:]
+                failedDisplays = displayIDs
+                return false
             }
-        } catch {
-            guard !Task.isCancelled else { return }
-            failedDisplays = displayIDs
         }
     }
 }

@@ -8,6 +8,6 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   -target "$(uname -m)-apple-macos15.0" \
   "$sources/MediaProcessing.swift" "$sources/EditorRegion.swift" "$sources/RecordingProject.swift" \
   "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources/LocalEditPlanner.swift" \
-  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/EditorAssistantPanel.swift" \
+  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" "$sources/DirectorConversation.swift" "$sources/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/FramingConflictChecks.swift" -o "$check_dir/check-framing-conflicts"
 "$check_dir/check-framing-conflicts" "$@"

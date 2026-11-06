@@ -13,6 +13,8 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalModelRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalSpeechInput.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorDiagnostics.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConversation.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/EditorAssistantSessionChecks.swift" \
   -o "$check_dir/check-editor-assistant"

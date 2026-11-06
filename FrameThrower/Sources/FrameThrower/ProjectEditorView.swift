@@ -97,9 +97,10 @@ struct ProjectEditorView: View {
             playback.pause()
             playback.seek(time)
         }
-        .onDisappear { assistant.cancel(); exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
+        .onAppear { assistant.attach(to: editor) }
+        .onDisappear { assistant.suspend(); exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-            assistant.cancel()
+            assistant.suspend()
             LocalModelRuntime.terminateOwnedProcess()
             _ = editor.finishDraft()
         }

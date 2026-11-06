@@ -236,8 +236,9 @@ A box's X removes its guide and optional name; Undo restores both.
 There is one instruction field and one microphone. An optional box name is
 available from its context menu; Return saves, Escape or dismissing cancels.
 Naming is never required to use a box. Names describe guides and do not become
-visible graphics. Dictation first produces editable text; submitting an instruction
-is a separate action. Apple SpeechAnalyzer runs on-device on supported macOS26+
+visible graphics. The microphone starts dictation; pressing it again finishes
+recognition and submits the instruction. Escape cancels. Typed instructions use
+Return or the send icon. Apple SpeechAnalyzer runs on-device on supported macOS26+
 hardware/locales. It may download Apple speech assets on first use; audio is
 never sent to a transcription service. There is no cloud speech fallback.
 An absent asset-installation request is a normal result when Apple already has
@@ -254,6 +255,11 @@ path inserts an editable full-frame waypoint halfway between the endpoints,
 using the shared acceleration/deceleration curves. Conflicting intervening edits
 produce a clarification instead of being replaced. Unknown or removed references
 produce a question naming the unresolved edit or box.
+For relative timing, “One second from now, pan from Box 1, zoom out, and into
+Box 2 after three seconds” starts one second after the playhead and arrives
+three seconds after that same playhead. The app builds the path from the named
+boxes and timing. A rejected model plan gets one automatic repair attempt using
+the actual rejection result; the user is not asked to repeat already stated timing.
 For a direct move without a preexisting endpoint, say “At Edit A, pan and zoom
 from Box 1 to Box 2 over five seconds.” The destination receives its own stable
 edit letter automatically. Pulling back to full frame happens only when requested.
@@ -267,11 +273,28 @@ results from applying. Escape, the request X, or closing the sidebar cancels it.
 Starting a manual framing or drawing gesture also cancels an in-flight plan.
 
 Human and agent changes share one chronological history. An agent request has one
-descriptive Director entry. **Edit history** beside Undo/Redo shows available
-entries; choosing an older entry includes all newer entries above it. Fresh edits
-clear Redo. The agent can create, move, and remove marks, and invoke the same
-Undo/Redo stack. It cannot selectively skip manual edits to undo an older request.
-Its tool context contains the same ordered history shown in the menu.
+descriptive Director entry. The standard Edit menu names the next Undo and Redo
+actions. Fresh edits clear Redo. The agent can create, move, and remove marks,
+and invoke the same Undo/Redo stack. It cannot selectively skip manual edits to
+undo an older request.
+
+Director receives ordered user messages, assistant tool calls, and the actual
+application results, alongside manual changes and Undo/Redo events. Every request
+also includes the complete current edit state. Recent exchanges retain matching
+tool-call/result pairs; older activity becomes compact summaries. Conversations,
+unfinished instructions, and pending questions are saved locally per project.
+Reopening preserves a question only if the recording revision still matches.
+The original instruction's playhead remains its timing anchor across answers;
+the current playhead and selected box/edit are supplied separately. An explicit
+“start at the current playhead instead” can change that anchor.
+
+Local debugging traces include recognition hypotheses and final text, model
+requests/responses, applied or rejected commands, and manual editor events.
+They are private JSONL files in `~/Library/Logs/FrameThrower/Director`, rotated
+at 5 MiB with three archives. They contain text and edit metadata, never audio
+or footage. Conversation archives live in
+`~/Library/Application Support/FrameThrower/Director`. Automated checks use
+temporary directories and synthetic PCM without opening a microphone or speaker.
 
 Video processing remains suspended. Guides and framing metadata work on the
 placeholder preview; decoding footage, screenshots of footage, visual recognition,

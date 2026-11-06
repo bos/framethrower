@@ -189,8 +189,8 @@ struct FramingConflictChecks {
         let payloads = await transport.payloads
         let payload = try JSONSerialization.jsonObject(with: payloads[1]) as! [String: Any]
         let tools = (payload["tools"] as! [[String: Any]]).compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
-        let messages = payload["messages"] as! [[String: String]]
-        try require(Set(tools) == ["resolve_framing_conflict", "ask_clarification"] && messages.last?["content"]?.contains(answer) == true,
+        let messages = payload["messages"] as! [[String: Any]]
+        try require(Set(tools) == ["resolve_framing_conflict", "ask_clarification"] && (messages.last?["content"] as? String)?.contains(answer) == true,
                     "Dictated answer receives only resolution tools, never a fresh movement plan")
         await transport.reply(1, try choice(conflict, "replace"))
         try await wait { !session.isBusy }
@@ -263,9 +263,10 @@ struct FramingConflictChecks {
         try await wait { await transport.payloads.count == 3 }
         let payloads = await transport.payloads
         let payload = try JSONSerialization.jsonObject(with: payloads[2]) as! [String: Any]
-        let messages = payload["messages"] as! [[String: String]]
-        let details = try JSONSerialization.jsonObject(with: Data(messages.last!["content"]!.utf8)) as! [String: Any]
-        try require(details["question"] as? String == question && details["answer"] as? String == answer,
+        let messages = payload["messages"] as! [[String: Any]]
+        let context = (messages[1]["content"] as! String).components(separatedBy: "\n").dropFirst().joined(separator: "\n")
+        let details = try JSONSerialization.jsonObject(with: Data(context.utf8)) as! [String: Any]
+        try require(details["question"] as? String == question && messages.last?["content"] as? String == answer,
                     "Follow-up answers see the latest question, not the original replacement question again")
         await transport.reply(2, try choice(conflict, "replace"))
         try await wait { !session.isBusy }

@@ -174,8 +174,8 @@ struct EditorAssistantSessionChecks {
         try await waitUntil { await transport.payloads.count == 2 }
         let data = await transport.payloads[1]
         let payload = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-        let messages = payload["messages"] as! [[String: String]]
-        try require(messages.last?["content"]?.contains("Undo your last change") == false,
+        let messages = payload["messages"] as! [[String: Any]]
+        try require((messages.last?["content"] as? String)?.contains("Undo your last change") == false,
                     "fresh framing request cannot be trapped inside an older history clarification")
         await transport.fail(1)
         try await waitUntil { !session.isBusy }
@@ -279,9 +279,13 @@ struct EditorAssistantSessionChecks {
         let payload = await transport.payloads[1]
         let object = try JSONSerialization.jsonObject(with: payload) as! [String: Any]
         let messages = object["messages"] as! [[String: Any]]
-        let content = messages.last?["content"] as? String ?? ""
-        try require(content.contains("Earlier instruction: " + original) && content.contains("Question: " + question) &&
-                    content.contains("Answer: At one second."), "followup retains the original request and its question")
+        let hasOriginal = messages.contains { $0["role"] as? String == "user" && $0["content"] as? String == original }
+        let hasActualQuestion = messages.contains { message in
+            guard message["role"] as? String == "tool", let text = message["content"] as? String else { return false }
+            return text.contains(question) && text.contains("needs_answer")
+        }
+        try require(hasOriginal && hasActualQuestion && messages.last?["content"] as? String == "At one second.",
+                    "followup receives actual prior user/tool-result turns and the current answer")
         await transport.succeed(1, data: try sequence(session: session, revision: revision, region: fixture.region.id))
         try await waitUntil { !session.isBusy }
         try require(fixture.editor.project.undoHistory.count == 1 && session.errorMessage == nil,

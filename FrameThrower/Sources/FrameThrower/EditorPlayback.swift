@@ -34,6 +34,7 @@ final class EditorPlayback: ObservableObject {
     private var sourceDuration = 0.0
     private var editFrameDuration = 1.0 / 30.0
     private var draftState: EditState?
+    private var pendingDraftState: EditState?
     private var draftGeneration: UInt64 = 0
     private var committedStillFrame: CGImage?
     private var committedStillTime: Double?
@@ -41,8 +42,21 @@ final class EditorPlayback: ObservableObject {
     private var seekInFlight = false
     private var pendingSeek: CMTime?
     private var scrubGestureActive = false
+    private var nativeFrameTask: Task<Void, Never>?
 
-    var isPreviewing: Bool { draftState != nil }
+    private enum NativeFrameError: LocalizedError {
+        case unavailable
+        var errorDescription: String? { "The paused recording frame could not be prepared." }
+    }
+
+    var isPreviewing: Bool { draftState != nil || pendingDraftState != nil }
+    var canPlay: Bool { !isClosed && !isLoading && renderedProject != nil }
+
+    var cursorRecording: CursorRecording? {
+        renderedProject?.videoComposition.instructions
+            .compactMap { $0 as? PIPCompositionInstruction }.first?.cursorRecording
+    }
+
 
     var editingTime: Double {
         RecordingProject.editingTime(at: time, duration: sourceDuration, frameDuration: editFrameDuration)
@@ -77,7 +91,7 @@ final class EditorPlayback: ObservableObject {
         // A successful gesture commits this exact draft next. Keep its last
         // displayed pixels across the rebuild so release never flashes back to
         // the old player's camera position; pending draft work is invalidated.
-        let retainedDraftFrame = draftState == nil ? nil : stillFrame
+        let retainedDraftFrame = isPreviewing ? stillFrame : nil
         invalidateStillFrames()
         stillFrame = retainedDraftFrame
         renderedProject = nil
@@ -94,6 +108,10 @@ final class EditorPlayback: ObservableObject {
             item.seekingWaitsForVideoCompositionRendering = true
             item.forwardPlaybackEndTime = CMTime(seconds: snapshot.state.trimEnd, preferredTimescale: 600)
             observeStatus(of: item, generation: request)
+            // The player may preroll its first frame as soon as the item is
+            // attached, before a zero-distance seek asks it to render again.
+            rendered.previewFrames.request(at: Self.frameTime(at: position,
+                bounds: snapshot.state.trimStart...snapshot.state.trimEnd))
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
             cameraAspect = rendered.cameraAspect
@@ -171,6 +189,8 @@ final class EditorPlayback: ObservableObject {
     }
 
     private func clearPausedFrameForSeek() {
+        nativeFrameTask?.cancel()
+        nativeFrameTask = nil
         stillRequests.invalidate()
         liveSources = nil
         if stillFrame != nil { stillFrame = nil }
@@ -181,6 +201,7 @@ final class EditorPlayback: ObservableObject {
         pendingSeek = nil
         seekInFlight = true
         let request = seekGeneration
+        renderedProject?.previewFrames.request(at: target)
         // Do not cancel an in-flight seek for each mouse event. Let its frame
         // reach AVPlayerLayer, then chase only the newest requested position.
         player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
@@ -197,11 +218,71 @@ final class EditorPlayback: ObservableObject {
 
     private func finishSeekIfSettled() {
         guard !seekInFlight, pendingSeek == nil, !scrubGestureActive else { return }
-        if isScrubbing { isScrubbing = false }
-        if !isPlaying { updateStillFrame() }
+        guard !isPlaying else {
+            if isScrubbing { isScrubbing = false }
+            return
+        }
+        let target = Self.frameTime(at: time, bounds: bounds)
+        let sourceRequest = generation
+        let seekRequest = seekGeneration
+        nativeFrameTask?.cancel()
+        nativeFrameTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.nativeSource(at: target, generation: sourceRequest, seekGeneration: seekRequest)
+                guard !Task.isCancelled else { return }
+                if self.isScrubbing { self.isScrubbing = false }
+                if self.errorMessage == NativeFrameError.unavailable.localizedDescription { self.errorMessage = nil }
+                if let draft = self.pendingDraftState {
+                    self.pendingDraftState = nil
+                    self.preview(draft)
+                } else { self.updateStillFrame() }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, sourceRequest == self.generation, seekRequest == self.seekGeneration else { return }
+                if self.isScrubbing { self.isScrubbing = false }
+                self.pendingDraftState = nil
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func nativeSource(at target: CMTime, generation request: Int,
+                              seekGeneration seekRequest: UInt64) async throws -> LivePreviewSources {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            guard !isClosed, request == generation, seekRequest == seekGeneration,
+                  CMTimeCompare(Self.frameTime(at: time, bounds: bounds), target) == 0,
+                  let renderedProject else { throw CancellationError() }
+            if let source = renderedProject.previewFrames.sources(at: target) { return source }
+            // A layer may attach/preroll just after an otherwise zero-distance
+            // seek completes. Wait for that native capture, never open a decoder.
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw NativeFrameError.unavailable
+    }
+
+    /// Full unmodified camera pixels at the frozen playhead for the framing
+    /// tool. Camera gaps return nil; lifecycle/source changes cancel the request.
+    func cameraFrame(at position: Double) async throws -> CGImage? {
+        guard !isClosed, !isLoading, let renderedProject else { throw CancellationError() }
+        pause()
+        let requested = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : time
+        let target = Self.frameTime(at: requested, bounds: bounds)
+        let request = generation
+        if renderedProject.previewFrames.sources(at: target) == nil { seek(requested) }
+        let seekRequest = seekGeneration
+        let source = try await nativeSource(at: target, generation: request, seekGeneration: seekRequest)
+        let image = try await source.cameraImage()
+        guard !isClosed, request == generation, seekRequest == seekGeneration else { throw CancellationError() }
+        return image
     }
 
     private func invalidateSeeks() {
+        nativeFrameTask?.cancel()
+        nativeFrameTask = nil
         seekGeneration &+= 1
         pendingSeek = nil
         seekInFlight = false
@@ -231,14 +312,39 @@ final class EditorPlayback: ObservableObject {
         let wasPlaying = isPlaying
         player.pause()
         isPlaying = false
-        if wasPlaying, !seekInFlight, pendingSeek == nil, !isScrubbing { updateStillFrame() }
+        guard wasPlaying, !seekInFlight, pendingSeek == nil, !isScrubbing,
+              let renderedProject else { return }
+        let current = player.currentTime().seconds
+        let position = current.isFinite ? min(max(current, bounds.lowerBound), bounds.upperBound) : time
+        let target = Self.frameTime(at: position, bounds: bounds)
+        if renderedProject.previewFrames.sources(at: target) != nil {
+            if time != position { time = position }
+            updateStillFrame()
+        } else {
+            // Freeze a native frame at the actual paused playhead, instead of
+            // opening an independent image-generator decoder behind the player.
+            requestSeek(position)
+        }
     }
 
     /// Transient paused composition used while a gesture is in progress. The
     /// durable project, AVPlayerItem, playhead, and source geometry stay intact.
     func preview(_ state: EditState) {
-        guard !isClosed, !isLoading, !isScrubbing, !seekInFlight, pendingSeek == nil,
+        guard !isClosed, !isLoading, !isScrubbing,
               let renderedProject, draftState != state else { return }
+        if seekInFlight || pendingSeek != nil {
+            pendingDraftState = state
+            return
+        }
+        let position = Self.frameTime(at: time, bounds: bounds)
+        guard let source = sourceCache(for: renderedProject, at: position) else {
+            // A gesture can begin in the same turn as Pause. Preserve its most
+            // recent state while the native exact seek supplies the source pair.
+            requestSeek(time)
+            pendingDraftState = state
+            return
+        }
+        pendingDraftState = nil
         if draftState == nil {
             player.pause()
             isPlaying = false
@@ -249,8 +355,6 @@ final class EditorPlayback: ObservableObject {
         }
         draftState = state
         let request = draftGeneration
-        let position = Self.frameTime(at: time, bounds: bounds)
-        let source = sourceCache(for: renderedProject, at: position)
         stillRequests.request(
             generate: { try await source.image(applying: state) },
             cancel: {},
@@ -270,14 +374,15 @@ final class EditorPlayback: ObservableObject {
     /// Restore the committed frame immediately when available, then refresh it
     /// through the same renderer. Any in-flight draft becomes ineligible.
     func cancelPreview() {
-        guard !isClosed, draftState != nil else { return }
+        guard !isClosed, isPreviewing else { return }
         discardPreview(restoringFrame: true)
         updateStillFrame()
     }
 
     private func discardPreview(restoringFrame: Bool) {
-        guard draftState != nil else { return }
+        guard isPreviewing else { return }
         draftState = nil
+        pendingDraftState = nil
         draftGeneration &+= 1
         stillRequests.invalidate()
         if restoringFrame, committedStillTime == time { stillFrame = committedStillFrame }
@@ -302,7 +407,10 @@ final class EditorPlayback: ObservableObject {
         guard !isClosed, !isPlaying, !isScrubbing, !seekInFlight, pendingSeek == nil,
               draftState == nil, let renderedProject, let committedState else { return }
         let position = Self.frameTime(at: time, bounds: bounds)
-        let source = sourceCache(for: renderedProject, at: position)
+        guard let source = sourceCache(for: renderedProject, at: position) else {
+            if errorMessage == nil { errorMessage = "The paused recording frame could not be prepared." }
+            return
+        }
         stillRequests.request(
             generate: { try await source.image(applying: committedState) },
             cancel: {},
@@ -315,16 +423,23 @@ final class EditorPlayback: ObservableObject {
         )
     }
 
-    private func sourceCache(for rendered: RenderedProject, at position: CMTime) -> LiveStillFrameCache {
+    private func sourceCache(for rendered: RenderedProject, at position: CMTime) -> LiveStillFrameCache? {
+        let source: LiveStillFrameCache
         if let liveSources, liveSources.rendered.asset === rendered.asset,
-           CMTimeCompare(liveSources.position, position) == 0 { return liveSources }
-        let source = LiveStillFrameCache(rendered: rendered, position: position)
-        liveSources = source
+           CMTimeCompare(liveSources.position, position) == 0 {
+            source = liveSources
+        } else {
+            guard let sources = rendered.previewFrames.sources(at: position) else { return nil }
+            source = LiveStillFrameCache(rendered: rendered, position: position, sources: sources)
+            liveSources = source
+        }
+        if errorMessage == NativeFrameError.unavailable.localizedDescription { errorMessage = nil }
         return source
     }
 
     private func invalidateStillFrames() {
         draftState = nil
+        pendingDraftState = nil
         draftGeneration &+= 1
         committedStillFrame = nil
         committedStillTime = nil
@@ -435,19 +550,16 @@ final class LatestStillFrameQueue<Output> {
 private final class LiveStillFrameCache {
     let rendered: RenderedProject
     let position: CMTime
-    private var sources: LivePreviewSources?
+    private let sources: LivePreviewSources
 
-    init(rendered: RenderedProject, position: CMTime) {
+    init(rendered: RenderedProject, position: CMTime, sources: LivePreviewSources) {
         self.rendered = rendered
         self.position = position
+        self.sources = sources
     }
 
     func image(applying state: EditState) async throws -> CGImage {
-        if sources == nil {
-            sources = try await ProjectRenderer.prepareLiveSources(rendered, at: position)
-        }
-        guard let sources else { throw ProjectRenderer.RenderError.cannotExport }
-        return try await ProjectRenderer.renderLivePreview(sources, applying: state)
+        try await ProjectRenderer.renderLivePreview(sources, applying: state)
     }
 }
 

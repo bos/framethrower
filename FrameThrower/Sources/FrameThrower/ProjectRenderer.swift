@@ -8,6 +8,16 @@ struct RenderedProject {
     let videoComposition: AVVideoComposition
     let screenSize: CGSize
     let cameraAspect: Double
+    let previewFrames: PreviewSourceFrames
+
+    init(asset: AVComposition, videoComposition: AVVideoComposition, screenSize: CGSize,
+         cameraAspect: Double, previewFrames: PreviewSourceFrames = PreviewSourceFrames()) {
+        self.asset = asset
+        self.videoComposition = videoComposition
+        self.screenSize = screenSize
+        self.cameraAspect = cameraAspect
+        self.previewFrames = previewFrames
+    }
 }
 
 @MainActor
@@ -94,10 +104,14 @@ enum ProjectRenderer {
                 cameraTrackID = cameraTrack.trackID
             }
         }
+        let cursorRecording = try project.cursorFilename.map {
+            try CursorRecording.load(from: directory.appendingPathComponent($0))
+        }
+        let previewFrames = PreviewSourceFrames()
         let instruction = PIPCompositionInstruction(
             timeRange: wholeRange, screenTrackID: screenTrack.trackID, cameraTrackID: cameraTrackID,
             screenGeometry: sourceGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
-            cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state
+            cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state, cursorRecording: cursorRecording, previewFrames: previewFrames
         )
         let videoComposition = AVMutableVideoComposition()
         videoComposition.customVideoCompositorClass = PIPVideoCompositor.self
@@ -111,7 +125,7 @@ enum ProjectRenderer {
         videoComposition.instructions = [instruction]
         return RenderedProject(
             asset: composition, videoComposition: videoComposition,
-            screenSize: renderSize, cameraAspect: cameraAspect
+            screenSize: renderSize, cameraAspect: cameraAspect, previewFrames: previewFrames
         )
     }
 
@@ -127,7 +141,8 @@ enum ProjectRenderer {
             return instruction
         }
         return RenderedProject(asset: rendered.asset, videoComposition: videoComposition,
-                               screenSize: rendered.screenSize, cameraAspect: rendered.cameraAspect)
+                               screenSize: rendered.screenSize, cameraAspect: rendered.cameraAspect,
+                               previewFrames: rendered.previewFrames)
     }
 
     /// Decode the current screen/camera source pair once for a frozen playhead.
@@ -137,6 +152,7 @@ enum ProjectRenderer {
         guard time.seconds.isFinite, time >= .zero, time < rendered.asset.duration else {
             throw RenderError.invalidTrim
         }
+        if let native = rendered.previewFrames.sources(at: time) { return native }
         let capture = FocusedFrameCapture(target: time, frameDuration: rendered.videoComposition.frameDuration)
         let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
         videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
@@ -156,6 +172,10 @@ enum ProjectRenderer {
                 _ = try await generator.image(at: time)
                 try Task.checkCancellation()
                 guard let sources = capture.finish() else { throw RenderError.cannotExport }
+                // Raw CVPixelBuffers remain valid independently of the decoder.
+                // Retire its prefetched work before returning this frozen pair,
+                // rather than keeping codec generations alive between seeks.
+                preparation.cancel()
                 return sources
             } catch {
                 preparation.cancel()
@@ -183,14 +203,15 @@ enum ProjectRenderer {
         let duration = try await asset.load(.duration).seconds
         guard cameraTime >= 0, cameraTime < duration else { return nil }
         let generator = AVAssetImageGenerator(asset: asset)
+        defer { generator.cancelAllCGImageGeneration() }
         generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
         return try await generator.image(at: time(cameraTime)).image
     }
 
     static func export(project: RecordingProject, directory: URL, to destination: URL) async throws {
-        let originalURLs = [project.screenFilename, project.cameraFilename].compactMap { $0 }.map {
+        let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }.map {
             directory.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()
         }
         guard !FileManager.default.fileExists(atPath: destination.path),

@@ -1,15 +1,35 @@
 @preconcurrency import AVFoundation
 import AudioToolbox
 import CoreGraphics
+import CoreImage
 import Foundation
 
 @main
 @MainActor
 struct ProjectRendererChecks {
     enum CheckError: Error { case failed(String) }
+    private static var cachedConsumer: NativeFrameConsumer?
+    private static var phaseStarted = ContinuousClock.now
+    private static var phase = "fixture creation" {
+        didSet { phaseStarted = .now }
+    }
 
     @MainActor
     static func main() async throws {
+        let watchdog = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                if ContinuousClock.now - phaseStarted >= .seconds(30) {
+                    FileHandle.standardError.write(Data("Renderer check timed out during \(phase).\n".utf8))
+                    exit(1)
+                }
+            }
+        }
+        defer {
+            watchdog.cancel()
+            cachedConsumer?.close()
+            cachedConsumer = nil
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-render-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -57,6 +77,10 @@ struct ProjectRendererChecks {
         try await frame(earlyRender, at: 0, expected: CGRect(x: 0, y: 0, width: 40, height: 20), yellow: true)
         try await frame(earlyRender, at: 3.5, expected: nil)
 
+        guard let currentCameraFrame = try await ProjectRenderer.cameraFrame(project: project, directory: directory, at: 2.01) else {
+            throw CheckError.failed("current camera frame is available for framing")
+        }
+        try pixel(currentCameraFrame, x: 40, y: 20, equals: [255, 255, 0])
         let plain = RecordingProject(screenFilename: "screen.mov", duration: 5)
         let plainRender = try await ProjectRenderer.makePreview(project: plain, directory: directory)
         try await frame(plainRender, at: 0.5, expected: nil)
@@ -76,8 +100,14 @@ struct ProjectRendererChecks {
         tinyOverlap.cameraOffset = 4.999999
         _ = try await ProjectRenderer.makePreview(project: tinyOverlap, directory: directory)
 
+        phase = "geometryChecks"
         try await geometryChecks(project: project, directory: directory)
+        phase = "draftChecks"
         try await draftChecks(project: project, directory: directory)
+        phase = "zoomChecks"
+        try await zoomChecks(directory: directory)
+        phase = "cursorChecks"
+        try await cursorChecks(directory: directory)
 
         project.state.trimStart = 1
         project.state.trimEnd = 3.5
@@ -89,6 +119,7 @@ struct ProjectRendererChecks {
         let exportedDuration = try await exported.load(.duration).seconds
         try require(abs(exportedDuration - 2.5) < 1.0 / 30, "trim export duration")
         let generator = AVAssetImageGenerator(asset: exported)
+        defer { generator.cancelAllCGImageGeneration() }
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
         let (firstImage, _) = try await generator.image(at: .zero)
@@ -105,7 +136,240 @@ struct ProjectRendererChecks {
         } catch ProjectRenderer.RenderError.destinationExists { }
         try require(try Data(contentsOf: screen) == originalScreen, "screen source remains byte-identical")
         try require(try Data(contentsOf: camera) == originalCamera, "camera source remains byte-identical")
-        print("Project renderer checks passed (jump, easing, timed shapes, repositionable crops, circle alpha, orientation, sync offsets, independent audio tracks, trim, preview/export parity, source preservation).")
+        print("Project renderer checks passed (editable cursor/clicks, manual/source zoom/pan, jump, easing, timed shapes, repositionable crops, circle alpha, orientation, sync offsets, independent audio tracks, trim, preview/export parity, source preservation).")
+    }
+
+    private static func cursorChecks(directory: URL) async throws {
+        let recording = CursorRecording(duration: 5, logicalWidth: 160, logicalHeight: 120,
+            samples: [CursorSample(time: 0, x: 0.5, y: 0.3), CursorSample(time: 5, x: 0.5, y: 0.3)], clicks: [])
+        let cursorURL = directory.appendingPathComponent("cursor.json")
+        try recording.write(to: cursorURL)
+        let originalCursor = try Data(contentsOf: cursorURL)
+        var project = RecordingProject(screenFilename: "screen.mov", cursorFilename: "cursor.json", duration: 5)
+        project.state.cursorStyle = CursorStyle(visible: true, size: 1.5, smoothing: 0, clickHighlight: false)
+        let normal = try await image(project, directory: directory, at: 0.5)
+        guard let normalBounds = try matchingBounds(normal, matches: { $0 > 180 && $1 > 180 && $2 > 180 }) else {
+            throw CheckError.failed("editable cursor is visible")
+        }
+        try require(abs(normalBounds.minX - 80) <= 3 && abs(normalBounds.minY - 36) <= 3,
+                    "cursor tip hotspot remains on recorded source point: \(normalBounds)")
+        try require(normalBounds.width > 20 && normalBounds.height > 30, "default pointer is large and readable")
+        try pixel(normal, x: 83, y: 46, equals: [255, 255, 255])
+        let rendered = try await ProjectRenderer.makePreview(project: project, directory: directory)
+        let sources = try await preparedSources(rendered, at: CMTime(seconds: 0.5, preferredTimescale: 600))
+        var larger = project.state
+        larger.cursorStyle.size = 3
+        let largeImage = try await ProjectRenderer.renderLivePreview(sources, applying: larger)
+        guard let largerBounds = try matchingBounds(largeImage, matches: { $0 > 180 && $1 > 180 && $2 > 180 }) else {
+            throw CheckError.failed("enlarged live cursor is visible")
+        }
+        try require(abs(largerBounds.width - normalBounds.width * 2) <= 4 &&
+                    abs(largerBounds.height - normalBounds.height * 2) <= 4,
+                    "cursor size scales while retaining its source hotspot")
+        var hidden = project.state
+        hidden.cursorStyle.visible = false
+        let hiddenImage = try await ProjectRenderer.renderLivePreview(sources, applying: hidden)
+        try blueOnly(hiddenImage)
+        var zoomed = project
+        zoomed.state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 2, x: 0.7, y: 0.5)]
+        let zoomImage = try await image(zoomed, directory: directory, at: 0.5)
+        guard let zoomBounds = try matchingBounds(zoomImage, matches: { $0 > 180 && $1 > 180 && $2 > 180 }) else {
+            throw CheckError.failed("zoomed cursor is visible")
+        }
+        try require(abs(zoomBounds.minX - (16 + 2 * (normalBounds.minX - 80))) <= 2 &&
+                    abs(zoomBounds.minY - (12 + 2 * (normalBounds.minY - 36))) <= 2 &&
+                    abs(zoomBounds.width - normalBounds.width * 2) <= 4,
+                    "cursor position and size follow the screen zoom/pan viewport: \(zoomBounds)")
+        let zoomLive = try await ProjectRenderer.renderLivePreview(sources, applying: zoomed.state)
+        let zoomDifference = zip(try rgba(zoomLive), try rgba(zoomImage)).map { abs(Int($0) - Int($1)) }.max() ?? 0
+        try require(zoomDifference <= 1, "cached cursor/zoom graph matches saved rendering")
+
+        // Camera overlays are composed after the cursor, so the pointer cannot
+        // float over a presenter's face when it passes beneath that frame.
+        project.cameraFilename = "camera.mov"
+        project.state.pipKeyframes = [PIPKeyframe(time: 0,
+            placement: PIPPlacement(x: 1, y: 35.0 / 80, scale: 0.5))]
+        let occluded = try await image(project, directory: directory, at: 0.5)
+        try require(try matchingBounds(occluded, matches: { $0 > 180 && $1 > 180 && $2 > 180 }) == nil,
+                    "camera overlay covers cursor pixels")
+        project.cameraFilename = nil
+
+        let invisible = CursorRecording(duration: 5, logicalWidth: 160, logicalHeight: 120,
+            samples: [CursorSample(time: 0, x: 0.5, y: 0.5, visible: false),
+                      CursorSample(time: 5, x: 0.5, y: 0.5, visible: false)],
+            clicks: [CursorClick(time: 0.25, x: 0.5, y: 0.5, button: 0)])
+        try invisible.write(to: directory.appendingPathComponent("clicks.json"))
+        project.cursorFilename = "clicks.json"
+        project.state.cursorStyle.clickHighlight = true
+        let click = try await image(project, directory: directory, at: 0.35)
+        try pixel(click, x: 80, y: 60, equals: [0, 0, 255])
+        try require(try matchingBounds(click, matches: { $0 < 150 && $1 > 40 && $2 > 180 }) != nil,
+                    "recorded click creates a visible hollow pulse even after pointer leaves source")
+        project.state.cursorStyle.clickHighlight = false
+        let noClick = try await image(project, directory: directory, at: 0.35)
+        try blueOnly(noClick)
+        project.state.cursorStyle.clickHighlight = true
+        let expired = try await image(project, directory: directory, at: 0.8)
+        try blueOnly(expired)
+        project.state.cursorStyle.visible = false
+        let noCursor = try await image(project, directory: directory, at: 0.35)
+        try blueOnly(noCursor)
+
+        let jitter = CursorRecording(duration: 5, logicalWidth: 160, logicalHeight: 120,
+            samples: [CursorSample(time: 0, x: 0.2, y: 0.2), CursorSample(time: 0.49, x: 0.2, y: 0.2),
+                      CursorSample(time: 0.5, x: 0.8, y: 0.2), CursorSample(time: 0.51, x: 0.2, y: 0.2),
+                      CursorSample(time: 5, x: 0.2, y: 0.2)], clicks: [])
+        try jitter.write(to: directory.appendingPathComponent("jitter.json"))
+        project.cursorFilename = "jitter.json"
+        project.state.cursorStyle = CursorStyle(visible: true, size: 1.5, smoothing: 0, clickHighlight: false)
+        let raw = try await image(project, directory: directory, at: 0.5)
+        project.state.cursorStyle.smoothing = 1
+        let smoothed = try await image(project, directory: directory, at: 0.5)
+        guard let rawBounds = try matchingBounds(raw, matches: { $0 > 180 && $1 > 180 && $2 > 180 }),
+              let smoothBounds = try matchingBounds(smoothed, matches: { $0 > 180 && $1 > 180 && $2 > 180 }) else {
+            throw CheckError.failed("smoothed cursor rendered")
+        }
+        try require(smoothBounds.minX < rawBounds.minX - 40, "offline smoothing suppresses isolated pointer jitter")
+
+        project.cursorFilename = "cursor.json"
+        project.state.cursorStyle.smoothing = 0
+        project.state.trimStart = 0.5
+        project.state.trimEnd = 1.0
+        let exportURL = directory.appendingPathComponent("cursor-export.mp4")
+        try await ProjectRenderer.export(project: project, directory: directory, to: exportURL)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: exportURL))
+        defer { generator.cancelAllCGImageGeneration() }
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (exported, _) = try await generator.image(at: .zero)
+        try colorBounds(exported, color: [255, 255, 255], equals: normalBounds)
+        try require(try Data(contentsOf: cursorURL) == originalCursor, "pointer edits preserve immutable recorded metadata")
+    }
+
+    private static func matchingBounds(_ image: CGImage, matches: (Int, Int, Int) -> Bool) throws -> CGRect? {
+        let bytes = try rgba(image)
+        var minX = image.width, minY = image.height, maxX = -1, maxY = -1
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                let offset = (y * image.width + x) * 4
+                if matches(Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2])) {
+                    minX = min(minX, x); minY = min(minY, y); maxX = max(maxX, x); maxY = max(maxY, y)
+                }
+            }
+        }
+        return maxX >= 0 ? CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1) : nil
+    }
+
+    private static func blueOnly(_ image: CGImage) throws {
+        let bytes = try rgba(image)
+        for offset in Swift.stride(from: 0, to: bytes.count, by: 4) {
+            try require(bytes[offset] < 40 && bytes[offset + 1] < 40 && bytes[offset + 2] > 180,
+                        "hidden or expired pointer pixels must reveal the original screen")
+        }
+    }
+
+    private static func zoomChecks(directory: URL) async throws {
+        let source = directory.appendingPathComponent("zoom-screen.mov")
+        try await movie(to: source, width: 160, height: 120, duration: 5, camera: false, zoomMarkers: true)
+        let original = try Data(contentsOf: source)
+        var project = RecordingProject(screenFilename: "zoom-screen.mov", duration: 5)
+        project.state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 2, x: 0.5, y: 0.5)]
+        phase = "centered zoom rendering"
+        let center = try await image(project, directory: directory, at: 0.5)
+        try colorBounds(center, color: [255, 0, 0], equals: CGRect(x: 20, y: 20, width: 20, height: 20))
+        try opaqueEdges(center)
+        for (x, y, color, expected) in [
+            (0.0, 0.0, [255, 255, 0], CGRect(x: 20, y: 20, width: 20, height: 20)),
+            (1.0, 0.0, [0, 255, 255], CGRect(x: 60, y: 40, width: 20, height: 20)),
+            (0.0, 1.0, [255, 255, 255], CGRect(x: 40, y: 60, width: 20, height: 20)),
+            (1.0, 1.0, [255, 0, 255], CGRect(x: 120, y: 80, width: 20, height: 20))
+        ] {
+            phase = "corner zoom rendering at \(x),\(y)"
+            project.state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 2, x: x, y: y)]
+            let corner = try await image(project, directory: directory, at: 0.5)
+            try colorBounds(corner, color: color, equals: expected)
+            try opaqueEdges(corner)
+        }
+        project.state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 3, x: 1, y: 1)]
+        let close = try await image(project, directory: directory, at: 0.5)
+        try colorBounds(close, color: [255, 0, 255], equals: CGRect(x: 100, y: 60, width: 30, height: 30))
+        try opaqueEdges(close)
+
+        // The screen camera moves; the presenter's camera remains anchored to
+        // the output canvas and its source pixels are never magnified with it.
+        project.cameraFilename = "camera.mov"
+        project.state.pipKeyframes = [PIPKeyframe(time: 0, placement: PIPPlacement(x: 1, y: 1, scale: 0.25))]
+        let withPIP = try await image(project, directory: directory, at: 0.5)
+        try checkBounds(withPIP, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+        project.cameraFilename = nil
+        project.state.zoomKeyframes = [
+            ZoomKeyframe(time: 0),
+            ZoomKeyframe(time: 1, scale: 2, x: 0.5, y: 0.5),
+            ZoomKeyframe(time: 3, scale: 3, x: 1, y: 1, transition: .smooth, duration: 1)
+        ]
+        let beforeJump = try await image(project, directory: directory, at: 29.0 / 30)
+        try colorBounds(beforeJump, color: [255, 0, 0], equals: CGRect(x: 50, y: 40, width: 10, height: 10))
+        let jump = try await image(project, directory: directory, at: 1)
+        try colorBounds(jump, color: [255, 0, 0], equals: CGRect(x: 20, y: 20, width: 20, height: 20))
+        let smooth = try await image(project, directory: directory, at: 2.5)
+        try colorBounds(smooth, color: [255, 128, 0], equals: CGRect(x: 63.333, y: 35, width: 25, height: 25))
+        let arrived = try await image(project, directory: directory, at: 3)
+        try colorBounds(arrived, color: [255, 0, 255], equals: CGRect(x: 100, y: 60, width: 30, height: 30))
+
+        var base = project
+        base.state.zoomKeyframes = []
+        let rendered = try await ProjectRenderer.makePreview(project: base, directory: directory)
+        phase = "zoom live-source preparation"
+        let sources = try await preparedSources(rendered, at: CMTime(seconds: 2.5, preferredTimescale: 600))
+        let live = try await ProjectRenderer.renderLivePreview(sources, applying: project.state)
+        let liveBytes = try rgba(live), smoothBytes = try rgba(smooth)
+        let maxDifference = zip(liveBytes, smoothBytes).map { abs(Int($0) - Int($1)) }.max() ?? 0
+        try require(maxDifference <= 1, "cached live zoom/pan differs beyond 8-bit output rounding: \(maxDifference)")
+        let unzoomed = try await ProjectRenderer.renderLivePreview(sources, applying: base.state)
+        try colorBounds(unzoomed, color: [255, 0, 0], equals: CGRect(x: 50, y: 40, width: 10, height: 10))
+
+        project.state.trimStart = 2.5
+        project.state.trimEnd = 3.5
+        let exportURL = directory.appendingPathComponent("zoom-export.mp4")
+        phase = "zoom export"
+        try await ProjectRenderer.export(project: project, directory: directory, to: exportURL)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: exportURL))
+        defer { generator.cancelAllCGImageGeneration() }
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (exportStart, _) = try await generator.image(at: .zero)
+        try colorBounds(exportStart, color: [255, 128, 0], equals: CGRect(x: 63.333, y: 35, width: 25, height: 25))
+        let (exportEnd, _) = try await generator.image(at: CMTime(seconds: 0.5, preferredTimescale: 600))
+        try colorBounds(exportEnd, color: [255, 0, 255], equals: CGRect(x: 100, y: 60, width: 30, height: 30))
+        try require(try Data(contentsOf: source) == original, "manual zoom preserves original recording bytes")
+    }
+
+    private static func colorBounds(_ image: CGImage, color: [Int], equals expected: CGRect) throws {
+        let bytes = try rgba(image)
+        var minX = image.width, minY = image.height, maxX = -1, maxY = -1
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                let offset = (y * image.width + x) * 4
+                if (0..<3).allSatisfy({ abs(Int(bytes[offset + $0]) - color[$0]) < 50 }) {
+                    minX = min(minX, x); minY = min(minY, y); maxX = max(maxX, x); maxY = max(maxY, y)
+                }
+            }
+        }
+        let actual = CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+        try require(maxX >= 0 && abs(actual.minX - expected.minX) <= 2 && abs(actual.minY - expected.minY) <= 2 &&
+                    abs(actual.width - expected.width) <= 3 && abs(actual.height - expected.height) <= 3,
+                    "zoomed marker bounds \(actual), expected \(expected)")
+    }
+
+    private static func opaqueEdges(_ image: CGImage) throws {
+        let bytes = try rgba(image)
+        for y in 0..<image.height {
+            for x in 0..<image.width where x == 0 || x == image.width - 1 || y == 0 || y == image.height - 1 {
+                let offset = (y * image.width + x) * 4
+                try require(bytes[offset + 3] == 255 && max(bytes[offset], bytes[offset + 1], bytes[offset + 2]) > 100,
+                            "screen zoom edge (\(x),\(y)) RGBA=\(Array(bytes[offset..<(offset + 4)])) must remain opaque and covered")
+            }
+        }
     }
 
     private static func draftChecks(project: RecordingProject, directory: URL) async throws {
@@ -162,7 +426,7 @@ struct ProjectRendererChecks {
         try require(try rgba(cropImage) == rgba(cropSaved), "draft crop and aspect pixels equal the saved edit")
 
         let frozenTime = CMTime(seconds: 0.5, preferredTimescale: 600)
-        let liveSources = try await ProjectRenderer.prepareLiveSources(base, at: frozenTime)
+        let liveSources = try await preparedSources(base, at: frozenTime)
         try require(liveSources.time == frozenTime, "live source pair remains tied to its frozen playhead")
         let liveImage = try await ProjectRenderer.renderLivePreview(liveSources, applying: savedProject.state)
         try require(try rgba(liveImage) == rgba(savedImage), "cached source move/resize/circle pixels equal saved composition")
@@ -174,10 +438,10 @@ struct ProjectRendererChecks {
         try require(smallLive.width == 80 && smallLive.height == 60, "cached source drafts respect bounded output size")
         try checkCircle(smallLive, frame: CGRect(x: 48, y: 28, width: 32, height: 32), color: [0, 255, 0])
 
-        let liveCropSources = try await ProjectRenderer.prepareLiveSources(croppedBase, at: frozenTime)
+        let liveCropSources = try await preparedSources(croppedBase, at: frozenTime)
         let liveCrop = try await ProjectRenderer.renderLivePreview(liveCropSources, applying: cropDraft)
         try require(try rgba(liveCrop) == rgba(cropSaved), "cached raw source crop/aspect pixels equal saved composition")
-        let laterSources = try await ProjectRenderer.prepareLiveSources(base, at: CMTime(seconds: 2.5, preferredTimescale: 600))
+        let laterSources = try await preparedSources(base, at: CMTime(seconds: 2.5, preferredTimescale: 600))
         let laterImage = try await ProjectRenderer.renderLivePreview(laterSources, applying: savedProject.state)
         try checkCircle(laterImage, frame: CGRect(x: 96, y: 56, width: 64, height: 64), color: [255, 255, 0])
         let earlierAgain = try await ProjectRenderer.renderLivePreview(liveSources, applying: savedProject.state)
@@ -186,13 +450,13 @@ struct ProjectRendererChecks {
         var delayed = baseProject
         delayed.cameraOffset = 1
         let delayedRender = try await ProjectRenderer.makePreview(project: delayed, directory: directory)
-        let beforeCamera = try await ProjectRenderer.prepareLiveSources(delayedRender, at: frozenTime)
+        let beforeCamera = try await preparedSources(delayedRender, at: frozenTime)
         let beforeImage = try await ProjectRenderer.renderLivePreview(beforeCamera, applying: savedProject.state)
         try checkBounds(beforeImage, expected: nil)
         var ended = baseProject
         ended.cameraOffset = -2
         let endedRender = try await ProjectRenderer.makePreview(project: ended, directory: directory)
-        let afterCamera = try await ProjectRenderer.prepareLiveSources(endedRender, at: CMTime(seconds: 3.5, preferredTimescale: 600))
+        let afterCamera = try await preparedSources(endedRender, at: CMTime(seconds: 3.5, preferredTimescale: 600))
         let afterImage = try await ProjectRenderer.renderLivePreview(afterCamera, applying: savedProject.state)
         try checkBounds(afterImage, expected: nil)
 
@@ -200,7 +464,7 @@ struct ProjectRendererChecks {
         var initiallyHidden = baseProject
         initiallyHidden.state.pipKeyframes[0].placement.visible = false
         let hiddenRender = try await ProjectRenderer.makePreview(project: initiallyHidden, directory: directory)
-        let hiddenSources = try await ProjectRenderer.prepareLiveSources(hiddenRender, at: frozenTime)
+        let hiddenSources = try await preparedSources(hiddenRender, at: frozenTime)
         let revealed = try await ProjectRenderer.renderLivePreview(hiddenSources, applying: savedProject.state)
         try require(try rgba(revealed) == rgba(liveImage), "hidden source camera can be revealed without another decode")
 
@@ -209,7 +473,7 @@ struct ProjectRendererChecks {
         betweenFrames.state.pipKeyframes.append(PIPKeyframe(time: 0.75,
             placement: PIPPlacement(x: 1, y: 1, scale: 0.4), transition: .smooth, duration: 0.75))
         let arbitraryTime = CMTime(seconds: 0.5173, preferredTimescale: 1_000_000)
-        let arbitrarySources = try await ProjectRenderer.prepareLiveSources(base, at: arbitraryTime)
+        let arbitrarySources = try await preparedSources(base, at: arbitraryTime)
         let arbitraryLive = try await ProjectRenderer.renderLivePreview(arbitrarySources, applying: betweenFrames.state)
         let arbitrarySaved = try await image(betweenFrames, directory: directory, at: arbitraryTime.seconds)
         try require(try rgba(arbitraryLive) == rgba(arbitrarySaved), "cached source edits preserve sub-frame frozen playhead timing")
@@ -255,12 +519,89 @@ struct ProjectRendererChecks {
         try require(completed.finish() == nil, "completed source preparation rejects late callbacks")
     }
 
+    /// Decode through the same native player path used by the editor. The
+    /// output is the display consumer for this headless test; no capture device
+    /// or separate custom-composition image generator is involved.
+    @MainActor
+    private final class NativeFrameConsumer {
+        let rendered: RenderedProject
+        private let item: AVPlayerItem
+        private let output: AVPlayerItemVideoOutput
+        private let player: AVPlayer
+        private let context = CIContext(options: [.cacheIntermediates: false])
+        private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+
+        init(rendered: RenderedProject, target: CMTime) {
+            self.rendered = rendered
+            rendered.previewFrames.request(at: target)
+            item = AVPlayerItem(asset: rendered.asset)
+            item.videoComposition = rendered.videoComposition
+            item.seekingWaitsForVideoCompositionRendering = true
+            output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ])
+            output.suppressesPlayerRendering = true
+            item.add(output)
+            player = AVPlayer(playerItem: item)
+            player.isMuted = true
+        }
+
+        func close() {
+            player.pause()
+            item.remove(output)
+            player.replaceCurrentItem(with: nil)
+        }
+
+        func image(at target: CMTime) async throws -> CGImage {
+            try Task.checkCancellation()
+            let readyDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while item.status == .unknown, ContinuousClock.now < readyDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard item.status == .readyToPlay else {
+                throw item.error ?? CheckError.failed("native renderer item is ready")
+            }
+            rendered.previewFrames.request(at: target)
+            guard await player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) else {
+                throw item.error ?? CheckError.failed("native renderer seek completed at \(target.seconds)s")
+            }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while ContinuousClock.now < deadline {
+                try Task.checkCancellation()
+                if item.status == .failed { throw item.error ?? CheckError.failed("native renderer item failed") }
+                if let error = player.error { throw error }
+                let result: CGImage? = autoreleasepool {
+                    var display = CMTime.invalid
+                    guard let buffer = output.copyPixelBuffer(forItemTime: target, itemTimeForDisplay: &display),
+                          display.seconds.isFinite,
+                          abs(display.seconds - target.seconds) <= rendered.videoComposition.frameDuration.seconds + 0.000_001 else { return nil }
+                    let image = CIImage(cvPixelBuffer: buffer)
+                    return context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: colorSpace)
+                }
+                if let result { return result }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            throw CheckError.failed("native renderer supplied no frame at \(target.seconds)s")
+        }
+    }
+
     private static func image(_ rendered: RenderedProject, at seconds: Double) async throws -> CGImage {
-        let generator = AVAssetImageGenerator(asset: rendered.asset)
-        generator.videoComposition = rendered.videoComposition
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)).image
+        let target = CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
+        let consumer: NativeFrameConsumer
+        if let cachedConsumer, cachedConsumer.rendered.asset === rendered.asset,
+           cachedConsumer.rendered.videoComposition === rendered.videoComposition {
+            consumer = cachedConsumer
+        } else {
+            cachedConsumer?.close()
+            consumer = NativeFrameConsumer(rendered: rendered, target: target)
+            cachedConsumer = consumer
+        }
+        return try await consumer.image(at: target)
+    }
+
+    private static func preparedSources(_ rendered: RenderedProject, at time: CMTime) async throws -> LivePreviewSources {
+        _ = try await image(rendered, at: time.seconds)
+        return try await ProjectRenderer.prepareLiveSources(rendered, at: time)
     }
 
     private static func geometryChecks(project: RecordingProject, directory: URL) async throws {
@@ -278,6 +619,28 @@ struct ProjectRendererChecks {
         let leftImage = try await image(left, directory: directory, at: 0.5)
         try pixel(leftImage, x: 10, y: 10, equals: red)
         try pixel(leftImage, x: 10, y: 30, equals: yellow)
+        var internallyZoomed = left
+        internallyZoomed.state.pipKeyframes[0].placement.sourceZoom = 2
+        internallyZoomed.state.pipKeyframes[0].placement.crop.y = 0
+        let internalClose = try await image(internallyZoomed, directory: directory, at: 0.5)
+        try pixel(internalClose, x: 10, y: 10, equals: red)
+        try pixel(internalClose, x: 10, y: 30, equals: red)
+        try pixel(internalClose, x: 45, y: 30, equals: [0, 0, 255])
+        internallyZoomed.state.pipKeyframes = [left.state.pipKeyframes[0],
+            PIPKeyframe(time: 2, placement: internallyZoomed.state.pipKeyframes[0].placement,
+                        transition: .smooth, duration: 1)]
+        let internalBefore = try await image(internallyZoomed, directory: directory, at: 1)
+        try pixel(internalBefore, x: 10, y: 30, equals: yellow)
+        let internalDuring = try await image(internallyZoomed, directory: directory, at: 1.5)
+        try pixel(internalDuring, x: 10, y: 20, equals: red)
+        try pixel(internalDuring, x: 10, y: 35, equals: yellow)
+        let internalAfter = try await image(internallyZoomed, directory: directory, at: 2)
+        try pixel(internalAfter, x: 10, y: 30, equals: red)
+        let internalBase = try await ProjectRenderer.makePreview(project: left, directory: directory)
+        let internalSources = try await preparedSources(internalBase, at: CMTime(seconds: 1.5, preferredTimescale: 600))
+        let internalLive = try await ProjectRenderer.renderLivePreview(internalSources, applying: internallyZoomed.state)
+        let internalDifference = zip(try rgba(internalLive), try rgba(internalDuring)).map { abs(Int($0) - Int($1)) }.max() ?? 0
+        try require(internalDifference <= 1, "camera source zoom shares live/saved viewport rendering")
         let right = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .square, crop: PIPCrop(x: 1, y: 0.5)))
         let rightImage = try await image(right, directory: directory, at: 0.5)
         try pixel(rightImage, x: 10, y: 10, equals: green)
@@ -367,6 +730,7 @@ struct ProjectRendererChecks {
         let exportURL = directory.appendingPathComponent("circle-export.mp4")
         try await ProjectRenderer.export(project: timed, directory: directory, to: exportURL)
         let exportedGenerator = AVAssetImageGenerator(asset: AVURLAsset(url: exportURL))
+        defer { exportedGenerator.cancelAllCGImageGeneration() }
         exportedGenerator.requestedTimeToleranceBefore = .zero
         exportedGenerator.requestedTimeToleranceAfter = .zero
         let (first, _) = try await exportedGenerator.image(at: .zero)
@@ -377,11 +741,7 @@ struct ProjectRendererChecks {
 
     private static func image(_ project: RecordingProject, directory: URL, at seconds: Double) async throws -> CGImage {
         let rendered = try await ProjectRenderer.makePreview(project: project, directory: directory)
-        let generator = AVAssetImageGenerator(asset: rendered.asset)
-        generator.videoComposition = rendered.videoComposition
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)).image
+        return try await image(rendered, at: seconds)
     }
 
     private static func rgba(_ image: CGImage) throws -> [UInt8] {
@@ -425,11 +785,8 @@ struct ProjectRendererChecks {
 
     @MainActor
     private static func frame(_ rendered: RenderedProject, at seconds: Double, expected: CGRect?, yellow: Bool = false) async throws {
-        let generator = AVAssetImageGenerator(asset: rendered.asset)
-        generator.videoComposition = rendered.videoComposition
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        let (image, _) = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000))
+        phase = "source-frame rendering at \(seconds)s"
+        let image = try await image(rendered, at: seconds)
         try checkBounds(image, expected: expected, yellow: yellow)
     }
 
@@ -522,10 +879,13 @@ struct ProjectRendererChecks {
         return buffer
     }
 
-    private static func movie(to url: URL, width: Int, height: Int, duration: Int, camera: Bool, transform: CGAffineTransform = .identity, pattern: Bool = false) async throws {
+    private static func movie(to url: URL, width: Int, height: Int, duration: Int, camera: Bool, transform: CGAffineTransform = .identity, pattern: Bool = false, zoomMarkers: Bool = false) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
+            // Small color fiducials use 4:4:4; ordinary screen/camera fixtures
+            // retain H264 with independent AAC tracks and MP4 export readback.
+            AVVideoCodecKey: zoomMarkers ? AVVideoCodecType.proRes4444 : AVVideoCodecType.h264,
+            AVVideoWidthKey: width, AVVideoHeightKey: height,
             AVVideoColorPropertiesKey: [
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
@@ -554,7 +914,7 @@ struct ProjectRendererChecks {
         guard writer.startWriting() else { throw writer.error ?? CheckError.failed("start synthetic writer") }
         writer.startSession(atSourceTime: .zero)
         let video = Task { @MainActor in
-            try await fillVideo(input, adaptor: adaptor, writer: writer, width: width, height: height, duration: duration, camera: camera, pattern: pattern)
+            try await fillVideo(input, adaptor: adaptor, writer: writer, width: width, height: height, duration: duration, camera: camera, pattern: pattern, zoomMarkers: zoomMarkers)
         }
         var audioTasks: [Task<Void, any Error>] = []
         for (track, audio) in audioInputs.enumerated() {
@@ -575,7 +935,7 @@ struct ProjectRendererChecks {
         guard writer.status == .completed else { throw writer.error ?? CheckError.failed("finish synthetic writer") }
     }
     private static func fillVideo(_ input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, writer: AVAssetWriter,
-                                  width: Int, height: Int, duration: Int, camera: Bool, pattern: Bool) async throws {
+                                  width: Int, height: Int, duration: Int, camera: Bool, pattern: Bool, zoomMarkers: Bool) async throws {
         for index in 0..<(duration * 30) {
             try await ready(input, writer: writer)
             var buffer: CVPixelBuffer?
@@ -591,6 +951,17 @@ struct ProjectRendererChecks {
                     base[offset + 1] = camera ? 255 : 0
                     base[offset + 2] = camera && index >= 60 ? 255 : 0
                     base[offset + 3] = 255
+                    if zoomMarkers {
+                        let rgb: [UInt8]?
+                        if (50..<60).contains(x), (40..<50).contains(y) { rgb = [255, 0, 0] }
+                        else if (10..<20).contains(x), (10..<20).contains(y) { rgb = [255, 255, 0] }
+                        else if (140..<150).contains(x), (100..<110).contains(y) { rgb = [255, 0, 255] }
+                        else if (110..<120).contains(x), (20..<30).contains(y) { rgb = [0, 255, 255] }
+                        else if (100..<110).contains(x), (70..<80).contains(y) { rgb = [255, 128, 0] }
+                        else if (20..<30).contains(x), (90..<100).contains(y) { rgb = [255, 255, 255] }
+                        else { rgb = nil }
+                        if let rgb { base[offset] = rgb[2]; base[offset + 1] = rgb[1]; base[offset + 2] = rgb[0] }
+                    }
                     if pattern {
                         let rgb: [UInt8]
                         if y < height / 2 { rgb = x < width / 2 ? [255, 0, 0] : [0, 255, 0] }

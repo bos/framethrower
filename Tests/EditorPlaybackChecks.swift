@@ -171,7 +171,8 @@ struct EditorPlaybackChecks {
         try require(editor.save(), "test project save")
         let originalProject = try Data(contentsOf: editor.url)
         let playback = EditorPlayback()
-        defer { playback.close() }
+        let display = HeadlessPlayerDisplay(player: playback.player)
+        defer { display.close(); playback.close() }
         await playback.rebuild(editor: editor)
         _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
         let item = playback.player.currentItem
@@ -264,7 +265,6 @@ struct EditorPlaybackChecks {
         let playback = EditorPlayback()
         defer { playback.close() }
         await playback.rebuild(editor: editor)
-        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270))
         guard let item = playback.player.currentItem else { throw PlaybackCheckError.failed("missing native player item") }
         try require(item.seekingWaitsForVideoCompositionRendering,
                     "native seek timing must wait for custom-composed frames before chasing the next target")
@@ -274,6 +274,7 @@ struct EditorPlaybackChecks {
         output.suppressesPlayerRendering = true
         item.add(output)
         defer { item.remove(output) }
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270), videoOutput: output)
         playback.beginScrubbing()
         var displayedColors = Set<UInt8>()
         var displayedFrames = Set<Int>()
@@ -286,16 +287,18 @@ struct EditorPlaybackChecks {
             try await Task.sleep(for: .milliseconds(16))
             try require(playback.isScrubbing && playback.stillFrame == nil,
                         "a stale still covered native video during active scrubbing")
-            let requested = playback.player.currentTime()
-            if output.hasNewPixelBuffer(forItemTime: requested) {
-                var displayed = CMTime.invalid
-                if let buffer = output.copyPixelBuffer(forItemTime: requested, itemTimeForDisplay: &displayed) {
-                    CVPixelBufferLockBaseAddress(buffer, .readOnly)
-                    let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
-                    let offset = 540 * CVPixelBufferGetBytesPerRow(buffer) + 960 * 4
-                    displayedColors.insert(bytes[offset + 2])
-                    CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
-                    if displayed.seconds.isFinite { displayedFrames.insert(Int((displayed.seconds * 30).rounded())) }
+            autoreleasepool {
+                let requested = playback.player.currentTime()
+                if output.hasNewPixelBuffer(forItemTime: requested) {
+                    var displayed = CMTime.invalid
+                    if let buffer = output.copyPixelBuffer(forItemTime: requested, itemTimeForDisplay: &displayed) {
+                        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+                        let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+                        let offset = 540 * CVPixelBufferGetBytesPerRow(buffer) + 960 * 4
+                        displayedColors.insert(bytes[offset + 2])
+                        CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+                        if displayed.seconds.isFinite { displayedFrames.insert(Int((displayed.seconds * 30).rounded())) }
+                    }
                 }
             }
         }
@@ -303,11 +306,22 @@ struct EditorPlaybackChecks {
                     "native video remained frozen before mouse-up (colors=\(displayedColors.count), frames=\(displayedFrames.count))")
         playback.endScrubbing()
         let deadline = Date().addingTimeInterval(5)
-        while playback.isScrubbing && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        try require(!playback.isScrubbing, "final chasing seek never settled")
+        while playback.isScrubbing && Date() < deadline {
+            // AVPlayerItemVideoOutput is the display consumer in this headless
+            // test. Keep pulling through mouse-up/final seek, just as a visible
+            // AVPlayerLayer continues its display loop after dragging ends.
+            autoreleasepool {
+                let requested = output.itemTime(forHostTime: CACurrentMediaTime())
+                if output.hasNewPixelBuffer(forItemTime: requested) {
+                    _ = output.copyPixelBuffer(forItemTime: requested, itemTimeForDisplay: nil)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try require(!playback.isScrubbing, "final chasing seek never settled (native=\(playback.player.currentTime().seconds),requested=\(playback.time),status=\(item.status.rawValue),error=\(String(describing:item.error)))")
         try require(abs(playback.player.currentTime().seconds - target) < 0.001,
                     "final native seek missed latest target")
-        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270))
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270), videoOutput: output)
         try require(playback.player.currentItem === item, "scrubbing replaced the native player item")
         playback.beginScrubbing()
         playback.scrub(to: 0.4)
@@ -320,9 +334,11 @@ struct EditorPlaybackChecks {
     }
 
     @MainActor
-    private static func waitForFrame(_ playback: EditorPlayback, expected: CGRect) async throws -> CGImage {
+    private static func waitForFrame(_ playback: EditorPlayback, expected: CGRect,
+                                     videoOutput: AVPlayerItemVideoOutput? = nil) async throws -> CGImage {
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
+            if let videoOutput { HeadlessPlayerDisplay.pull(videoOutput) }
             if let frame = playback.stillFrame, let bounds = try cameraBounds(frame),
                abs(bounds.minX - expected.minX) <= 2 && abs(bounds.minY - expected.minY) <= 2,
                abs(bounds.width - expected.width) <= 3 && abs(bounds.height - expected.height) <= 3 {
@@ -405,4 +421,58 @@ struct EditorPlaybackChecks {
         guard writer.status == .completed else { throw writer.error ?? PlaybackCheckError.failed("fixture finalization") }
     }
 
+}
+
+
+/// A real AVPlayerItemVideoOutput consumer supplies display demand in backend
+/// tests. The app's continuously displayed native AVPlayerLayer supplies it in UI.
+@MainActor
+private final class HeadlessPlayerDisplay {
+    private let player: AVPlayer
+    private var item: AVPlayerItem?
+    private var output: AVPlayerItemVideoOutput?
+    private var loop: Task<Void, Never>?
+
+    init(player: AVPlayer) {
+        self.player = player
+        loop = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.tick()
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+    }
+
+    private func tick() {
+        if player.currentItem !== item {
+            if let item, let output { item.remove(output) }
+            item = player.currentItem
+            output = nil
+            if let item {
+                let next = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+                ])
+                next.suppressesPlayerRendering = true
+                item.add(next)
+                output = next
+            }
+        }
+        if let output { Self.pull(output) }
+    }
+
+    static func pull(_ output: AVPlayerItemVideoOutput) {
+        autoreleasepool {
+            let time = output.itemTime(forHostTime: CACurrentMediaTime())
+            if time.isValid, output.hasNewPixelBuffer(forItemTime: time) {
+                _ = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil)
+            }
+        }
+    }
+
+    func close() {
+        loop?.cancel(); loop = nil
+        if let item, let output { item.remove(output) }
+        item = nil; output = nil
+    }
 }

@@ -22,7 +22,16 @@ struct ProjectPlaybackIntegrationChecks {
             PIPKeyframe(time: 1, placement: PIPPlacement(x: 1, y: 0, scale: 0.25, shape: .rectangle, aspectRatio: 4)),
             PIPKeyframe(time: 1.5, placement: PIPPlacement(x: 0, y: 1, scale: 0.4, shape: .circle, aspectRatio: 1), transition: .smooth, duration: 0.4)
         ]
+        let cursor = CursorRecording(duration: 3, logicalWidth: 160, logicalHeight: 120,
+            samples: [CursorSample(time: 0, x: 0.7, y: 0.5), CursorSample(time: 3, x: 0.7, y: 0.5)], clicks: [])
+        try cursor.write(to: directory.appendingPathComponent("cursor.json"))
+        project.cursorFilename = "cursor.json"
+        project.state.cursorStyle = CursorStyle(visible: true, size: 1, smoothing: 0.5, clickHighlight: false)
+        project.state.zoomKeyframes = [ZoomKeyframe(time: 0),
+            ZoomKeyframe(time: 1, scale: 1.8, x: 0.6, y: 0.5, transition: .smooth, duration: 0.4),
+            ZoomKeyframe(time: 2, transition: .smooth, duration: 0.4)]
         let delayed = try await play(project, directory: directory, cameraRange: 0.5..<2)
+        try require(delayed.cursorFrames >= 65, "real streaming cursor frames track smooth screen zoom/pan")
         try require(delayed.before > 5, "streaming playback emitted frames before delayed camera start")
         try require(delayed.after > 15, "streaming playback continued after camera source ended")
         try require(delayed.circles > 8 && delayed.rectangles >= 2 && delayed.moving >= 5,
@@ -30,16 +39,18 @@ struct ProjectPlaybackIntegrationChecks {
 
         project.cameraOffset = -0.5
         let early = try await play(project, directory: directory, cameraRange: 0..<1)
+        try require(early.cursorFrames >= 65, "cursor rendering remains independent of camera source offsets")
         try require(early.circles > 15, "camera that started earlier appears from screen time zero")
         try require(early.after > 35, "early camera end does not freeze or repeat its last frame")
         try await movie(to: directory.appendingPathComponent("late-screen.mov"), width: 160, height: 120, frames: 90, camera: false, firstFrame: 4)
         var delayedScreen = project
         delayedScreen.screenFilename = "late-screen.mov"
         delayedScreen.cameraOffset = 0.5
+        delayedScreen.cursorFilename = nil
         let screenGap = try await play(delayedScreen, directory: directory, cameraRange: 0.5..<2, screenStart: 4.0 / 30)
         try require(screenGap.initialScreenGap >= 2, "missing initial video samples render black without failing streaming playback")
         try require(screenGap.circles > 8 && screenGap.after > 15, "playback recovers after initial source gap and continues through camera end")
-        print("Project streaming playback checks passed (AVPlayerItemVideoOutput: \(delayed.frames + early.frames + screenGap.frames) frames, delayed/early camera, source gaps, timed circle/rectangle, smooth motion, missing initial screen samples, and clean item/player status).")
+        print("Project streaming playback checks passed (AVPlayerItemVideoOutput: \(delayed.frames + early.frames + screenGap.frames) frames, delayed/early camera, source gaps, timed circle/rectangle, smooth cursor/zoom motion, missing initial screen samples, and clean item/player status).")
     }
 
     private struct Counts {
@@ -50,6 +61,7 @@ struct ProjectPlaybackIntegrationChecks {
         var rectangles = 0
         var moving = 0
         var initialScreenGap = 0
+        var cursorFrames = 0
     }
 
     private static func play(_ project: RecordingProject, directory: URL, cameraRange: Range<Double>, screenStart: Double = 0) async throws -> Counts {
@@ -176,6 +188,32 @@ struct ProjectPlaybackIntegrationChecks {
             }
             counts.initialScreenGap += 1
             return
+        }
+        if project.cursorFilename != nil, project.state.cursorStyle.visible {
+            var whiteMinX = width, whiteMinY = height, whiteMaxX = -1, whiteMaxY = -1
+            for y in 0..<height {
+                for x in 0..<width {
+                    let offset = y * stride + x * 4
+                    if base[offset] > 180 && base[offset + 1] > 180 && base[offset + 2] > 180 {
+                        whiteMinX = min(whiteMinX, x); whiteMinY = min(whiteMinY, y)
+                        whiteMaxX = max(whiteMaxX, x); whiteMaxY = max(whiteMaxY, y)
+                    }
+                }
+            }
+            let zoom = project.state.zoom(at: seconds)
+            let viewport = zoom.viewport(in: CGSize(width: width, height: height))
+            let hotspot = CGPoint(x: (0.7 * Double(width) - viewport.minX) * zoom.scale,
+                                  y: (0.5 * Double(height) - viewport.minY) * zoom.scale)
+            let cursorWidth = Double(whiteMaxX - whiteMinX + 1)
+            let cursorHeight = Double(whiteMaxY - whiteMinY + 1)
+            try require(whiteMaxX >= 0 && Double(whiteMinX) >= hotspot.x - 2 &&
+                        Double(whiteMinX) <= hotspot.x + 4 * zoom.scale &&
+                        Double(whiteMinY) >= hotspot.y - 2 && Double(whiteMinY) <= hotspot.y + 4 * zoom.scale,
+                        "streaming cursor hotspot follows source viewport at \(seconds)")
+            try require(cursorWidth >= 12 * zoom.scale && cursorWidth <= 19 * zoom.scale &&
+                        cursorHeight >= 20 * zoom.scale && cursorHeight <= 27 * zoom.scale,
+                        "streaming cursor size follows smooth zoom scale at \(seconds)")
+            counts.cursorFrames += 1
         }
         // Avoid a one-frame boundary ambiguity between output timebases; test
         // the complete stable intervals on both sides of each source boundary.

@@ -40,11 +40,11 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
         super.init()
     }
     func applying(_ state: EditState, focusedCapture: FocusedFrameCapture? = nil,
-                  preservePreviewFrames: Bool = true) -> PIPCompositionInstruction {
+                  preservePreviewFrames: Bool = true, renderSize: CGSize? = nil) -> PIPCompositionInstruction {
         PIPCompositionInstruction(timeRange: timeRange, screenTrackID: screenTrackID, cameraTrackID: cameraTrackID,
                                   screenGeometry: screenGeometry, cameraGeometry: cameraGeometry,
-                                  renderSize: PresentationGeometry(sourceSize: screenGeometry.size,
-                                                                   presentation: state.presentation).outputSize,
+                                  renderSize: renderSize ?? PresentationGeometry(sourceSize: screenGeometry.size,
+                                                                                presentation: state.presentation).outputSize,
                                   cameraStart: cameraStart, cameraEnd: cameraEnd, state: state, focusedCapture: focusedCapture,
                                   cursorRecording: cursorRecording,
                                   previewFrames: preservePreviewFrames && focusedCapture == nil ? previewFrames : nil)

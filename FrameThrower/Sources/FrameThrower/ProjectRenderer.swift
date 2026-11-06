@@ -1,6 +1,37 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+enum VideoExportPreset: String, CaseIterable, Sendable {
+    case fullResolution, hd, small
+
+    var title: String {
+        switch self {
+        case .fullResolution: "Full resolution"
+        case .hd: "1080p"
+        case .small: "720p"
+        }
+    }
+
+    /// Fit within the named video bounds, rotating them for portrait output.
+    /// Squares use 1080/720 on both axes; smaller recordings are never enlarged.
+    func outputSize(for source: CGSize) -> CGSize {
+        guard source.width.isFinite, source.height.isFinite, source.width > 0, source.height > 0 else {
+            return CGSize(width: 2, height: 2)
+        }
+        let scale: CGFloat
+        if self == .fullResolution { scale = 1 }
+        else {
+            let short: CGFloat = self == .hd ? 1080 : 720
+            let long: CGFloat = self == .hd ? 1920 : 1280
+            let bounds = source.width == source.height ? CGSize(width: short, height: short)
+                : source.width > source.height ? CGSize(width: long, height: short) : CGSize(width: short, height: long)
+            scale = min(1, bounds.width / source.width, bounds.height / source.height)
+        }
+        func even(_ value: CGFloat) -> CGFloat { max(2, (value / 2).rounded(.down) * 2) }
+        return CGSize(width: even(source.width * scale), height: even(source.height * scale))
+    }
+}
+
 /// Both the editor's AVPlayerItem and exported movie use this exact composition.
 /// Times remain in source seconds; trimming is applied only when playing/exporting.
 struct RenderedProject {
@@ -214,29 +245,71 @@ enum ProjectRenderer {
         return try await generator.image(at: time(cameraTime)).image
     }
 
-    static func export(project: RecordingProject, directory: URL, to destination: URL) async throws {
+    static func export(project: RecordingProject, directory: URL, to destination: URL,
+                       preset: VideoExportPreset = .fullResolution,
+                       replaceExisting: Bool = false,
+                       progress: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) async throws {
+        try Task.checkCancellation()
         let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }.map {
             directory.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()
         }
-        guard !FileManager.default.fileExists(atPath: destination.path),
+        let files = FileManager.default
+        let existed = files.fileExists(atPath: destination.path)
+        let originalAttributes = existed ? try files.attributesOfItem(atPath: destination.path) : nil
+        guard (!existed || replaceExisting),
               !originalURLs.contains(destination.standardizedFileURL.resolvingSymlinksInPath()) else {
             throw RenderError.destinationExists
         }
+        let staged = destination.deletingLastPathComponent()
+            .appendingPathComponent(".framethrower-export-" + UUID().uuidString + ".mp4")
+        defer { try? files.removeItem(at: staged) }
         let rendered = try await makePreview(project: project, directory: directory)
         let end = min(project.state.trimEnd, rendered.asset.duration.seconds)
         let start = project.state.trimStart
         guard start.isFinite, end.isFinite, start >= 0, end > start else { throw RenderError.invalidTrim }
+        try Task.checkCancellation()
+        // AVFoundation's named presets treat square output as a long-edge
+        // limit (1920² for "1080p"). Render explicitly at the requested bounds
+        // instead, preserving presentation geometry and smaller originals.
+        let outputSize = preset.outputSize(for: rendered.screenSize)
+        let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
+        videoComposition.renderSize = outputSize
+        videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
+            if let pip = instruction as? PIPCompositionInstruction {
+                return pip.applying(pip.state, preservePreviewFrames: false, renderSize: outputSize)
+            }
+            return instruction
+        }
         guard let exporter = AVAssetExportSession(asset: rendered.asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw RenderError.cannotExport
         }
-        exporter.videoComposition = rendered.videoComposition
+        exporter.videoComposition = videoComposition
         exporter.timeRange = CMTimeRange(start: time(start), duration: time(end - start))
         exporter.shouldOptimizeForNetworkUse = true
+        let progressTask = Task { @MainActor in
+            for await state in exporter.states(updateInterval: 0.2) {
+                if case .exporting(let value) = state { progress(value.fractionCompleted) }
+            }
+        }
+        defer { progressTask.cancel() }
         do {
-            try await exporter.export(to: destination, as: .mp4)
+            try await withTaskCancellationHandler {
+                try await exporter.export(to: staged, as: .mp4)
+                try Task.checkCancellation()
+            } onCancel: { exporter.cancelExport() }
+            if existed {
+                let current = try files.attributesOfItem(atPath: destination.path)
+                for key: FileAttributeKey in [.systemFileNumber, .size, .modificationDate] {
+                    guard (originalAttributes?[key] as? NSObject)?.isEqual(current[key]) == true else {
+                        throw RenderError.destinationExists
+                    }
+                }
+                _ = try files.replaceItemAt(destination, withItemAt: staged, options: .usingNewMetadataOnly)
+            } else { try files.moveItem(at: staged, to: destination) }
+            progress(1)
         } catch {
-            // Only this invocation's newly created export can be removed on failure.
-            try? FileManager.default.removeItem(at: destination)
+            // The destination is replaced only after a complete, uncancelled
+            // export. Failed attempts remove only this invocation's staging file.
             throw error
         }
     }

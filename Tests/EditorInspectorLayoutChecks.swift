@@ -19,6 +19,7 @@ struct EditorInspectorLayoutChecks {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        try cancelledSliderGesture(in: directory)
 
         for size in [CGSize(width: 820, height: 760), CGSize(width: 1100, height: 900)] {
             var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
@@ -65,7 +66,57 @@ struct EditorInspectorLayoutChecks {
             guard editor.project.state == project.state else { throw Failure.failed("Tool switching changed project edits") }
             window.close()
         }
-        print("Editor inspector layout checks passed (all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).")
+        print("Editor inspector layout checks passed (slider Escape/release/next-drag rollback, all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).")
+    }
+
+    private static func cancelledSliderGesture(in directory: URL) throws {
+        let editor = ProjectEditor(project: RecordingProject(screenFilename: "missing.mov", duration: 12),
+            url: directory.appendingPathComponent("slider.framethrower"))
+        guard editor.save() else { throw Failure.failed("Save slider metadata") }
+        let original = editor.project
+        let originalBytes = try Data(contentsOf: editor.url)
+        let range = 0.0...100.0
+        var slider = CommitSliderGesture()
+        slider.synchronize(editor.editingState.audio.volume * 100, in: range)
+        slider.begin()
+        slider.draft = 35
+        var draft = editor.editingState
+        draft.audio.volume = slider.draft / 100
+        guard editor.updateDraft(draft, at: 0), editor.cancelDraft() else { throw Failure.failed("Cancel volume while tracking") }
+        slider.synchronize(editor.editingState.audio.volume * 100, in: range)
+        // Escape cleared the owner's gesture token, so mouse-up has no commit.
+        _ = slider.finish(restoring: editor.editingState.audio.volume * 100, in: range)
+        guard slider.draft == 100, !slider.isEditing,
+              editor.project == original, try Data(contentsOf: editor.url) == originalBytes else {
+            throw Failure.failed("Escape then release must restore the thumb without saving a discarded volume")
+        }
+        slider.begin()
+        guard slider.draft == 100 else { throw Failure.failed("Next drag began from the discarded volume") }
+        slider.draft -= 5
+        draft = editor.editingState
+        draft.audio.volume = slider.draft / 100
+        guard editor.updateDraft(draft, at: 0) else { throw Failure.failed("Preview next volume gesture") }
+        let proposed = slider.finish(restoring: editor.editingState.audio.volume * 100, in: range)
+        guard proposed == 95, editor.finishDraft(name: "Change recording volume"),
+              editor.project.state.audio.volume == 0.95, editor.project.undoHistory.count == 1,
+              editor.undo(), editor.project.state == original.state else {
+            throw Failure.failed("Next drag must edit from the restored volume with one correct Undo step")
+        }
+
+        // Controls without live previews still commit the final dragged value;
+        // the subsequent owner notification supplies their displayed value.
+        var committedOnly = CommitSliderGesture()
+        committedOnly.synchronize(20, in: range)
+        committedOnly.begin()
+        committedOnly.draft = 60
+        let accepted = committedOnly.finish(restoring: 20, in: range)
+        committedOnly.synchronize(accepted, in: range)
+        guard accepted == 60, committedOnly.draft == 60 else { throw Failure.failed("Committed-only slider lost its final value") }
+        committedOnly.draft = 90
+        committedOnly.begin()
+        guard committedOnly.finish(restoring: 60, in: range) == 90 else {
+            throw Failure.failed("Starting tracking must preserve an initial click sample supplied by the native slider")
+        }
     }
 
     private static func settle(_ host: NSView) async throws {

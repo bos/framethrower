@@ -1081,6 +1081,31 @@ final class MotionDurationTextField: NSTextField, NSTextFieldDelegate {
     }
 }
 
+/// Keep a native drag local until release, then reconcile with the owning
+/// value. The owner may have rolled back an unfinished edit while tracking.
+struct CommitSliderGesture {
+    var draft = 0.0
+    private(set) var isEditing = false
+
+    mutating func synchronize(_ value: Double, in range: ClosedRange<Double>) {
+        guard !isEditing else { return }
+        draft = min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    mutating func begin() {
+        // Native controls may already have supplied a click's first sample.
+        // Preserve it; idle owner changes and the previous release reconcile.
+        isEditing = true
+    }
+
+    mutating func finish(restoring value: Double, in range: ClosedRange<Double>) -> Double {
+        let proposed = draft
+        isEditing = false
+        synchronize(value, in: range)
+        return proposed
+    }
+}
+
 /// Slider release finishes a gesture; the editor decides its undo boundary.
 struct CommitSlider: View {
     let title: String
@@ -1091,23 +1116,27 @@ struct CommitSlider: View {
     var begin: () -> Void = {}
     var preview: ((Double) -> Void)? = nil
     var commit: (Double) -> Void
-    @State private var draft = 0.0
-    @State private var editing = false
+    @State private var gesture = CommitSliderGesture()
     var body: some View {
         HStack {
             Text(title).font(.caption)
-            Slider(value: $draft, in: range) { active in
-                editing = active
-                if active { begin() } else { commit(draft) }
+            Slider(value: $gesture.draft, in: range) { active in
+                if active {
+                    gesture.begin()
+                    begin()
+                } else {
+                    let proposed = gesture.finish(restoring: value, in: range)
+                    commit(proposed)
+                }
             }.accessibilityLabel(title)
             if let valueSuffix {
-                Text("\(editing ? draft : value, specifier: valueFormat)\(valueSuffix)")
+                Text("\(gesture.isEditing ? gesture.draft : value, specifier: valueFormat)\(valueSuffix)")
                     .font(.caption).monospacedDigit().frame(width: 45, alignment: .trailing)
             }
         }
-        .onChange(of: draft) { _, next in if editing { preview?(next) } }
-        .onAppear { draft = min(max(value, range.lowerBound), range.upperBound) }
-        .onChange(of: value) { _, next in if !editing { draft = min(max(next, range.lowerBound), range.upperBound) } }
+        .onChange(of: gesture.draft) { _, next in if gesture.isEditing { preview?(next) } }
+        .onAppear { gesture.synchronize(value, in: range) }
+        .onChange(of: value) { _, next in gesture.synchronize(next, in: range) }
     }
 }
 

@@ -46,6 +46,7 @@ targets:
       path: Resources/FrameThrower.entitlements
       properties:
         com.apple.security.device.camera: true
+        com.apple.security.device.audio-input: true
     info:
       path: Resources/Info.plist
       properties:
@@ -54,7 +55,7 @@ targets:
         CFBundleIconFile: Resources/FrameThrower.icns
         NSCameraUsageDescription: FrameThrower records your selected camera as an editable picture-in-picture track.
         NSCameraUseContinuityCameraType: true
-        NSMicrophoneUsageDescription: FrameThrower uses your microphone to add voiceover to recordings.
+        NSMicrophoneUsageDescription: FrameThrower uses your microphone for recording audio and on-device editing instructions.
         CFBundleShortVersionString: "0.1.7"
         CFBundleVersion: "8"
         GDriveClientID: ""

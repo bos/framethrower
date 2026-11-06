@@ -283,9 +283,7 @@ struct ContentView: View {
                 }
             })) {
                 Text("Off").tag(MicrophoneInputChoice.off)
-                if model.selectedMicrophoneID == nil, model.recordMicrophoneAudio {
-                    Text("Default").tag(MicrophoneInputChoice.systemDefault)
-                }
+                Text("Default").tag(MicrophoneInputChoice.systemDefault)
                 ForEach(model.microphones) { microphone in
                     Text(microphone.name).tag(MicrophoneInputChoice.device(microphone.id))
                 }
@@ -298,7 +296,8 @@ struct ContentView: View {
                 .toggleStyle(.checkbox)
                 .fixedSize()
                 .help(model.recordSystemAudio ? "Record audio from apps" : "System audio is off")
-            CameraInputPicker(camera: model.camera, locked: captureLocked)
+            CameraInputPicker(camera: model.camera, locked: captureLocked,
+                onSelectionChange: model.cameraSelectionWillChange)
                 .frame(minWidth: 190, maxWidth: .infinity)
         }
         .font(.system(size: 11))

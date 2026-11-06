@@ -157,9 +157,6 @@ final class CaptureViewModel: ObservableObject {
     private let slackSelectedChannelKey = "slack.selectedChannelID"
     private let slackCachedUsersKey = "slack.cachedUsers"
     private let slackCachedChannelsKey = "slack.cachedChannels"
-    private let recordSystemAudioKey = "audio.recordSystem"
-    private let recordMicrophoneAudioKey = "audio.recordMicrophone"
-    private let selectedMicrophoneIDKey = "audio.selectedMicrophoneID"
     private let areaXKey = "capture.area.x"
     private let areaYKey = "capture.area.y"
     private let areaWidthKey = "capture.area.width"
@@ -673,11 +670,20 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func loadAudioSettings() {
-        recordSystemAudio = userDefaults.bool(forKey: recordSystemAudioKey)
-        recordMicrophoneAudio = userDefaults.bool(forKey: recordMicrophoneAudioKey)
-        selectedMicrophoneID = userDefaults.string(forKey: selectedMicrophoneIDKey)
+        let saved = CaptureAudioSettings(defaults: userDefaults)
+        recordSystemAudio = saved.recordSystemAudio
+        recordMicrophoneAudio = saved.recordMicrophoneAudio
+        selectedMicrophoneID = saved.microphoneID
         refreshMicrophonePermissionState()
         refreshMicrophones()
+    }
+
+    func cameraSelectionWillChange(from previous: String?, to next: String?) {
+        var settings = audioSettings
+        settings.cameraSelectionChanged(from: previous, to: next)
+        if recordMicrophoneAudio != settings.recordMicrophoneAudio {
+            recordMicrophoneAudio = settings.recordMicrophoneAudio
+        }
     }
 
     func loadAreaSettings() {
@@ -1539,17 +1545,18 @@ final class CaptureViewModel: ObservableObject {
             lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
         microphones = list
-        if let selectedMicrophoneID,
-           list.contains(where: { $0.id == selectedMicrophoneID }) {
-            return
-        }
-        selectedMicrophoneID = list.first?.id
+        var settings = audioSettings
+        settings.reconcileMicrophone(availableIDs: Set(list.map(\.id)))
+        selectedMicrophoneID = settings.microphoneID
+    }
+
+    private var audioSettings: CaptureAudioSettings {
+        CaptureAudioSettings(recordSystemAudio: recordSystemAudio,
+            recordMicrophoneAudio: recordMicrophoneAudio, microphoneID: selectedMicrophoneID)
     }
 
     private func persistAudioSettings() {
-        userDefaults.set(recordSystemAudio, forKey: recordSystemAudioKey)
-        userDefaults.set(recordMicrophoneAudio, forKey: recordMicrophoneAudioKey)
-        userDefaults.set(selectedMicrophoneID, forKey: selectedMicrophoneIDKey)
+        audioSettings.store(in: userDefaults)
     }
 
     private func persistAreaSettings() {

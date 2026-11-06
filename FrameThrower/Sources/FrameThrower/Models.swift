@@ -113,6 +113,37 @@ struct MicrophoneDevice: Identifiable, Hashable {
     let name: String
 }
 
+/// A value snapshot avoids one restored property overwriting the remaining
+/// saved fields through the view model's persistence observers.
+struct CaptureAudioSettings: Equatable {
+    var recordSystemAudio = false
+    var recordMicrophoneAudio = false
+    /// nil lets ScreenCaptureKit follow the Mac's default microphone.
+    var microphoneID: String?
+}
+
+extension CaptureAudioSettings {
+    init(defaults: UserDefaults) {
+        recordSystemAudio = defaults.bool(forKey: "audio.recordSystem")
+        recordMicrophoneAudio = defaults.bool(forKey: "audio.recordMicrophone")
+        microphoneID = defaults.string(forKey: "audio.selectedMicrophoneID")
+    }
+
+    func store(in defaults: UserDefaults) {
+        defaults.set(recordSystemAudio, forKey: "audio.recordSystem")
+        defaults.set(recordMicrophoneAudio, forKey: "audio.recordMicrophone")
+        defaults.set(microphoneID, forKey: "audio.selectedMicrophoneID")
+    }
+
+    mutating func cameraSelectionChanged(from previous: String?, to next: String?) {
+        if previous == nil, next != nil { recordMicrophoneAudio = true }
+    }
+
+    mutating func reconcileMicrophone(availableIDs: Set<String>) {
+        if let microphoneID, !availableIDs.contains(microphoneID) { self.microphoneID = nil }
+    }
+}
+
 struct CaptureArea: Hashable {
     var x: Double = 0
     var y: Double = 0

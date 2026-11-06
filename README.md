@@ -70,7 +70,9 @@ available source selection. A window that has closed requires choosing a new one
 4. Optionally choose a **Camera**. Its live layout appears inline automatically
    with the selected source behind it, so you can set its initial PIP position and
    size against the recording content. Area backgrounds show only the selected crop.
-   Camera and microphone selection are independent. Camera
+   Turning the camera on enables the microphone, using your remembered device or
+   the Mac's default. You can turn the microphone off; switching cameras keeps
+   that choice until you turn the camera off and on again. Camera
    access is requested only when you select a camera. Choose **Off** to stop it.
 5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
@@ -162,6 +164,8 @@ Automated checks run without camera hardware or connected accounts:
   legacy defaults, and persisted reversible zoom/pointer edits.
 - `Tests/check-cursor-recording.sh`: mouse coordinates, precise click events and
   dragging, smoothing, source-time alignment, and immutable metadata.
+- `Tests/check-capture-audio-settings.sh`: remembered microphone restoration,
+  system-default fallback, and camera-session microphone defaults without hardware.
 - `Tests/check-cursor-zoom-suggestions.sh`: click grouping, holds, smooth focus
   suggestions, trim bounds, deterministic points, and limits on long recordings.
 - `Tests/check-zoom-interactions.sh`: actual editor double-click zoom, pan, PIP

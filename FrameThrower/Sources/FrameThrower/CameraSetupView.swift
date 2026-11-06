@@ -88,10 +88,12 @@ struct CameraSetupView: View {
 struct CameraInputPicker: View {
     @ObservedObject var camera: CameraRecorder
     let locked: Bool
+    var onSelectionChange: (String?, String?) -> Void = { _, _ in }
 
     var body: some View {
         HStack(spacing: 6) {
             Picker("Camera", selection: Binding(get: { camera.selectedDeviceID }, set: { id in
+                onSelectionChange(camera.selectedDeviceID, id)
                 Task { await camera.selectDevice(id) }
             })) {
                 Text("Off").tag(Optional<String>.none)

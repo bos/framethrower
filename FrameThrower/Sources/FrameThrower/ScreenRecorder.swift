@@ -82,6 +82,47 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
         }
     }
 
+    /// ScreenCaptureKit's movie may contain audio before its first video frame.
+    /// Inspect encoded timestamps, without decoding pixels, to map host time to
+    /// that movie timeline. H.264 reordering is bounded to sixteen pictures;
+    /// inspecting the first thirty-two samples includes the first display frame.
+    static func firstVideoPresentationTime(in url: URL) async throws -> Double {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw RecorderError.noFramesCaptured
+        }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw RecorderError.noFramesCaptured }
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? RecorderError.noFramesCaptured }
+        defer { reader.cancelReading() }
+        var first = Double.infinity
+        for _ in 0..<32 {
+            guard let sample = output.copyNextSampleBuffer() else { break }
+            // Empty edit-list markers can carry a valid zero timestamp without
+            // containing a picture. They are not the first captured video frame.
+            guard CMSampleBufferGetNumSamples(sample) > 0,
+                  CMSampleBufferGetTotalSampleSize(sample) > 0 else { continue }
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+            if timestamp.isFinite, timestamp >= 0 { first = min(first, timestamp) }
+        }
+        guard first.isFinite else { throw reader.error ?? RecorderError.noFramesCaptured }
+        // Compressed-reader samples use the media timeline. A movie edit list
+        // can place that media later in the movie (for example audio at zero).
+        let segments = try await track.load(.segments)
+        if let segment = segments.first(where: { !$0.isEmpty }) {
+            let mapping = segment.timeMapping
+            let source = mapping.source.start.seconds
+            let target = mapping.target.start.seconds
+            if source.isFinite, target.isFinite {
+                first += target - source
+            }
+        }
+        return max(0, first)
+    }
+
     func stop() async throws {
         guard let active = try callbackQueue.sync(execute: { () throws -> SCStream? in
             guard let stream else { return nil }

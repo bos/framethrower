@@ -13,6 +13,7 @@
 		2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36ACB61C84F04DE05285C1AA /* OAuth.swift */; };
 		323105BF10991A94F95A197F /* StatusChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD520E85E319DD599528423A /* StatusChip.swift */; };
 		3926CB2F05E2D44AD38392DB /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6581FEB23256078CAFBAD45C /* CameraPreview.swift */; };
+		4781464A4A910CAE5339759E /* CursorRecording.swift in Sources */ = {isa = PBXBuildFile; fileRef = F905EC803998351752697F83 /* CursorRecording.swift */; };
 		485B2C647E5B8415DED8C557 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D36B84B4B1F8D344D22C3892 /* Models.swift */; };
 		4A53D6CBF0FFE3F1F99B7A9A /* CapturePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB5CFC6F84DBC5F3A292EE02 /* CapturePreview.swift */; };
 		4D3C86393CA8F435ED45793C /* PIPGeometryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 195ED7EEA588C1534E5375CA /* PIPGeometryViews.swift */; };
@@ -71,6 +72,7 @@
 		DB5CFC6F84DBC5F3A292EE02 /* CapturePreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePreview.swift; sourceTree = "<group>"; };
 		DD643FF7C65778C3D5A01A54 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		F658B134CC765957233533CB /* FrameThrowerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameThrowerApp.swift; sourceTree = "<group>"; };
+		F905EC803998351752697F83 /* CursorRecording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorRecording.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -96,6 +98,7 @@
 				086715F7B7342A4708FCB9F7 /* CaptureSourcePreviews.swift */,
 				7DD2537A645D90E8DF5E74A8 /* CaptureViewModel.swift */,
 				DD643FF7C65778C3D5A01A54 /* ContentView.swift */,
+				F905EC803998351752697F83 /* CursorRecording.swift */,
 				576C7E1DB025530CEFC06FD2 /* DisplayCarousel.swift */,
 				4370A1AA27EA8518D9E26D61 /* DriveUploader.swift */,
 				4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */,
@@ -216,6 +219,7 @@
 				4DD96793F5540419472BA1CE /* CaptureSourcePreviews.swift in Sources */,
 				E9D1C38430BA19C5DE799205 /* CaptureViewModel.swift in Sources */,
 				6FAD6B2ACDC1A15905CFB4B1 /* ContentView.swift in Sources */,
+				4781464A4A910CAE5339759E /* CursorRecording.swift in Sources */,
 				D9D3E9F4ADA65D5739663177 /* DisplayCarousel.swift in Sources */,
 				CD481459319AF75BCBCCD680 /* DriveUploader.swift in Sources */,
 				50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */,

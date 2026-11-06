@@ -146,6 +146,9 @@ final class CaptureViewModel: ObservableObject {
     private var exportedURL: URL?
 
     private let recorder = ScreenRecorder()
+    private let cursorRecorder = CursorRecorder()
+    private var activeCursorCapture = false
+    private var activeScreenStartHostTime: Double?
     private let uploader = DriveUploader()
     private let tokenStorageKey = "drive.tokens"
     private let slackTokenStorageKey = "slack.tokens"
@@ -962,13 +965,21 @@ final class CaptureViewModel: ObservableObject {
             activeRecordingURL = outputURL
             activeCameraURL = nil
             activeCameraOffset = 0
+            activeCursorCapture = false
+            activeScreenStartHostTime = nil
             var cameraStart: Double?
             if camera.selectedDeviceID != nil {
                 let url = outputURL.deletingPathExtension().appendingPathExtension("camera.mov")
                 activeCameraURL = url
                 cameraStart = try await camera.startRecording(to: url)
             }
+            if let source = cursorCaptureSource(filter: filter, configuration: configuration) {
+                activeCursorCapture = cursorRecorder.start(source: source)
+            }
+            // Keep the baked cursor if mouse-only metadata capture cannot start.
+            configuration.showsCursor = !activeCursorCapture
             let screenStart = try await recorder.start(filter: filter, configuration: configuration, outputURL: outputURL)
+            activeScreenStartHostTime = screenStart
             if let cameraStart { activeCameraOffset = cameraStart - screenStart }
             lastDriveFileURL = nil
             lastSlackFileURL = nil
@@ -979,6 +990,9 @@ final class CaptureViewModel: ObservableObject {
             lastRecordingURL = outputURL
             log(cameraStart == nil ? "Recording started." : "Recording screen and camera independently.")
         } catch {
+            cursorRecorder.cancel()
+            activeCursorCapture = false
+            activeScreenStartHostTime = nil
             try? await camera.stopRecording()
             if let activeRecordingURL { log("Captured sources kept beside \(activeRecordingURL.path)") }
             activeRecordingURL = nil
@@ -993,11 +1007,16 @@ final class CaptureViewModel: ObservableObject {
         defer { isCaptureBusy = false }
         var failures: [String] = []
         do { try await recorder.stop() } catch { failures.append(error.localizedDescription) }
+        cursorRecorder.stopCollecting()
         do { try await camera.stopRecording() } catch { failures.append(error.localizedDescription) }
         isRecording = false
         let outputURL = activeRecordingURL
         activeRecordingURL = nil
-        defer { activeCameraURL = nil }
+        defer {
+            activeCameraURL = nil
+            activeCursorCapture = false
+            activeScreenStartHostTime = nil
+        }
         guard let outputURL, FileManager.default.fileExists(atPath: outputURL.path) else {
             log("No screen file was found. " + failures.joined(separator: " "), level: .error)
             updateRecordingAvailability()
@@ -1006,6 +1025,15 @@ final class CaptureViewModel: ObservableObject {
         lastRecordingURL = outputURL
         do {
             let duration = try await AVURLAsset(url: outputURL).load(.duration).seconds
+            let firstFrameTime = try await ScreenRecorder.firstVideoPresentationTime(in: outputURL)
+            var cursorFilename: String?
+            if activeCursorCapture, let screenStart = activeScreenStartHostTime {
+                let recording = try cursorRecorder.finish(screenStartHostTime: screenStart,
+                    duration: duration, firstFrameSourceTime: firstFrameTime)
+                let cursorURL = outputURL.deletingPathExtension().appendingPathExtension("cursor.json")
+                try recording.write(to: cursorURL)
+                cursorFilename = cursorURL.lastPathComponent
+            }
             var cameraFilename: String?
             if let cameraURL = activeCameraURL {
                 do {
@@ -1020,8 +1048,8 @@ final class CaptureViewModel: ObservableObject {
                 }
             }
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
-                cameraFilename: cameraFilename,
-                cameraOffset: activeCameraOffset, duration: duration)
+                cameraFilename: cameraFilename, cursorFilename: cursorFilename,
+                cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
             let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")
             let editor = ProjectEditor(project: project, url: url)
@@ -1326,6 +1354,21 @@ final class CaptureViewModel: ObservableObject {
                 }
                 continuation.resume(returning: content)
             }
+        }
+    }
+
+    private func cursorCaptureSource(filter: SCContentFilter, configuration: SCStreamConfiguration) -> CursorCaptureSource? {
+        switch captureKind {
+        case .window:
+            guard let window = selectedWindow,
+                  let processID = window.window.owningApplication?.processID else { return nil }
+            return .window(id: window.id, processID: processID, logicalSize: filter.contentRect.size)
+        case .display:
+            guard let id = selectedDisplayID else { return nil }
+            return .display(bounds: CGDisplayBounds(id))
+        case .area:
+            guard let id = selectedDisplayID else { return nil }
+            return .area(displayBounds: CGDisplayBounds(id), sourceRect: configuration.sourceRect)
         }
     }
 

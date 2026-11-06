@@ -51,8 +51,16 @@ if [[ ! -f "$package_dir/build.fingerprint" ]] || [[ $(cat "$package_dir/build.f
 fi
 output=${1:-"$repo_dir/build/LocalSpeech"}
 mkdir -p "$output"
-# A new app build receives the already-built runtime. Signing follows copy.
-rsync -a --delete "$package_dir/" "$output/"
+# Helpers is a nested-code location: text manifests and licenses belong in
+# Resources, otherwise signing the outer application treats them as unsigned code.
+rsync -a --delete --delete-excluded --exclude=build.fingerprint --exclude=whisper-LICENSE.txt "$package_dir/" "$output/"
+if [[ -n ${TARGET_BUILD_DIR:-} && -n ${UNLOCALIZED_RESOURCES_FOLDER_PATH:-} ]]; then
+    resources="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+else
+    resources=$(dirname "$output")
+fi
+mkdir -p "$resources"
+cp "$package_dir/whisper-LICENSE.txt" "$resources/LocalSpeech-LICENSE.txt"
 identity=${EXPANDED_CODE_SIGN_IDENTITY:--}
 if [[ -z $identity ]]; then identity=-; fi
 sign_options=runtime

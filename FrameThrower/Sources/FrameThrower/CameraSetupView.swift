@@ -102,6 +102,7 @@ struct CameraInputPicker: View {
                     Text("Camera disconnected").tag(Optional(id))
                 }
             }
+            .tint(camera.selectedDeviceID == nil ? Color.secondary : RecorderStyle.accent)
             .disabled(locked || camera.isPreparing)
             if camera.isPreparing { ProgressView().controlSize(.small) }
         }

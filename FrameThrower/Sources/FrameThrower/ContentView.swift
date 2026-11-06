@@ -291,6 +291,7 @@ struct ContentView: View {
                     Text("Microphone unavailable").tag(MicrophoneInputChoice.device(id)).disabled(true)
                 }
             }
+            .tint(model.recordMicrophoneAudio ? RecorderStyle.accent : Color.secondary)
             .frame(minWidth: 150, maxWidth: .infinity)
             Toggle("System audio", isOn: $model.recordSystemAudio)
                 .toggleStyle(.checkbox)

@@ -6,6 +6,7 @@ import SwiftUI
 struct DisplayCarousel: View {
     @ObservedObject var model: CaptureViewModel
     var isEnabled: Bool
+    let sourcePreviews: CaptureSourcePreviews
     var onSelect: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var images: [CGDirectDisplayID: NSImage] = [:]
@@ -15,7 +16,10 @@ struct DisplayCarousel: View {
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var displayKey: String {
-        model.displays.map { "\($0.id):\($0.display.width)x\($0.display.height)" }
+        model.displays.map {
+            let frame = $0.display.frame
+            return "\($0.id):\(frame.minX),\(frame.minY),\(frame.width),\(frame.height):\($0.display.width)x\($0.display.height)"
+        }
             .joined(separator: ",")
     }
 
@@ -109,6 +113,7 @@ struct DisplayCarousel: View {
     private func refreshPreviews() async {
         guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess() else {
             images = [:]
+            sourcePreviews.clear()
             return
         }
         let displays = model.displays
@@ -148,10 +153,15 @@ struct DisplayCarousel: View {
                         contentFilter: filter, configuration: configuration
                     )
                     try Task.checkCancellation()
+                    guard !captureLocked, model.hasScreenRecordingPermission,
+                          CGPreflightScreenCaptureAccess() else { return }
+                    let source = CapturePreviewSource.display(id: display.id, frame: display.display.frame)
+                    sourcePreviews.store(capture, contentSize: size, for: source)
                     images[display.id] = NSImage(cgImage: capture, size: size)
                 } catch {
                     try Task.checkCancellation()
                     images[display.id] = nil
+                    sourcePreviews.remove(.display(id: display.id, frame: display.display.frame))
                     failedDisplays.insert(display.id)
                 }
             }

@@ -6,7 +6,9 @@ import SwiftUI
 struct CapturePreview: View {
     @ObservedObject var model: CaptureViewModel
     var isEnabled: Bool
+    let sourcePreviews: CaptureSourcePreviews
     @State private var image: NSImage?
+    @State private var imageSource: CapturePreviewSource?
     @State private var imageDisplayFrame: CGRect?
     @State private var isLoading = false
     @State private var failed = false
@@ -19,16 +21,29 @@ struct CapturePreview: View {
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
 
-    private var selectionKey: String {
-        switch model.captureKind {
-        case .window:
-            return "window:\(model.selectedWindowID ?? 0)"
-        case .display:
-            return "display:\(model.selectedDisplayID ?? 0)"
-        case .area:
-            return "area:\(model.selectedDisplayID ?? 0)"
-        }
+    private var source: CapturePreviewSource? {
+        if model.captureKind == .window { return model.selectedWindow.map(CapturePreviewSource.window) }
+        guard let display = model.displays.first(where: { $0.id == model.selectedDisplayID }) else { return nil }
+        return .display(id: display.id, frame: display.display.frame)
     }
+
+    private struct RefreshKey: Hashable {
+        var source: CapturePreviewSource?
+        var kind: String
+        var refreshID: Int
+        var hasPermission: Bool
+        var enabled: Bool
+        var requested: Bool
+        var locked: Bool
+    }
+
+    private var refreshKey: RefreshKey {
+        RefreshKey(source: source, kind: model.captureKind.rawValue, refreshID: refreshID,
+                   hasPermission: model.hasScreenRecordingPermission, enabled: isEnabled,
+                   requested: previewRequested, locked: captureLocked)
+    }
+
+    private var currentImage: NSImage? { imageSource == source ? image : nil }
 
     var body: some View {
         ZStack {
@@ -39,7 +54,7 @@ struct CapturePreview: View {
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
-            if let image {
+            if let image = currentImage {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -117,7 +132,7 @@ struct CapturePreview: View {
                 .padding(12)
             }
         }
-        .task(id: "\(selectionKey):\(refreshID):\(model.hasScreenRecordingPermission):\(isEnabled):\(previewRequested):\(captureLocked)") {
+        .task(id: refreshKey) {
             await refreshPreview()
         }
     }
@@ -136,9 +151,13 @@ struct CapturePreview: View {
         guard !captureLocked else { return }
         guard isEnabled || previewRequested else { return }
         image = nil
+        imageSource = nil
         imageDisplayFrame = nil
         failed = false
-        guard model.hasScreenRecordingPermission else { return }
+        guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess(), let requestedSource = source else {
+            if !model.hasScreenRecordingPermission { sourcePreviews.clear() }
+            return
+        }
         isLoading = true
         defer { isLoading = false }
 
@@ -158,6 +177,8 @@ struct CapturePreview: View {
             do {
                 content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
                 try Task.checkCancellation()
+                guard !captureLocked, model.hasScreenRecordingPermission,
+                      CGPreflightScreenCaptureAccess(), source == requestedSource else { return }
             } catch {
                 failed = true
                 return
@@ -175,16 +196,24 @@ struct CapturePreview: View {
         configuration.showsCursor = false
         do {
             try Task.checkCancellation()
+            guard !captureLocked, model.hasScreenRecordingPermission,
+                  CGPreflightScreenCaptureAccess(), source == requestedSource else { return }
             let capture = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
             )
             try Task.checkCancellation()
+            guard source == requestedSource, !captureLocked, model.hasScreenRecordingPermission,
+                  CGPreflightScreenCaptureAccess() else { return }
+            sourcePreviews.store(capture, contentSize: size, for: requestedSource)
             imageDisplayFrame = displayFrame
+            imageSource = requestedSource
             image = NSImage(cgImage: capture, size: size)
         } catch is CancellationError {
             return
         } catch {
+            guard source == requestedSource else { return }
+            sourcePreviews.remove(requestedSource)
             failed = true
         }
     }

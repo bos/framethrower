@@ -62,13 +62,14 @@ available source selection. A window that has closed requires choosing a new one
    to resize it. Arrow keys move the focused region by one point (Shift: ten).
    **Choose…** still opens the full-screen selector for precise adjustments.
    Display thumbnails load at startup when recording access is already granted;
-   use refresh to update them. Window/area previews load when requested. Permission
-   requests do not run automatically on launch.
+   use refresh to update them. Window/area previews load when requested or when
+   positioning a selected camera. Permission requests do not run automatically on launch.
 3. Use the audio checkboxes to enable system audio and/or a microphone. Microphone
    capture needs its own macOS permission.
 4. Optionally choose a **Camera**. Its live layout appears inline automatically
-   so you can set its initial PIP position and size. Camera and microphone selection
-   are independent. Camera
+   with the selected source behind it, so you can set its initial PIP position and
+   size against the recording content. Area backgrounds show only the selected crop.
+   Camera and microphone selection are independent. Camera
    access is requested only when you select a camera. Choose **Off** to stop it.
 5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
@@ -145,6 +146,8 @@ Automated checks run without camera hardware or connected accounts:
   finalization, and retry isolation.
 - `Tests/check-editor-interactions.sh`: production editor mouse gestures, exact
   drag deltas, persisted undo/redo, and trim integration.
+- `Tests/check-capture-source-previews.sh`: source identity, area crop pixels,
+  negative display origins, fitted PIP bounds, and screenshot cache invalidation.
 - `Tests/check-editor-canvas.sh`: native image orientation, letterboxing, resize
   handle alignment, and Escape cancellation without an edit.
 - `Tests/check-live-editor-layout.sh`: real 1080p video, changing scrub and live

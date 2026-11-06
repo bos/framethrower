@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var clipDuration: Double?
     @State private var clipSize = ""
     @State private var previewEnabled = false
+    @StateObject private var sourcePreviews = CaptureSourcePreviews()
     @State private var isSharingPresented = false
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
@@ -20,6 +21,14 @@ struct ContentView: View {
         case .display: return model.selectedDisplayID != nil
         case .area: return model.selectedDisplayID != nil && model.area.width >= 2 && model.area.height >= 2
         }
+    }
+    private var selectedPreviewSource: CapturePreviewSource? {
+        guard model.hasScreenRecordingPermission else { return nil }
+        if model.captureKind == .window {
+            return model.selectedWindow.map(CapturePreviewSource.window)
+        }
+        guard let display = model.displays.first(where: { $0.id == model.selectedDisplayID }) else { return nil }
+        return .display(id: display.id, frame: display.display.frame)
     }
     private var showRecording: Bool { model.hasRecordingToUpload && !model.isRecording }
 
@@ -51,6 +60,9 @@ struct ContentView: View {
             model.refreshScreenRecordingPermissionState()
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
+        }
+        .onChange(of: model.hasScreenRecordingPermission) { _, granted in
+            if !granted { sourcePreviews.clear() }
         }
         .onChange(of: model.editorOpenRequest) { _, request in
             if let request { openWindow(id: "editor", value: request.url) }
@@ -135,11 +147,13 @@ struct ContentView: View {
             .disabled(captureLocked)
 
             if model.captureKind == .display && model.hasScreenRecordingPermission {
-                DisplayCarousel(model: model, isEnabled: previewEnabled) {
+                DisplayCarousel(model: model, isEnabled: previewEnabled, sourcePreviews: sourcePreviews) {
                     previewEnabled = true
                 }
             } else if model.hasScreenRecordingPermission {
-                CapturePreview(model: model, isEnabled: previewEnabled)
+                CapturePreview(model: model,
+                    isEnabled: previewEnabled || model.camera.selectedDeviceID != nil,
+                    sourcePreviews: sourcePreviews)
             }
 
             if model.hasScreenRecordingPermission {
@@ -155,7 +169,9 @@ struct ContentView: View {
             audioControls
                 .disabled(captureLocked)
             Divider().opacity(0.6)
-            CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked)
+            CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked,
+                sourcePreviews: sourcePreviews, source: selectedPreviewSource,
+                area: model.captureKind == .area ? model.area.rect : nil)
         }
         .padding(18)
         .modifier(RecorderCard())

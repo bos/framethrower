@@ -6,6 +6,9 @@ struct CameraSetupView: View {
     @ObservedObject var camera: CameraRecorder
     @Binding var placement: PIPPlacement
     let locked: Bool
+    @ObservedObject var sourcePreviews: CaptureSourcePreviews
+    let source: CapturePreviewSource?
+    let area: CGRect?
     @State private var origin: PIPPlacement?
 
     var body: some View {
@@ -33,12 +36,32 @@ struct CameraSetupView: View {
         .font(.system(size: 11))
     }
 
+    private var sourceContentSize: CGSize {
+        guard let source else { return CGSize(width: 16, height: 9) }
+        if let area {
+            let clipped = area.intersection(source.frame)
+            return clipped.isNull ? CGSize(width: 16, height: 9) : clipped.size
+        }
+        return source.frame.size
+    }
+
     private var cameraLayout: some View {
         HStack(spacing: 16) {
             GeometryReader { proxy in
-                let rect = placement.frame(in: proxy.size, cameraAspect: 16.0 / 9.0)
+                let background = sourcePreviews.preview(for: source, area: area)
+                let size = background?.contentSize ?? sourceContentSize
+                let content = CaptureSourcePreviewGeometry.fittedRect(contentSize: size, in: proxy.size)
+                let localRect = placement.frame(in: content.size, cameraAspect: 16.0 / 9.0)
+                let rect = localRect.offsetBy(dx: content.minX, dy: content.minY)
                 ZStack(alignment: .topLeading) {
                     Color.primary.opacity(0.05)
+                    if let background {
+                        Image(decorative: background.image, scale: 1)
+                            .resizable()
+                            .frame(width: content.width, height: content.height)
+                            .offset(x: content.minX, y: content.minY)
+                            .accessibilityHidden(true)
+                    }
                     CameraPreview(session: camera.session)
                         .background(.black)
                         .frame(width: rect.width, height: rect.height)
@@ -48,8 +71,8 @@ struct CameraSetupView: View {
                             guard !locked else { return }
                             if origin == nil { origin = placement }
                             guard var next = origin else { return }
-                            next.x = min(1, max(0, next.x + value.translation.width / max(1, proxy.size.width - rect.width)))
-                            next.y = min(1, max(0, next.y + value.translation.height / max(1, proxy.size.height - rect.height)))
+                            next.x = min(1, max(0, next.x + value.translation.width / max(1, content.width - rect.width)))
+                            next.y = min(1, max(0, next.y + value.translation.height / max(1, content.height - rect.height)))
                             placement = next
                         }.onEnded { _ in origin = nil })
                         .accessibilityLabel("Live camera preview. Drag to set initial position.")

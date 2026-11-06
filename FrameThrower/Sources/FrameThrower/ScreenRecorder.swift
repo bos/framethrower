@@ -2,19 +2,32 @@
 import Foundation
 @preconcurrency import ScreenCaptureKit
 
-/// ScreenCaptureKit owns encoding; this extra stream output records the first
-/// usable frame's host timestamp for alignment with the independent camera.
+/// Compact captures use ScreenCaptureKit's movie output. High-quality captures
+/// feed the bounded ProRes/PCM writer; both paths report the first encoded
+/// screen frame's host timestamp for alignment with the independent camera.
 final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     SCStreamDelegate, @unchecked Sendable {
     private let callbackQueue = DispatchQueue(label: "screencast.recording.queue")
     // All mutable state below is confined to callbackQueue.
     private var stream: SCStream?
     private var recordingOutput: SCRecordingOutput?
+    private var masterWriter: ScreenMasterWriter?
+    private var isMasterStopping = false
     private var lifecycle = ScreenRecordingState()
     private var startContinuation: CheckedContinuation<Double, any Error>?
     private var finishContinuation: CheckedContinuation<Void, any Error>?
     private var isStarting = false
     private var isStopping = false
+    private var unexpectedFailureHandler: (@Sendable (any Error) -> Void)?
+
+    /// Called once for a failure during an active take. The handler runs on the
+    /// callback queue and should schedule UI/cleanup work on its owning actor.
+    func setUnexpectedFailureHandler(_ handler: @escaping @Sendable (any Error) -> Void) {
+        callbackQueue.async {
+            self.unexpectedFailureHandler = handler
+            self.notifyUnexpectedFailureIfNeeded()
+        }
+    }
 
     enum RecorderError: LocalizedError {
         case noFramesCaptured
@@ -31,19 +44,56 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
 
     @discardableResult
     func start(filter: SCContentFilter, configuration: SCStreamConfiguration,
-               outputURL: URL) async throws -> Double {
+               outputURL: URL, quality: RecordingQuality = .compact) async throws -> Double {
+        try callbackQueue.sync { guard stream == nil else { throw RecorderError.alreadyRecording } }
+        if quality == .highQuality { configuration.colorSpaceName = CGColorSpace.sRGB }
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: self)
-        let recordingConfiguration = SCRecordingOutputConfiguration()
-        recordingConfiguration.outputURL = outputURL
-        recordingConfiguration.outputFileType = .mp4
-        recordingConfiguration.videoCodecType = .h264
-        let output = SCRecordingOutput(configuration: recordingConfiguration, delegate: self)
-        try newStream.addRecordingOutput(output)
         try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: callbackQueue)
+        let output: SCRecordingOutput?
+        let master: ScreenMasterWriter?
+        if quality == .highQuality {
+            var audioTracks = Set<ScreenMasterWriter.Track>()
+            if configuration.capturesAudio { audioTracks.insert(.systemAudio) }
+            if configuration.captureMicrophone { audioTracks.insert(.microphone) }
+            if configuration.capturesAudio { try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: callbackQueue) }
+            if configuration.captureMicrophone { try newStream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: callbackQueue) }
+            master = try ScreenMasterWriter(url: outputURL, width: configuration.width, height: configuration.height,
+                audioTracks: audioTracks, frameDuration: configuration.minimumFrameInterval,
+                onFirstVideo: { [weak self, weak newStream] hostTime in
+                    guard let self, let newStream else { return }
+                    self.callbackQueue.async {
+                        guard self.stream === newStream else { return }
+                        self.lifecycle.didStartRecording = true
+                        self.lifecycle.firstFrameTime = hostTime
+                        self.resolveStart()
+                    }
+                }, onFailure: { [weak self, weak newStream] error in
+                    guard let self, let newStream else { return }
+                    self.callbackQueue.async {
+                        guard self.stream === newStream else { return }
+                        self.lifecycle.recordStreamFailure(error)
+                        self.resolveStart()
+                        self.notifyUnexpectedFailureIfNeeded()
+                        self.requestMasterStop(newStream)
+                    }
+                })
+            output = nil
+        } else {
+            master = nil
+            let recordingConfiguration = SCRecordingOutputConfiguration()
+            recordingConfiguration.outputURL = outputURL
+            recordingConfiguration.outputFileType = .mp4
+            recordingConfiguration.videoCodecType = .h264
+            let compactOutput = SCRecordingOutput(configuration: recordingConfiguration, delegate: self)
+            try newStream.addRecordingOutput(compactOutput)
+            output = compactOutput
+        }
         try callbackQueue.sync {
             guard stream == nil else { throw RecorderError.alreadyRecording }
             stream = newStream
             recordingOutput = output
+            masterWriter = master
+            isMasterStopping = false
             lifecycle = ScreenRecordingState()
             isStarting = true
         }
@@ -63,18 +113,32 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
                     }
                 }
             }
-            callbackQueue.sync { isStarting = false }
+            try callbackQueue.sync {
+                // A first-frame continuation can succeed just before an
+                // encoder/stream error arrives. Do not publish that failed
+                // take as a newly active recording in the caller's UI.
+                guard let result = lifecycle.startResult else { throw RecorderError.noFramesCaptured }
+                _ = try result.get()
+                isStarting = false
+            }
             return firstHostTime
         } catch {
             // Cleanup must also be bounded: framework start/stop callbacks can
             // fail to arrive after a device/permission interruption.
-            try? await CaptureOperationDeadline.run(seconds: 3, timeoutError: RecorderError.timedOut) { completion in
-                newStream.stopCapture(completionHandler: completion)
+            if master != nil {
+                callbackQueue.sync { requestMasterStop(newStream, timeout: 3) }
+                try? await waitForFinish(newStream, deadline: .now() + 15)
+            } else {
+                try? await CaptureOperationDeadline.run(seconds: 3, timeoutError: RecorderError.timedOut) { completion in
+                    newStream.stopCapture(completionHandler: completion)
+                }
             }
             callbackQueue.sync {
                 if stream === newStream {
                     stream = nil
                     recordingOutput = nil
+                    masterWriter = nil
+                    isMasterStopping = false
                     isStarting = false
                 }
             }
@@ -135,8 +199,15 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
             callbackQueue.sync {
                 stream = nil
                 recordingOutput = nil
+                masterWriter = nil
+                isMasterStopping = false
                 isStopping = false
             }
+        }
+        if callbackQueue.sync(execute: { masterWriter != nil }) {
+            callbackQueue.sync { requestMasterStop(active) }
+            try await waitForFinish(active, deadline: deadline)
+            return
         }
         do {
             try await CaptureOperationDeadline.run(seconds: 15, timeoutError: RecorderError.timedOut) { completion in
@@ -150,6 +221,10 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
                 // finished flushing its file. Await its delegate or deadline.
             }
         }
+        try await waitForFinish(active, deadline: deadline)
+    }
+
+    private func waitForFinish(_ active: SCStream, deadline: DispatchTime) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             callbackQueue.async {
                 if let result = self.lifecycle.finishResult {
@@ -167,19 +242,33 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
+        if self.stream === stream, let masterWriter {
+            if type == .screen {
+                guard let hostTime = videoHostTime(sampleBuffer, stream: stream) else { return }
+                masterWriter.append(sampleBuffer, track: .video, hostTime: hostTime)
+            } else if sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer), CMSampleBufferGetNumSamples(sampleBuffer) > 0 {
+                if type == .audio { masterWriter.append(sampleBuffer, track: .systemAudio) }
+                else if type == .microphone { masterWriter.append(sampleBuffer, track: .microphone) }
+            }
+            return
+        }
         guard self.stream === stream, type == .screen, lifecycle.firstFrameTime == nil,
-              sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer),
+              let hostTime = videoHostTime(sampleBuffer, stream: stream) else { return }
+        lifecycle.firstFrameTime = hostTime
+        resolveStart()
+    }
+
+    private func videoHostTime(_ sampleBuffer: CMSampleBuffer, stream: SCStream) -> Double? {
+        guard sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer),
               CMSampleBufferGetImageBuffer(sampleBuffer) != nil,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int,
-              ScreenRecordingState.acceptsFirstFrame(status: SCFrameStatus(rawValue: status)) else { return }
+              ScreenRecordingState.acceptsFirstFrame(status: SCFrameStatus(rawValue: status)) else { return nil }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard let clock = stream.synchronizationClock else { return }
+        guard let clock = stream.synchronizationClock else { return nil }
         let host = CMSyncConvertTime(pts, from: clock, to: CMClockGetHostTimeClock())
-        guard host.seconds.isFinite else { return }
-        lifecycle.firstFrameTime = host.seconds
-        resolveStart()
+        return host.seconds.isFinite ? host.seconds : nil
     }
 
     func recordingOutputDidStartRecording(_ output: SCRecordingOutput) {
@@ -209,6 +298,42 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
             guard self.stream === stream else { return }
             self.lifecycle.recordStreamFailure(error)
             self.resolveStart()
+            self.notifyUnexpectedFailureIfNeeded()
+            if self.masterWriter != nil { self.requestMasterStop(stream) }
+        }
+    }
+
+    /// One bounded stop/finalization path handles Stop, failed startup, and an
+    /// overloaded encoder. A stream callback is never treated as a flushed file.
+    private func requestMasterStop(_ active: SCStream, timeout: Double = 8) {
+        guard stream === active, let masterWriter, !isMasterStopping else { return }
+        isMasterStopping = true
+        let end = active.synchronizationClock.map { CMClockGetTime($0) }
+        callbackQueue.asyncAfter(deadline: .now() + 15) {
+            guard self.stream === active, !self.lifecycle.didFinish else { return }
+            self.finishRecording(error: RecorderError.timedOut)
+        }
+        Task {
+            var stopError: (any Error)?
+            do {
+                try await CaptureOperationDeadline.run(seconds: timeout, timeoutError: RecorderError.timedOut) { completion in
+                    active.stopCapture(completionHandler: completion)
+                }
+            } catch { stopError = error }
+            let failure = stopError
+            self.callbackQueue.async {
+                guard self.stream === active else { return }
+                if let failure { self.lifecycle.recordStreamFailure(failure) }
+                masterWriter.finish(at: end) { result in
+                    self.callbackQueue.async {
+                        guard self.stream === active else { return }
+                        switch result {
+                        case .success: self.finishRecording(error: nil)
+                        case .failure(let error): self.finishRecording(error: error)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -221,10 +346,17 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     private func finishRecording(error: (any Error)?) {
         lifecycle.finish(error: error)
         resolveStart()
+        notifyUnexpectedFailureIfNeeded()
         if let continuation = finishContinuation, let result = lifecycle.finishResult {
             finishContinuation = nil
             continuation.resume(with: result)
         }
+    }
+
+    private func notifyUnexpectedFailureIfNeeded() {
+        guard stream != nil, let handler = unexpectedFailureHandler,
+              let error = lifecycle.takeUnexpectedFailure(isStarting: isStarting, isStopping: isStopping) else { return }
+        handler(error)
     }
 }
 
@@ -236,6 +368,7 @@ struct ScreenRecordingState {
     var firstFrameTime: Double?
     private(set) var didFinish = false
     private(set) var error: (any Error)?
+    private var hasReportedUnexpectedFailure = false
 
     static func acceptsFirstFrame(status: SCFrameStatus?) -> Bool {
         // A data-bearing .started sample can be the initial recorded frame,
@@ -258,6 +391,12 @@ struct ScreenRecordingState {
 
     mutating func recordStreamFailure(_ error: any Error) {
         self.error = self.error ?? error
+    }
+
+    mutating func takeUnexpectedFailure(isStarting: Bool, isStopping: Bool) -> (any Error)? {
+        guard !isStarting, !isStopping, !hasReportedUnexpectedFailure, let error else { return nil }
+        hasReportedUnexpectedFailure = true
+        return error
     }
 
     mutating func finish(error: (any Error)?) {

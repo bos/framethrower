@@ -121,7 +121,7 @@ final class CameraRecorder: ObservableObject {
 
     /// Returns the host-clock timestamp of the first frame written, not the time
     /// this method was called. Use it to align the independent screen track.
-    func startRecording(to url: URL) async throws -> Double {
+    func startRecording(to url: URL, quality: RecordingQuality = .compact) async throws -> Double {
         guard selectedDeviceID != nil, isReady, !isPreparing else {
             throw CameraRecordingError.unavailable
         }
@@ -129,7 +129,7 @@ final class CameraRecorder: ObservableObject {
         isRecording = true
         errorMessage = nil
         do {
-            return try await engine.startRecording(to: url)
+            return try await engine.startRecording(to: url, quality: quality)
         } catch {
             isRecording = false
             errorMessage = error.localizedDescription
@@ -167,6 +167,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     private var videoOutput: AVCaptureVideoDataOutput?
     private var trackWriter: CameraTrackWriter?
     private var outputURL: URL?
+    private var quality: RecordingQuality = .compact
     private var pendingStart: CheckedContinuation<Double, any Error>?
     private var recordingError: (any Error)?
     private var generation = UUID()
@@ -253,7 +254,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         }
     }
 
-    func startRecording(to url: URL) async throws -> Double {
+    func startRecording(to url: URL, quality: RecordingQuality) async throws -> Double {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
@@ -265,6 +266,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
                     return
                 }
                 self.outputURL = url
+                self.quality = quality
                 self.pendingStart = continuation
                 self.recordingError = nil
                 self.generation = UUID()
@@ -340,7 +342,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
             guard let clock = session.synchronizationClock else { throw CameraRecordingError.noFrames }
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let hostTime = CMSyncConvertTime(pts, from: clock, to: CMClockGetHostTimeClock()).seconds
-            if trackWriter == nil { trackWriter = CameraTrackWriter(url: outputURL) }
+            if trackWriter == nil { trackWriter = CameraTrackWriter(url: outputURL, quality: quality) }
             if try trackWriter?.append(sampleBuffer, hostTime: hostTime) == true, let pendingStart {
                 self.pendingStart = nil
                 pendingStart.resume(returning: hostTime)
@@ -379,12 +381,13 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
 /// can be exercised with synthetic camera samples.
 final class CameraTrackWriter: @unchecked Sendable {
     private let url: URL
+    private let quality: RecordingQuality
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var firstHostTime: Double?
     private var isFinishing = false
 
-    init(url: URL) { self.url = url }
+    init(url: URL, quality: RecordingQuality = .compact) { self.url = url; self.quality = quality }
 
     /// Returns true only when this sample was actually accepted by the encoder.
     @discardableResult
@@ -400,11 +403,9 @@ final class CameraTrackWriter: @unchecked Sendable {
             }
             let dimensions = CMVideoFormatDescriptionGetDimensions(format)
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-            let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: Int(dimensions.width),
-                AVVideoHeightKey: Int(dimensions.height)
-            ])
+            let input = AVAssetWriterInput(mediaType: .video,
+                outputSettings: quality.videoSettings(width: Int(dimensions.width), height: Int(dimensions.height)),
+                sourceFormatHint: format)
             input.expectsMediaDataInRealTime = true
             guard writer.canAdd(input) else { throw CameraRecordingError.configurationFailed }
             writer.add(input)

@@ -10,6 +10,7 @@
 		0DA60B5ECB363F697D65472B /* RecordingTitleEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B7A08447970D31081CF851F /* RecordingTitleEditor.swift */; };
 		0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */; };
 		20038457D5FA2C5D0E037802 /* SlackAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B02FAC8C4CE33A644C90D03 /* SlackAPI.swift */; };
+		20C5FF01DFB50F8BB4020F39 /* ScreenMasterWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C13D6D3BD67DEADECF4C615B /* ScreenMasterWriter.swift */; };
 		26BC0545D234B3A03FB2725F /* CameraSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6840E3AAEFC0329B397E930 /* CameraSetupView.swift */; };
 		27F3F0DB81E8955E54E16625 /* ScreenRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266C5CA13CA133D15B080420 /* ScreenRecorder.swift */; };
 		2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36ACB61C84F04DE05285C1AA /* OAuth.swift */; };
@@ -22,6 +23,7 @@
 		4DD96793F5540419472BA1CE /* CaptureSourcePreviews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 086715F7B7342A4708FCB9F7 /* CaptureSourcePreviews.swift */; };
 		50A0768F94F57C66BAB89465 /* RecordingLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83C307FF6A8F2001BBD2CCD8 /* RecordingLibrary.swift */; };
 		50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */; };
+		51ED87EB2FB0482C9295DEFB /* RecordingQuality.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3B0FD9E3B359AFCC12A9730 /* RecordingQuality.swift */; };
 		5DE6C50872135C1523F17FB9 /* WindowSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 010F10320038E81B6F92F45A /* WindowSelection.swift */; };
 		667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */; };
 		67AAAA5AF554D2C21BE34ECE /* RecordingProject.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CF655690A9E839FF2C6B1E0 /* RecordingProject.swift */; };
@@ -77,7 +79,9 @@
 		962D8A6D2ACDE330845F2F3E /* RecordingLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingLibraryView.swift; sourceTree = "<group>"; };
 		A3C013F5884A583103ED27CE /* AreaPreviewEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AreaPreviewEditor.swift; sourceTree = "<group>"; };
 		B24ECC967558913130770853 /* PIPVideoCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PIPVideoCompositor.swift; sourceTree = "<group>"; };
+		B3B0FD9E3B359AFCC12A9730 /* RecordingQuality.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingQuality.swift; sourceTree = "<group>"; };
 		BD5A7848536A44F91C389E05 /* RecorderStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderStyle.swift; sourceTree = "<group>"; };
+		C13D6D3BD67DEADECF4C615B /* ScreenMasterWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenMasterWriter.swift; sourceTree = "<group>"; };
 		C6840E3AAEFC0329B397E930 /* CameraSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraSetupView.swift; sourceTree = "<group>"; };
 		CD520E85E319DD599528423A /* StatusChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusChip.swift; sourceTree = "<group>"; };
 		D36B84B4B1F8D344D22C3892 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -130,8 +134,10 @@
 				83C307FF6A8F2001BBD2CCD8 /* RecordingLibrary.swift */,
 				962D8A6D2ACDE330845F2F3E /* RecordingLibraryView.swift */,
 				6CF655690A9E839FF2C6B1E0 /* RecordingProject.swift */,
+				B3B0FD9E3B359AFCC12A9730 /* RecordingQuality.swift */,
 				8D9D58433C5C2899A8DE0AB9 /* RecordingTimeline.swift */,
 				2B7A08447970D31081CF851F /* RecordingTitleEditor.swift */,
+				C13D6D3BD67DEADECF4C615B /* ScreenMasterWriter.swift */,
 				266C5CA13CA133D15B080420 /* ScreenRecorder.swift */,
 				4B02FAC8C4CE33A644C90D03 /* SlackAPI.swift */,
 				CD520E85E319DD599528423A /* StatusChip.swift */,
@@ -257,8 +263,10 @@
 				50A0768F94F57C66BAB89465 /* RecordingLibrary.swift in Sources */,
 				D7E5F6840BB712CA9F960037 /* RecordingLibraryView.swift in Sources */,
 				67AAAA5AF554D2C21BE34ECE /* RecordingProject.swift in Sources */,
+				51ED87EB2FB0482C9295DEFB /* RecordingQuality.swift in Sources */,
 				FE5454804B382FF94725ED6D /* RecordingTimeline.swift in Sources */,
 				0DA60B5ECB363F697D65472B /* RecordingTitleEditor.swift in Sources */,
+				20C5FF01DFB50F8BB4020F39 /* ScreenMasterWriter.swift in Sources */,
 				27F3F0DB81E8955E54E16625 /* ScreenRecorder.swift in Sources */,
 				20038457D5FA2C5D0E037802 /* SlackAPI.swift in Sources */,
 				323105BF10991A94F95A197F /* StatusChip.swift in Sources */,

@@ -51,6 +51,41 @@ struct CaptureLifecycleChecks {
         let encoderFirstTime = try encoderFirst.startResult?.get()
         try require(encoderFirstTime == 42, "callback ordering changed source alignment")
 
+        // A continuation may already have returned its first-frame timestamp
+        // when the encoder reports a terminal error. Startup must check again.
+        encoderFirst.recordStreamFailure(CaptureCheckError.operation)
+        do {
+            _ = try encoderFirst.startResult?.get()
+            throw CaptureCheckError.failed("failure between first-frame success and startup return was missed")
+        } catch CaptureCheckError.operation {}
+        try require(encoderFirst.takeUnexpectedFailure(isStarting: true, isStopping: false) == nil,
+                    "startup errors must return to the start caller without an active-take notification")
+
+        var running = ScreenRecordingState()
+        running.didStartRecording = true
+        running.firstFrameTime = 42
+        running.recordStreamFailure(CaptureCheckError.operation)
+        try require(running.takeUnexpectedFailure(isStarting: false, isStopping: true) == nil,
+                    "ordinary Stop errors must not trigger reentrant recording cleanup")
+        let runtimeFailure = running.takeUnexpectedFailure(isStarting: false, isStopping: false) as? CaptureCheckError
+        try require(runtimeFailure == .operation, "runtime stream/encoder failures must notify their owner")
+        running.finish(error: CaptureCheckError.timeout)
+        try require(running.takeUnexpectedFailure(isStarting: false, isStopping: false) == nil,
+                    "duplicate stream/output/finalization errors must produce one notification per run")
+
+        var compactFailure = ScreenRecordingState()
+        compactFailure.didStartRecording = true
+        compactFailure.firstFrameTime = 43
+        compactFailure.finish(error: CaptureCheckError.operation)
+        try require(compactFailure.takeUnexpectedFailure(isStarting: false, isStopping: false) as? CaptureCheckError == .operation,
+                    "compact output failures must notify even when the encoded file has already finished")
+        var retry = ScreenRecordingState()
+        try require(retry.takeUnexpectedFailure(isStarting: false, isStopping: false) == nil,
+                    "successful new runs cannot inherit an old failure")
+        retry.recordStreamFailure(CaptureCheckError.timeout)
+        try require(retry.takeUnexpectedFailure(isStarting: false, isStopping: false) as? CaptureCheckError == .timeout,
+                    "a new run must be able to report its own first failure")
+
         // A framework that never invokes completion must not strand capture UI.
         let started = ContinuousClock.now
         do {
@@ -101,6 +136,6 @@ struct CaptureLifecycleChecks {
             }
             try await group.waitForAll()
         }
-        print("Capture lifecycle checks passed (event ordering, file finalization, missing/late/duplicate callbacks, and retries).")
+        print("Capture lifecycle checks passed (startup races, once-per-run unexpected failures, stop suppression, file finalization, bounded callbacks, and retries).")
     }
 }

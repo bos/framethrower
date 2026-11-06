@@ -15,7 +15,6 @@ struct ContentView: View {
     @State private var clipSize = ""
     @State private var previewEnabled = false
     @StateObject private var sourcePreviews = CaptureSourcePreviews()
-    @State private var isSharingPresented = false
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var canRecord: Bool {
@@ -34,7 +33,9 @@ struct ContentView: View {
         guard let display = model.displays.first(where: { $0.id == model.selectedDisplayID }) else { return nil }
         return .display(id: display.id, frame: display.display.frame)
     }
-    private var showRecording: Bool { model.hasRecordingToUpload && !model.isRecording }
+    private var showRecording: Bool {
+        (!model.recordingLibrary.entries.isEmpty || model.recordingLibrary.canUndoRemoval) && !model.isRecording
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -401,25 +402,12 @@ struct ContentView: View {
     }
 
     private var recordingSummary: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "play.rectangle")
-                .font(.system(size: 22)).foregroundStyle(RecorderStyle.accent)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Your recording").font(.system(size: 12, weight: .medium))
-                Text(clipSummary).font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Edit…") { model.requestProjectEditor() }
-                .disabled(model.projectEditor == nil || captureLocked || model.isAnyUploadActive)
-            Button("Share…") { isSharingPresented = true }
-                .disabled(captureLocked)
-                .popover(isPresented: $isSharingPresented) {
-                    recordingCard.frame(width: 560).padding(16)
-                }
-        }
-        .controlSize(.small)
-        .padding(14)
-        .modifier(RecorderCard())
+        RecordingLibraryView(library: model.recordingLibrary,
+            isLocked: captureLocked || model.isAnyUploadActive,
+            editorForURL: { try model.editor(for: $0) },
+            onOpen: { model.openRecording(at: $0) },
+            onShare: { model.selectRecordingForSharing(at: $0) },
+            shareContent: { AnyView(recordingCard.frame(width: 560).padding(16)) })
     }
 
     private var recordingCard: some View {
@@ -439,17 +427,15 @@ struct ContentView: View {
                 .help("Review and edit recording")
                 .accessibilityLabel("Review and edit recording")
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(model.projectEditor == nil ? "Your recording" : "Review and edit")
-                        .font(.system(size: 13, weight: .semibold))
+                    if let editor = model.projectEditor {
+                        RecordingTitleEditor(editor: editor)
+                            .frame(height: 24)
+                    }
                     Text(clipSummary)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if model.projectEditor != nil {
-                    Button("Edit…") { model.requestProjectEditor() }
-                        .disabled(model.isAnyUploadActive || captureLocked)
-                }
                 Button {
                     if let url = model.lastRecordingURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
                 } label: {

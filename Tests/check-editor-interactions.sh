@@ -14,6 +14,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PIPGeometryViews.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/CursorZoomSuggestions.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTitleEditor.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" \
   "$repo_dir/Tests/EditorInteractionChecks.swift" \
   -o "$check_dir/check-editor-interactions"

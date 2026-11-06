@@ -31,10 +31,12 @@ struct ProjectEditorView: View {
     var body: some View {
         VStack(spacing: 16) {
             HStack {
+                RecordingTitleEditor(editor: editor, font: .systemFont(ofSize: 14, weight: .semibold))
+                    .frame(minWidth: 140, idealWidth: 240, maxWidth: 300, minHeight: 24, maxHeight: 24)
                 ProjectUndoButtons(editor: editor)
                 Spacer()
                 Button("Export…") { Task { await export() } }.disabled(isExporting || playback.isLoading)
-            }
+            }.frame(height: 24)
             player
             timeline
             inspector
@@ -47,6 +49,7 @@ struct ProjectEditorView: View {
         .frame(minWidth: 820, idealWidth: 940, maxWidth: .infinity,
                minHeight: 760, idealHeight: 780, maxHeight: .infinity)
         .background(.background)
+        .navigationTitle(editor.displayName)
         .task { await playback.rebuild(editor: editor) }
         .onChange(of: editor.project.state) { _, _ in
             Task { await playback.rebuild(editor: editor) }

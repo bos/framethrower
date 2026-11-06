@@ -52,13 +52,41 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             guard editor.project == project, finalScreenBytes == screenBytes, finalCameraBytes == cameraBytes else {
                 throw ProbeError.failed("Play, trim-handle grab, or scrubbing mutated project/history/source media")
             }
+            guard let window = NSApplication.shared.windows.first(where: { window in
+                guard let host = window.contentView else { return false }
+                return find(in: host) as EditorCanvasView? != nil
+            }), let host = window.contentView, let canvas: EditorCanvasView = find(in: host),
+                  let timeline: RecordingTimelineView = find(in: host) else {
+                throw ProbeError.failed("editor window for title synchronization")
+            }
+            let beforeRename = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+            guard editor.rename(to: "Renamed recording " + String(repeating: "long name ", count: 12)) else {
+                throw ProbeError.failed("rename the recording")
+            }
+            try await titleMatches(editor, window: window)
+            try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                             baseline: beforeRename, context: "renamed recording", compareScrolls: false)
+            guard editor.undo(), editor.project.state == project.state else {
+                throw ProbeError.failed("undo rename without changing video edits")
+            }
+            try await titleMatches(editor, window: window)
             try? FileManager.default.removeItem(at: directory)
-            output("WindowGroup layout checks passed (real SwiftUI scene, Play, paused trim grab, and source scrubbing).")
+            output("WindowGroup layout checks passed (real SwiftUI scene, Play, trim/scrub, synchronized window names, and rename without reflow).")
             Darwin.exit(0)
         } catch {
             try? FileManager.default.removeItem(at: directory)
             output("WINDOWGROUP LAYOUT FAILURE: \(error)")
             Darwin.exit(1)
+        }
+    }
+
+    private func titleMatches(_ editor: ProjectEditor, window: NSWindow) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while window.title != editor.displayName {
+            guard ContinuousClock.now < deadline else {
+                throw ProbeError.failed("window title '\(window.title)' does not match '\(editor.displayName)'")
+            }
+            try await Task.sleep(for: .milliseconds(10))
         }
     }
 

@@ -76,6 +76,8 @@ struct ProjectRendererChecks {
         tinyOverlap.cameraOffset = 4.999999
         _ = try await ProjectRenderer.makePreview(project: tinyOverlap, directory: directory)
 
+        try await geometryChecks(project: project, directory: directory)
+
         project.state.trimStart = 1
         project.state.trimEnd = 3.5
         let destination = directory.appendingPathComponent("export.mp4")
@@ -102,7 +104,167 @@ struct ProjectRendererChecks {
         } catch ProjectRenderer.RenderError.destinationExists { }
         try require(try Data(contentsOf: screen) == originalScreen, "screen source remains byte-identical")
         try require(try Data(contentsOf: camera) == originalCamera, "camera source remains byte-identical")
-        print("Project renderer checks passed (jump, easing, visibility, sync offsets, camera orientation, independent audio tracks, screen-only, trim, export parity, source preservation).")
+        print("Project renderer checks passed (jump, easing, timed shapes, repositionable crops, circle alpha, orientation, sync offsets, independent audio tracks, trim, preview/export parity, source preservation).")
+    }
+
+    private static func geometryChecks(project: RecordingProject, directory: URL) async throws {
+        let patterned = directory.appendingPathComponent("patterned.mov")
+        try await movie(to: patterned, width: 80, height: 40, duration: 5, camera: true, pattern: true)
+        var cropProject = project
+        cropProject.cameraFilename = "patterned.mov"
+        func single(_ placement: PIPPlacement) -> RecordingProject {
+            var value = cropProject
+            value.state.pipKeyframes = [PIPKeyframe(time: 0, placement: placement)]
+            return value
+        }
+        let red = [255, 0, 0], green = [0, 255, 0], yellow = [255, 255, 0], magenta = [255, 0, 255]
+        let left = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .square, crop: PIPCrop(x: 0, y: 0.5)))
+        let leftImage = try await image(left, directory: directory, at: 0.5)
+        try pixel(leftImage, x: 10, y: 10, equals: red)
+        try pixel(leftImage, x: 10, y: 30, equals: yellow)
+        let right = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .square, crop: PIPCrop(x: 1, y: 0.5)))
+        let rightImage = try await image(right, directory: directory, at: 0.5)
+        try pixel(rightImage, x: 10, y: 10, equals: green)
+        try pixel(rightImage, x: 10, y: 30, equals: magenta)
+        let wideTop = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .rectangle,
+                                          aspectRatio: 4, crop: PIPCrop(x: 0.5, y: 0)))
+        let wideTopImage = try await image(wideTop, directory: directory, at: 0.5)
+        try pixel(wideTopImage, x: 10, y: 3, equals: red)
+        try pixel(wideTopImage, x: 30, y: 3, equals: green)
+        try pixel(wideTopImage, x: 10, y: 15, equals: [0, 0, 255])
+        let wideBottom = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .rectangle,
+                                             aspectRatio: 4, crop: PIPCrop(x: 0.5, y: 1)))
+        let wideBottomImage = try await image(wideBottom, directory: directory, at: 0.5)
+        try pixel(wideBottomImage, x: 10, y: 3, equals: yellow)
+        try pixel(wideBottomImage, x: 30, y: 3, equals: magenta)
+        let portrait = single(PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .rectangle,
+                                           aspectRatio: 0.5, crop: PIPCrop(x: 1, y: 0.5)))
+        let portraitImage = try await image(portrait, directory: directory, at: 0.5)
+        try pixel(portraitImage, x: 20, y: 20, equals: green)
+        try pixel(portraitImage, x: 20, y: 60, equals: magenta)
+        try pixel(portraitImage, x: 45, y: 20, equals: [0, 0, 255])
+
+        // Preferred transforms are applied before the crop's top-left axes.
+        let rotated = directory.appendingPathComponent("patterned-rotated.mov")
+        try await movie(to: rotated, width: 80, height: 40, duration: 5, camera: true,
+                        transform: CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 40, ty: 0), pattern: true)
+        var rotatedTop = left
+        rotatedTop.cameraFilename = "patterned-rotated.mov"
+        rotatedTop.state.pipKeyframes[0].placement.crop = PIPCrop(x: 0.5, y: 0)
+        let topImage = try await image(rotatedTop, directory: directory, at: 0.5)
+        try pixel(topImage, x: 10, y: 10, equals: yellow)
+        try pixel(topImage, x: 30, y: 10, equals: red)
+        rotatedTop.state.pipKeyframes[0].placement.crop.y = 1
+        let bottomImage = try await image(rotatedTop, directory: directory, at: 0.5)
+        try pixel(bottomImage, x: 10, y: 10, equals: magenta)
+        try pixel(bottomImage, x: 30, y: 10, equals: green)
+        guard let rawFrame = try await ProjectRenderer.cameraFrame(project: rotatedTop, directory: directory, at: 0.5) else {
+            throw CheckError.failed("raw oriented camera frame")
+        }
+        try require(rawFrame.width == 40 && rawFrame.height == 80, "raw frame honors preferred orientation")
+        try pixel(rawFrame, x: 10, y: 10, equals: yellow)
+        try pixel(rawFrame, x: 10, y: 60, equals: magenta)
+
+        // Continuous crop movement is sampled at the exact composition time.
+        var cropMotion = left
+        cropMotion.state.pipKeyframes.append(PIPKeyframe(
+            time: 2, placement: right.state.pipKeyframes[0].placement, transition: .smooth, duration: 2
+        ))
+        let cropMiddle = try await image(cropMotion, directory: directory, at: 1)
+        try pixel(cropMiddle, x: 5, y: 10, equals: red)
+        try pixel(cropMiddle, x: 35, y: 10, equals: green)
+
+        var timed = project
+        timed.state.pipKeyframes = [
+            PIPKeyframe(time: 0, placement: PIPPlacement(x: 0, y: 0, scale: 0.25, shape: .rectangle, aspectRatio: 2)),
+            PIPKeyframe(time: 1, placement: PIPPlacement(x: 1, y: 0, scale: 0.25, shape: .square)),
+            PIPKeyframe(time: 3, placement: PIPPlacement(x: 0, y: 1, scale: 0.5, shape: .circle), transition: .smooth, duration: 1),
+            PIPKeyframe(time: 4, placement: PIPPlacement(x: 1, y: 0, scale: 0.25, shape: .circle), transition: .smooth, duration: 1)
+        ]
+        let timedRender = try await ProjectRenderer.makePreview(project: timed, directory: directory)
+        try await frame(timedRender, at: 29.0 / 30, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        try await frame(timedRender, at: 1, expected: CGRect(x: 120, y: 0, width: 40, height: 40))
+        let beforeCircle = try await image(timed, directory: directory, at: 2.5)
+        try pixel(beforeCircle, x: 52, y: 32, equals: yellow)
+        let circle = try await image(timed, directory: directory, at: 3)
+        try checkCircle(circle, frame: CGRect(x: 0, y: 40, width: 80, height: 80), color: yellow)
+        let movingCircle = try await image(timed, directory: directory, at: 3.5)
+        try checkCircle(movingCircle, frame: CGRect(x: 50, y: 30, width: 60, height: 60), color: yellow)
+        let finalCircle = try await image(timed, directory: directory, at: 4)
+        try checkCircle(finalCircle, frame: CGRect(x: 120, y: 0, width: 40, height: 40), color: yellow)
+
+        // Alpha reveals different screen content behind each circle corner.
+        let patternedScreen = directory.appendingPathComponent("patterned-screen.mov")
+        try await movie(to: patternedScreen, width: 160, height: 120, duration: 5, camera: false, pattern: true)
+        var alphaProject = timed
+        alphaProject.screenFilename = "patterned-screen.mov"
+        alphaProject.state.pipKeyframes = [PIPKeyframe(time: 0, placement: PIPPlacement(x: 0.5, y: 0.5, scale: 0.5, shape: .circle))]
+        let alphaImage = try await image(alphaProject, directory: directory, at: 0.5)
+        try pixel(alphaImage, x: 42, y: 22, equals: red)
+        try pixel(alphaImage, x: 118, y: 22, equals: green)
+        try pixel(alphaImage, x: 42, y: 98, equals: yellow)
+        try pixel(alphaImage, x: 118, y: 98, equals: magenta)
+        try pixel(alphaImage, x: 60, y: 50, equals: green)
+
+        timed.state.trimStart = 3
+        timed.state.trimEnd = 4.5
+        let exportURL = directory.appendingPathComponent("circle-export.mp4")
+        try await ProjectRenderer.export(project: timed, directory: directory, to: exportURL)
+        let exportedGenerator = AVAssetImageGenerator(asset: AVURLAsset(url: exportURL))
+        exportedGenerator.requestedTimeToleranceBefore = .zero
+        exportedGenerator.requestedTimeToleranceAfter = .zero
+        let (first, _) = try await exportedGenerator.image(at: .zero)
+        try checkCircle(first, frame: CGRect(x: 0, y: 40, width: 80, height: 80), color: yellow, requireAntialias: false)
+        let (middle, _) = try await exportedGenerator.image(at: CMTime(seconds: 0.5, preferredTimescale: 600))
+        try checkCircle(middle, frame: CGRect(x: 50, y: 30, width: 60, height: 60), color: yellow, requireAntialias: false)
+    }
+
+    private static func image(_ project: RecordingProject, directory: URL, at seconds: Double) async throws -> CGImage {
+        let rendered = try await ProjectRenderer.makePreview(project: project, directory: directory)
+        let generator = AVAssetImageGenerator(asset: rendered.asset)
+        generator.videoComposition = rendered.videoComposition
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        return try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
+    }
+
+    private static func rgba(_ image: CGImage) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let context = CGContext(data: &bytes, width: image.width, height: image.height, bitsPerComponent: 8,
+                                      bytesPerRow: image.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw CheckError.failed("pixel context")
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return bytes
+    }
+
+    private static func pixel(_ image: CGImage, x: Int, y: Int, equals expected: [Int]) throws {
+        let bytes = try rgba(image)
+        let index = (y * image.width + x) * 4
+        let actual = [Int(bytes[index]), Int(bytes[index + 1]), Int(bytes[index + 2])]
+        try require(zip(actual, expected).allSatisfy { abs($0 - $1) <= 40 },
+                    "pixel (\(x),\(y)) = \(actual), expected \(expected)")
+    }
+
+    private static func checkCircle(_ image: CGImage, frame: CGRect, color: [Int], requireAntialias: Bool = true) throws {
+        try pixel(image, x: Int(frame.midX), y: Int(frame.midY), equals: color)
+        try pixel(image, x: Int(frame.minX + 2), y: Int(frame.minY + 2), equals: [0, 0, 255])
+        try pixel(image, x: Int(frame.maxX - 3), y: Int(frame.maxY - 3), equals: [0, 0, 255])
+        try pixel(image, x: Int(frame.minX + frame.width * 0.25), y: Int(frame.minY + frame.height * 0.25), equals: color)
+        if requireAntialias {
+            let bytes = try rgba(image)
+            var partialAlpha = false
+            for y in Int(frame.minY)..<Int(frame.maxY) {
+                for x in Int(frame.minX)..<Int(frame.maxX) {
+                    let index = (y * image.width + x) * 4
+                    if bytes[index + 1] > 15 && bytes[index + 1] < 240 && bytes[index + 2] > 15 && bytes[index + 2] < 240 {
+                        partialAlpha = true
+                    }
+                }
+            }
+            try require(partialAlpha, "circle boundary has antialiased alpha")
+        }
     }
 
     @MainActor
@@ -121,7 +283,7 @@ struct ProjectRendererChecks {
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         guard let context = CGContext(
             data: &rgba, width: width, height: height, bitsPerComponent: 8,
-            bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { throw CheckError.failed("image context") }
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
@@ -204,10 +366,15 @@ struct ProjectRendererChecks {
         return buffer
     }
 
-    private static func movie(to url: URL, width: Int, height: Int, duration: Int, camera: Bool, transform: CGAffineTransform = .identity) async throws {
+    private static func movie(to url: URL, width: Int, height: Int, duration: Int, camera: Bool, transform: CGAffineTransform = .identity, pattern: Bool = false) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
         ])
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -231,7 +398,7 @@ struct ProjectRendererChecks {
         guard writer.startWriting() else { throw writer.error ?? CheckError.failed("start synthetic writer") }
         writer.startSession(atSourceTime: .zero)
         let video = Task { @MainActor in
-            try await fillVideo(input, adaptor: adaptor, writer: writer, width: width, height: height, duration: duration, camera: camera)
+            try await fillVideo(input, adaptor: adaptor, writer: writer, width: width, height: height, duration: duration, camera: camera, pattern: pattern)
         }
         var audioTasks: [Task<Void, any Error>] = []
         for (track, audio) in audioInputs.enumerated() {
@@ -252,7 +419,7 @@ struct ProjectRendererChecks {
         guard writer.status == .completed else { throw writer.error ?? CheckError.failed("finish synthetic writer") }
     }
     private static func fillVideo(_ input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, writer: AVAssetWriter,
-                                  width: Int, height: Int, duration: Int, camera: Bool) async throws {
+                                  width: Int, height: Int, duration: Int, camera: Bool, pattern: Bool) async throws {
         for index in 0..<(duration * 30) {
             try await ready(input, writer: writer)
             var buffer: CVPixelBuffer?
@@ -268,6 +435,12 @@ struct ProjectRendererChecks {
                     base[offset + 1] = camera ? 255 : 0
                     base[offset + 2] = camera && index >= 60 ? 255 : 0
                     base[offset + 3] = 255
+                    if pattern {
+                        let rgb: [UInt8]
+                        if y < height / 2 { rgb = x < width / 2 ? [255, 0, 0] : [0, 255, 0] }
+                        else { rgb = x < width / 2 ? [255, 255, 0] : [255, 0, 255] }
+                        base[offset] = rgb[2]; base[offset + 1] = rgb[1]; base[offset + 2] = rgb[0]
+                    }
                 }
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])

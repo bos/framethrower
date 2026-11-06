@@ -63,27 +63,26 @@ enum ProjectRenderer {
             try audioTrack.insertTimeRange(range, of: audioSource, at: range.start)
         }
 
-        let screenLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: screenTrack)
-        screenLayer.setTransform(sourceGeometry.transform.concatenating(CGAffineTransform(
-            scaleX: renderSize.width / sourceGeometry.size.width,
-            y: renderSize.height / sourceGeometry.size.height
-        )), at: .zero)
-        var layers: [AVVideoCompositionLayerInstruction] = [screenLayer]
         var cameraAspect = 16.0 / 9.0
+        var cameraTrackID: CMPersistentTrackID?
+        var cameraGeometry: PIPSourceGeometry?
+        var cameraStart = 0.0
+        var cameraEnd = 0.0
 
         if let cameraFilename = project.cameraFilename {
             let cameraAsset = AVURLAsset(url: directory.appendingPathComponent(cameraFilename))
             guard let cameraSource = try await cameraAsset.loadTracks(withMediaType: .video).first else {
                 throw RenderError.invalidVideo(cameraFilename)
             }
-            let cameraGeometry = try await geometry(of: cameraSource)
-            cameraAspect = cameraGeometry.size.width / cameraGeometry.size.height
+            let loadedCameraGeometry = try await geometry(of: cameraSource)
+            cameraGeometry = loadedCameraGeometry
+            cameraAspect = loadedCameraGeometry.size.width / loadedCameraGeometry.size.height
             let cameraDuration = try await cameraAsset.load(.duration).seconds
             guard cameraDuration.isFinite, cameraDuration > 0, project.cameraOffset.isFinite else {
                 throw RenderError.invalidVideo(cameraFilename)
             }
-            let cameraStart = max(0, project.cameraOffset)
-            let cameraEnd = min(duration, project.cameraOffset + cameraDuration)
+            cameraStart = max(0, project.cameraOffset)
+            cameraEnd = min(duration, project.cameraOffset + cameraDuration)
             if cameraEnd > cameraStart, time(cameraEnd - cameraStart) > .zero {
                 guard let cameraTrack = composition.addMutableTrack(
                     withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid
@@ -92,18 +91,21 @@ enum ProjectRenderer {
                     CMTimeRange(start: time(max(0, -project.cameraOffset)), duration: time(cameraEnd - cameraStart)),
                     of: cameraSource, at: time(cameraStart)
                 )
-                let cameraLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: cameraTrack)
-                configureCamera(
-                    cameraLayer, state: project.state, geometry: cameraGeometry,
-                    renderSize: renderSize, start: cameraStart, end: cameraEnd
-                )
-                layers.insert(cameraLayer, at: 0)
+                cameraTrackID = cameraTrack.trackID
             }
         }
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = wholeRange
-        instruction.layerInstructions = layers
+        let instruction = PIPCompositionInstruction(
+            timeRange: wholeRange, screenTrackID: screenTrack.trackID, cameraTrackID: cameraTrackID,
+            screenGeometry: sourceGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
+            cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state
+        )
         let videoComposition = AVMutableVideoComposition()
+        videoComposition.customVideoCompositorClass = PIPVideoCompositor.self
+        // The compositor renders into sRGB; explicitly tag matching output and
+        // request matching source conversion instead of inheriting one track's profile.
+        videoComposition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+        videoComposition.colorTransferFunction = AVVideoTransferFunction_IEC_sRGB
+        videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
         videoComposition.renderSize = renderSize
         videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
         videoComposition.instructions = [instruction]
@@ -111,6 +113,22 @@ enum ProjectRenderer {
             asset: composition, videoComposition: videoComposition,
             screenSize: renderSize, cameraAspect: cameraAspect
         )
+    }
+
+    /// A raw, oriented source frame for repositioning the nondestructive crop.
+    /// `at` is in screen-source seconds, independent of the editable trim.
+    static func cameraFrame(project: RecordingProject, directory: URL, at seconds: Double) async throws -> CGImage? {
+        try project.validate()
+        guard let filename = project.cameraFilename, seconds.isFinite else { return nil }
+        let asset = AVURLAsset(url: directory.appendingPathComponent(filename))
+        let cameraTime = seconds - project.cameraOffset
+        let duration = try await asset.load(.duration).seconds
+        guard cameraTime >= 0, cameraTime < duration else { return nil }
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .zero
+        return try await generator.image(at: time(cameraTime)).image
     }
 
     static func export(project: RecordingProject, directory: URL, to destination: URL) async throws {
@@ -140,19 +158,14 @@ enum ProjectRenderer {
         }
     }
 
-    private struct Geometry {
-        let size: CGSize
-        let transform: CGAffineTransform
-    }
-
-    private static func geometry(of track: AVAssetTrack) async throws -> Geometry {
+    private static func geometry(of track: AVAssetTrack) async throws -> PIPSourceGeometry {
         let naturalSize = try await track.load(.naturalSize)
         let preferred = try await track.load(.preferredTransform)
         let bounds = CGRect(origin: .zero, size: naturalSize).applying(preferred).standardized
         guard bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 else {
             throw RenderError.cannotExport
         }
-        return Geometry(
+        return PIPSourceGeometry(
             size: bounds.size,
             transform: preferred.concatenating(CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY))
         )
@@ -160,60 +173,5 @@ enum ProjectRenderer {
 
     private static func time(_ seconds: Double) -> CMTime {
         CMTime(seconds: seconds, preferredTimescale: 60_000)
-    }
-
-    private static func configureCamera(
-        _ layer: AVMutableVideoCompositionLayerInstruction, state: EditState,
-        geometry: Geometry, renderSize: CGSize, start: Double, end: Double
-    ) {
-        let aspect = geometry.size.width / geometry.size.height
-        func transform(at seconds: Double) -> CGAffineTransform {
-            let frame = state.placement(at: seconds).frame(in: renderSize, cameraAspect: aspect)
-            // AVVideoComposition transforms use top-left coordinates, just like the editor.
-            return geometry.transform
-                .concatenating(CGAffineTransform(scaleX: frame.width / geometry.size.width, y: frame.height / geometry.size.height))
-                .concatenating(CGAffineTransform(translationX: frame.minX, y: frame.minY))
-        }
-        let points = state.pipKeyframes.sorted { $0.time < $1.time }
-        var boundaries = Set([start, end])
-        var smoothRanges: [ClosedRange<Double>] = []
-        for (index, point) in points.enumerated() {
-            if point.time > start, point.time < end { boundaries.insert(point.time) }
-            guard index > 0, point.transition == .smooth, point.duration > 0 else { continue }
-            let beginning = max(points[index - 1].time, point.time - point.duration)
-            let low = max(start, beginning)
-            let high = min(end, point.time)
-            guard high > low else { continue }
-            smoothRanges.append(low...high)
-            boundaries.insert(low)
-            boundaries.insert(high)
-            // Sample easing only during actual movement, never throughout long holds.
-            let steps = max(1, Int(ceil((high - low) * 30)))
-            for step in 1..<steps {
-                boundaries.insert(low + (high - low) * Double(step) / Double(steps))
-            }
-        }
-        // Canonicalize to the composition timebase so near-identical saved
-        // timestamps cannot create zero-length or overlapping transform ramps.
-        let times = Set(boundaries.map { time($0).value }).sorted().map { Double($0) / 60_000 }
-        for index in 0..<(times.count - 1) {
-            let a = times[index]
-            let b = times[index + 1]
-            if smoothRanges.contains(where: { $0.contains((a + b) / 2) }) {
-                layer.setTransformRamp(
-                    fromStart: transform(at: a), toEnd: transform(at: b),
-                    timeRange: CMTimeRange(start: time(a), duration: time(b - a))
-                )
-            } else {
-                layer.setTransform(transform(at: a), at: time(a))
-            }
-        }
-        // Visibility changes are discrete; a missing camera segment stays transparent.
-        if start > 0 { layer.setOpacity(0, at: .zero) }
-        layer.setOpacity(state.placement(at: start).visible ? 1 : 0, at: time(start))
-        for point in points where point.time > start && point.time < end {
-            layer.setOpacity(point.placement.visible ? 1 : 0, at: time(point.time))
-        }
-        layer.setOpacity(0, at: time(end))
     }
 }

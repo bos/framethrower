@@ -7,6 +7,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   -target "$(uname -m)-apple-macos15.0" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectRenderer.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/PIPVideoCompositor.swift" \
   "$repo_dir/Tests/ProjectRendererChecks.swift" \
   -o "$check_dir/check-project-renderer"
 "$check_dir/check-project-renderer"

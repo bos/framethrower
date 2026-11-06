@@ -97,12 +97,14 @@ pauses playback.
 
 The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**
 controls. Double-click the recording to zoom in at that position or return to
-1×. Drag a zoomed recording to pan. The Zoom slider and editable focus points
-support **Jump** and **Smooth** arrivals with adjustable duration. Select a point
-to change its arrival or move it to the playhead; delete it to remove the edit.
-**Auto zoom** offers Subtle and Focused suggestions from recorded click groups,
+1×. Drag a zoomed recording to pan. The Zoom slider and timed zoom changes
+support **Jump** and **Smooth** arrivals with adjustable duration. Select a change
+to change its movement or use the current video time; remove it to delete the edit.
+Purple diamonds link each zoom change to its time on the timeline; click a diamond
+or its matching list item to select it. Hover controls for action-specific help.
+**Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
 with steady holds and returns to the wider context. Suggestions are ordinary
-editable points and applying them is one undo step.
+editable changes and applying them is one undo step.
 
 For new recordings, **Pointer** changes pointer size, smoothing, visibility, and
 click highlights after capture. Smoothing keeps click targets exact and preserves
@@ -111,7 +113,7 @@ cursor; screen zooming and panning still work on them. Pointer tracking covers
 Window, Display, and Area capture, including moving windows and multiple displays.
 If pointer capture cannot start, recording retains the ordinary baked-in cursor.
 
-Camera edits create placement points at the playhead. Move the PIP by dragging or
+Camera edits create timed camera changes. Move the PIP by dragging or
 using a corner button; resize with **Size** or any of its four corner handles. **Original**
 preserves the camera aspect, **Rectangle** allows independent width and height,
 and **Square** and **Circle** crop without stretching. **Framing…** lets you move
@@ -120,8 +122,8 @@ of the PIP window size. Main-view and camera movement share transition timing,
 easing, and viewport bounds. Shape, framing, zoom, size, position, and visibility
 can all change over time. Dragging updates the PIP picture live and commits one
 undo step when released. **Jump** changes placement instantly; **Smooth** eases
-position, size, aspect, and framing toward the point. Shape and visibility switch
-at the point's timestamp.
+position, size, aspect, and framing toward the change. Shape and visibility switch
+at the change's time.
 
 Every edit, including trim, supports Command-Z and Shift-Command-Z. Each drag is
 one undo step. Edits and history save automatically and survive reopening through
@@ -176,7 +178,7 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-native-preview-sources.sh`: native playback pixel parity, bounded
   source-frame ownership, full camera framing, and live zoom/PIP/pointer drafts.
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, overlapping
-  hit targets, undo grouping, bounds, and keyboard seeking.
+  hit targets, visible/selectable zoom markers, undo grouping, bounds, and keyboard seeking.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
 - `Tests/check-capture-lifecycle.sh`: bounded SDK callbacks, event ordering, media
   finalization, and retry isolation.

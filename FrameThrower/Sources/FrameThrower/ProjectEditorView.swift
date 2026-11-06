@@ -94,9 +94,11 @@ struct ProjectEditorView: View {
                     onSeek: { playback.scrub(to: $0) },
                     onScrubBegan: { playback.beginScrubbing() },
                     onScrubEnded: { playback.endScrubbing() },
-                    onTrim: { start, end in setTrim(start, end) })
+                    onTrim: { start, end in setTrim(start, end) },
+                    zoomChanges: state.zoomKeyframes.map { RecordingTimelineMarker(id: $0.id, time: $0.time, help: zoomChangeHelp($0)) },
+                    selectedZoomChangeID: selectedZoomPoint,
+                    onSelectZoomChange: { selectZoomChange($0) })
                     .frame(height: 36)
-                    .help("Click or drag to scrub. Drag the blue handles to trim.")
                     .contextMenu {
                         Button("Reset trim") { setTrim(0, editor.project.duration) }
                             .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
@@ -151,81 +153,118 @@ struct ProjectEditorView: View {
                 }) { value in
                     var next = zoom; next.scale = value
                     setZoom(next, at: dragTime, name: "Zoom recording")
-                }.frame(width: 285)
-                Button("1×") { setZoom(ZoomPlacement(), at: playback.editingTime, name: "Zoom out") }
-                Spacer(minLength: 0)
-                Button("Center") {
+                }
+                .frame(width: 285)
+                .help("Change the magnification at the current video time. Double-click the video to zoom where you click; drag a zoomed view to pan.")
+                Button("Full frame") { setZoom(ZoomPlacement(), at: playback.editingTime, name: "Zoom out") }
+                    .help("Show the whole recording at this time, without zooming or panning.")
+                Button("Center view") {
                     var next = zoom; next.x = 0.5; next.y = 0.5
                     setZoom(next, at: playback.editingTime, name: "Center zoom")
                 }
-                Menu("Auto zoom") {
+                .help("Keep the current magnification and move the view to the center of the recording.")
+                Menu("Suggest zooms") {
                     ForEach([CursorZoomSuggestions.Preset.subtle, .focused], id: \.self) { preset in
-                        Button(preset.title) { suggestZooms(preset) }
+                        Button("\(preset.title) (\(String(format: "%.1f", preset.scale))×)") { suggestZooms(preset) }
                             .disabled(playback.cursorRecording?.clicks.isEmpty != false)
+                            .help("Replace existing zoom changes with editable views centered on recorded mouse clicks.")
                     }
                     Divider()
-                    Button("Remove all zooms") {
+                    Button("Remove all zoom changes") {
                         playback.pause()
                         var next = state; next.zoomKeyframes = []
                         if editor.commit(next, name: "Remove zooms") { selectedZoomPoint = nil }
-                    }.disabled(state.zoomKeyframes.isEmpty)
+                    }
+                    .disabled(state.zoomKeyframes.isEmpty)
+                    .help("Show the full recording throughout. Undo restores the removed zoom changes.")
                 }
                 .fixedSize()
-                .help(playback.cursorRecording == nil ? "Automatic zooms need a new recording with pointer tracking." : "Replace zoom points using recorded clicks.")
+                .help(playback.cursorRecording == nil ? "Zoom suggestions need a new recording with pointer tracking." : "Suggest editable zoom changes around recorded mouse clicks. Replaces existing changes; Undo restores them.")
+                Spacer(minLength: 0)
             }.frame(height: 24)
             HStack(spacing: 12) {
-                Picker("Arrive", selection: Binding(get: { zoomPoint?.transition ?? zoomTransition }, set: { value in
+                Picker("Movement", selection: Binding(get: { zoomPoint?.transition ?? zoomTransition }, set: { value in
                     zoomTransition = value
                     updateZoomPoint { $0.transition = value }
                 })) {
                     Text("Jump").tag(PIPTransition.jump)
                     Text("Smooth").tag(PIPTransition.smooth)
-                }.frame(width: 170)
-                CommitSlider(title: "Duration", value: zoomPoint?.duration ?? zoomDuration, range: 0.1...3,
+                }
+                .frame(width: 185)
+                .help("Jump switches instantly at the change's time. Smooth moves into that view over the chosen duration. Without a selection, this sets the movement for new changes.")
+                CommitSlider(title: "Duration", value: zoomPoint?.duration ?? zoomDuration, range: 0.1...3, valueSuffix: " s",
                     begin: { playback.pause() }) { value in
                     zoomDuration = value
                     updateZoomPoint { $0.duration = value }
                 }
-                .frame(width: 200)
+                .frame(width: 240)
                 .opacity((zoomPoint?.transition ?? zoomTransition) == .smooth ? 1 : 0)
                 .disabled((zoomPoint?.transition ?? zoomTransition) != .smooth)
                 .accessibilityHidden((zoomPoint?.transition ?? zoomTransition) != .smooth)
+                .help("How many seconds the view takes to reach this zoom change. The movement finishes at the change's time.")
+                Button("Add zoom change") { setZoom(zoom, at: playback.editingTime, name: "Add zoom change") }
+                    .help("Remember the current magnification and framing at the current video time. Later smooth movements can start from this view.")
                 Spacer(minLength: 0)
-                Button("Add point") { setZoom(zoom, at: playback.editingTime, name: "Add zoom point") }
             }.frame(height: 24)
-            ScrollView(.horizontal) {
-                HStack {
-                    ForEach(state.zoomKeyframes) { point in
-                        Button {
-                            selectedZoomPoint = point.id
-                            zoomTransition = point.transition
-                            zoomDuration = point.duration
-                            playback.pause(); playback.seek(point.time)
-                        } label: {
-                            Text("\(point.time, specifier: "%.2f")s · \(point.scale, specifier: "%.2f")×")
-                                .font(.caption).padding(.horizontal, 9).padding(.vertical, 6)
-                                .background(selectedZoomPoint == point.id ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.05), in: Capsule())
-                        }.buttonStyle(.plain)
+            HStack(spacing: 12) {
+                Label("Zoom changes", systemImage: "diamond.fill")
+                    .font(.caption).foregroundStyle(.purple).fixedSize()
+                    .help("Each purple diamond remembers a zoomed view at a particular time. Matching diamonds appear on the timeline.")
+                if state.zoomKeyframes.isEmpty {
+                    Text("Double-click the video to zoom; drag a zoomed view to pan.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                } else {
+                    ScrollView(.horizontal) {
+                        HStack {
+                            ForEach(state.zoomKeyframes) { change in
+                                Button { selectZoomChange(change.id) } label: {
+                                    Label {
+                                        Text("\(change.time, specifier: "%.2f") s · \(change.scale, specifier: "%.2f")×")
+                                    } icon: {
+                                        Image(systemName: "diamond.fill").foregroundStyle(.purple)
+                                    }
+                                    .font(.caption).padding(.horizontal, 9).padding(.vertical, 6)
+                                    .background(selectedZoomPoint == change.id ? Color.purple.opacity(0.2) : Color.primary.opacity(0.05), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .help(zoomChangeHelp(change))
+                            }
+                        }
                     }
                 }
             }.frame(height: 32)
-            HStack {
+            HStack(spacing: 12) {
                 if let zoomPoint {
-                    Text("Point time: \(zoomPoint.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
-                    Button("Move point to playhead") { updateZoomPoint { $0.time = playback.editingTime } }
+                    Text("At \(zoomPoint.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
+                    Button("Use current time") { updateZoomPoint { $0.time = playback.editingTime } }
                         .disabled(abs(playback.editingTime - zoomPoint.time) < 0.001)
-                    Spacer()
-                    Button("Delete point") {
+                        .help("Move this zoom change to the current video time. Its magnification and framing stay the same.")
+                    Button("Remove zoom change") {
                         playback.pause()
                         var next = state
                         next.zoomKeyframes.removeAll { $0.id == zoomPoint.id }
-                        if editor.commit(next, name: "Delete zoom point") { selectedZoomPoint = nil }
+                        if editor.commit(next, name: "Remove zoom change") { selectedZoomPoint = nil }
                     }
+                    .help("Remove the selected zoom change. Undo restores it.")
                 }
                 Spacer(minLength: 0)
             }.font(.caption).frame(height: 24)
         }
-        .help("Double-click the recording to zoom in or out. Drag a zoomed recording to pan.")
+    }
+
+    private func zoomChangeHelp(_ change: ZoomKeyframe) -> String {
+        "Zoom change at \(String(format: "%.2f", change.time)) seconds: \(String(format: "%.2f", change.scale))×. Click to visit and edit this view."
+    }
+
+    private func selectZoomChange(_ id: UUID) {
+        guard let change = state.zoomKeyframes.first(where: { $0.id == id }) else { return }
+        selectedInspector = .zoom
+        selectedZoomPoint = change.id
+        zoomTransition = change.transition
+        zoomDuration = change.duration
+        playback.pause()
+        playback.seek(change.time)
     }
 
     private var pointerControls: some View {
@@ -310,7 +349,7 @@ struct ProjectEditorView: View {
         next.zoomKeyframes.removeAll { $0.id == point.id || abs($0.time - point.time) < 0.001 }
         next.zoomKeyframes.append(point)
         next.zoomKeyframes.sort { $0.time < $1.time }
-        editor.commit(next, name: "Change zoom point")
+        editor.commit(next, name: "Edit zoom change")
     }
 
     private func setCursorStyle(_ style: CursorStyle, name: String) {
@@ -327,6 +366,7 @@ struct ProjectEditorView: View {
                     var next = placement; next.visible = value
                     setPlacement(next, at: playback.time, name: value ? "Show camera" : "Hide camera")
                 })).toggleStyle(.checkbox)
+                    .help("Show or hide the camera at the current video time.")
                 Spacer()
             }
             .frame(height: 24)
@@ -344,8 +384,10 @@ struct ProjectEditorView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 340)
+                .help("Change the camera's outline at the current video time. Square and Circle crop the source without stretching it.")
                 Group {
                     Button("Framing…") { openFraming() }
+                        .help("Zoom or reposition the original camera image inside its outline.")
                         .popover(isPresented: $isFramingPresented) {
                             CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
                                 placement: state.placement(at: framingTime), preview: { crop in
@@ -385,7 +427,7 @@ struct ProjectEditorView: View {
                     } label: {
                         Image(systemName: ["arrow.up.left", "arrow.up.right", "arrow.down.left", "arrow.down.right"][index])
                     }
-                    .help(["Top left", "Top right", "Bottom left", "Bottom right"][index])
+                    .help(["Move camera to the top left", "Move camera to the top right", "Move camera to the bottom left", "Move camera to the bottom right"][index])
                     .accessibilityLabel(["Camera top left", "Camera top right", "Camera bottom left", "Camera bottom right"][index])
                 }
                 CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { playback.pause() }, preview: { value in
@@ -395,14 +437,16 @@ struct ProjectEditorView: View {
                     var next = placement; next.scale = value
                     setPlacement(next, at: playback.time, name: "Resize camera")
                 }.frame(width: 180)
-                Picker("Arrive", selection: Binding(get: { point?.transition ?? transition }, set: { value in
+                    .help("Resize the camera overlay at the current video time. Drag any camera corner to resize it directly.")
+                Picker("Movement", selection: Binding(get: { point?.transition ?? transition }, set: { value in
                     transition = value
                     updateSelected { $0.transition = value }
                 })) {
                     Text("Jump").tag(PIPTransition.jump)
                     Text("Smooth").tag(PIPTransition.smooth)
                 }.frame(width: 155)
-                CommitSlider(title: "Duration", value: point?.duration ?? transitionDuration, range: 0.1...3, begin: { playback.pause() }) { value in
+                    .help("Jump switches instantly at the camera change's time. Smooth moves and resizes the camera into that view over the chosen duration.")
+                CommitSlider(title: "Duration", value: point?.duration ?? transitionDuration, range: 0.1...3, valueSuffix: " s", begin: { playback.pause() }) { value in
                     transitionDuration = value
                     updateSelected { $0.duration = value }
                 }
@@ -410,6 +454,7 @@ struct ProjectEditorView: View {
                     .opacity((point?.transition ?? transition) == .smooth ? 1 : 0)
                     .disabled((point?.transition ?? transition) != .smooth)
                     .accessibilityHidden((point?.transition ?? transition) != .smooth)
+                    .help("How many seconds the camera takes to reach this change. The movement finishes at the change's time.")
             }
             .frame(height: 24)
             ScrollView(.horizontal) {
@@ -426,25 +471,28 @@ struct ProjectEditorView: View {
                                 .background(selectedPoint == keyframe.id ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.05),
                                             in: Capsule())
                         }.buttonStyle(.plain)
+                            .help("Camera change at \(String(format: "%.2f", keyframe.time)) seconds. Click to visit and edit its position, size, shape, and framing.")
                     }
                     if let point, point.time > 0 {
-                        Button("Delete point") {
+                        Button("Remove camera change") {
                             var next = state
                             next.pipKeyframes.removeAll { $0.id == point.id }
-                            if editor.commit(next, name: "Delete camera point") { selectedPoint = nil }
+                            if editor.commit(next, name: "Remove camera change") { selectedPoint = nil }
                         }.font(.caption)
+                            .help("Remove this camera change. Undo restores it.")
                     }
                 }
             }
             .frame(height: 32)
             HStack {
                 if let point, point.time > 0 {
-                    Text("Point time: \(point.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
-                    Button("Move point to playhead") {
+                    Text("At \(point.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
+                    Button("Use current time") {
                         updateSelected { $0.time = playback.editingTime }
                     }.font(.caption).disabled(playback.editingTime <= 0 || abs(playback.editingTime - point.time) < 0.001)
+                        .help("Move the selected camera change to the current video time, keeping its position, size, shape, and framing.")
                     if point.transition == .smooth {
-                        Text("Smooth movement ends at this point.").font(.caption).foregroundStyle(.secondary)
+                        Text("Movement finishes at this time.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 0)
@@ -507,7 +555,7 @@ struct ProjectEditorView: View {
         edited.pipKeyframes.removeAll { $0.id == selected.id || abs($0.time - selected.time) < 0.001 }
         edited.pipKeyframes.append(selected)
         edited.pipKeyframes.sort { $0.time < $1.time }
-        editor.commit(edited, name: "Change camera point")
+        editor.commit(edited, name: "Edit camera change")
     }
 
     private func export() async {

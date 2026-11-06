@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+struct RecordingTimelineMarker: Identifiable, Equatable {
+    let id: UUID
+    let time: Double
+    let help: String
+}
+
 struct RecordingTimeline: NSViewRepresentable {
     let duration: Double
     let trimStart: Double
@@ -11,6 +17,9 @@ struct RecordingTimeline: NSViewRepresentable {
     var onScrubBegan: () -> Void = {}
     var onScrubEnded: () -> Void = {}
     var onTrim: (Double, Double) -> Void
+    var zoomChanges: [RecordingTimelineMarker] = []
+    var selectedZoomChangeID: UUID?
+    var onSelectZoomChange: (UUID) -> Void = { _ in }
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -23,14 +32,17 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onScrubEnded = onScrubEnded
         view.onSeek = onSeek
         view.onTrim = onTrim
+        view.zoomChanges = zoomChanges
+        view.selectedZoomChangeID = selectedZoomChangeID
+        view.onSelectZoomChange = onSelectZoomChange
     }
 }
 
 /// A single source-time axis for the playhead and both trim boundaries. Native
 /// mouse events keep hit-testing explicit when the playhead meets a trim handle.
 @MainActor
-final class RecordingTimelineView: NSView {
-    var duration = 1.0 { didSet { needsDisplay = true } }
+final class RecordingTimelineView: NSView, NSViewToolTipOwner {
+    var duration = 1.0 { didSet { needsDisplay = true; if duration != oldValue { updateTooltips() } } }
     var trimStart = 0.0 { didSet { needsDisplay = true } }
     var trimEnd = 1.0 { didSet { needsDisplay = true } }
     var playhead = 0.0 { didSet { needsDisplay = true } }
@@ -39,6 +51,12 @@ final class RecordingTimelineView: NSView {
     var onInteractionBegan: (() -> Void)?
     var onScrubBegan: (() -> Void)?
     var onScrubEnded: (() -> Void)?
+    var zoomChanges: [RecordingTimelineMarker] = [] {
+        didSet { if zoomChanges != oldValue { needsDisplay = true; updateTooltips() } }
+    }
+    var selectedZoomChangeID: UUID? { didSet { needsDisplay = true } }
+    var onSelectZoomChange: ((UUID) -> Void)?
+    private var tooltipText: [Int: String] = [:]
 
     private enum Interaction { case start, end, scrub }
     private struct Drag {
@@ -61,7 +79,7 @@ final class RecordingTimelineView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.slider)
         setAccessibilityLabel("Recording timeline")
-        setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim.")
+        setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim. Purple diamonds mark zoom changes; click one to edit it.")
     }
     required init?(coder: NSCoder) { nil }
 
@@ -71,6 +89,27 @@ final class RecordingTimelineView: NSView {
 
     private func time(for x: CGFloat) -> Double {
         min(max(Double((x - 12) / railWidth) * duration, 0), duration)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        updateTooltips()
+    }
+
+    private func updateTooltips() {
+        removeAllToolTips()
+        tooltipText.removeAll()
+        guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
+        let base = addToolTip(bounds, owner: self, userData: nil)
+        tooltipText[base] = "Drag the playhead to scrub. Drag the blue handles to trim. Purple diamonds mark zoom changes."
+        for marker in zoomChanges where marker.time.isFinite {
+            let rect = CGRect(x: x(for: marker.time) - 6, y: 0, width: 12, height: 12)
+            tooltipText[addToolTip(rect, owner: self, userData: nil)] = marker.help
+        }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: Int, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        tooltipText[tag] ?? ""
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -106,6 +145,26 @@ final class RecordingTimelineView: NSView {
         thumb.close()
         NSColor.labelColor.setFill()
         thumb.fill()
+        // Keep a zoom change visible even when selection moves the white
+        // playhead to exactly the same time. The stem still identifies the
+        // playhead, whose mouse hit target retains priority over the diamond.
+        for marker in zoomChanges where marker.time.isFinite {
+            let center = CGPoint(x: x(for: marker.time), y: 6)
+            let selected = marker.id == selectedZoomChangeID
+            let diamond = NSBezierPath()
+            diamond.move(to: CGPoint(x: center.x, y: 1))
+            diamond.line(to: CGPoint(x: center.x + 5, y: 6))
+            diamond.line(to: CGPoint(x: center.x, y: 11))
+            diamond.line(to: CGPoint(x: center.x - 5, y: 6))
+            diamond.close()
+            NSColor.systemPurple.withAlphaComponent(marker.time >= start && marker.time <= end ? 1 : 0.35).setFill()
+            diamond.fill()
+            if selected {
+                NSColor.labelColor.setStroke()
+                diamond.lineWidth = 1.5
+                diamond.stroke()
+            }
+        }
         if window?.firstResponder === self {
             NSColor.keyboardFocusIndicatorColor.setStroke()
             let focus = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
@@ -119,6 +178,14 @@ final class RecordingTimelineView: NSView {
         window?.makeFirstResponder(self)
         onInteractionBegan?()
         let point = convert(event.locationInWindow, from: nil)
+        // Keep the scrub thumb easy to grab when it overlaps a change marker.
+        // Lower trim handles retain their existing independent hit targets.
+        if point.y < 12, abs(point.x - x(for: playhead)) > 10,
+           let marker = zoomChanges.filter({ $0.time.isFinite && abs(point.x - x(for: $0.time)) <= 6 })
+            .min(by: { abs(point.x - x(for: $0.time)) < abs(point.x - x(for: $1.time)) }) {
+            onSelectZoomChange?(marker.id)
+            return
+        }
         let startDistance = abs(point.x - x(for: trimStart))
         let endDistance = abs(point.x - x(for: trimEnd))
         let interaction: Interaction

@@ -155,8 +155,54 @@ struct RecordingTimelineChecks {
         _ = timeline.accessibilityPerformIncrement()
         precondition(scrubPhases.suffix(2) == ["begin", "end"], "Accessible seek finishes its scrub")
 
+        let zoomChange = RecordingTimelineMarker(id: UUID(), time: 5,
+            help: "Zoom change at 5 seconds: 2×. Click to visit and edit this view.")
+        var selectedChanges: [UUID] = []
+        timeline.onSelectZoomChange = { selectedChanges.append($0) }
+        reset(start: 0, end: 10, playhead: 4)
+        let height = timeline.intrinsicContentSize.height
+        timeline.zoomChanges = [zoomChange]
+        let markerPoint = CGPoint(x: timeline.x(for: 5), y: 6)
+        down(markerPoint)
+        up(markerPoint)
+        precondition(selectedChanges == [zoomChange.id] && seeks.isEmpty && trims.isEmpty,
+                     "Clicking a zoom diamond selects that change without scrubbing or trimming")
+        precondition(timeline.intrinsicContentSize.height == height && height == 36,
+                     "Zoom changes must not grow or rearrange the timeline")
+        func purpleMarkerPixels() -> Int {
+            guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: timeline.bounds) else {
+                fatalError("Could not render timeline marker")
+            }
+            timeline.cacheDisplay(in: timeline.bounds, to: bitmap)
+            let scaleX = Double(bitmap.pixelsWide) / timeline.bounds.width
+            var purplePixels = 0
+            for x in Int((markerPoint.x - 6) * scaleX)...Int((markerPoint.x + 6) * scaleX) {
+                for y in 0..<bitmap.pixelsHigh {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                       color.redComponent > color.greenComponent + 0.1,
+                       color.blueComponent > color.greenComponent + 0.2 { purplePixels += 1 }
+                }
+            }
+            return purplePixels
+        }
+        precondition(purpleMarkerPixels() >= 12,
+                     "Zoom changes must have a visible purple diamond matching the inspector legend")
+
+        reset(start: 0, end: 10, playhead: 5)
+        timeline.selectedZoomChangeID = zoomChange.id
+        precondition(purpleMarkerPixels() >= 12,
+                     "A selected zoom diamond must remain visibly purple when the playhead is at the same time")
+        selectedChanges = []
+        gesture(from: markerPoint, to: CGPoint(x: timeline.x(for: 6), y: 6))
+        near(seeks.last, 6, "The playhead remains draggable over a zoom diamond")
+        precondition(selectedChanges.isEmpty && trims.isEmpty, "A zoom marker cannot steal the playhead hit target")
+        reset(start: 5, end: 10, playhead: 7)
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 24), to: CGPoint(x: timeline.x(for: 6), y: 24))
+        near(trims.last?.0, 6, "The lower trim handle remains draggable beneath a zoom diamond")
+        precondition(selectedChanges.isEmpty && seeks.isEmpty, "Zoom markers cannot steal trim handle hits")
+
         window.close()
-        print("Recording timeline checks passed: shared geometry, continuous scrub, overlap hit targets, trim gesture grouping, clamping, and keyboard seek.")
+        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, visible zoom diamonds/selection, and playhead/trim hit priority.")
     }
 
     static func near(_ actual: Double?, _ expected: Double, _ message: String) {

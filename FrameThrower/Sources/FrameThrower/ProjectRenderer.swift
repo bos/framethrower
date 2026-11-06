@@ -195,8 +195,8 @@ enum ProjectRenderer {
 
     /// Source-time ramps preserve independent tracks and any leading gaps.
     /// Identity settings deliberately leave the original audio pipeline alone.
-    private static func audioMix(for state: EditState, trackIDs: [CMPersistentTrackID],
-                                 duration: Double) -> AVAudioMix? {
+    static func audioMix(for state: EditState, trackIDs: [CMPersistentTrackID],
+                         duration: Double) -> AVAudioMix? {
         guard state.audio != RecordingAudio(), !trackIDs.isEmpty else { return nil }
         let points = state.audio.envelope(trimStart: state.trimStart, trimEnd: min(state.trimEnd, duration))
         guard let first = points.first else { return nil }

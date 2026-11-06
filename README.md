@@ -451,6 +451,8 @@ Automated checks run without camera hardware or connected accounts:
   with metadata-only previews. UI fixtures use in-memory Director sessions.
 - `Tests/check-recording-audio.sh`: gain/fade curves, trim behavior, legacy
   migration, validation, persistence, Undo/Redo, and unchanged original bytes.
+- `Tests/check-recording-audio-mix.sh`: actual AVAudioMix gain ramps and track
+  mapping, including short trims and mute, without opening assets or playing audio.
 - `Tests/check-pointer-recovery.sh`: same-size source mutations, atomic path
   replacement, exact stable copies, staging cleanup, and no-overwrite publication
   using temporary pointer JSON while movie recovery remains suspended.

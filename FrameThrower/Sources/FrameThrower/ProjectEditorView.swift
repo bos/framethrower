@@ -25,11 +25,7 @@ struct ProjectEditorView: View {
     var body: some View {
         VStack(spacing: 16) {
             HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Review your explanation").font(.title2.weight(.semibold))
-                    Text("Edits are saved automatically.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                Text("Edit recording").font(.title2.weight(.semibold))
                 Spacer()
                 ProjectUndoButtons(editor: editor)
                 Button("Export…") { Task { await export() } }.disabled(isExporting || playback.isLoading)

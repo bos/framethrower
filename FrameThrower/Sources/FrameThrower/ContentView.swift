@@ -71,14 +71,9 @@ struct ContentView: View {
                 .foregroundStyle(RecorderStyle.accent)
                 .frame(width: 38, height: 38)
                 .background(RecorderStyle.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("FrameThrower")
-                    .font(.system(size: 19, weight: .semibold))
-                    .tracking(-0.6)
-                Text("A little context goes a long way.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
+            Text("FrameThrower")
+                .font(.system(size: 19, weight: .semibold))
+                .tracking(-0.6)
             Spacer()
             Button { model.chooseProject() } label: {
                 Label("Open…", systemImage: "folder")
@@ -289,20 +284,17 @@ struct ContentView: View {
     private var recordingBar: some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 7) {
-                    if model.isRecording {
-                        Circle().fill(RecorderStyle.accent).frame(width: 6, height: 6)
+                if let recordingStatus {
+                    HStack(spacing: 7) {
+                        if model.isRecording {
+                            Circle().fill(RecorderStyle.accent).frame(width: 6, height: 6)
+                        }
+                        Text(recordingStatus).font(.system(size: 14, weight: .medium))
                     }
-                    Text(recordingHeading)
-                        .font(.system(size: 14, weight: .medium))
                 }
                 if let started = recordingStartedAt, model.isRecording {
                     Text(started, style: .timer)
                         .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(recordingHint)
-                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -465,8 +457,6 @@ struct ContentView: View {
             destinationIcon("externaldrive", color: RecorderStyle.green)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Google Drive").font(.system(size: 12, weight: .medium))
-                Text(model.isAuthorized ? "Upload a private copy" : "Connect your account to share")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
             if let _ = model.lastDriveFileURL {
@@ -515,8 +505,6 @@ struct ContentView: View {
                     }
                     .controlSize(.small)
                     .disabled(model.isAnyUploadActive || captureLocked)
-                } else {
-                    Text("Connect your workspace to share").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 8)
@@ -539,20 +527,21 @@ struct ContentView: View {
         model.slackTargetKind == .person ? model.selectedSlackUserID != nil : model.selectedSlackChannelID != nil
     }
 
-    private var recordingHeading: String {
-        if model.isCaptureBusy { return model.isRecording ? "Finishing capture…" : "Starting capture…" }
+    private var recordingStatus: String? {
+        if model.isCaptureBusy { return model.isRecording ? "Finishing recording…" : "Starting recording…" }
         if model.isRecording { return "Recording" }
-        if model.isCountdownActive { return "Get ready…" }
-        if !model.hasScreenRecordingPermission { return "One quick setup." }
-        return canRecord ? "Ready when you are." : "Choose your capture."
-    }
-
-    private var recordingHint: String {
-        if model.isCaptureBusy { return "Saving independent source tracks." }
-        if model.isCountdownActive { return "Your recording will start automatically." }
-        if !model.hasScreenRecordingPermission { return "Allow screen recording to get started." }
-        if !canRecord { return "Pick a window or switch to a display or area." }
-        return "⌘R to record. Use the arrow for a countdown."
+        if let remaining = model.countdownRemainingSeconds { return "Recording starts in \(remaining)s" }
+        if !model.hasScreenRecordingPermission { return "Screen recording permission required" }
+        if model.camera.isPreparing { return "Starting camera…" }
+        if !model.isCameraReadyForCapture { return "Camera unavailable" }
+        if !canRecord {
+            switch model.captureKind {
+            case .window: return "Choose a window"
+            case .display: return "Choose a display"
+            case .area: return "Select a recording area"
+            }
+        }
+        return nil
     }
 
     private func destinationIcon(_ name: String, color: Color) -> some View {
@@ -565,11 +554,14 @@ struct ContentView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Image(systemName: model.latestLogEntry?.level == .error ? "exclamationmark.circle" : "lock")
-                .foregroundStyle(model.latestLogEntry?.level == .error ? RecorderStyle.accent : .secondary)
-            Text(footerMessage)
-                .lineLimit(1)
-                .foregroundStyle(model.latestLogEntry?.level == .error ? RecorderStyle.accent : .secondary)
+            if let footerMessage {
+                if model.latestLogEntry?.level == .error {
+                    Image(systemName: "exclamationmark.circle").foregroundStyle(RecorderStyle.accent)
+                }
+                Text(footerMessage)
+                    .lineLimit(1)
+                    .foregroundStyle(model.latestLogEntry?.level == .error ? RecorderStyle.accent : .secondary)
+            }
             Spacer(minLength: 8)
             Button {
                 model.isLogExpanded.toggle()
@@ -587,10 +579,11 @@ struct ContentView: View {
         .background(.primary.opacity(0.025))
     }
 
-    private var footerMessage: String {
+    private var footerMessage: String? {
         if model.latestLogEntry?.level == .error { return model.latestStatusLine }
-        if model.isAnyUploadActive { return "Uploading your recording…" }
-        return "Local by default. Yours to share."
+        if model.isExporting { return "Rendering video…" }
+        if model.isAnyUploadActive { return "Uploading… \(Int(model.uploadProgressFraction * 100))%" }
+        return nil
     }
 
     private var activityLog: some View {

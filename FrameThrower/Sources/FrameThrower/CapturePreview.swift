@@ -124,11 +124,11 @@ struct CapturePreview: View {
 
     private var placeholder: String {
         if !model.hasScreenRecordingPermission { return "Allow screen recording to see a preview" }
-        if !hasSource { return "Choose a window below to get started" }
-        if !isEnabled && !previewRequested { return "See exactly what you'll record" }
+        if !hasSource { return "Choose a window" }
+        if !isEnabled && !previewRequested { return "Preview not loaded" }
         if isLoading { return "Loading preview…" }
-        if failed { return "Preview unavailable. You can still try recording." }
-        return "Choose something to record"
+        if failed { return "Preview unavailable" }
+        return "Select a source"
     }
 
     @MainActor

@@ -39,8 +39,6 @@ struct CameraSetupView: View {
                 let rect = placement.frame(in: proxy.size, cameraAspect: 16.0 / 9.0)
                 ZStack(alignment: .topLeading) {
                     Color.primary.opacity(0.05)
-                    Text("Initial camera layout")
-                        .font(.caption2).foregroundStyle(.secondary).padding(8)
                     CameraPreview(session: camera.session)
                         .background(.black)
                         .frame(width: rect.width, height: rect.height)
@@ -61,9 +59,7 @@ struct CameraSetupView: View {
             .frame(width: 200, height: 112.5)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 10) {
-                Text("Drag to position your camera.").font(.caption)
-                Text("You can move, resize, or hide it after recording, too.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("Drag to move").font(.caption)
                 HStack {
                     ForEach(0..<4) { index in
                         Button {

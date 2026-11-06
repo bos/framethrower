@@ -28,6 +28,9 @@ struct RecordingTimelineChecks {
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 680, height: 100),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        // Pixel assertions below classify the light selected outline, so keep
+        // this synthetic fixture independent of the user's appearance setting.
+        window.appearance = NSAppearance(named: .darkAqua)
         let timeline = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 624, height: 72))
         window.contentView!.addSubview(timeline)
 
@@ -521,6 +524,26 @@ struct RecordingTimelineChecks {
         timeline.selectedEditID = early.id
         timeline.selectedEditID = late.id
         near(timeline.visibleStart, 5, "A fresh selection reveals the edit again")
+
+        timeline.duration = 10
+        timeline.fit(request: UUID())
+        let namedA = RecordingTimelineMarker(id: UUID(), time: 2, help: "First edit", label: "Edit A")
+        let namedB = RecordingTimelineMarker(id: UUID(), time: 7, help: "Second edit", label: "Edit B")
+        timeline.edits = [namedB, namedA]
+        timeline.selectedEditID = namedA.id
+        let labels = timeline.markerLabels()
+        precondition(Set(labels.map(\.text)) == ["A", "B"], "Timeline diamonds show their stable letters independently of array order")
+        precondition(!labels[0].frame.intersects(labels[1].frame), "Readable timeline labels do not overlap")
+        var labelSelection: UUID?
+        timeline.onSelectEdit = { labelSelection = $0 }
+        let target = labels.first { $0.id == namedB.id }!.frame
+        let labelPoint = CGPoint(x: target.midX, y: target.midY)
+        down(labelPoint); up(labelPoint)
+        precondition(labelSelection == namedB.id, "Clicking a letter selects the matching diamond without scrubbing")
+        let crowded = RecordingTimelineMarker(id: UUID(), time: 2.01, help: "Close edit", label: "Edit C")
+        timeline.edits = [namedA, crowded]
+        timeline.selectedEditID = namedA.id
+        precondition(timeline.markerLabels().contains { $0.id == namedA.id }, "Selected edits retain a visible letter at crowded scales")
 
         window.close()
         print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, separate edit lane, selection on release, grouped edit moves, neighbor limits, cancellation, locked drag targets, trackpad timeline navigation, zoomed time precision, selected transition bands, deliberate selection reveal, blank-lane deselection, Escape cancellation, and understated keyboard focus.")

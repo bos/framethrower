@@ -17,7 +17,7 @@ struct ScribbleChecks {
     static func main() throws {
         try checkGeometry()
         try checkNativeCanvas()
-        print("Scribble checks passed (source-coordinate round trips, clipping, minimum size, empty native canvas, selection, Escape, and gesture mode boundaries).")
+        print("Scribble checks passed (source-coordinate round trips, clipping, minimum size, numbered guide badges, linked selection, badge hit targets, empty native canvas, Escape, and gesture mode boundaries).")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -86,6 +86,8 @@ struct ScribbleChecks {
                     "drawing cannot pan or move the camera")
         let guide = EditorRegion(time: 0, rect: drawn[0])
         canvas.regions = [guide]
+        canvas.regionLabels = [guide.id: "Box 1"]
+        configure()
         let inside = CGPoint(x: 120, y: 130)
         canvas.mouseDown(with: mouse(.leftMouseDown, at: inside, canvas: canvas, window: window))
         canvas.mouseUp(with: mouse(.leftMouseUp, at: inside, canvas: canvas, window: window))
@@ -96,8 +98,53 @@ struct ScribbleChecks {
         canvas.mouseUp(with: mouse(.leftMouseUp, at: end, canvas: canvas, window: window))
         try require(drawn.count == 1, "Escape discards unfinished scribble")
 
+        let other = EditorRegion(time: 0, rect: EditorRegionRect(x: 0.7, y: 0.2, width: 0.2, height: 0.3))
+        let edge = EditorRegion(time: 0, rect: EditorRegionRect(x: 0.97, y: 0.9, width: 0.03, height: 0.1))
+        canvas.regions = [edge, other, guide]
+        canvas.regionLabels = [guide.id: "Box 1", other.id: "Box 7", edge.id: "Box 12"]
+        canvas.selectedRegionID = other.id
+        configure()
+        try require(Set(canvas.guideBadges.map(\.label)) == ["Box 1", "Box 7", "Box 12"],
+                    "preview labels use durable references rather than current array indices")
+        try require(canvas.guideBadges.first(where: { $0.selected })?.regionID == other.id,
+                    "sidebar selection highlights the matching preview badge")
+        try require(canvas.guideBadges.allSatisfy { canvas.contentRect.contains($0.frame) },
+                    "badges remain fully visible inside the recording even for clipped edge guides")
+        let badge = canvas.guideBadges.first { $0.regionID == edge.id }!
+        let badgePoint = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, at: badgePoint, canvas: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, at: badgePoint, canvas: canvas, window: window))
+        try require(selected == edge.id && drawn.count == 1,
+                    "clicking a badge outside its small box selects that box instead of drawing another")
+        canvas.selectedRegionID = selected
+        configure()
+        try require(canvas.guideBadges.first(where: { $0.selected })?.label == "Box 12",
+                    "preview selection round-trips to the same durable reference")
+        let nested = EditorRegion(time: 0, rect: guide.rect)
+        let third = EditorRegion(time: 0, rect: guide.rect)
+        canvas.regions = [guide, nested, third]
+        canvas.regionLabels = [guide.id: "Box 1", nested.id: "Box 2", third.id: "Box 3"]
+        canvas.selectedRegionID = guide.id
+        configure()
+        let packed = canvas.guideBadges
+        try require(packed.count == 3 && !packed[0].frame.intersects(packed[1].frame) &&
+                    !packed[0].frame.intersects(packed[2].frame) && !packed[1].frame.intersects(packed[2].frame),
+                    "nested boxes sharing an origin must retain distinct readable number badges")
+        for badge in packed {
+            let point = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+            canvas.mouseDown(with: mouse(.leftMouseDown, at: point, canvas: canvas, window: window))
+            canvas.mouseUp(with: mouse(.leftMouseUp, at: point, canvas: canvas, window: window))
+            try require(selected == badge.regionID, "each packed badge selects its own box")
+        }
+        canvas.selectedRegionID = third.id
+        configure()
+        try require(canvas.guideBadges.map(\.frame) == packed.map(\.frame),
+                    "selection changes highlight guides without shifting their number badges")
+
         canvas.scribbleMode = false
         configure(zoom: ZoomPlacement(scale: 2))
+        try require(canvas.guideBadges.isEmpty && canvas.accessibilityValue() == nil,
+                    "exiting Scribble clears visible and accessibility guide labels")
         canvas.mouseDown(with: mouse(.leftMouseDown, at: start, canvas: canvas, window: window))
         canvas.mouseDragged(with: mouse(.leftMouseDragged, at: end, canvas: canvas, window: window))
         canvas.scribbleMode = true

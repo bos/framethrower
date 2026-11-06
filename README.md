@@ -213,13 +213,24 @@ unchanged, and existing files are never overwritten by this recovery action.
 Open the editor's speech-bubble button to type or dictate an editing instruction.
 The pencil button turns on **Scribble** and opens the same sidebar. Drag a box on
 the preview to identify an area; select it and say “this area” in an instruction.
-The box is stored in original source coordinates with the source timestamp.
-Selecting a saved area returns to that frame. Scribble mode owns drawing gestures;
+Boxes show matching **Box 1**, **Box 2** badges in the preview and sidebar.
+Timeline edits have speakable **Edit A**, **Edit B** references in marker labels,
+edit chips, and the selected-edit preview badge. These references survive
+retiming, insertion, removal, Undo/Redo, recovery, and reopening; they do not
+silently renumber. New edits can therefore have later letters between older edits.
+The box is stored in original source coordinates with the source timestamp and
+the edit selected when drawn. Selecting a saved box returns to its original
+frame; moving the associated edit does not silently move that source frame.
+If the frame has no edit yet, drawing a box creates its reference mark in the
+same undoable operation. This adds no zoom or camera movement, so the first
+box-first workflow has an Edit A to refer to without changing the footage.
+Scribble mode owns drawing gestures;
 turn it off to pan, pinch, or move the camera. Escape cancels an unfinished box,
 then exits Scribble. An area's X removes its guide and note; Undo restores both.
 
-An optional area note can be typed or dictated. Return saves a note; Escape or
-moving focus away cancels its draft. Notes describe guides and do not become
+There is one instruction field and one microphone. An optional box name is
+available from its context menu; Return saves, Escape or dismissing cancels.
+Naming is never required to use a box. Names describe guides and do not become
 visible graphics. Dictation first produces editable text; submitting an instruction
 is a separate action. Apple SpeechAnalyzer runs on-device on supported macOS26+
 hardware/locales. It may download Apple speech assets on first use; audio is
@@ -227,7 +238,13 @@ never sent to a transcription service. There is no cloud speech fallback.
 
 Supported instructions add smooth region-to-region framing sequences with timed
 holds, return to full frame, revise the selected edit while preserving its timing,
-and label areas. Each complete request is one normal saved Undo/Redo operation.
+and label areas. Named references work across frames: “At Edit A, frame Box 1.
+Between A and B, zoom out then smoothly into Box 2, arriving at B.” A two-leg
+path inserts an editable full-frame waypoint halfway between the endpoints,
+using the shared acceleration/deceleration curves. Conflicting intervening edits
+produce a clarification instead of being replaced. Unknown or removed references
+produce a question naming the unresolved edit or box.
+Each complete request is one normal saved Undo/Redo operation.
 Ambiguous requests ask a question. If a sequence overlaps existing framing edits,
 the assistant asks for an explicit revision instead of silently replacing them.
 Edits made while a request is running invalidate its revision and prevent stale
@@ -238,8 +255,8 @@ placeholder preview; decoding footage, screenshots of footage, visual recognitio
 capture, rendering, and export remain unavailable. The text model knows only
 provided area coordinates/notes and the selected edit, and cannot inspect footage.
 
-`llama.cpp` can run the optional Qwen3-4B Q4_K_M GGUF locally. The installer pins
-an official Qwen release and verifies its SHA-256 before using it. The 2.50 GB
+`llama.cpp` runs the optional Qwen3-8B Q4_K_M GGUF locally. The installer pins
+an official Qwen release and verifies its SHA-256 before using it. The 5.03 GB
 model stays in `~/Library/Caches/FrameThrower/LocalModel/models`, outside the
 repository. Model weights use Apache-2.0; see the linked model card in the saved
 manifest. Install `llama.cpp` first if `llama-server` is unavailable.
@@ -250,6 +267,7 @@ Tests/check-local-agent.sh
 python3 -B Tests/LocalModelClientChecks.py
 Tests/check-local-edit-planner.sh --model
 Tests/check-local-model-runtime.sh --model
+Tests/check-spoken-references.sh --model
 ```
 
 Installation downloads weights. Inference uses an offline server bound to numeric
@@ -275,16 +293,26 @@ To keep a model server open for development, run
 `python3 -B Tools/local_model.py serve`. It prints its loopback address and the
 local key/log directory; Control-C stops it. Model and runtime choices are
 isolated from the editor's project model and command API.
+The 8B default replaced 4B after the smaller model inconsistently completed
+multi-edit named-reference instructions in native tests. The earlier pinned
+4B file can still be supplied explicitly to the Python runner for diagnostics.
+The native assistant uses an 8,192-token context and Metal on Apple Silicon.
 
 `EditorCommandBatch` is the provider-independent integration boundary: a version,
 project UUID, expected SHA-256 revision, and ordered typed commands. Supported
-actions are `frameRegion`, `fullFrame`, `holdFraming`, `reviseFraming`, and
-`labelRegion`. Times are original recording seconds; framing timestamps are
+actions are `frameRegion`, `fullFrame`, `holdFraming`, `reviseFraming`,
+`moveBetweenEdits`, and `labelRegion`. Times are original recording seconds; framing timestamps are
 arrival times and movement duration specifies the preceding transition. Region
 rectangles use normalized top-left source coordinates. The dispatcher validates
 the complete batch before committing, accepts no paths or executable operations,
 and rejects stale projects and pending manual drafts. UI, future MCP adapters,
 and App Intents can share it; external MCP/Siri adapters are not implemented yet.
+
+Safe UI regressions include `Tests/check-editor-inspector-layout.sh` (all four
+tools keep identical preview/timeline geometry), `Tests/check-assistant-panel.sh`
+(one instruction field/microphone and compact linked box rows), and
+`Tests/check-editor-references.sh` (persistent names and recovery). These checks
+use metadata, empty previews, and vector guides while video remains suspended.
 
 ## Accounts and sharing
 

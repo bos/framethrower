@@ -5,6 +5,7 @@ struct RecordingTimelineMarker: Identifiable, Equatable {
     let id: UUID
     let time: Double
     let help: String
+    var label: String? = nil
     var transitionStart: Double? = nil
     var easeIn: Double = 0
     var easeOut: Double = 0
@@ -60,6 +61,12 @@ struct RecordingTimeline: NSViewRepresentable {
 /// mouse events keep hit-testing explicit when the playhead meets a trim handle.
 @MainActor
 final class RecordingTimelineView: NSView, NSViewToolTipOwner {
+    struct MarkerLabel: Equatable {
+        let id: UUID
+        let text: String
+        let frame: CGRect
+        let overlaysMarker: Bool
+    }
     var duration = 1.0 {
         didSet {
             guard duration != oldValue else { return }
@@ -83,6 +90,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var selectedEditID: UUID? {
         didSet {
             needsDisplay = true
+            if selectedEditID != oldValue { updateTooltips() }
             if selectedEditID != oldValue,
                let selected = edits.first(where: { $0.id == selectedEditID }),
                !markerIsVisible(selected.time) {
@@ -158,7 +166,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         tooltipText[base] = "Drag the playhead to scrub. Drag the blue handles to trim. Purple diamonds below the track mark edits. Click to select; drag to change an edit's time. Pinch to zoom the timeline; scroll to navigate time."
         for marker in edits where markerIsVisible(marker.time) {
             let rect = CGRect(x: x(for: marker.time) - 8, y: 38, width: 16, height: 18)
-            tooltipText[addToolTip(rect, owner: self, userData: nil)] = marker.help
+            tooltipText[addToolTip(rect, owner: self, userData: nil)] = marker.label.map { marker.help.hasPrefix($0) ? marker.help : $0 + ": " + marker.help } ?? marker.help
+        }
+        for label in markerLabels() {
+            if let marker = edits.first(where: { $0.id == label.id }) {
+                tooltipText[addToolTip(label.frame, owner: self, userData: nil)] = marker.label.map { marker.help.hasPrefix($0) ? marker.help : $0 + ": " + marker.help } ?? marker.help
+            }
         }
     }
 
@@ -233,11 +246,62 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 diamond.stroke()
             }
         }
+        drawMarkerLabels()
         drawTimeTicks()
         if keyboardFocus, window?.firstResponder === self, markerIsVisible(current) {
             NSColor.keyboardFocusIndicatorColor.setFill()
             NSBezierPath(roundedRect: CGRect(x: cursorX - 7, y: 35, width: 14, height: 2),
                          xRadius: 1, yRadius: 1).fill()
+        }
+    }
+
+    /// Labels are part of the edit target. At crowded scales the selected edit
+    /// keeps a compact label over its own diamond; other labels wait for room.
+    func markerLabels() -> [MarkerLabel] {
+        let visible = edits.filter { markerIsVisible(displayTime(for: $0)) }
+        let font = NSFont.systemFont(ofSize: 9, weight: .semibold)
+        var labels: [MarkerLabel] = []
+        let ordered = visible.sorted { ($0.id == selectedEditID ? 0 : 1) < ($1.id == selectedEditID ? 0 : 1) }
+        for marker in ordered {
+            guard let label = marker.label, !label.isEmpty else { continue }
+            let text = label.hasPrefix("Edit ") ? String(label.dropFirst(5)) : label
+            let width = min(70, ceil((text as NSString).size(withAttributes: [.font: font]).width) + 6)
+            let center = x(for: displayTime(for: marker))
+            let candidates = [CGRect(x: center + 8, y: 39, width: width, height: 16),
+                              CGRect(x: center - 8 - width, y: 39, width: width, height: 16)]
+            let available = candidates.first { candidate in
+                candidate.minX >= 0 && candidate.maxX <= bounds.width &&
+                    !visible.contains { other in
+                        other.id != marker.id && candidate.insetBy(dx: -2, dy: 0).intersects(
+                            CGRect(x: x(for: displayTime(for: other)) - 7, y: 38, width: 14, height: 18))
+                    } && !labels.contains { $0.frame.insetBy(dx: -2, dy: 0).intersects(candidate) }
+            }
+            if let available { labels.append(MarkerLabel(id: marker.id, text: text, frame: available, overlaysMarker: false)) }
+            else if marker.id == selectedEditID {
+                let frame = CGRect(x: min(max(0, center - width / 2), max(0, bounds.width - width)),
+                                   y: 39, width: width, height: 16)
+                labels.append(MarkerLabel(id: marker.id, text: text, frame: frame, overlaysMarker: true))
+            }
+        }
+        return labels
+    }
+
+    private func displayTime(for marker: RecordingTimelineMarker) -> Double {
+        drag?.interaction == .edit(marker.id) ? drag?.editTime ?? marker.time : marker.time
+    }
+
+    private func drawMarkerLabels() {
+        for label in markerLabels().reversed() {
+            let selected = label.id == selectedEditID
+            (label.overlaysMarker ? NSColor.systemPurple : NSColor.windowBackgroundColor).setFill()
+            NSBezierPath(roundedRect: label.frame, xRadius: 3, yRadius: 3).fill()
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+                .foregroundColor: label.overlaysMarker ? NSColor.white : selected ? NSColor.labelColor : NSColor.secondaryLabelColor
+            ]
+            let text = label.text as NSString
+            let width = text.size(withAttributes: attributes).width
+            text.draw(at: CGPoint(x: label.frame.midX - width / 2, y: label.frame.minY + 2), withAttributes: attributes)
         }
     }
 
@@ -365,7 +429,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         window?.makeFirstResponder(self)
         onInteractionBegan?()
         if point.y >= 38 && point.y < 56 {
-            if let marker = edits.filter({ markerIsVisible($0.time) && abs(point.x - x(for: $0.time)) <= 8 })
+            let labelTarget = markerLabels().first { $0.frame.contains(point) }?.id
+            if let marker = edits.filter({ markerIsVisible($0.time) && (labelTarget == nil ? abs(point.x - x(for: $0.time)) <= 8 : $0.id == labelTarget) })
                 .min(by: { abs(point.x - x(for: $0.time)) < abs(point.x - x(for: $1.time)) }) {
                 let others = edits.filter { $0.id != marker.id && $0.time.isFinite }
                 let gap = frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30

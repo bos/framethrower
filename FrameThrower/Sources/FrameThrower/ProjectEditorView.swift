@@ -73,14 +73,15 @@ struct ProjectEditorView: View {
         }
         .onChange(of: editor.project.state) { old, next in
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
+            if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
             var oldVisual = old; oldVisual.regions = []
             var nextVisual = next; nextVisual.regions = []
+            oldVisual.editAnchors = []; nextVisual.editAnchors = []
             guard oldVisual != nextVisual else { return }
             Task {
                 await playback.rebuild(editor: editor)
                 if playAfterRebuild { playAfterRebuild = false; playback.togglePlayback() }
             }
-            if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
         }
         .onChange(of: editor.draftState) { old, next in
             if let next { playback.preview(next) }
@@ -105,10 +106,12 @@ struct ProjectEditorView: View {
             ToolbarItemGroup(placement: .navigation) { ProjectUndoButtons(editor: editor) }
             recordingTitleToolbar
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { toggleScribble() } label: { Image(systemName: "pencil.tip.crop.circle") }
-                    .tint(scribbleMode ? .accentColor : .primary)
+                Toggle(isOn: Binding(get: { scribbleMode }, set: { value in
+                    if value != scribbleMode { toggleScribble() }
+                })) { Image(systemName: "pencil") }
+                    .toggleStyle(.button)
                     .accessibilityLabel(scribbleMode ? "Stop scribbling" : "Scribble on preview")
-                    .help("Draw a box on the preview to identify an area for an editing instruction.")
+                    .help(scribbleMode ? "Stop drawing boxes to pan or move the camera." : "Draw a numbered box on the preview to use in an editing instruction.")
                 Button { isAssistantPresented.toggle() } label: { Image(systemName: "text.bubble") }
                     .accessibilityLabel("Local editing assistant")
                     .help("Type or dictate editing instructions using an on-device model.")
@@ -120,7 +123,7 @@ struct ProjectEditorView: View {
             }
         }
         .inspector(isPresented: $isAssistantPresented) {
-            EditorAssistantPanel(editor: editor, session: assistant, scribbleMode: $scribbleMode,
+            EditorAssistantPanel(editor: editor, session: assistant,
                 selectedRegionID: selectedRegionID, onSelectRegion: { selectRegion($0) },
                 onRemoveRegion: { removeRegion($0) }, onSubmit: {
                     playback.pause()
@@ -173,6 +176,9 @@ struct ProjectEditorView: View {
             presentation: canvasPresentation, nativeSourceSize: playback.sourceSize,
             scribbleMode: scribbleMode,
             regions: state.regions.filter { abs($0.time - playback.time) < frameDuration },
+            regionLabels: Dictionary(uniqueKeysWithValues: state.regions.compactMap { region in
+                editor.references.boxLabel(for: region.id).map { (region.id, $0) }
+            }),
             selectedRegionID: selectedRegionID,
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectedRegionID = $0 })
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
@@ -191,6 +197,14 @@ struct ProjectEditorView: View {
                     }
                 }
             }
+            .overlay(alignment: .topLeading) {
+                if let selectedEdit, let label = editor.references.editLabel(for: selectedEdit.id) {
+                    Text(label).font(.caption.weight(.semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(.black.opacity(0.65), in: Capsule())
+                        .padding(10).allowsHitTesting(false)
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
@@ -205,15 +219,21 @@ struct ProjectEditorView: View {
 
     private func addRegion(_ rect: EditorRegionRect) {
         guard editor.finishDraft() else { return }
-        let region = EditorRegion(time: playback.time, rect: rect)
         var next = editor.project.state
-        next.regions.append(region)
-        if editor.commit(next, name: "Draw area") { selectedRegionID = region.id }
+        let region = next.addRegion(rect: rect, at: editTime, includeCamera: editor.project.cameraFilename != nil)
+        if editor.commit(next, name: "Draw box") {
+            selectedRegionID = region.id
+            selectedEditID = region.editID
+        }
     }
 
     private func selectRegion(_ id: UUID) {
         guard editor.finishDraft(), let region = state.regions.first(where: { $0.id == id }) else { return }
-        playback.pause(); selectedEditID = nil
+        playback.pause()
+        let associated = region.editID.flatMap {
+            editor.references.edit(in: state, id: $0, includeCamera: editor.project.cameraFilename != nil)
+        }
+        selectedEditID = associated.flatMap { abs($0.time - region.time) < 0.000001 ? $0.id : nil }
         selectedRegionID = id; scribbleMode = true
         playback.seek(region.time)
     }
@@ -281,14 +301,19 @@ struct ProjectEditorView: View {
 
     private var inspector: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Picker("Edit", selection: $selectedInspector) {
-                ForEach(EditorInspector.allCases.filter { $0 != .camera || editor.project.cameraFilename != nil }, id: \.self) {
-                    Text($0.rawValue).tag($0)
+            HStack(spacing: 12) {
+                Picker("Edit", selection: $selectedInspector) {
+                    ForEach(EditorInspector.allCases.filter { $0 != .camera || editor.project.cameraFilename != nil }, id: \.self) {
+                        Text($0.rawValue).tag($0)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 360, height: 24)
+                Spacer(minLength: 0)
+                if selectedInspector == .camera { cameraVisibility }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 360, height: 24)
+            .frame(height: 24)
             Group {
                 switch selectedInspector {
                 case .zoom: zoomControls
@@ -311,22 +336,13 @@ struct ProjectEditorView: View {
                         })
                 }
             }
-            // Allocate by tab, never by playback values or edit selection.
+            // Tool tabs, playback values, and edit selection share one allocation.
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .frame(height: inspectorHeight, alignment: .top)
+            .frame(height: 100, alignment: .top)
         }
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var inspectorHeight: CGFloat {
-        switch selectedInspector {
-        case .zoom: 100
-        case .pointer: 100
-        case .camera: 176
-        case .canvas: 100
-        }
     }
 
     private var zoomControls: some View {
@@ -378,13 +394,13 @@ struct ProjectEditorView: View {
                     ForEach(edits) { edit in
                         HStack(spacing: 6) {
                             Button { selectEdit(edit.id) } label: {
-                                Label("\(edit.time, specifier: "%.2f") s · \(editSummary(edit))", systemImage: "diamond.fill")
+                                Label(editTitle(edit), systemImage: "diamond.fill")
                             }
                             .buttonStyle(.plain)
-                            .help("Select this edit and show its frame. Drag its diamond on the timeline to change its time.")
+                            .help("\(editLabel(edit)) at \(String(format: "%.2f", edit.time)) seconds. Click to select; drag its timeline diamond to move it.")
                             Button { removeEdit(edit) } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 20) }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Remove edit at \(String(format: "%.2f", edit.time)) seconds")
+                                .accessibilityLabel("Remove \(editLabel(edit))")
                                 .help("Remove this edit's view and camera changes. Undo restores them.")
                         }
                         .font(.caption).padding(.leading, 10).padding(.trailing, 4).frame(height: 28)
@@ -400,10 +416,19 @@ struct ProjectEditorView: View {
         .frame(height: 34)
     }
 
+    private func editLabel(_ edit: TimedEdit) -> String {
+        editor.references.editLabel(for: edit.id) ?? "Edit"
+    }
+
     private func editSummary(_ edit: TimedEdit) -> String {
         let view = state.zoomKeyframes.first { $0.id == edit.zoomID }
         if let view { return String(format: "%.2f×", view.scale) + (edit.cameraID == nil ? "" : " · Camera") }
-        return "Camera"
+        return edit.cameraID == nil ? "Reference mark" : "Camera"
+    }
+
+    private func editTitle(_ edit: TimedEdit) -> String {
+        if edit.zoomID == nil && edit.cameraID == nil { return editLabel(edit) }
+        return editLabel(edit) + " · " + editSummary(edit)
     }
 
     private func timelineMarker(_ edit: TimedEdit) -> RecordingTimelineMarker {
@@ -418,7 +443,8 @@ struct ProjectEditorView: View {
         let ramps = MotionInterpolation.rampDurations(duration: edit.time - start,
             easeIn: useCamera ? camera?.easeIn : view?.easeIn, easeOut: useCamera ? camera?.easeOut : view?.easeOut)
         return RecordingTimelineMarker(id: edit.id, time: edit.time,
-            help: "Edit at \(String(format: "%.2f", edit.time)) seconds: \(editSummary(edit)). Click to select; drag to move.",
+            help: "\(editLabel(edit)) at \(String(format: "%.2f", edit.time)) seconds: \(editSummary(edit)). Click to select; drag to move.",
+            label: editLabel(edit),
             transitionStart: transition == .smooth ? start : nil, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
             minimumTime: edit.cameraID == nil ? 0 : frameDuration,
             maximumTime: editor.project.editingTime(at: editor.project.duration, frameDuration: frameDuration))
@@ -428,7 +454,7 @@ struct ProjectEditorView: View {
         if id == selectedEditID { playback.pause(); return }
         guard editor.finishDraft(), let edit = edits.first(where: { $0.id == id }) else { return }
         selectedEditID = id
-        if edit.zoomID == nil { selectedInspector = .camera }
+        if edit.zoomID == nil && edit.cameraID != nil { selectedInspector = .camera }
         else if edit.cameraID == nil { selectedInspector = .zoom }
         playback.pause()
         playback.seek(edit.time)
@@ -595,17 +621,16 @@ struct ProjectEditorView: View {
         if !editor.commit(next, name: name) { playback.cancelPreview() }
     }
 
+    private var cameraVisibility: some View {
+        Toggle("Visible", isOn: Binding(get: { placement.visible }, set: { value in
+            var next = placement; next.visible = value
+            setPlacement(next, at: editTime, name: value ? "Show camera" : "Hide camera")
+        })).toggleStyle(.checkbox)
+            .help("Show or hide the camera at the selected edit or playhead.")
+    }
+
     private var cameraControls: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Toggle("Visible", isOn: Binding(get: { placement.visible }, set: { value in
-                    var next = placement; next.visible = value
-                    setPlacement(next, at: editTime, name: value ? "Show camera" : "Hide camera")
-                })).toggleStyle(.checkbox)
-                    .help("Show or hide the camera at the current video time.")
-                Spacer()
-            }
-            .frame(height: 24)
             HStack(spacing: 12) {
                 Picker("Shape", selection: Binding(get: { placement.shape }, set: { shape in
                     var next = placement
@@ -621,48 +646,30 @@ struct ProjectEditorView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 340)
-                .help("Change the camera's outline at the current video time. Square and Circle crop the source without stretching it.")
-                Group {
-                    Button("Framing…") { openFraming() }
-                        .help("Zoom or reposition the original camera image inside its outline.")
-                        .popover(isPresented: $isFramingPresented) {
-                            CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
-                                placement: state.placement(at: framingTime), preview: { crop in
-                                    var next = state.placement(at: framingTime)
-                                    next.crop = crop
-                                    setPlacement(next, at: framingTime, name: "Edit")
-                                }, zoomPreview: { value in
-                                    var next = state.placement(at: framingTime)
-                                    next.sourceZoom = value
-                                    setPlacement(next, at: framingTime, name: "Edit")
-                                }, zoomCommit: { value in
-                                    var next = state.placement(at: framingTime)
-                                    next.sourceZoom = value
-                                    setPlacement(next, at: framingTime, name: "Zoom camera")
-                                }) { crop in
-                                    var next = state.placement(at: framingTime)
-                                    next.crop = crop
-                                    setPlacement(next, at: framingTime, name: "Frame camera")
-                            }
-                            .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
+                .help("Change the camera's outline at the selected edit or playhead. Square and Circle crop without stretching.")
+                Button("Framing…") { openFraming() }
+                    .help("Zoom or reposition the original camera image inside its outline.")
+                    .popover(isPresented: $isFramingPresented) {
+                        CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
+                            placement: state.placement(at: framingTime), preview: { crop in
+                                var next = state.placement(at: framingTime)
+                                next.crop = crop
+                                setPlacement(next, at: framingTime, name: "Edit")
+                            }, zoomPreview: { value in
+                                var next = state.placement(at: framingTime)
+                                next.sourceZoom = value
+                                setPlacement(next, at: framingTime, name: "Edit")
+                            }, zoomCommit: { value in
+                                var next = state.placement(at: framingTime)
+                                next.sourceZoom = value
+                                setPlacement(next, at: framingTime, name: "Zoom camera")
+                            }) { crop in
+                                var next = state.placement(at: framingTime)
+                                next.crop = crop
+                                setPlacement(next, at: framingTime, name: "Frame camera")
                         }
-                }
-                Spacer()
-            }
-            .frame(height: 24)
-            HStack(spacing: 12) {
-                ForEach(0..<4) { index in
-                    Button {
-                        var next = placement
-                        next.x = index % 2 == 0 ? 0.04 : 0.96
-                        next.y = index < 2 ? 0.04 : 0.96
-                        setPlacement(next, at: editTime, name: "Move camera")
-                    } label: {
-                        Image(systemName: ["arrow.up.left", "arrow.up.right", "arrow.down.left", "arrow.down.right"][index])
+                        .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
                     }
-                    .help(["Move camera to the top left", "Move camera to the top right", "Move camera to the bottom left", "Move camera to the bottom right"][index])
-                    .accessibilityLabel(["Camera top left", "Camera top right", "Camera bottom left", "Camera bottom right"][index])
-                }
                 CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { playback.pause() }, preview: { value in
                     var next = placement; next.scale = value
                     setPlacement(next, at: editTime, name: "Edit")
@@ -670,11 +677,28 @@ struct ProjectEditorView: View {
                     var next = placement; next.scale = value
                     setPlacement(next, at: editTime, name: "Resize camera")
                 }.frame(width: 180)
-                    .help("Resize the camera overlay at the current video time. Drag any camera corner to resize it directly.")
-
+                    .help("Resize the camera overlay. Drag any camera corner to resize directly.")
+                Spacer(minLength: 0)
             }
             .frame(height: 24)
             transitionControls(camera: true)
+        }
+    }
+
+    private var cameraCornerControls: some View {
+        HStack(spacing: 8) {
+            ForEach(0..<4) { index in
+                Button {
+                    var next = placement
+                    next.x = index % 2 == 0 ? 0.04 : 0.96
+                    next.y = index < 2 ? 0.04 : 0.96
+                    setPlacement(next, at: editTime, name: "Move camera")
+                } label: {
+                    Image(systemName: ["arrow.up.left", "arrow.up.right", "arrow.down.left", "arrow.down.right"][index])
+                }
+                .help(["Move camera to the top left", "Move camera to the top right", "Move camera to the bottom left", "Move camera to the bottom right"][index])
+                .accessibilityLabel(["Camera top left", "Camera top right", "Camera bottom left", "Camera bottom right"][index])
+            }
         }
     }
 
@@ -743,38 +767,38 @@ struct ProjectEditorView: View {
         let easeIn = camera ? point?.easeIn : zoomPoint?.easeIn
         let easeOut = camera ? point?.easeOut : zoomPoint?.easeOut
         let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
-        return Group {
-            if selectedEdit != nil && hasComponent && editTime > previous {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 12) {
-                        Picker("Movement", selection: Binding(get: { mode }, set: { value in
-                            if camera { transition = value; updateSelected { $0.transition = value } }
-                            else { zoomTransition = value; updateZoomPoint { $0.transition = value } }
-                        })) {
-                            Text("Jump").tag(PIPTransition.jump)
-                            Text("Smooth").tag(PIPTransition.smooth)
-                        }
-                        .frame(width: 185)
-                        .help("Jump applies this edit instantly. Smooth accelerates, moves at steady speed, and decelerates to arrive at this edit.")
-                        if mode == .smooth {
-                            Text("Duration").font(.caption)
-                            MotionDurationField(value: requested, maximum: max(editor.project.duration, requested), change: { value in
-                                if camera { transitionDuration = value; updateSelected { $0.duration = value } }
-                                else { zoomDuration = value; updateZoomPoint { $0.duration = value } }
-                            }, cancel: { cancelDraft() })
-                                .frame(width: 64, height: 24)
-                                .help("Total movement time in seconds. The previous edit limits how much of this time is available.")
-                            Text("s").font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                    }.frame(height: 24)
+        let showsMovement = selectedEdit != nil && hasComponent && editTime > previous
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                if camera { cameraCornerControls }
+                if showsMovement {
+                    Picker("Movement", selection: Binding(get: { mode }, set: { value in
+                        if camera { transition = value; updateSelected { $0.transition = value } }
+                        else { zoomTransition = value; updateZoomPoint { $0.transition = value } }
+                    })) {
+                        Text("Jump").tag(PIPTransition.jump)
+                        Text("Smooth").tag(PIPTransition.smooth)
+                    }
+                    .frame(width: 185)
+                    .help("Jump applies this edit instantly. Smooth accelerates, moves at steady speed, and decelerates to arrive at this edit.")
                     if mode == .smooth {
-                        MotionRampStrip(duration: span, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
-                            change: { incoming, value in setRamp(value, camera: camera, incoming: incoming, span: span, other: incoming ? ramps.easeOut : ramps.easeIn) })
-                            .frame(width: 526, height: 32)
-                            .help("Drag the left boundary to adjust acceleration, or the right boundary to adjust deceleration. The middle moves at steady speed. The strip shows the time available before this edit.")
+                        Text("Duration").font(.caption)
+                        MotionDurationField(value: requested, maximum: max(editor.project.duration, requested), change: { value in
+                            if camera { transitionDuration = value; updateSelected { $0.duration = value } }
+                            else { zoomDuration = value; updateZoomPoint { $0.duration = value } }
+                        }, cancel: { cancelDraft() })
+                            .frame(width: 64, height: 24)
+                            .help("Total movement time in seconds. The previous edit limits how much of this time is available.")
+                        Text("s").font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                Spacer(minLength: 0)
+            }.frame(height: 24)
+            if showsMovement && mode == .smooth {
+                MotionRampStrip(duration: span, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
+                    change: { incoming, value in setRamp(value, camera: camera, incoming: incoming, span: span, other: incoming ? ramps.easeOut : ramps.easeIn) })
+                    .frame(width: 526, height: 32)
+                    .help("Drag the left boundary to adjust acceleration, or the right boundary to adjust deceleration. The middle moves at steady speed. The strip shows the time available before this edit.")
             }
         }
         // Keep selection changes from moving the recording or timeline.

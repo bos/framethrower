@@ -25,6 +25,7 @@ struct EditorCanvas: NSViewRepresentable {
     var nativeSourceSize: CGSize? = nil
     var scribbleMode = false
     var regions: [EditorRegion] = []
+    var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID? = nil
     var onDrawRegion: (EditorRegionRect) -> Void = { _ in }
     var onSelectRegion: (UUID?) -> Void = { _ in }
@@ -41,6 +42,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.allowsZoomEditing = allowsZoomEditing
         view.scribbleMode = scribbleMode
         view.regions = regions
+        view.regionLabels = regionLabels
         view.selectedRegionID = selectedRegionID
         view.onDrawRegion = onDrawRegion
         view.onSelectRegion = onSelectRegion
@@ -53,6 +55,12 @@ struct EditorCanvas: NSViewRepresentable {
 
 @MainActor
 final class EditorCanvasView: NSView {
+    struct GuideBadge: Equatable {
+        let regionID: UUID
+        let label: String
+        let frame: CGRect
+        let selected: Bool
+    }
     let playerLayer = AVPlayerLayer()
     let stillLayer = CALayer()
     private let canvasBorder = CALayer()
@@ -63,16 +71,19 @@ final class EditorCanvasView: NSView {
         didSet {
             guard oldValue != scribbleMode else { return }
             if scribbleMode { trackpad = nil; zoomDrag = nil; drag = nil }
-            if !scribbleMode { scribbleStart = nil; scribbleDraft = nil }
+            if !scribbleMode { scribbleStart = nil; scribbleDraft = nil; guidePressID = nil }
             window?.invalidateCursorRects(for: self)
         }
     }
     var regions: [EditorRegion] = []
+    var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID?
     var onDrawRegion: ((EditorRegionRect) -> Void)?
     var onSelectRegion: ((UUID?) -> Void)?
     private var scribbleStart: CGPoint?
     private var scribbleDraft: EditorRegionRect?
+    private var guidePressID: UUID?
+    private(set) var guideBadges: [GuideBadge] = []
     private(set) var canvasRect = CGRect.zero
     private(set) var contentRect = CGRect.zero
     private(set) var placement = PIPPlacement()
@@ -206,9 +217,14 @@ final class EditorCanvasView: NSView {
     private func updateGuides() {
         guides.frame = bounds
         guides.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guideBadges = []
+        setAccessibilityValue(nil)
         guard scribbleMode else { return }
-        let values = regions.map { ($0.rect, $0.id == selectedRegionID) } + (scribbleDraft.map { [($0, true)] } ?? [])
-        for (region, selected) in values {
+        let values = regions.map { ($0.rect, $0.id == selectedRegionID, Optional($0.id)) }
+            + (scribbleDraft.map { [($0, true, nil as UUID?)] } ?? [])
+        var shapeLayers: [(CALayer, Bool)] = []
+        var badgeLayers: [(CALayer, Bool)] = []
+        for (region, selected, id) in values {
             let rect = scribbleGeometry.viewRect(region).intersection(contentRect)
             guard !rect.isNull, !rect.isEmpty else { continue }
             let shape = CAShapeLayer()
@@ -217,8 +233,74 @@ final class EditorCanvasView: NSView {
             shape.fillColor = NSColor.controlAccentColor.withAlphaComponent(selected ? 0.15 : 0.04).cgColor
             shape.lineWidth = selected ? 2 : 1
             shape.lineDashPattern = selected ? nil : [5, 3]
-            guides.addSublayer(shape)
+            shapeLayers.append((shape, selected))
+            if let id, let label = regionLabels[id] {
+                let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+                let measured = (label as NSString).size(withAttributes: [.font: font]).width + 14
+                let width = min(max(38, measured), contentRect.width)
+                let height = min(22, contentRect.height)
+                let frame = availableBadgeFrame(at: rect.origin, size: CGSize(width: width, height: height))
+                if !frame.intersects(rect) {
+                    let connector = CAShapeLayer()
+                    let line = CGMutablePath()
+                    let center = CGPoint(x: frame.midX, y: frame.midY)
+                    line.move(to: center)
+                    line.addLine(to: CGPoint(x: min(rect.maxX, max(rect.minX, center.x)),
+                                            y: min(rect.maxY, max(rect.minY, center.y))))
+                    connector.path = line
+                    connector.strokeColor = shape.strokeColor
+                    connector.lineWidth = 1
+                    shapeLayers.append((connector, selected))
+                }
+                let badge = CALayer()
+                badge.frame = frame
+                badge.backgroundColor = (selected ? NSColor.controlAccentColor : NSColor.black.withAlphaComponent(0.85)).cgColor
+                badge.borderWidth = selected ? 2 : 1
+                badge.borderColor = NSColor.white.cgColor
+                badge.cornerRadius = 4
+                let text = CATextLayer()
+                text.string = label
+                text.font = font
+                text.fontSize = 11
+                text.alignmentMode = .center
+                text.truncationMode = .end
+                text.foregroundColor = NSColor.white.cgColor
+                text.contentsScale = window?.backingScaleFactor ?? 2
+                text.frame = CGRect(x: 4, y: 3, width: max(0, width - 8), height: max(0, height - 4))
+                badge.addSublayer(text)
+                badgeLayers.append((badge, selected))
+                guideBadges.append(GuideBadge(regionID: id, label: label, frame: frame, selected: selected))
+            }
         }
+        for (child, _) in shapeLayers.sorted(by: { !$0.1 && $1.1 }) { guides.addSublayer(child) }
+        for (child, _) in badgeLayers.sorted(by: { !$0.1 && $1.1 }) { guides.addSublayer(child) }
+        setAccessibilityValue(guideBadges.map { $0.label + ($0.selected ? ", selected" : "") }.joined(separator: "; "))
+    }
+
+    private func availableBadgeFrame(at point: CGPoint, size: CGSize) -> CGRect {
+        func frame(_ x: CGFloat, _ y: CGFloat) -> CGRect {
+            CGRect(x: min(max(x, contentRect.minX), contentRect.maxX - size.width),
+                   y: min(max(y, contentRect.minY), contentRect.maxY - size.height),
+                   width: size.width, height: size.height)
+        }
+        let preferred = frame(point.x, point.y)
+        let horizontalStep = size.width + 4
+        let verticalStep = size.height + 4
+        let columns = max(1, Int(contentRect.width / horizontalStep) + 1)
+        let rows = max(1, Int(contentRect.height / verticalStep) + 1)
+        // Pack along the box's top edge first, then above/below it. Placement
+        // follows guide order, not selection, so highlighting cannot move names.
+        let horizontal = [CGFloat.zero] + (1...columns).flatMap { [CGFloat($0), -CGFloat($0)] }
+        let vertical = [CGFloat.zero] + (1...rows).flatMap { [CGFloat($0), -CGFloat($0)] }
+        for row in vertical {
+            for column in horizontal {
+                let candidate = frame(preferred.minX + column * horizontalStep, preferred.minY + row * verticalStep)
+                if !guideBadges.contains(where: { $0.frame.insetBy(dx: -2, dy: -2).intersects(candidate) }) {
+                    return candidate
+                }
+            }
+        }
+        return preferred
     }
 
     private func cornerPoint(_ corner: PIPResizeCorner, in rect: CGRect) -> CGPoint {
@@ -236,6 +318,10 @@ final class EditorCanvasView: NSView {
         if scribbleMode {
             guard scribbleGeometry.sourcePoint(point) != nil else { return }
             window?.makeFirstResponder(self)
+            if let badge = guideBadges.reversed().first(where: { $0.frame.contains(point) }) {
+                guidePressID = badge.regionID
+                return
+            }
             scribbleStart = point
             scribbleDraft = nil
             return
@@ -311,6 +397,11 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let guidePressID {
+            self.guidePressID = nil
+            onSelectRegion?(guidePressID)
+            return
+        }
         if let scribbleStart {
             let point = convert(event.locationInWindow, from: nil)
             let region = scribbleGeometry.region(from: scribbleStart, to: point)
@@ -395,6 +486,7 @@ final class EditorCanvasView: NSView {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if guidePressID != nil { guidePressID = nil; return }
         if scribbleStart != nil {
             scribbleStart = nil; scribbleDraft = nil
             CATransaction.begin(); CATransaction.setDisableActions(true)

@@ -38,7 +38,7 @@ final class EditorAssistantSession: ObservableObject {
                     let data = try await transport(payload)
                     try Task.checkCancellation()
                     guard let self, self.generation == token else { return }
-                    switch try LocalEditPlanner.result(data, context: context) {
+                    switch try LocalEditPlanner.result(data, context: context, instruction: text) {
                     case let .commands(batch, summary):
                         try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID)
                         self.notice = summary
@@ -68,83 +68,42 @@ final class EditorAssistantSession: ObservableObject {
 struct EditorAssistantPanel: View {
     @ObservedObject var editor: ProjectEditor
     @ObservedObject var session: EditorAssistantSession
-    @Binding var scribbleMode: Bool
     let selectedRegionID: UUID?
     let onSelectRegion: (UUID) -> Void
     let onRemoveRegion: (UUID) -> Void
     let onSubmit: () -> Void
     @StateObject private var instructionSpeech = LocalSpeechInput()
-    @StateObject private var noteSpeech = LocalSpeechInput()
-    @State private var noteDraft = ""
-    @FocusState private var noteFocused: Bool
+    @State private var namingRegionID: UUID?
+    @State private var nameDraft = ""
+    @FocusState private var nameFocused: Bool
 
     private var regions: [EditorRegion] { editor.editingState.regions }
-    private var selectedRegion: EditorRegion? { regions.first { $0.id == selectedRegionID } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Toggle(isOn: $scribbleMode) { Label("Scribble", systemImage: "pencil.tip.crop.circle") }
-                    .toggleStyle(.button)
-                    .help("Draw a box on the preview to refer to an area in an instruction. Turn off Scribble to pan or move the camera.")
-                Spacer()
-            }
             if !regions.isEmpty {
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach(Array(regions.enumerated()), id: \.element.id) { index, region in
-                            HStack(spacing: 4) {
-                                Button { onSelectRegion(region.id) } label: {
-                                    HStack {
-                                        Image(systemName: "rectangle.dashed")
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(region.note.isEmpty ? "Area \(index + 1)" : region.note).lineLimit(1)
-                                            Text("\(region.time, specifier: "%.2f") s").font(.caption).foregroundStyle(.secondary)
-                                        }
-                                        Spacer(minLength: 0)
-                                    }.padding(6).contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .help("Select this area and show the frame where it was drawn.")
-                                Button { onRemoveRegion(region.id) } label: { Image(systemName: "xmark") }
-                                    .buttonStyle(.borderless)
-                                    .accessibilityLabel("Remove area \(index + 1)")
-                                    .help("Remove this scribble and its note. Undo restores it.")
-                                    .padding(.trailing, 6)
-                            }
-                            .background(selectedRegionID == region.id ? Color.accentColor.opacity(0.15) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
+                ScrollViewReader { reader in
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            ForEach(regions) { region in regionRow(region).id(region.id) }
                         }
                     }
-                }.frame(maxHeight: 180)
-            }
-            if let region = selectedRegion {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("Area note").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        LocalVoiceButton(speech: noteSpeech, purpose: "Dictate an area note") { text in
-                            noteDraft = text; noteFocused = true
-                        }.disabled(instructionSpeech.phase != .idle)
+                    .onChange(of: selectedRegionID) { _, selected in
+                        if let selected { reader.scrollTo(selected, anchor: .center) }
                     }
-                    TextField("Describe this area", text: $noteDraft, axis: .vertical)
-                        .textFieldStyle(.roundedBorder).lineLimit(2...4)
-                        .focused($noteFocused)
-                        .onSubmit { saveNote(region.id) }
-                        .onExitCommand { noteDraft = region.note; noteFocused = false; Task { await noteSpeech.cancel() } }
-                        .help("Return saves the note. Escape or clicking away cancels. A note does not change the video.")
-                    speechStatus(noteSpeech)
                 }
+                .frame(height: min(180, CGFloat(regions.count) * 44 + CGFloat(max(0, regions.count - 1)) * 4))
+                Divider()
             }
-            Divider()
-            TextField("Describe an edit…", text: $session.instruction, axis: .vertical)
+            TextField("What would you like to change?", text: $session.instruction, axis: .vertical)
                 .textFieldStyle(.roundedBorder).lineLimit(3...6)
-                .onSubmit { if instructionSpeech.phase == .idle && noteSpeech.phase == .idle { onSubmit() } }
+                .onSubmit { if instructionSpeech.phase == .idle { onSubmit() } }
                 .disabled(session.isBusy)
-                .help("For example: At one second, zoom into this area; hold for four seconds, then zoom back out.")
+                .accessibilityLabel("Editing instruction")
+                .help("For example: At Edit A, zoom into Box 1. Then smoothly zoom out and into Box 2 at Edit B.")
             HStack {
                 LocalVoiceButton(speech: instructionSpeech) { text in session.instruction = text }
-                    .disabled(session.isBusy || noteSpeech.phase != .idle)
+                    .disabled(session.isBusy)
                 Text("On-device").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if session.isBusy {
@@ -154,7 +113,7 @@ struct EditorAssistantPanel: View {
                 } else {
                     Button(action: onSubmit) { Image(systemName: "arrow.up.circle.fill") }
                         .buttonStyle(.borderless).font(.title2)
-                        .disabled(session.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || instructionSpeech.phase != .idle || noteSpeech.phase != .idle)
+                        .disabled(session.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || instructionSpeech.phase != .idle)
                         .help("Apply this instruction. Undo reverses the whole request.")
                         .accessibilityLabel("Apply edit instruction")
                 }
@@ -168,27 +127,82 @@ struct EditorAssistantPanel: View {
             Spacer(minLength: 0)
         }
         .padding(16)
-        .onChange(of: selectedRegionID, initial: true) { _, _ in
-            noteFocused = false; noteDraft = selectedRegion?.note ?? ""
-            Task { await noteSpeech.cancel() }
-        }
-        .onChange(of: selectedRegion?.note) { _, note in if !noteFocused { noteDraft = note ?? "" } }
-        .onChange(of: noteFocused) { _, focused in if !focused { noteDraft = selectedRegion?.note ?? "" } }
         .onExitCommand {
             session.cancel()
-            Task { await instructionSpeech.cancel(); await noteSpeech.cancel() }
+            Task { await instructionSpeech.cancel() }
         }
         .onDisappear {
             session.cancel()
-            Task { await instructionSpeech.cancel(); await noteSpeech.cancel() }
+            Task { await instructionSpeech.cancel() }
         }
     }
 
-    private func saveNote(_ id: UUID) {
+    private func regionRow(_ region: EditorRegion) -> some View {
+        let label = editor.references.boxLabel(for: region.id) ?? "Box"
+        let editLabel = region.editID.flatMap { editor.references.editLabel(for: $0) }
+        let editExists = region.editID.flatMap { editor.references.edit(in: editor.editingState, id: $0) } != nil
+        let association = editLabel.map { "· " + $0 + (editExists ? "" : " · removed") }
+        let selected = region.id == selectedRegionID
+        return HStack(spacing: 4) {
+            regionSelectButton(region, label: label, editLabel: editLabel, association: association, selected: selected)
+            Button { onRemoveRegion(region.id) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Remove " + label)
+                .help("Remove " + label + ". Undo restores it.")
+                .padding(.trailing, 8)
+        }
+        .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2))
+        .contextMenu {
+            Button("Name " + label + "…") { nameDraft = region.note; namingRegionID = region.id }
+        }
+        .popover(isPresented: Binding(get: { namingRegionID == region.id }, set: { if !$0 { namingRegionID = nil } })) {
+            TextField("Name " + label, text: $nameDraft)
+                .textFieldStyle(.roundedBorder).focused($nameFocused)
+                .onSubmit { saveName(region.id) }
+                .onExitCommand { namingRegionID = nil }
+                .help("Return saves the optional name. Escape or clicking outside cancels.")
+                .frame(width: 220).padding(12)
+                .onAppear { nameFocused = true }
+        }
+    }
+
+    private func regionSelectButton(_ region: EditorRegion, label: String, editLabel: String?, association: String?, selected: Bool) -> some View {
+        let accessibilityName: String = label + (editLabel.map { " at " + $0 } ?? "")
+        let time: String = String(format: "%.2f", region.time)
+        let tooltip: String = "Select \(label) and show its original frame (\(time) s)."
+        return Button(action: { onSelectRegion(region.id) }, label: {
+            regionButtonLabel(region, label: label, association: association, selected: selected)
+        })
+        .buttonStyle(.plain)
+        .accessibilityValue(Text(selected ? "Selected" : ""))
+        .accessibilityLabel(Text(accessibilityName))
+        .help(Text(tooltip))
+    }
+
+    private func regionButtonLabel(_ region: EditorRegion, label: String, association: String?, selected: Bool) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: selected ? "rectangle.inset.filled" : "rectangle.dashed")
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(label).fontWeight(selected ? .semibold : .regular)
+                    if let association { Text(association).foregroundStyle(.secondary) }
+                }
+                .lineLimit(1)
+                if !region.note.isEmpty {
+                    Text(region.note).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8).frame(height: 44).contentShape(Rectangle())
+    }
+
+    private func saveName(_ id: UUID) {
         guard editor.finishDraft(), let index = editor.project.state.regions.firstIndex(where: { $0.id == id }) else { return }
         var next = editor.project.state
-        next.regions[index].note = noteDraft
-        if editor.commit(next, name: "Edit area note") { noteFocused = false }
+        next.regions[index].note = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if editor.commit(next, name: "Name box") { namingRegionID = nil }
     }
 
     @ViewBuilder private func speechStatus(_ speech: LocalSpeechInput) -> some View {

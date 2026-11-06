@@ -26,13 +26,27 @@ final class CaptureViewModel: ObservableObject {
         let sharingState: Int?
     }
 
-    @Published var captureKind: CaptureSourceKind = .window {
-        didSet { handleCaptureKindChanged() }
+    @Published var captureKind: CaptureSourceKind = .display {
+        didSet {
+            capturePreferences.remember(kind: captureKind)
+            handleCaptureKindChanged()
+        }
     }
     @Published var windows: [ShareableWindow] = []
     @Published var displays: [ShareableDisplay] = []
-    @Published var selectedWindowID: CGWindowID?
-    @Published var selectedDisplayID: CGDirectDisplayID?
+    @Published var selectedWindowID: CGWindowID? {
+        didSet {
+            guard !isReconcilingCaptureSelection else { return }
+            explicitlySelectedWindowID = selectedWindowID
+            capturePreferences.remember(windowID: selectedWindowID,
+                identity: selectedWindow.map(captureWindowIdentity))
+        }
+    }
+    @Published var selectedDisplayID: CGDirectDisplayID? {
+        didSet {
+            if !isReconcilingCaptureSelection { capturePreferences.remember(displayID: selectedDisplayID) }
+        }
+    }
     @Published var area = CaptureArea() {
         didSet { persistAreaSettings() }
     }
@@ -101,7 +115,13 @@ final class CaptureViewModel: ObservableObject {
     let camera = CameraRecorder()
     private var cameraChanges: AnyCancellable?
 
-    init() {
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        let preferences = CaptureSelectionPreferences(defaults: userDefaults)
+        capturePreferences = preferences
+        captureKind = preferences.kind
+        selectedWindowID = preferences.windowID
+        selectedDisplayID = preferences.displayID
         cameraChanges = camera.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
     }
 
@@ -136,7 +156,10 @@ final class CaptureViewModel: ObservableObject {
     private let areaYKey = "capture.area.y"
     private let areaWidthKey = "capture.area.width"
     private let areaHeightKey = "capture.area.height"
-    private let userDefaults = UserDefaults.standard
+    private let userDefaults: UserDefaults
+    private let capturePreferences: CaptureSelectionPreferences
+    private var isReconcilingCaptureSelection = false
+    private var explicitlySelectedWindowID: CGWindowID?
     private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Screencast.log")
     private let clipboardTimestampFormatter: DateFormatter = {
@@ -264,16 +287,18 @@ final class CaptureViewModel: ObservableObject {
         guard hasScreenRecordingPermission else {
             windows = []
             displays = []
+            // Permission loss is not a new source choice. Keep the remembered
+            // preference so granting access later restores the user's selection.
+            isReconcilingCaptureSelection = true
             selectedWindowID = nil
             selectedDisplayID = nil
+            isReconcilingCaptureSelection = false
             if logErrors {
                 log("Screen recording permission is required.", level: .error)
             }
             return
         }
 
-        let previousWindowID = selectedWindowID
-        let previousDisplayID = selectedDisplayID
         do {
             let content = try await shareableContent()
             let allWindows = content.windows.map(ShareableWindow.init)
@@ -303,18 +328,22 @@ final class CaptureViewModel: ObservableObject {
             displays = content.displays.enumerated().map { offset, display in
                 ShareableDisplay(display: display, index: offset + 1)
             }
-            if let previousWindowID,
-               windows.contains(where: { $0.id == previousWindowID }) {
-                selectedWindowID = previousWindowID
-            } else {
-                // A disappearing window must not silently switch the recording to another app.
-                selectedWindowID = nil
+            // Read preferences after discovery completes: a user may choose
+            // another source while shareableContent() is suspended.
+            let choice = capturePreferences.reconciled(
+                windows: windows.map(captureWindowIdentity), displays: displays.map(\.id),
+                currentDisplayID: selectedDisplayID, explicitlySelectedWindowID: explicitlySelectedWindowID
+            )
+            isReconcilingCaptureSelection = true
+            selectedWindowID = choice.window?.id
+            selectedDisplayID = choice.displayID
+            isReconcilingCaptureSelection = false
+            explicitlySelectedWindowID = nil
+            if let window = choice.window {
+                capturePreferences.remember(windowID: window.id, identity: window)
             }
-            if let previousDisplayID,
-               displays.contains(where: { $0.id == previousDisplayID }) {
-                selectedDisplayID = previousDisplayID
-            } else {
-                selectedDisplayID = displays.first?.id
+            if capturePreferences.displayID == nil {
+                capturePreferences.remember(displayID: choice.displayID)
             }
             if logSuccess {
                 log("Sources refreshed. Showing \(windows.count) windows.")
@@ -405,7 +434,17 @@ final class CaptureViewModel: ObservableObject {
 
     private func handleCaptureKindChanged() {
         updateSourceRefreshScheduling()
-        sourceRefreshTriggered(force: true)
+        // Initialization/preferences changes do not initiate capture discovery.
+        // ContentView starts refresh explicitly when it becomes visible.
+        if isSourceRefreshConfigured { sourceRefreshTriggered(force: true) }
+    }
+
+    private func captureWindowIdentity(_ window: ShareableWindow) -> CaptureSelectionPreferences.WindowIdentity {
+        let processID = window.window.owningApplication?.processID ?? 0
+        return CaptureSelectionPreferences.WindowIdentity(
+            id: window.id, processID: processID, bundleIdentifier: window.bundleIdentifier,
+            launchDate: NSRunningApplication(processIdentifier: processID)?.launchDate
+        )
     }
 
     private func registerSourceRefreshObservers() {
@@ -1524,5 +1563,83 @@ final class CaptureViewModel: ObservableObject {
             "mpim:write",
             "users:read"
         ]
+    }
+}
+
+
+/// The remembered explicit choice is separate from temporary discovery fallback.
+/// This value-only reconciliation is also testable without screen access.
+@MainActor
+struct CaptureSelectionPreferences {
+    struct WindowIdentity: Codable, Equatable {
+        var id: CGWindowID
+        var processID: pid_t
+        var bundleIdentifier: String?
+        var launchDate: Date?
+
+        func matches(_ candidate: WindowIdentity) -> Bool {
+            guard id == candidate.id, processID == candidate.processID,
+                  bundleIdentifier == candidate.bundleIdentifier else { return false }
+            if let launchDate {
+                guard let candidateLaunchDate = candidate.launchDate,
+                      abs(launchDate.timeIntervalSince(candidateLaunchDate)) < 0.001 else { return false }
+            }
+            return true
+        }
+    }
+
+    private let defaults: UserDefaults
+    private static let kindKey = "capture.kind"
+    private static let windowKey = "capture.window.id"
+    private static let windowIdentityKey = "capture.window.identity"
+    private static let displayKey = "capture.display.id"
+
+    init(defaults: UserDefaults) { self.defaults = defaults }
+
+    var kind: CaptureSourceKind {
+        defaults.string(forKey: Self.kindKey).flatMap(CaptureSourceKind.init(rawValue:)) ?? .display
+    }
+    var windowID: CGWindowID? { identifier(forKey: Self.windowKey) }
+    var displayID: CGDirectDisplayID? { identifier(forKey: Self.displayKey) }
+    private var windowIdentity: WindowIdentity? {
+        defaults.data(forKey: Self.windowIdentityKey).flatMap { try? JSONDecoder().decode(WindowIdentity.self, from: $0) }
+    }
+
+    func remember(kind: CaptureSourceKind) { defaults.set(kind.rawValue, forKey: Self.kindKey) }
+
+    func remember(windowID: CGWindowID?, identity: WindowIdentity?) {
+        let previousID = self.windowID
+        defaults.set(windowID.map { NSNumber(value: $0) }, forKey: Self.windowKey)
+        if let identity, identity.id == windowID, let data = try? JSONEncoder().encode(identity) {
+            defaults.set(data, forKey: Self.windowIdentityKey)
+        } else if windowID == nil || windowID != previousID {
+            defaults.removeObject(forKey: Self.windowIdentityKey)
+        }
+    }
+
+    func remember(displayID: CGDirectDisplayID?) {
+        defaults.set(displayID.map { NSNumber(value: $0) }, forKey: Self.displayKey)
+    }
+
+    func reconciled(windows: [WindowIdentity], displays: [CGDirectDisplayID],
+                    currentDisplayID: CGDirectDisplayID?, explicitlySelectedWindowID: CGWindowID?)
+        -> (window: WindowIdentity?, displayID: CGDirectDisplayID?) {
+        let window = windows.first { candidate in
+            guard candidate.id == windowID else { return false }
+            return explicitlySelectedWindowID == candidate.id
+                || (candidate.processID > 0 && windowIdentity?.matches(candidate) == true)
+        }
+        let display: CGDirectDisplayID?
+        if let displayID, displays.contains(displayID) { display = displayID }
+        else if let currentDisplayID, displays.contains(currentDisplayID) { display = currentDisplayID }
+        else { display = displays.first }
+        return (window, display)
+    }
+
+    private func identifier(forKey key: String) -> UInt32? {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite, value > 0, value <= Double(UInt32.max), value.rounded() == value else { return nil }
+        return UInt32(value)
     }
 }

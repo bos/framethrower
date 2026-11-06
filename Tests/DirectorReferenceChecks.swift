@@ -38,7 +38,7 @@ struct DirectorReferenceChecks {
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("reference.framethrower"))
         try require(editor.save(), "Save metadata-only fixture")
         let original = editor.project
-        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: true))
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: true, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 1240, height: 820),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

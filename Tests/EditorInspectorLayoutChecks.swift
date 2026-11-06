@@ -33,7 +33,7 @@ struct EditorInspectorLayoutChecks {
             project.state.audio = RecordingAudio(volume: 0.7, fadeIn: 1, fadeOut: 3)
             let editor = ProjectEditor(project: project, url: directory.appendingPathComponent(UUID().uuidString + ".framethrower"))
             guard editor.save() else { throw Failure.failed("Save metadata-only fixture") }
-            let host = NSHostingView(rootView: ProjectEditorView(editor: editor))
+            let host = NSHostingView(rootView: ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
             let window = NSWindow(contentRect: CGRect(origin: CGPoint(x: -10000, y: -10000), size: size),
                                   styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false

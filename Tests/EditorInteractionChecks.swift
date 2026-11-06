@@ -25,7 +25,7 @@ struct EditorInteractionChecks {
                                                                shape: .rectangle, aspectRatio: 2)
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("editor.json"))
         try require(editor.save(), "initial project save")
-        let host = NSHostingView(rootView: ProjectEditorView(editor: editor))
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
         let window = makeWindow(content: host, size: CGSize(width: 940, height: 800))
         defer { window.close() }
         await settle()

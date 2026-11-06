@@ -27,7 +27,7 @@ struct ZoomInteractionChecks {
         project.state.pipKeyframes[0].placement = PIPPlacement(x: 0.75, y: 0.75, scale: 0.2)
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("test.framethrower"))
         try require(editor.save(), "save fixture project")
-        let host = NSHostingView(rootView: ProjectEditorView(editor: editor))
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 940, height: 780),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

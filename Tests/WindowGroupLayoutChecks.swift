@@ -28,7 +28,7 @@ struct WindowGroupLayoutChecks: App {
     var body: some Scene {
         WindowGroup("WindowGroup layout regression") {
             Group {
-                if let editor = probe.editor { ProjectEditorView(editor: editor).focusedSceneObject(editor) }
+                if let editor = probe.editor { ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })).focusedSceneObject(editor) }
                 else { ProgressView("Preparing synthetic recording…").frame(width: 940, height: 780) }
             }
             .preferredColorScheme(probe.reviewColorScheme)

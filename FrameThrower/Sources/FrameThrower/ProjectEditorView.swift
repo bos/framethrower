@@ -31,7 +31,7 @@ struct ProjectEditorView: View {
     @State private var cameraFrameError: String?
     @StateObject private var exportSession = VideoExportSession()
     @State private var playAfterRebuild = false
-    @StateObject private var assistant = EditorAssistantSession()
+    @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
     @State private var selectedRegionID: UUID?
 
@@ -46,8 +46,10 @@ struct ProjectEditorView: View {
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
     private var frameDuration: Double { playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30 }
 
-    init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false) {
+    init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false,
+         assistant: EditorAssistantSession? = nil) {
         self.editor = editor
+        _assistant = StateObject(wrappedValue: assistant ?? EditorAssistantSession())
         _directorMode = State(initialValue: directorModeInitiallyEnabled)
     }
 

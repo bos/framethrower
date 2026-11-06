@@ -34,7 +34,7 @@ struct LiveEditorLayoutChecks {
                                                               shape: .rectangle, aspectRatio: 2)
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("test.framethrower"))
         guard editor.save() else { throw LiveLayoutError.failed("save fixture project") }
-        let controller = NSHostingController(rootView: ProjectEditorView(editor: editor))
+        let controller = NSHostingController(rootView: ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
         controller.sizingOptions = [.minSize, .preferredContentSize]
         let host = controller.view
         let window = NSWindow(contentViewController: controller)

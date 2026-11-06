@@ -169,8 +169,6 @@ struct ProjectEditorView: View {
                     setPlacement(next, at: playback.time, name: value ? "Show camera" : "Hide camera")
                 })).toggleStyle(.checkbox)
                 Spacer()
-                Text("Camera edits apply at the playhead.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 12) {
                 Picker("Shape", selection: Binding(get: { placement.shape }, set: { shape in

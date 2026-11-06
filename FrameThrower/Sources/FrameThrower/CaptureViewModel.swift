@@ -97,6 +97,19 @@ final class CaptureViewModel: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "SlackClientSecret") as? String ?? ""
     }
 
+    let camera = CameraRecorder()
+    @Published var initialCameraPlacement = PIPPlacement()
+    @Published var projectEditor: ProjectEditor?
+    @Published var isProjectEditorPresented = false
+    @Published private(set) var isCaptureBusy = false
+    @Published private(set) var isExporting = false
+    private var activeCameraURL: URL?
+    private var activeCameraOffset = 0.0
+    private var didRestoreProject = false
+    private var exportedState: EditState?
+    private var exportedProjectURL: URL?
+    private var exportedURL: URL?
+
     private let recorder = ScreenRecorder()
     private let uploader = DriveUploader()
     private let tokenStorageKey = "drive.tokens"
@@ -148,7 +161,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     var isAnyUploadActive: Bool {
-        isUploading || isSlackUploading
+        isUploading || isSlackUploading || isExporting
     }
 
     var latestLogEntry: LogEntry? {
@@ -806,10 +819,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func uploadLastRecordingToSlack() async {
-        guard let fileURL = resolveRecordingURL() else {
-            log("Record something first.", level: .error)
-            return
-        }
+        guard !isAnyUploadActive, !isRecording, !isCaptureBusy else { return }
         guard let token = slackTokens?.accessToken else {
             log("Connect Slack first.", level: .error)
             return
@@ -822,6 +832,7 @@ final class CaptureViewModel: ObservableObject {
         }
 
         do {
+            let fileURL = try await recordingForSharing()
             let size = try fileSize(for: fileURL)
             log("Slack upload starting: \(fileURL.path) (\(size) bytes)")
             if size == 0 {
@@ -880,80 +891,141 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording else { return }
+        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
+        isCaptureBusy = true
+        defer { isCaptureBusy = false }
         refreshMicrophones()
         if recordMicrophoneAudio {
-            let granted = await ensureMicrophonePermission()
-            guard granted else { return }
+            guard await ensureMicrophonePermission() else { return }
         }
 
         do {
-            let filter = try selectedFilter()
+            let filter = try await selectedFilter()
             let configuration = try makeConfiguration(filter: filter)
             let outputURL = try makeOutputURL()
             activeRecordingURL = outputURL
-
-            try await recorder.start(
-                filter: filter,
-                configuration: configuration,
-                outputURL: outputURL
-            )
+            activeCameraURL = nil
+            activeCameraOffset = 0
+            var cameraStart: Double?
+            if camera.selectedDeviceID != nil {
+                let url = outputURL.deletingPathExtension().appendingPathExtension("camera.mov")
+                activeCameraURL = url
+                cameraStart = try await camera.startRecording(to: url)
+            }
+            let screenStart = try await recorder.start(filter: filter, configuration: configuration, outputURL: outputURL)
+            if let cameraStart { activeCameraOffset = cameraStart - screenStart }
             lastDriveFileURL = nil
             lastSlackFileURL = nil
+            projectEditor = nil
+            exportedState = nil
+            exportedURL = nil
             isRecording = true
             lastRecordingURL = outputURL
-            let systemAudioEnabled = recordSystemAudio
-            let microphoneEnabled = recordMicrophoneAudio
-            if !systemAudioEnabled && !microphoneEnabled {
-                log("Recording started.")
-                return
-            }
-            var inputs: [String] = []
-            if systemAudioEnabled {
-                inputs.append("system audio")
-            }
-            if microphoneEnabled {
-                let microphoneName = microphones
-                    .first(where: { $0.id == selectedMicrophoneID })?.name
-                    ?? "System Default Microphone"
-                inputs.append("voiceover: \(microphoneName)")
-            }
-            log("Recording started with \(inputs.joined(separator: " + ")).")
+            log(cameraStart == nil ? "Recording started." : "Recording screen and camera independently.")
         } catch {
+            try? await camera.stopRecording()
+            if let activeRecordingURL { log("Captured sources kept beside \(activeRecordingURL.path)") }
             activeRecordingURL = nil
+            activeCameraURL = nil
             log("Recording failed: \(error.localizedDescription)", level: .error)
         }
     }
 
     func stopRecording() async {
-        guard isRecording else { return }
-        do {
-            try await recorder.stop()
-            isRecording = false
-            let outputURL = activeRecordingURL ?? lastRecordingURL
-            activeRecordingURL = nil
-            if let outputURL,
-               FileManager.default.fileExists(atPath: outputURL.path) {
-                lastRecordingURL = outputURL
-                let size = (try? fileSize(for: outputURL)) ?? 0
-                log(
-                    "Recording stopped. Saved \(outputURL.lastPathComponent) " +
-                    "(\(size) bytes)."
-                )
-                log("Local file URL: \(outputURL.absoluteString)")
-            } else {
-                updateRecordingAvailability()
-                log("Recording stopped, but no output file was found.", level: .error)
-            }
-        } catch {
-            log("Stop failed: \(error.localizedDescription)", level: .error)
+        guard isRecording, !isCaptureBusy else { return }
+        isCaptureBusy = true
+        defer { isCaptureBusy = false }
+        var failures: [String] = []
+        do { try await recorder.stop() } catch { failures.append(error.localizedDescription) }
+        do { try await camera.stopRecording() } catch { failures.append(error.localizedDescription) }
+        isRecording = false
+        let outputURL = activeRecordingURL
+        activeRecordingURL = nil
+        defer { activeCameraURL = nil }
+        guard let outputURL, FileManager.default.fileExists(atPath: outputURL.path) else {
+            log("No screen file was found. " + failures.joined(separator: " "), level: .error)
+            updateRecordingAvailability()
+            return
         }
+        lastRecordingURL = outputURL
+        do {
+            let duration = try await AVURLAsset(url: outputURL).load(.duration).seconds
+            var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
+                cameraFilename: activeCameraURL?.lastPathComponent,
+                cameraOffset: activeCameraOffset, duration: duration)
+            project.state.pipKeyframes[0].placement = initialCameraPlacement
+            let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")
+            let editor = ProjectEditor(project: project, url: url)
+            guard editor.save() else { throw ProjectError.invalid(editor.errorMessage ?? "Could not save the project.") }
+            projectEditor = editor
+            userDefaults.set(url.path, forKey: "editor.lastProject")
+            isProjectEditorPresented = true
+            log("Recording saved. Review, trim, and arrange your camera before sharing.")
+        } catch {
+            log("Sources are safe at \(outputURL.path), but project creation failed: \(error.localizedDescription)", level: .error)
+        }
+        if !failures.isEmpty { log("Capture reported: " + failures.joined(separator: " "), level: .error) }
+    }
+
+    func restoreLastProject() {
+        guard !didRestoreProject else { return }
+        didRestoreProject = true
+        guard let path = userDefaults.string(forKey: "editor.lastProject"),
+              FileManager.default.fileExists(atPath: path) else { return }
+        openProject(at: URL(fileURLWithPath: path), present: false)
+    }
+
+    func chooseProject() {
+        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a FrameThrower project (.framethrower) to continue editing."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        openProject(at: url, present: true)
+    }
+
+    private func openProject(at url: URL, present: Bool) {
+        do {
+            let editor = try ProjectEditor.open(url: url)
+            let screenURL = editor.mediaURL(for: editor.project.screenFilename)
+            guard FileManager.default.fileExists(atPath: screenURL.path) else {
+                throw ProjectError.invalid("Keep the project and its original media files together.")
+            }
+            projectEditor = editor
+            lastRecordingURL = screenURL
+            lastDriveFileURL = nil
+            lastSlackFileURL = nil
+            userDefaults.set(url.path, forKey: "editor.lastProject")
+            isProjectEditorPresented = present
+        } catch { log("Could not open project: \(error.localizedDescription)", level: .error) }
+    }
+
+    /// Both destinations use this exact snapshot, never the unedited screen file.
+    private func recordingForSharing() async throws -> URL {
+        guard let editor = projectEditor else {
+            guard let source = resolveRecordingURL() else { throw ProjectError.invalid("Record something first.") }
+            return source
+        }
+        guard editor.save() else { throw ProjectError.invalid(editor.errorMessage ?? "Could not save the edit.") }
+        let snapshot = editor.project
+        if exportedState == snapshot.state, exportedProjectURL == editor.url,
+           let exportedURL, FileManager.default.fileExists(atPath: exportedURL.path) { return exportedURL }
+        isExporting = true
+        defer { isExporting = false }
+        let url = editor.mediaURL(for: snapshot.screenFilename).deletingPathExtension()
+            .appendingPathExtension("edited-" + UUID().uuidString + ".mp4")
+        try await ProjectRenderer.export(project: snapshot, directory: editor.url.deletingLastPathComponent(), to: url)
+        exportedState = snapshot.state
+        exportedProjectURL = editor.url
+        exportedURL = url
+        return url
     }
 
     func startRecordingAfterDelay(seconds: Int) async {
-        guard !isRecording else { return }
+        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         let countdownSeconds = max(1, seconds)
@@ -1012,11 +1084,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func uploadLastRecording() async {
-        guard let fileURL = resolveRecordingURL() else {
-            log("Record something first.", level: .error)
-            return
-        }
-
+        guard !isAnyUploadActive, !isRecording, !isCaptureBusy else { return }
         isUploading = true
         beginUploadProgress()
         defer {
@@ -1025,6 +1093,7 @@ final class CaptureViewModel: ObservableObject {
         }
 
         do {
+            let fileURL = try await recordingForSharing()
             let accessToken = try await validAccessToken()
             let result = try await uploader.upload(
                 fileURL: fileURL,
@@ -1125,7 +1194,7 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    private func selectedFilter() throws -> SCContentFilter {
+    private func selectedFilter() async throws -> SCContentFilter {
         switch captureKind {
         case .window:
             guard let id = selectedWindowID,
@@ -1138,7 +1207,9 @@ final class CaptureViewModel: ObservableObject {
                   let selected = displays.first(where: { $0.id == id }) else {
                 throw URLError(.badURL)
             }
-            return SCContentFilter(display: selected.display, excludingWindows: [])
+            let content = try await shareableContent()
+            let ownApplications = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+            return SCContentFilter(display: selected.display, excludingApplications: ownApplications, exceptingWindows: [])
         }
     }
 
@@ -1228,10 +1299,11 @@ final class CaptureViewModel: ObservableObject {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let filename = "Screencast-\(formatter.string(from: Date())).mp4"
+        let filename = "Screencast-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).mp4"
 
         let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)
             .first ?? FileManager.default.temporaryDirectory
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory.appendingPathComponent(filename)
     }
 

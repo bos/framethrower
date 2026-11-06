@@ -10,9 +10,9 @@ struct ContentView: View {
     @State private var clipSize = ""
     @State private var previewEnabled = false
 
-    private var captureLocked: Bool { model.isRecording || model.isCountdownActive }
+    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var canRecord: Bool {
-        guard model.hasScreenRecordingPermission else { return false }
+        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.camera.isPreparing else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
         case .display: return model.selectedDisplayID != nil
@@ -56,6 +56,7 @@ struct ContentView: View {
         .tint(RecorderStyle.accent)
         .frame(minWidth: 640, minHeight: 610)
         .onAppear {
+            model.restoreLastProject()
             model.loadTokens()
             model.loadSlackTokens()
             model.loadAudioSettings()
@@ -63,6 +64,9 @@ struct ContentView: View {
             model.refreshScreenRecordingPermissionState()
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
+        }
+        .sheet(isPresented: $model.isProjectEditorPresented) {
+            if let editor = model.projectEditor { ProjectEditorView(editor: editor) }
         }
         .onDisappear { model.stopSourceAutoRefresh() }
         .onOpenURL { SlackCallbackRouter.shared.handle(url: $0) }
@@ -90,6 +94,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button { model.chooseProject() } label: {
+                Label("Open…", systemImage: "folder")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(captureLocked || model.isAnyUploadActive)
             SettingsLink {
                 Label("Accounts", systemImage: "person.crop.circle")
                     .font(.system(size: 12, weight: .medium))
@@ -161,6 +172,8 @@ struct ContentView: View {
             Divider().opacity(0.6)
             audioControls
                 .disabled(captureLocked)
+            Divider().opacity(0.6)
+            CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked)
         }
         .padding(18)
         .modifier(RecorderCard())
@@ -325,6 +338,7 @@ struct ContentView: View {
             }
             .buttonStyle(RecordButtonStyle())
             .keyboardShortcut("r", modifiers: [.command])
+            .disabled(model.isCaptureBusy)
         } else if let remaining = model.countdownRemainingSeconds {
             Button {
                 model.cancelRecordingCountdown()
@@ -399,7 +413,8 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 12) {
                 Button {
-                    if let url = model.lastRecordingURL { NSWorkspace.shared.open(url) }
+                    if model.projectEditor != nil { model.isProjectEditorPresented = true }
+                    else if let url = model.lastRecordingURL { NSWorkspace.shared.open(url) }
                 } label: {
                     Image(systemName: "play.fill")
                         .font(.system(size: 15))
@@ -408,16 +423,20 @@ struct ContentView: View {
                         .background(RecorderStyle.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
                 }
                 .buttonStyle(.plain)
-                .help("Play recording")
-                .accessibilityLabel("Play recording")
+                .help("Review and edit recording")
+                .accessibilityLabel("Review and edit recording")
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Your recording")
+                    Text(model.projectEditor == nil ? "Your recording" : "Review and edit")
                         .font(.system(size: 13, weight: .semibold))
                     Text(clipSummary)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if model.projectEditor != nil {
+                    Button("Edit…") { model.isProjectEditorPresented = true }
+                        .disabled(model.isAnyUploadActive || captureLocked)
+                }
                 Button {
                     if let url = model.lastRecordingURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
                 } label: {
@@ -525,6 +544,7 @@ struct ContentView: View {
     }
 
     private var recordingHeading: String {
+        if model.isCaptureBusy { return model.isRecording ? "Finishing capture…" : "Starting capture…" }
         if model.isRecording { return "Recording" }
         if model.isCountdownActive { return "Get ready…" }
         if !model.hasScreenRecordingPermission { return "One quick setup." }
@@ -532,6 +552,7 @@ struct ContentView: View {
     }
 
     private var recordingHint: String {
+        if model.isCaptureBusy { return "Saving independent source tracks." }
         if model.isCountdownActive { return "Your recording will start automatically." }
         if !model.hasScreenRecordingPermission { return "Allow screen recording to get started." }
         if !canRecord { return "Pick a window or switch to a display or area." }

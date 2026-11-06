@@ -14,6 +14,13 @@ enum PIPShape: String, Codable, CaseIterable, Sendable {
     case circle
 }
 
+enum PIPResizeCorner: CaseIterable, Hashable, Sendable {
+    case topLeft
+    case topRight
+    case bottomLeft
+    case bottomRight
+}
+
 /// The crop is expressed in the oriented camera source's top-left coordinate
 /// space. Its anchor selects a fraction of the available horizontal/vertical
 /// travel, so the same edit works independently of the capture resolution.
@@ -114,24 +121,50 @@ struct PIPPlacement: Codable, Equatable, Sendable {
                       width: width, height: height)
     }
 
-    /// Resize from the bottom-right while retaining the top-left position
-    /// whenever the new bounds fit. Only free rectangles change aspect ratio.
-    func resized(by translation: CGSize, in canvas: CGSize, cameraAspect: Double) -> PIPPlacement {
+    /// Resize from any corner while retaining its opposite corner whenever
+    /// minimum size and canvas bounds permit. Only rectangles change aspect.
+    func resized(by translation: CGSize, corner: PIPResizeCorner = .bottomRight,
+                 in canvas: CGSize, cameraAspect: Double) -> PIPPlacement {
         guard canvas.width.isFinite, canvas.height.isFinite,
               canvas.width > 0, canvas.height > 0,
               translation.width.isFinite, translation.height.isFinite,
               translation != .zero else { return self }
         let original = frame(in: canvas, cameraAspect: cameraAspect)
-        let proposedWidth = min(canvas.width * 0.5,
-                                max(canvas.width * 0.12, original.width + translation.width))
+        let growsRight = corner == .topRight || corner == .bottomRight
+        let growsDown = corner == .bottomLeft || corner == .bottomRight
+        let anchor = CGPoint(x: growsRight ? original.minX : original.maxX,
+                             y: growsDown ? original.minY : original.maxY)
+        let availableWidth = growsRight ? canvas.width - anchor.x : anchor.x
+        let availableHeight = growsDown ? canvas.height - anchor.y : anchor.y
+        let horizontalDelta = translation.width * (growsRight ? 1 : -1)
+        let verticalDelta = translation.height * (growsDown ? 1 : -1)
+        let widthDelta: Double
+        if shape == .rectangle {
+            widthDelta = horizontalDelta
+        } else {
+            let horizontalFraction = horizontalDelta / original.width
+            let verticalFraction = verticalDelta / original.height
+            let dominant = abs(horizontalFraction) >= abs(verticalFraction) ? horizontalFraction : verticalFraction
+            widthDelta = original.width * dominant
+        }
+        let proposedWidth = max(canvas.width * 0.12,
+                                min(canvas.width * 0.5, availableWidth, original.width + widthDelta))
         var next = self
         next.scale = proposedWidth / canvas.width
         if shape == .rectangle {
-            next.aspectRatio = min(5, max(0.2, proposedWidth / max(1, original.height + translation.height)))
+            let proposedHeight = max(1, min(availableHeight, canvas.height * 0.8, original.height + verticalDelta))
+            next.aspectRatio = min(5, max(0.2, proposedWidth / proposedHeight))
         }
-        let resized = next.frame(in: canvas, cameraAspect: cameraAspect)
-        next.x = min(1, max(0, original.minX / max(1, canvas.width - resized.width)))
-        next.y = min(1, max(0, original.minY / max(1, canvas.height - resized.height)))
+        var resized = next.frame(in: canvas, cameraAspect: cameraAspect)
+        let fit = min(1, availableWidth / resized.width, availableHeight / resized.height)
+        if fit < 1 {
+            next.scale = min(0.5, max(0.12, resized.width * max(0, fit) / canvas.width))
+            resized = next.frame(in: canvas, cameraAspect: cameraAspect)
+        }
+        let originX = growsRight ? anchor.x : anchor.x - resized.width
+        let originY = growsDown ? anchor.y : anchor.y - resized.height
+        next.x = min(1, max(0, originX / max(1, canvas.width - resized.width)))
+        next.y = min(1, max(0, originY / max(1, canvas.height - resized.height)))
         return next
     }
 }

@@ -7,6 +7,7 @@ struct RecordingProjectChecks {
         try checkPlacementGeometry()
         checkShapeAndCropGeometry()
         checkInteractiveGeometry()
+        checkCornerResizing()
         checkEditingTime()
         checkTransitions()
         try checkPersistence()
@@ -94,7 +95,8 @@ struct RecordingProjectChecks {
             let before = placement.frame(in: canvas, cameraAspect: nativeAspect)
             let changed = placement.resized(by: CGSize(width: 100, height: 100), in: canvas, cameraAspect: nativeAspect)
             let after = changed.frame(in: canvas, cameraAspect: nativeAspect)
-            near(after.width, 400, "Constrained shapes resize their width")
+            near(after.width, shape == .original ? 300 + 100 * nativeAspect : 400,
+                 "Constrained shapes resize with the dominant relative pointer axis")
             near(after.width / after.height, shape == .original ? nativeAspect : 1,
                  "Original, square and circle retain their aspect")
             near(after.minX, before.minX, "Constrained resize anchors X")
@@ -105,21 +107,22 @@ struct RecordingProjectChecks {
                               cameraAspect: nativeAspect).scale, 0.5, "Resize maximum width")
         near(rectangle.resized(by: CGSize(width: -10000, height: 0), in: canvas,
                               cameraAspect: nativeAspect).scale, 0.12, "Resize minimum width")
-        near(rectangle.resized(by: CGSize(width: 0, height: 10000), in: canvas,
-                              cameraAspect: nativeAspect).aspectRatio, 0.2, "Resize minimum aspect")
+        precondition(rectangle.resized(by: CGSize(width: 0, height: 10000), in: canvas,
+                                       cameraAspect: nativeAspect).aspectRatio >= 0.2,
+                     "Resize stays within minimum aspect and available canvas height")
         near(rectangle.resized(by: CGSize(width: 0, height: -10000), in: canvas,
                               cameraAspect: nativeAspect).aspectRatio, 5, "Resize maximum aspect")
         let corner = PIPPlacement(x: 1, y: 1, scale: 0.3, shape: .circle)
         let expanded = corner.resized(by: CGSize(width: 200, height: 200), in: canvas, cameraAspect: nativeAspect)
-        expect(expanded.frame(in: canvas, cameraAspect: nativeAspect), CGRect(x: 500, y: 300, width: 500, height: 500),
-               "Expanding at an edge stays inside the canvas")
+        expect(expanded.frame(in: canvas, cameraAspect: nativeAspect), CGRect(x: 700, y: 500, width: 300, height: 300),
+               "Expanding at an edge clamps while preserving the opposite anchor")
         let shortCanvas = CGSize(width: 1000, height: 200)
         let capped = rectangle.resized(by: CGSize(width: 100, height: 100), in: shortCanvas, cameraAspect: nativeAspect)
         near(capped.scale, 0.4, "Height cap preserves the requested width fraction")
-        near(capped.aspectRatio, 1.6, "Height cap preserves the requested rectangle aspect")
+        near(capped.aspectRatio, 2.5, "Free rectangle height clamps independently at the canvas cap")
         let cappedRect = capped.frame(in: shortCanvas, cameraAspect: nativeAspect)
         near(cappedRect.height, 160, "Height cap takes precedence over requested width")
-        near(cappedRect.width, 256, "Height cap retains the chosen rectangle aspect")
+        near(cappedRect.width, 400, "Height cap preserves the free rectangle's requested width")
         precondition(cappedRect.minX >= 0 && cappedRect.maxX <= shortCanvas.width && cappedRect.maxY <= shortCanvas.height)
         precondition(rectangle.resized(by: .zero, in: shortCanvas, cameraAspect: nativeAspect) == rectangle,
                      "A stationary resize must not create a spurious edit")
@@ -142,6 +145,75 @@ struct RecordingProjectChecks {
         near(centered.moved(by: CGSize(width: 0, height: 30), in: landscape, shape: .rectangle, aspectRatio: 2).y,
              0.75, "Free rectangle crop pan uses its own aspect")
         precondition(centered.moved(by: .zero, in: .zero, shape: .circle) == centered)
+    }
+
+    static func checkCornerResizing() {
+        let canvas = CGSize(width: 1000, height: 800)
+        let nativeAspect = 16.0 / 9.0
+        func signs(_ corner: PIPResizeCorner) -> (Double, Double) {
+            (corner == .topRight || corner == .bottomRight ? 1 : -1,
+             corner == .bottomLeft || corner == .bottomRight ? 1 : -1)
+        }
+        func anchor(_ rect: CGRect, corner: PIPResizeCorner) -> CGPoint {
+            let (horizontal, vertical) = signs(corner)
+            return CGPoint(x: horizontal > 0 ? rect.minX : rect.maxX,
+                           y: vertical > 0 ? rect.minY : rect.maxY)
+        }
+        func expectAnchor(_ actual: CGRect, _ before: CGRect, corner: PIPResizeCorner, _ message: String) {
+            let afterAnchor = anchor(actual, corner: corner)
+            let beforeAnchor = anchor(before, corner: corner)
+            near(afterAnchor.x, beforeAnchor.x, message)
+            near(afterAnchor.y, beforeAnchor.y, message)
+        }
+        for corner in PIPResizeCorner.allCases {
+            let (horizontal, vertical) = signs(corner)
+            let rectangle = PIPPlacement(x: 0.4, y: 0.4, scale: 0.2, shape: .rectangle, aspectRatio: 2)
+            let before = rectangle.frame(in: canvas, cameraAspect: nativeAspect)
+            for delta in [CGSize(width: horizontal * 80, height: 0),
+                          CGSize(width: 0, height: vertical * 40),
+                          CGSize(width: horizontal * 80, height: vertical * 40)] {
+                let resized = rectangle.resized(by: delta, corner: corner, in: canvas, cameraAspect: nativeAspect)
+                let after = resized.frame(in: canvas, cameraAspect: nativeAspect)
+                near(after.width, before.width + abs(delta.width), "Each rectangle corner independently changes width")
+                near(after.height, before.height + abs(delta.height), "Each rectangle corner independently changes height")
+                expectAnchor(after, before, corner: corner, "Rectangle resize keeps its opposite corner fixed")
+            }
+            for shape in [PIPShape.original, .square, .circle] {
+                let placement = PIPPlacement(x: 0.4, y: 0.4, scale: 0.2, shape: shape)
+                let original = placement.frame(in: canvas, cameraAspect: nativeAspect)
+                for delta in [CGSize(width: horizontal * 60, height: 0),
+                              CGSize(width: 0, height: vertical * 40),
+                              CGSize(width: horizontal * 60, height: vertical * 40)] {
+                    let resized = placement.resized(by: delta, corner: corner, in: canvas, cameraAspect: nativeAspect)
+                    let after = resized.frame(in: canvas, cameraAspect: nativeAspect)
+                    let aspect = shape == .original ? nativeAspect : 1
+                    let growth = max(abs(delta.width), abs(delta.height) * aspect)
+                    near(after.width, original.width + growth, "Every constrained corner supports either pointer axis")
+                    near(after.width / after.height, aspect, "Constrained corner preserves native or square aspect")
+                    expectAnchor(after, original, corner: corner, "Constrained resize keeps its opposite corner fixed")
+                }
+                let crossed = placement.resized(by: CGSize(width: -horizontal * 10000, height: -vertical * 10000),
+                                                 corner: corner, in: canvas, cameraAspect: nativeAspect)
+                let minimum = crossed.frame(in: canvas, cameraAspect: nativeAspect)
+                near(crossed.scale, 0.12, "Dragging through the opposite anchor stops at minimum size")
+                precondition(minimum.width > 0 && minimum.height > 0)
+                expectAnchor(minimum, original, corner: corner, "Minimum resize never flips across the opposite corner")
+            }
+            let crossedRectangle = rectangle.resized(
+                by: CGSize(width: -horizontal * 10000, height: -vertical * 10000),
+                corner: corner, in: canvas, cameraAspect: nativeAspect)
+            let minimumRectangle = crossedRectangle.frame(in: canvas, cameraAspect: nativeAspect)
+            near(crossedRectangle.scale, 0.12, "Free rectangle stops at minimum width when crossing its anchor")
+            precondition(minimumRectangle.width > 0 && minimumRectangle.height > 0)
+            expectAnchor(minimumRectangle, before, corner: corner, "Free rectangle cannot flip across its opposite corner")
+            let extreme = rectangle.resized(by: CGSize(width: horizontal * 10000, height: vertical * 10000),
+                                             corner: corner, in: canvas, cameraAspect: nativeAspect)
+            let bounded = extreme.frame(in: canvas, cameraAspect: nativeAspect)
+            precondition(bounded.minX >= -0.000_001 && bounded.minY >= -0.000_001 &&
+                         bounded.maxX <= canvas.width + 0.000_001 && bounded.maxY <= canvas.height + 0.000_001)
+            precondition((0.12...0.5).contains(extreme.scale) && (0.2...5).contains(extreme.aspectRatio))
+            expectAnchor(bounded, before, corner: corner, "Canvas-clamped resize preserves an anchor when minimum geometry fits")
+        }
     }
 
     static func checkEditingTime() {

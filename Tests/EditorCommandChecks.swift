@@ -10,6 +10,7 @@ struct EditorCommandChecks {
         try checkCodable()
         try checkAtomicHistory()
         try checkValidation()
+        try checkScreenFramingReplacement()
         print("Editor command checks passed (region geometry, strict commands, atomic batches, same-time coalescing, preserved edit identity, stale/draft rejection, and Undo/Redo).")
     }
 
@@ -44,14 +45,89 @@ struct EditorCommandChecks {
             .fullFrame(time: 5), .reviseFraming(editID: UUID(), regionID: UUID()), .labelRegion(regionID: UUID(), note: "Title"),
             .moveBetweenEdits(fromEditID: UUID(), toEditID: UUID(), regionID: UUID()),
             .moveForDuration(startEditID: UUID(), fromRegionID: UUID(), toRegionID: UUID(), duration: 5),
-            .createEdit(time: 1), .moveEdit(editID: UUID(), time: 2), .removeEdit(editID: UUID())]
+            .createEdit(time: 1), .moveEdit(editID: UUID(), time: 2), .removeEdit(editID: UUID()),
+            .removeScreenFraming(editID: UUID())]
         let data = try JSONEncoder().encode(commands)
         try require(try JSONDecoder().decode([EditorCommand].self, from: data) == commands, "every command round trips")
         for json in ["{\"action\":\"runShell\",\"path\":\"/tmp\"}",
                      "{\"action\":\"fullFrame\",\"time\":1,\"path\":\"/tmp\"}",
-                     "{\"action\":\"fullFrame\",\"time\":1,\"regionID\":\"irrelevant\"}"] {
+                     "{\"action\":\"fullFrame\",\"time\":1,\"regionID\":\"irrelevant\"}",
+                     "{\"action\":\"removeScreenFraming\",\"editID\":\"\(UUID().uuidString)\",\"regionID\":\"irrelevant\"}"] {
             try rejects({ _ = try JSONDecoder().decode(EditorCommand.self, from: Data(json.utf8)) }, "unknown actions and fields must fail")
         }
+    }
+
+    private static func checkScreenFramingReplacement() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let point = ZoomKeyframe(time: 2, scale: 2)
+        let unrelated = ZoomKeyframe(time: 8, scale: 1.5)
+        var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
+        project.title = "Keep this title"
+        project.state.zoomKeyframes = [point, unrelated]
+        project.state.pipKeyframes.append(PIPKeyframe(id: point.id, time: 2, placement: PIPPlacement(x: 0.1, y: 0.2, scale: 0.3)))
+        project.state.cursorStyle.size = 2.5
+        project.state.trimStart = 0.5
+        project.state.trimEnd = 11
+        project.state.presentation.padding = 0.1
+        project.state.regions = [EditorRegion(time: 2, rect: .init(x: 0.1, y: 0.1, width: 0.2, height: 0.3), editID: point.id)]
+        project.state.editAnchors = [EditAnchor(id: point.id, time: 2)]
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("replacement.framethrower"))
+        try require(editor.save(), "save independent changes")
+        let baseline = editor.project
+        let saved = try Data(contentsOf: editor.url)
+        let revision = try EditorCommandDispatcher.revision(for: baseline)
+        let projectID = UUID()
+        for commands: [EditorCommand] in [[.removeScreenFraming(editID: UUID())],
+                                         [.removeScreenFraming(editID: point.id), .frameRegion(regionID: UUID(), time: 3)]] {
+            let invalid = EditorCommandBatch(projectID: projectID, revision: revision, commands: commands)
+            try rejects({ try EditorCommandDispatcher.apply(invalid, to: editor, projectID: projectID) },
+                        "unknown framing or a later invalid replacement must reject")
+            try require(editor.project == baseline && (try Data(contentsOf: editor.url)) == saved,
+                        "rejected replacement leaves saved state and history untouched")
+        }
+        let batch = EditorCommandBatch(projectID: projectID, revision: revision,
+            commands: [.removeScreenFraming(editID: point.id), .fullFrame(time: 3)])
+        try EditorCommandDispatcher.apply(batch, to: editor, projectID: projectID)
+        var expected = baseline.state
+        expected.zoomKeyframes.removeAll { $0.id == point.id }
+        expected.zoomKeyframes.append(contentsOf: editor.project.state.zoomKeyframes.filter { $0.time == 3 })
+        expected.zoomKeyframes.sort { $0.time < $1.time }
+        try require(editor.project.state == expected && editor.project.title == baseline.title,
+                    "replacement removes only requested screen framing; camera, pointer, boxes, marks, trim, canvas and title remain")
+        try require(editor.project.state.zoomKeyframes.contains(unrelated) && editor.project.undoHistory.count == 1,
+                    "unrelated framing survives and removal plus replacement is one transaction")
+        let replaced = editor.project.state
+        try require(try ProjectEditor.open(url: editor.url).project.state == replaced,
+                    "replacement is durable metadata")
+        try require(editor.undo() && editor.project.state == baseline.state && editor.project.title == baseline.title,
+                    "one Undo restores removed screen framing and all independent changes")
+        try require(editor.redo() && editor.project.state == replaced, "one Redo restores the whole replacement")
+
+        var identityProject = baseline
+        identityProject.state.editAnchors = []
+        identityProject.state.pipKeyframes[1].id = UUID()
+        let target = EditorRegion(time: 4, rect: .init(x: 0.6, y: 0.5, width: 0.3, height: 0.2))
+        identityProject.state.regions.append(target)
+        let identityRevision = try EditorCommandDispatcher.revision(for: identityProject)
+        let cleared = try EditorCommandDispatcher.prepare(EditorCommandBatch(projectID: projectID, revision: identityRevision,
+            commands: [.removeScreenFraming(editID: point.id)]), for: identityProject, projectID: projectID)
+        let survivor = cleared.timedEdits(includeCamera: true).first { $0.time == point.time }
+        try require(survivor?.id == point.id && survivor?.zoomID == nil &&
+                    survivor?.cameraID == identityProject.state.pipKeyframes[1].id &&
+                    cleared.editAnchors == [EditAnchor(id: point.id, time: point.time)],
+                    "clearing framing preserves the named moment despite a different surviving camera ID")
+        let continued = try EditorCommandDispatcher.prepare(EditorCommandBatch(projectID: projectID, revision: identityRevision,
+            commands: [.removeScreenFraming(editID: point.id),
+                       .moveForDuration(startEditID: point.id, fromRegionID: identityProject.state.regions[0].id,
+                                        toRegionID: target.id, duration: 3)]), for: identityProject, projectID: projectID)
+        try require(continued.zoom(at: 2) == identityProject.state.regions[0].rect.framing() &&
+                    continued.zoom(at: 5) == target.rect.framing() &&
+                    continued.pipKeyframes == identityProject.state.pipKeyframes &&
+                    continued.regions == identityProject.state.regions &&
+                    continued.timedEdits(includeCamera: true).first(where: { $0.time == 2 })?.id == point.id,
+                    "a replacement can use the original start edit after removing its old framing")
     }
 
     private static func checkAtomicHistory() throws {

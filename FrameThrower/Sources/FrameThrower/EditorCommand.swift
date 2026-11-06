@@ -29,6 +29,7 @@ enum EditorCommand: Codable, Equatable, Sendable {
     case createEdit(time: Double)
     case moveEdit(editID: UUID, time: Double)
     case removeEdit(editID: UUID)
+    case removeScreenFraming(editID: UUID)
     case labelRegion(regionID: UUID, note: String)
 
     private enum Key: String, CodingKey {
@@ -88,6 +89,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
         case "removeEdit":
             allowed = ["action", "editID"]
             self = .removeEdit(editID: try values.decode(UUID.self, forKey: .editID))
+        case "removeScreenFraming":
+            allowed = ["action", "editID"]
+            self = .removeScreenFraming(editID: try values.decode(UUID.self, forKey: .editID))
         default:
             throw EditorCommandError.invalid("The requested editing action is not supported.")
         }
@@ -141,6 +145,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
             try values.encode(time, forKey: .time)
         case let .removeEdit(editID):
             try values.encode("removeEdit", forKey: .action)
+            try values.encode(editID, forKey: .editID)
+        case let .removeScreenFraming(editID):
+            try values.encode("removeScreenFraming", forKey: .action)
             try values.encode(editID, forKey: .editID)
         }
     }
@@ -267,6 +274,21 @@ enum EditorCommandDispatcher {
                     throw EditorCommandError.invalid("The edit mark no longer exists. Select a visible edit and try again.")
                 }
                 next.remove(edit)
+            case let .removeScreenFraming(editID):
+                guard let index = next.zoomKeyframes.firstIndex(where: { $0.id == editID }) else {
+                    throw EditorCommandError.invalid("That screen-framing change no longer exists. Try the instruction again.")
+                }
+                if let edit = next.timedEdits(includeCamera: true).first(where: { $0.zoomID == editID }),
+                   edit.anchorID == nil {
+                    // A pending replacement can still refer to this named
+                    // moment. Without an anchor, a surviving camera track
+                    // would change its identity when the zoom is removed.
+                    next.editAnchors.append(EditAnchor(id: edit.id, time: edit.time))
+                    next.editAnchors.sort { $0.time < $1.time }
+                }
+                // Replacing screen movement must leave independent camera,
+                // pointer, reference-box, and edit-mark changes untouched.
+                next.zoomKeyframes.remove(at: index)
             case let .frameRegion(regionID, time, motion):
                 try validTime(time)
                 try motion.validate()

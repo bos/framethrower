@@ -83,6 +83,23 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             try await Task.sleep(for: .milliseconds(150))
             let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
             output("WindowGroup baseline at width \(width): \(baseline)")
+            guard let inspector = findAll(NSSegmentedControl.self, in: host).first(where: { $0.segmentCount == 3 }),
+                  let action = inspector.action else {
+                throw ProbeError.failed("missing native Zoom/Pointer/Camera inspector control")
+            }
+            for segment in [1, 2, 0] {
+                inspector.selectedSegment = segment
+                guard inspector.sendAction(action, to: inspector.target) else {
+                    throw ProbeError.failed("inspector segment action was not delivered")
+                }
+                try await Task.sleep(for: .milliseconds(80))
+                let cameraShapeVisible = findAll(NSSegmentedControl.self, in: host).contains { $0.segmentCount == 4 }
+                guard cameraShapeVisible == (segment == 2) else {
+                    throw ProbeError.failed("inspector selection did not change the production controls")
+                }
+                try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                                 baseline: baseline, context: "width \(width), inspector segment \(segment)", compareScrolls: false)
+            }
             for cycle in 0..<3 {
                 let timelineRect = host.convert(timeline.bounds, from: timeline)
                 let play = CGPoint(x: timelineRect.minX - 35, y: timelineRect.midY)
@@ -140,8 +157,11 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             scrolls: findAll(NSScrollView.self, in: host).map { host.convert($0.bounds, from: $0) })
     }
 
-    private func assertStable(_ value: Measurements, baseline: Measurements, context: String) throws {
-        for (actual, expected) in zip(value.rectangles, baseline.rectangles) {
+    private func assertStable(_ value: Measurements, baseline: Measurements, context: String,
+                              compareScrolls: Bool = true) throws {
+        let actualRects = compareScrolls ? value.rectangles : Array(value.rectangles.prefix(6))
+        let expectedRects = compareScrolls ? baseline.rectangles : Array(baseline.rectangles.prefix(6))
+        for (actual, expected) in zip(actualRects, expectedRects) {
             guard abs(actual.minX - expected.minX) < 0.5, abs(actual.minY - expected.minY) < 0.5,
                   abs(actual.width - expected.width) < 0.5, abs(actual.height - expected.height) < 0.5 else {
                 throw ProbeError.failed("\(context) resized/reflowed. Before: \(baseline). After: \(value)")

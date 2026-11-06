@@ -16,6 +16,11 @@ struct EditorCanvas: NSViewRepresentable {
     var onPreview: (PIPPlacement) -> Void
     var onCommit: (PIPPlacement, String) -> Void
     var onCancel: () -> Void
+    var zoom = ZoomPlacement()
+    var allowsZoomEditing = true
+    var onZoomBegin: () -> Void = {}
+    var onZoomPreview: (ZoomPlacement) -> Void = { _ in }
+    var onZoomCommit: (ZoomPlacement, String) -> Void = { _, _ in }
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -23,9 +28,13 @@ struct EditorCanvas: NSViewRepresentable {
         view.onPreview = onPreview
         view.onCommit = onCommit
         view.onCancel = onCancel
+        view.onZoomBegin = onZoomBegin
+        view.onZoomPreview = onZoomPreview
+        view.onZoomCommit = onZoomCommit
+        view.allowsZoomEditing = allowsZoomEditing
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
-            placement: placement, cameraEnabled: cameraEnabled)
+            placement: placement, cameraEnabled: cameraEnabled, zoom: zoom)
     }
 }
 
@@ -44,6 +53,17 @@ final class EditorCanvasView: NSView {
     var onPreview: ((PIPPlacement) -> Void)?
     var onCommit: ((PIPPlacement, String) -> Void)?
     var onCancel: (() -> Void)?
+    var onZoomBegin: (() -> Void)?
+    var onZoomPreview: ((ZoomPlacement) -> Void)?
+    var onZoomCommit: ((ZoomPlacement, String) -> Void)?
+    var allowsZoomEditing = true
+    private(set) var zoom = ZoomPlacement()
+    private struct ZoomDrag {
+        let point: CGPoint
+        let origin: ZoomPlacement
+        var draft: ZoomPlacement
+    }
+    private var zoomDrag: ZoomDrag?
     private struct Drag {
         let point: CGPoint
         let origin: PIPPlacement
@@ -73,12 +93,12 @@ final class EditorCanvasView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
-        setAccessibilityHelp("Drag the camera to move it. Drag any camera corner to resize. Escape cancels a drag.")
+        setAccessibilityHelp("Drag the camera to move it. Drag any camera corner to resize. Double-click the recording to zoom. Drag a zoomed recording to pan. Escape cancels a drag.")
     }
     required init?(coder: NSCoder) { nil }
 
     func configure(player: AVPlayer, image: CGImage?, sourceSize: CGSize,
-                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool) {
+                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool, zoom: ZoomPlacement = ZoomPlacement()) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if playerLayer.player !== player { playerLayer.player = player }
@@ -88,6 +108,7 @@ final class EditorCanvasView: NSView {
         self.cameraAspect = cameraAspect
         self.cameraEnabled = cameraEnabled
         self.placement = placement
+        self.zoom = zoom
         updateLayers()
         CATransaction.commit()
     }
@@ -129,8 +150,11 @@ final class EditorCanvasView: NSView {
                 y: corner == .topLeft || corner == .topRight ? rect.minY : rect.maxY)
     }
 
+    override func resetCursorRects() {
+        if allowsZoomEditing, zoom.scale > 1 { addCursorRect(canvasRect, cursor: .openHand) }
+    }
+
     override func mouseDown(with event: NSEvent) {
-        guard cameraEnabled, placement.visible else { return }
         let point = convert(event.locationInWindow, from: nil)
         let rect = placement.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
@@ -138,13 +162,40 @@ final class EditorCanvasView: NSView {
             let target = cornerPoint(corner, in: rect)
             return abs(target.x - point.x) <= 12 && abs(target.y - point.y) <= 12
         }
-        guard corner != nil || rect.contains(point) else { return }
-        window?.makeFirstResponder(self)
-        onBegin?()
-        drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
+        if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
+            window?.makeFirstResponder(self)
+            onBegin?()
+            drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
+            return
+        }
+        guard allowsZoomEditing, canvasRect.contains(point), canvasRect.width > 0, canvasRect.height > 0 else { return }
+        if event.clickCount == 2 {
+            onZoomBegin?()
+            let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+            let next = zoom.scale > 1 ? ZoomPlacement() : ZoomPlacement(scale: 2,
+                x: viewport.minX + (point.x - canvasRect.minX) / canvasRect.width * viewport.width,
+                y: viewport.minY + (point.y - canvasRect.minY) / canvasRect.height * viewport.height).clamped
+            zoom = next
+            onZoomCommit?(next, next.scale > 1 ? "Zoom in" : "Zoom out")
+        } else if zoom.scale > 1 {
+            window?.makeFirstResponder(self)
+            onZoomBegin?()
+            zoomDrag = ZoomDrag(point: point, origin: zoom.clamped, draft: zoom.clamped)
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if var pan = zoomDrag {
+            let point = convert(event.locationInWindow, from: nil)
+            let next = ZoomPlacement(scale: pan.origin.scale,
+                x: pan.origin.x - (point.x - pan.point.x) / max(1, canvasRect.width * pan.origin.scale),
+                y: pan.origin.y - (point.y - pan.point.y) / max(1, canvasRect.height * pan.origin.scale)).clamped
+            guard next != pan.draft else { return }
+            pan.draft = next
+            zoomDrag = pan
+            onZoomPreview?(next)
+            return
+        }
         guard var drag else { return }
         let point = convert(event.locationInWindow, from: nil)
         let translation = CGSize(width: point.x - drag.point.x, height: point.y - drag.point.y)
@@ -167,6 +218,13 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let pan = zoomDrag {
+            zoomDrag = nil
+            zoom = pan.draft
+            if pan.draft != pan.origin { onZoomCommit?(pan.draft, "Pan recording") }
+            else { onCancel?() }
+            return
+        }
         guard let drag else { return }
         self.drag = nil
         placement = drag.draft
@@ -176,7 +234,8 @@ final class EditorCanvasView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard event.keyCode == 53, drag != nil else { super.keyDown(with: event); return }
+        guard event.keyCode == 53, drag != nil || zoomDrag != nil else { super.keyDown(with: event); return }
+        zoomDrag = nil
         drag = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)

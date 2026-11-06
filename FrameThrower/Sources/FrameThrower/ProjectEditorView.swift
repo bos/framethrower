@@ -1,8 +1,16 @@
 import SwiftUI
 
+private enum EditorInspector: String, CaseIterable {
+    case zoom = "Zoom", pointer = "Pointer", camera = "Camera"
+}
+
 struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
     @StateObject private var playback = EditorPlayback()
+    @State private var selectedInspector: EditorInspector = .zoom
+    @State private var selectedZoomPoint: UUID?
+    @State private var zoomTransition: PIPTransition = .smooth
+    @State private var zoomDuration = 0.4
     @State private var selectedPoint: UUID?
     @State private var transition: PIPTransition = .jump
     @State private var transitionDuration = 0.6
@@ -17,6 +25,8 @@ struct ProjectEditorView: View {
     private var state: EditState { editor.project.state }
     private var point: PIPKeyframe? { state.pipKeyframes.first { $0.id == selectedPoint } }
     private var placement: PIPPlacement { state.placement(at: playback.editingTime) }
+    private var zoom: ZoomPlacement { state.zoom(at: playback.editingTime) }
+    private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { $0.id == selectedZoomPoint } }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -27,11 +37,7 @@ struct ProjectEditorView: View {
             }
             player
             timeline
-            if editor.project.cameraFilename != nil {
-                // Native control rows keep their content height during scene
-                // updates, leaving only the preview to absorb vertical space.
-                cameraControls.fixedSize(horizontal: false, vertical: true)
-            }
+            inspector
             if let message = editor.errorMessage ?? playback.errorMessage ?? exportError {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
@@ -44,6 +50,9 @@ struct ProjectEditorView: View {
         .task { await playback.rebuild(editor: editor) }
         .onChange(of: editor.project.state) { _, _ in
             Task { await playback.rebuild(editor: editor) }
+            if let selectedZoomPoint, !state.zoomKeyframes.contains(where: { $0.id == selectedZoomPoint }) {
+                self.selectedZoomPoint = nil
+            }
             if let selectedPoint, !state.pipKeyframes.contains(where: { $0.id == selectedPoint }) {
                 self.selectedPoint = nil
             }
@@ -57,10 +66,14 @@ struct ProjectEditorView: View {
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
             placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing,
             showsStill: !playback.isPlaying,
-            onBegin: { playback.pause(); dragTime = playback.editingTime },
+            onBegin: { playback.pause(); dragTime = playback.editingTime; selectedInspector = .camera },
             onPreview: { next in playback.preview(applying(next, at: dragTime)) },
             onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
-            onCancel: { playback.cancelPreview() })
+            onCancel: { playback.cancelPreview() },
+            zoom: zoom, allowsZoomEditing: !playback.isLoading && !playback.isScrubbing,
+            onZoomBegin: { beginZoomGesture() },
+            onZoomPreview: { next in playback.preview(applyingZoom(next, at: dragTime)) },
+            onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) })
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay { if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) } }
             .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -73,7 +86,8 @@ struct ProjectEditorView: View {
                     Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
                 }
                 .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
-                .disabled(playback.isLoading || playback.errorMessage != nil)
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(!playback.canPlay)
                 RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
                     trimEnd: state.trimEnd, playhead: playback.time,
                     onInteractionBegan: { playback.pause() },
@@ -101,10 +115,214 @@ struct ProjectEditorView: View {
         editor.commit(edited, name: "Trim")
     }
 
+    private var inspector: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("Edit", selection: $selectedInspector) {
+                ForEach(EditorInspector.allCases.filter { $0 != .camera || editor.project.cameraFilename != nil }, id: \.self) {
+                    Text($0.rawValue).tag($0)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 300, height: 24)
+            Group {
+                switch selectedInspector {
+                case .zoom: zoomControls
+                case .pointer: pointerControls
+                case .camera: cameraControls
+                }
+            }
+            // Each inspector keeps the same allocation. Controls cannot take
+            // space from the preview when playback updates their values.
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(height: 176, alignment: .top)
+        }
+        .padding(14)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var zoomControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                CommitSlider(title: "Zoom", value: zoom.scale, range: 1...3, valueSuffix: "×", begin: { beginZoomGesture() }, preview: { value in
+                    var next = zoom; next.scale = value
+                    playback.preview(applyingZoom(next, at: dragTime))
+                }) { value in
+                    var next = zoom; next.scale = value
+                    setZoom(next, at: dragTime, name: "Zoom recording")
+                }.frame(width: 285)
+                Button("1×") { setZoom(ZoomPlacement(), at: playback.editingTime, name: "Zoom out") }
+                Spacer(minLength: 0)
+                Button("Center") {
+                    var next = zoom; next.x = 0.5; next.y = 0.5
+                    setZoom(next, at: playback.editingTime, name: "Center zoom")
+                }
+                Menu("Auto zoom") {
+                    ForEach([CursorZoomSuggestions.Preset.subtle, .focused], id: \.self) { preset in
+                        Button(preset.title) { suggestZooms(preset) }
+                            .disabled(playback.cursorRecording?.clicks.isEmpty != false)
+                    }
+                    Divider()
+                    Button("Remove all zooms") {
+                        playback.pause()
+                        var next = state; next.zoomKeyframes = []
+                        if editor.commit(next, name: "Remove zooms") { selectedZoomPoint = nil }
+                    }.disabled(state.zoomKeyframes.isEmpty)
+                }
+                .fixedSize()
+                .help(playback.cursorRecording == nil ? "Automatic zooms need a new recording with pointer tracking." : "Replace zoom points using recorded clicks.")
+            }.frame(height: 24)
+            HStack(spacing: 12) {
+                Picker("Arrive", selection: Binding(get: { zoomPoint?.transition ?? zoomTransition }, set: { value in
+                    zoomTransition = value
+                    updateZoomPoint { $0.transition = value }
+                })) {
+                    Text("Jump").tag(PIPTransition.jump)
+                    Text("Smooth").tag(PIPTransition.smooth)
+                }.frame(width: 170)
+                CommitSlider(title: "Duration", value: zoomPoint?.duration ?? zoomDuration, range: 0.1...3,
+                    begin: { playback.pause() }) { value in
+                    zoomDuration = value
+                    updateZoomPoint { $0.duration = value }
+                }
+                .frame(width: 200)
+                .opacity((zoomPoint?.transition ?? zoomTransition) == .smooth ? 1 : 0)
+                .disabled((zoomPoint?.transition ?? zoomTransition) != .smooth)
+                .accessibilityHidden((zoomPoint?.transition ?? zoomTransition) != .smooth)
+                Spacer(minLength: 0)
+                Button("Add point") { setZoom(zoom, at: playback.editingTime, name: "Add zoom point") }
+            }.frame(height: 24)
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(state.zoomKeyframes) { point in
+                        Button {
+                            selectedZoomPoint = point.id
+                            zoomTransition = point.transition
+                            zoomDuration = point.duration
+                            playback.pause(); playback.seek(point.time)
+                        } label: {
+                            Text("\(point.time, specifier: "%.2f")s · \(point.scale, specifier: "%.2f")×")
+                                .font(.caption).padding(.horizontal, 9).padding(.vertical, 6)
+                                .background(selectedZoomPoint == point.id ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.05), in: Capsule())
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }.frame(height: 32)
+            HStack {
+                if let zoomPoint {
+                    Text("Point time: \(zoomPoint.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
+                    Button("Move point to playhead") { updateZoomPoint { $0.time = playback.editingTime } }
+                        .disabled(abs(playback.editingTime - zoomPoint.time) < 0.001)
+                    Spacer()
+                    Button("Delete point") {
+                        playback.pause()
+                        var next = state
+                        next.zoomKeyframes.removeAll { $0.id == zoomPoint.id }
+                        if editor.commit(next, name: "Delete zoom point") { selectedZoomPoint = nil }
+                    }
+                }
+                Spacer(minLength: 0)
+            }.font(.caption).frame(height: 24)
+        }
+        .help("Double-click the recording to zoom in or out. Drag a zoomed recording to pan.")
+    }
+
+    private var pointerControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 20) {
+                Toggle("Show pointer", isOn: Binding(get: { state.cursorStyle.visible }, set: { value in
+                    var next = state.cursorStyle; next.visible = value
+                    setCursorStyle(next, name: value ? "Show pointer" : "Hide pointer")
+                }))
+                Toggle("Click highlights", isOn: Binding(get: { state.cursorStyle.clickHighlight }, set: { value in
+                    var next = state.cursorStyle; next.clickHighlight = value
+                    setCursorStyle(next, name: "Change click highlights")
+                }))
+                Spacer()
+            }.toggleStyle(.checkbox).frame(height: 24)
+            HStack {
+                CommitSlider(title: "Size", value: state.cursorStyle.size, range: 1...4, valueSuffix: "×", begin: { playback.pause() }, preview: { value in
+                    var next = state; next.cursorStyle.size = value; playback.preview(next)
+                }) { value in
+                    var next = state.cursorStyle; next.size = value
+                    setCursorStyle(next, name: "Resize pointer")
+                }.frame(width: 300)
+                Spacer()
+            }.frame(height: 24)
+            CommitSlider(title: "Smoothing", value: state.cursorStyle.smoothing, range: 0...1, begin: { playback.pause() }, preview: { value in
+                var next = state; next.cursorStyle.smoothing = value; playback.preview(next)
+            }) { value in
+                var next = state.cursorStyle; next.smoothing = value
+                setCursorStyle(next, name: "Smooth pointer")
+            }.frame(width: 300, height: 24)
+        }
+        .disabled(editor.project.cursorFilename == nil)
+        .help(editor.project.cursorFilename == nil ? "Record a new clip to edit its pointer." : "Size and smoothing affect the recorded pointer. Click highlights mark mouse presses.")
+    }
+
+    private func suggestZooms(_ preset: CursorZoomSuggestions.Preset) {
+        guard let recording = playback.cursorRecording else { return }
+        playback.pause()
+        var next = state
+        next.zoomKeyframes = CursorZoomSuggestions.points(in: recording,
+            range: state.trimStart...state.trimEnd, preset: preset,
+            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+        if editor.commit(next, name: "Suggest zooms") { selectedZoomPoint = nil }
+    }
+
+    private func beginZoomGesture() {
+        playback.pause()
+        dragTime = playback.editingTime
+        selectedInspector = .zoom
+    }
+
+    private func applyingZoom(_ placement: ZoomPlacement, at position: Double) -> EditState {
+        let time = editor.project.editingTime(at: position,
+            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+        var next = state
+        let existing = next.zoomKeyframes.first { abs($0.time - time) < 0.001 }
+        let placement = placement.clamped
+        next.zoomKeyframes.removeAll { abs($0.time - time) < 0.001 }
+        next.zoomKeyframes.append(ZoomKeyframe(id: existing?.id ?? UUID(), time: existing?.time ?? time,
+            scale: placement.scale, x: placement.x, y: placement.y,
+            transition: existing?.transition ?? zoomTransition, duration: existing?.duration ?? zoomDuration))
+        next.zoomKeyframes.sort { $0.time < $1.time }
+        return next
+    }
+
+    private func setZoom(_ placement: ZoomPlacement, at time: Double, name: String) {
+        playback.pause()
+        let next = applyingZoom(placement, at: time)
+        if next == state { playback.cancelPreview(); return }
+        if editor.commit(next, name: name) {
+            let normalized = editor.project.editingTime(at: time,
+                frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+            selectedZoomPoint = next.zoomKeyframes.first { abs($0.time - normalized) < 0.001 }?.id
+        } else { playback.cancelPreview() }
+    }
+
+    private func updateZoomPoint(_ change: (inout ZoomKeyframe) -> Void) {
+        guard var point = zoomPoint else { return }
+        playback.pause()
+        change(&point)
+        var next = state
+        next.zoomKeyframes.removeAll { $0.id == point.id || abs($0.time - point.time) < 0.001 }
+        next.zoomKeyframes.append(point)
+        next.zoomKeyframes.sort { $0.time < $1.time }
+        editor.commit(next, name: "Change zoom point")
+    }
+
+    private func setCursorStyle(_ style: CursorStyle, name: String) {
+        playback.pause()
+        var next = state
+        next.cursorStyle = style
+        if !editor.commit(next, name: name) { playback.cancelPreview() }
+    }
+
     private var cameraControls: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Camera").font(.headline)
                 Toggle("Visible", isOn: Binding(get: { placement.visible }, set: { value in
                     var next = placement; next.visible = value
                     setPlacement(next, at: playback.time, name: value ? "Show camera" : "Hide camera")
@@ -126,7 +344,7 @@ struct ProjectEditorView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 340)
-                if placement.shape != .original {
+                Group {
                     Button("Framing…") { openFraming() }
                         .popover(isPresented: $isFramingPresented) {
                             CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
@@ -134,11 +352,21 @@ struct ProjectEditorView: View {
                                     var next = state.placement(at: framingTime)
                                     next.crop = crop
                                     playback.preview(applying(next, at: framingTime))
+                                }, zoomPreview: { value in
+                                    var next = state.placement(at: framingTime)
+                                    next.sourceZoom = value
+                                    playback.preview(applying(next, at: framingTime))
+                                }, zoomCommit: { value in
+                                    var next = state.placement(at: framingTime)
+                                    next.sourceZoom = value
+                                    setPlacement(next, at: framingTime, name: "Zoom camera")
                                 }) { crop in
                                     var next = state.placement(at: framingTime)
                                     next.crop = crop
                                     setPlacement(next, at: framingTime, name: "Frame camera")
                             }
+                            .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
+                            .onDisappear { playback.cancelPreview() }
                         }
                 }
                 Spacer()
@@ -223,8 +451,6 @@ struct ProjectEditorView: View {
             }
             .frame(height: 24)
         }
-        .padding(14)
-        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func applying(_ next: PIPPlacement, at time: Double) -> EditState {
@@ -246,14 +472,19 @@ struct ProjectEditorView: View {
         cameraFrame = nil
         cameraFrameError = nil
         isFramingPresented = true
-        let snapshot = editor.project
-        let time = framingTime
-        Task {
-            do {
-                cameraFrame = try await ProjectRenderer.cameraFrame(project: snapshot,
-                    directory: editor.url.deletingLastPathComponent(), at: time)
-                if cameraFrame == nil { cameraFrameError = "No camera frame is available at this time." }
-            } catch { cameraFrameError = error.localizedDescription }
+    }
+
+    private func loadCameraFrame(at time: Double) async {
+        do {
+            let image = try await playback.cameraFrame(at: time)
+            guard !Task.isCancelled, isFramingPresented, time == framingTime else { return }
+            cameraFrame = image
+            if image == nil { cameraFrameError = "No camera frame is available at this time." }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, isFramingPresented, time == framingTime else { return }
+            cameraFrameError = error.localizedDescription
         }
     }
 
@@ -311,6 +542,7 @@ struct CommitSlider: View {
     let title: String
     let value: Double
     let range: ClosedRange<Double>
+    var valueSuffix: String? = nil
     var begin: () -> Void = {}
     var preview: ((Double) -> Void)? = nil
     var commit: (Double) -> Void
@@ -323,6 +555,10 @@ struct CommitSlider: View {
                 editing = active
                 if active { begin() } else { commit(draft) }
             }.accessibilityLabel(title)
+            if let valueSuffix {
+                Text("\(editing ? draft : value, specifier: "%.2f")\(valueSuffix)")
+                    .font(.caption).monospacedDigit().frame(width: 45, alignment: .trailing)
+            }
         }
         .onChange(of: draft) { _, next in if editing { preview?(next) } }
         .onAppear { draft = min(max(value, range.lowerBound), range.upperBound) }

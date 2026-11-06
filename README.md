@@ -64,8 +64,9 @@ available source selection. A window that has closed requires choosing a new one
    Display thumbnails load at startup when recording access is already granted;
    use refresh to update them. Window/area previews load when requested or when
    positioning a selected camera. Permission requests do not run automatically on launch.
-3. Use the audio checkboxes to enable system audio and/or a microphone. Microphone
-   capture needs its own macOS permission.
+3. Choose a microphone or **Off**, and enable **System audio** as needed. Microphone,
+   system audio, and camera selection share one row. Microphone capture needs its
+   own macOS permission.
 4. Optionally choose a **Camera**. Its live layout appears inline automatically
    with the selected source behind it, so you can set its initial PIP position and
    size against the recording content. Area backgrounds show only the selected crop.
@@ -78,8 +79,9 @@ available source selection. A window that has closed requires choosing a new one
 
 Screen originals are H.264 MP4 files saved as
 `~/Movies/Screencast-<UTC timestamp>-<unique suffix>.mp4`. Camera video is saved
-separately beside the screen original as `.camera.mov`, with a `.framethrower`
-project that stores edits and undo history. Keep these files together. The legacy
+separately beside the screen original as `.camera.mov`. New recordings also save
+mouse motion and clicks in an immutable `.cursor.json` sidecar. A `.framethrower`
+project stores edits and undo history. Keep these files together. The legacy
 filename prefix is retained for compatibility with the upload helper. Local
 recording and editing do not require connecting Google Drive or Slack.
 
@@ -87,13 +89,32 @@ recording and editing do not require connecting Google Drive or Slack.
 
 Use the single timeline to scrub and drag its blue handles to trim. Arrow keys
 seek by 0.1 seconds; Shift-arrow seeks by one second. Trimming keeps every original
-frame available, and **Restore full recording** restores the full range.
+frame available. Right-click the timeline for **Reset trim**. Space starts or
+pauses playback.
+
+The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**
+controls. Double-click the recording to zoom in at that position or return to
+1×. Drag a zoomed recording to pan. The Zoom slider and editable focus points
+support **Jump** and **Smooth** arrivals with adjustable duration. Select a point
+to change its arrival or move it to the playhead; delete it to remove the edit.
+**Auto zoom** offers Subtle and Focused suggestions from recorded click groups,
+with steady holds and returns to the wider context. Suggestions are ordinary
+editable points and applying them is one undo step.
+
+For new recordings, **Pointer** changes pointer size, smoothing, visibility, and
+click highlights after capture. Smoothing keeps click targets exact and preserves
+held-button paths when dragging or drawing. Older recordings retain their baked-in
+cursor; screen zooming and panning still work on them. Pointer tracking covers
+Window, Display, and Area capture, including moving windows and multiple displays.
+If pointer capture cannot start, recording retains the ordinary baked-in cursor.
 
 Camera edits create placement points at the playhead. Move the PIP by dragging or
 using a corner button; resize with **Size** or any of its four corner handles. **Original**
 preserves the camera aspect, **Rectangle** allows independent width and height,
 and **Square** and **Circle** crop without stretching. **Framing…** lets you move
-the crop within the full camera image. Shape, framing, size, position, and visibility
+the crop within the full camera image and zoom the camera source independently
+of the PIP window size. Main-view and camera movement share transition timing,
+easing, and viewport bounds. Shape, framing, zoom, size, position, and visibility
 can all change over time. Dragging updates the PIP picture live and commits one
 undo step when released. **Jump** changes placement instantly; **Smooth** eases
 position, size, aspect, and framing toward the point. Shape and visibility switch
@@ -135,10 +156,20 @@ Automated checks run without camera hardware or connected accounts:
 
 - `Tests/check-recording-project.sh`: edit persistence, legacy compatibility,
   undo/redo, resize and crop geometry, and source preservation.
-- `Tests/check-project-renderer.sh`: pixel-level composition, shape and crop
-  transitions, synchronization, audio preservation, and preview/export parity.
+- `Tests/check-project-renderer.sh`: pixel-level screen/camera zoom and pan, pointer
+  sizing/smoothing/clicks, shape transitions, audio, and preview/export parity.
+- `Tests/check-zoom-model.sh`: shared main/PIP motion, bounded source zooms,
+  legacy defaults, and persisted reversible zoom/pointer edits.
+- `Tests/check-cursor-recording.sh`: mouse coordinates, precise click events and
+  dragging, smoothing, source-time alignment, and immutable metadata.
+- `Tests/check-cursor-zoom-suggestions.sh`: click grouping, holds, smooth focus
+  suggestions, trim bounds, deterministic points, and limits on long recordings.
+- `Tests/check-zoom-interactions.sh`: actual editor double-click zoom, pan, PIP
+  gesture priority, Escape, undo/redo, and stable inspector allocation.
 - `Tests/check-editor-playback.sh`: bounded still-frame work during rapid scrubbing,
   cancellation, stale-result suppression, and end-exclusive seeking.
+- `Tests/check-native-preview-sources.sh`: native playback pixel parity, bounded
+  source-frame ownership, full camera framing, and live zoom/PIP/pointer drafts.
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, overlapping
   hit targets, undo grouping, bounds, and keyboard seeking.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
@@ -148,6 +179,8 @@ Automated checks run without camera hardware or connected accounts:
   drag deltas, persisted undo/redo, and trim integration.
 - `Tests/check-capture-source-previews.sh`: source identity, area crop pixels,
   negative display origins, fitted PIP bounds, and screenshot cache invalidation.
+- `Tests/check-display-carousel.sh`: aspect-fitted display thumbnails, selection
+  borders, compact unavailable states, and clickable image/name/dimensions.
 - `Tests/check-editor-canvas.sh`: native image orientation, letterboxing, resize
   handle alignment, and Escape cancellation without an edit.
 - `Tests/check-windowgroup-layout.sh`: the actual SwiftUI editor scene, repeated
@@ -173,6 +206,9 @@ using the app's saved Slack token. Running it sends a real message.
 
 ## Deferred improvements
 
+- Higher-quality video/audio masters with separately configurable compressed
+  exports. Current screen and camera originals use H.264; nondestructive editing
+  preserves them but does not make the original capture lossless.
 - Automatically detect and center an off-center face when the PIP crop is smaller
   than the full camera image. Keep the full source, retain manual framing overrides,
   and make automatic framing reversible through the existing edit history.

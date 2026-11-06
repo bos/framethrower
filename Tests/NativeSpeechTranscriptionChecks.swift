@@ -18,8 +18,10 @@ struct NativeSpeechTranscriptionChecks {
     }
 
     private static func check() async throws {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 45) {
-            FileHandle.standardError.write(Data("Native speech check exceeded 45 seconds; no microphone was opened.\n".utf8))
+        let benchmark = CommandLine.arguments.contains("--benchmark")
+        let timeout: Double = benchmark ? 90 : 45
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+            FileHandle.standardError.write(Data("Native speech check exceeded \(Int(timeout)) seconds; no microphone was opened.\n".utf8))
             Darwin.exit(1)
         }
         guard #available(macOS 26, *),
@@ -49,17 +51,40 @@ struct NativeSpeechTranscriptionChecks {
                 throw NativeSpeechFailure.failed("Native final transcription lost command targets, action order, or relative timing. Input: \(source); actual: \(final)")
             }
         }
-        print("Native speech transcription passed (four commands preserving targets, action order, and one/two/three/twelve-second timing; existing local TTS → production PCM converter → production on-device DictationTranscriber; no microphone, playback, audio file, or video).")
+        guard benchmark else {
+            print("Native speech regression checks passed (four commands preserving targets, action order and timing; production editing vocabulary; no microphone, playback, audio file, or video).")
+            return
+        }
+        // Explicit quality benchmark, separate from the stable regression
+        // corpus. Keep every meaning assertion strict: current system dictation
+        // can misrecognize short pan commands, and this mode must expose that.
+        let voices = AVSpeechSynthesisVoice.speechVoices().filter {
+            ["com.apple.voice.compact.en-US.Samantha", "com.apple.voice.super-compact.en-GB.Daniel", "com.apple.voice.super-compact.en-IE.Moira"].contains($0.identifier)
+        }
+        let pan = "Pan box one to box three over the next three seconds."
+        let panMeaning = #"(?is)\bpan\W+box\W+(?:one|1)\W+to\W+box\W+(?:three|3)\b.*\bnext\W+(?:three|3)\W+seconds\b"#
+        var failures: [String] = []
+        for voice in voices {
+            for rate: Float in [AVSpeechUtteranceDefaultSpeechRate, AVSpeechUtteranceDefaultSpeechRate * 1.15] {
+                let final = try await transcribe(pan, locale: locale, voice: voice, rate: rate,
+                    compareBaseline: voice.identifier == "com.apple.voice.compact.en-US.Samantha")
+                FileHandle.standardOutput.write(Data("Editing vocabulary transcript [\(voice.name), rate \(rate)]: \(final)\n".utf8))
+                if final.range(of: panMeaning, options: .regularExpression) == nil { failures.append("\(voice.name), rate \(rate): \(final)") }
+            }
+        }
+        guard failures.isEmpty else { throw NativeSpeechFailure.failed("Editing vocabulary lost pan/boxes/timing: " + failures.joined(separator: "; ")) }
+        print("Native speech quality benchmark passed (editing vocabulary, \(voices.count) installed voices at two rates, targets/action order and timing; no microphone, playback, audio file, or video).")
     }
 
     @available(macOS 26, *)
-    private static func transcribe(_ source: String, locale: Locale, voice: AVSpeechSynthesisVoice) async throws -> String {
-        let transcriber = AppleSpeechConfiguration.transcriber(locale: locale)
-        try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
+    private static func transcribe(_ source: String, locale: Locale, voice: AVSpeechSynthesisVoice,
+                                   rate: Float = AVSpeechUtteranceDefaultSpeechRate,
+                                   compareBaseline: Bool = false) async throws -> String {
         let synthesizer = AVSpeechSynthesizer()
         defer { synthesizer.stopSpeaking(at: .immediate) }
         let utterance = AVSpeechUtterance(string: source)
         utterance.voice = voice
+        utterance.rate = rate
         let synthesized = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SynthesizedPCM, any Error>) in
             let collection = SynthesizedPCM(continuation: continuation)
             synthesizer.write(utterance) { buffer in collection.receive(buffer) }
@@ -69,11 +94,26 @@ struct NativeSpeechTranscriptionChecks {
               buffers.allSatisfy({ $0.format == first.format }) else {
             throw NativeSpeechFailure.failed("Apple synthesis returned no usable consistent PCM")
         }
+        if compareBaseline {
+            let baseline = try await recognize(buffers, locale: locale, useVocabulary: false)
+            FileHandle.standardOutput.write(Data("Unbiased same-PCM transcript [\(voice.name), rate \(rate)]: \(baseline)\n".utf8))
+        }
+        return try await recognize(buffers, locale: locale, useVocabulary: true)
+    }
+
+    @available(macOS 26, *)
+    private static func recognize(_ buffers: [AVAudioPCMBuffer], locale: Locale, useVocabulary: Bool) async throws -> String {
+        let transcriber = AppleSpeechConfiguration.transcriber(locale: locale)
+        try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
+        guard let first = buffers.first else { throw NativeSpeechFailure.failed("No synthetic PCM") }
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber], considering: first.format),
               let converter = AVAudioConverter(from: first.format, to: format) else {
             throw NativeSpeechFailure.failed("Cannot convert synthetic PCM to the recognizer's native audio format")
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
+        if useVocabulary {
+            try await AppleSpeechConfiguration.configure(analyzer, contextualStrings: ["Box 1", "Box 2", "Box 3", "Edit A", "Edit B"])
+        }
         try await analyzer.prepareToAnalyze(in: format)
         let resultTask = Task { @MainActor in
             var transcript = SpeechTranscript()

@@ -108,6 +108,26 @@ enum AppleSpeechConfiguration {
     static func transcriber(locale: Locale) -> DictationTranscriber {
         DictationTranscriber(locale: locale, preset: preset)
     }
+
+    /// Apple recommends at most 100 brief app-specific phrases. These bias
+    /// recognition itself; finalized words are never corrected or substituted.
+    static func vocabulary(contextualStrings: [String] = []) -> [String] {
+        let editing = ["pan", "pan box", "pan from", "pan left", "pan right", "zoom", "zoom in", "zoom out", "full frame",
+                       "box", "edit", "playhead", "trim", "undo", "redo", "replace", "keep",
+                       "camera", "pointer", "crop", "smooth", "jump"]
+        var seen = Set<String>()
+        return (editing + contextualStrings).compactMap { value in
+            let phrase = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !phrase.isEmpty, phrase.count <= 80, seen.insert(phrase.lowercased()).inserted else { return nil }
+            return phrase
+        }.prefix(100).map { $0 }
+    }
+
+    static func configure(_ analyzer: SpeechAnalyzer, contextualStrings: [String] = []) async throws {
+        let context = AnalysisContext()
+        context.contextualStrings[.general] = vocabulary(contextualStrings: contextualStrings)
+        try await analyzer.setContext(context)
+    }
 }
 
 @available(macOS 26, *)
@@ -148,16 +168,14 @@ final class LocalSpeechInput: ObservableObject {
     @Published private(set) var transcript = ""
     @Published private(set) var errorMessage: String?
     @Published private(set) var statusMessage: String?
+    var contextualStrings: [String] = []
     private var hypothesis = SpeechTranscript()
     private var session: (any LocalSpeechSession)?
     private var generation = UUID()
-    private let makeSession: @MainActor () throws -> any LocalSpeechSession
+    private let makeSession: (@MainActor () throws -> any LocalSpeechSession)?
 
     init(makeSession: (@MainActor () throws -> any LocalSpeechSession)? = nil) {
-        self.makeSession = makeSession ?? {
-            if #available(macOS 26, *) { return AppleLocalSpeechSession() }
-            throw LocalSpeechError.unavailable
-        }
+        self.makeSession = makeSession
     }
 
     deinit {
@@ -177,7 +195,10 @@ final class LocalSpeechInput: ObservableObject {
         statusMessage = "Preparing on-device dictation…"
         phase = .preparing
         do {
-            let next = try makeSession()
+            let next: any LocalSpeechSession
+            if let makeSession { next = try makeSession() }
+            else if #available(macOS 26, *) { next = AppleLocalSpeechSession(contextualStrings: contextualStrings) }
+            else { throw LocalSpeechError.unavailable }
             session = next
             do {
                 try await next.start(onResult: { [weak self] result in
@@ -285,6 +306,7 @@ struct LocalVoiceButton: View {
 @available(macOS 26, *)
 @MainActor
 private final class AppleLocalSpeechSession: LocalSpeechSession {
+    private let contextualStrings: [String]
     private var engine: AVAudioEngine?
     private var analyzer: SpeechAnalyzer?
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
@@ -293,6 +315,8 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
     private var analysisTask: Task<Void, any Error>?
     private var onFailure: (@MainActor (String) -> Void)?
     private var stopped = false
+
+    init(contextualStrings: [String]) { self.contextualStrings = contextualStrings }
 
     func start(onResult: @escaping @MainActor (SpeechTranscript.Segment) -> Void,
                onFailure: @escaping @MainActor (String) -> Void) async throws {
@@ -319,6 +343,7 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber], considering: naturalFormat),
               let converter = AVAudioConverter(from: naturalFormat, to: format) else { throw LocalSpeechError.invalidAudio }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
+        try await AppleSpeechConfiguration.configure(analyzer, contextualStrings: contextualStrings)
         self.analyzer = analyzer
         self.engine = engine
         self.onFailure = onFailure

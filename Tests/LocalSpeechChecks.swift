@@ -33,6 +33,14 @@ struct LocalSpeechChecks {
             expect(preset.transcriptionOptions == DictationTranscriber.Preset.longDictation.transcriptionOptions &&
                    preset.contentHints.isEmpty && preset.attributeOptions.isEmpty,
                    "command dictation retains Apple's punctuation without short-form finalization or unused attributes")
+            let vocabulary = AppleSpeechConfiguration.vocabulary(contextualStrings: [" Box 3 ", "PAN", "box 3", " "])
+            expect(vocabulary.contains("pan") && vocabulary.contains("Box 3") &&
+                   vocabulary.filter { $0.lowercased() == "pan" }.count == 1 &&
+                   vocabulary.filter { $0.lowercased() == "box 3" }.count == 1,
+                   "editing terms and actual labels bias recognition without duplicate or empty phrases")
+            let bounded = AppleSpeechConfiguration.vocabulary(contextualStrings: (1...200).map { "Box \($0)" })
+            expect(bounded.count == 100 && bounded.first == "pan",
+                   "vocabulary stays within Apple's supported phrase limit and retains editing terms")
         }
         var transcript = SpeechTranscript()
         transcript.receive(.init(start: 0, duration: 1, text: "zoom it", isFinal: false))
@@ -81,6 +89,11 @@ struct LocalSpeechChecks {
         mock.emit("unfinished", final: false)
         let partialOnly = await speech.finish()
         expect(partialOnly == nil, "unfinished hypotheses are never returned as final instructions")
+
+        await speech.start()
+        mock.finishAction = { mock.emit("Pond box one to box three", final: true) }
+        let unmodified = await speech.finish()
+        expect(unmodified == "Pond box one to box three", "recognition bias never silently rewrites the recognized words")
 
         await speech.start()
         mock.onFailure?("The microphone was disconnected.")

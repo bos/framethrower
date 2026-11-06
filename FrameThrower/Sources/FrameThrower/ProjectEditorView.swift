@@ -23,7 +23,7 @@ struct ProjectEditorView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Review your explanation").font(.title2.weight(.semibold))
-                    Text("Edits are saved automatically. Your originals stay intact.")
+                    Text("Edits are saved automatically.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -314,11 +314,11 @@ struct TrimTimeline: View {
             GeometryReader { proxy in
                 let width = max(1, proxy.size.width - 20)
                 ZStack(alignment: .leading) {
-                    Capsule().fill(.primary.opacity(0.08)).frame(height: 24)
+                    Capsule().fill(.primary.opacity(0.08)).frame(height: 6)
                     Rectangle().fill(Color.accentColor.opacity(0.25))
-                        .frame(width: max(1, (end - start) / duration * width), height: 24)
+                        .frame(width: max(1, (end - start) / duration * width), height: 6)
                         .offset(x: start / duration * width + 10)
-                    Rectangle().fill(.primary).frame(width: 1, height: 32)
+                    Rectangle().fill(.primary).frame(width: 1, height: 20)
                         .offset(x: min(time, duration) / duration * width + 10)
                     trimHandle(label: "Trim start", x: start / duration * width + 10)
                         .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("trim")).onChanged { value in
@@ -329,9 +329,9 @@ struct TrimTimeline: View {
                             draftEnd = max(min(duration, state.trimEnd + value.translation.width / width * duration), start + minimumLength)
                         }.onEnded { _ in onTrim(start, end); draftEnd = nil })
                 }
-                .frame(height: 36)
+                .frame(height: 28)
                 .coordinateSpace(name: "trim")
-            }.frame(height: 36)
+            }.frame(height: 28)
             HStack {
                 Text("Keep \(start, specifier: "%.2f")–\(end, specifier: "%.2f") s").font(.caption).monospacedDigit()
                 Spacer()
@@ -344,8 +344,10 @@ struct TrimTimeline: View {
 
     private func trimHandle(label: String, x: Double) -> some View {
         RoundedRectangle(cornerRadius: 4).fill(Color.accentColor)
-            .frame(width: 14, height: 34).overlay { Capsule().fill(.white).frame(width: 2, height: 16) }
-            .position(x: x, y: 18)
+            .frame(width: 10, height: 20).overlay { Capsule().fill(.white).frame(width: 2, height: 8) }
+            .frame(width: 24, height: 28)
+            .contentShape(Rectangle())
+            .position(x: x, y: 14)
             .accessibilityLabel(label)
     }
 }

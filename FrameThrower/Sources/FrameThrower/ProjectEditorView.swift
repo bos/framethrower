@@ -109,7 +109,6 @@ struct ProjectEditorView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 ProjectUndoButtons(editor: editor)
-                EditorHistoryMenu(editor: editor)
             }
             recordingTitleToolbar
             ToolbarItemGroup(placement: .primaryAction) {

@@ -23,6 +23,7 @@ struct DirectorConversationChecks {
         try await checkManualEventsAndCurrentState()
         try await checkManualChangeDuringInference()
         try await checkQuestionPersistence()
+        try await checkTypedAnswerDurability()
         try await checkConflictPersistenceAndStaleInvalidation()
         try checkDraftUndoRedoAndNewBranch()
         try await checkCompactProjectSnapshot()
@@ -295,6 +296,50 @@ struct DirectorConversationChecks {
             }
             next.suspend()
         }
+    }
+
+    static func checkTypedAnswerDurability() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let firstTransport = ConversationTransport()
+        var first: EditorAssistantSession? = fixture.session(firstTransport)
+        first!.instruction = "One second from now, pan from Box 1 to Box 2."
+        first!.submit(editor: fixture.editor, playhead: 2, regionID: nil, editID: nil)
+        try await wait { await firstTransport.payloads.count == 1 }
+        await firstTransport.reply(0, try tool("ask_clarification", ["question": "How long should that movement take?"]))
+        try await wait { !first!.isBusy }
+        for text in ["T", "Three", "Three seconds."] {
+            first!.instruction = text
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try await wait {
+            DirectorConversation(storageURL: fixture.storage).draftInstruction == "Three seconds."
+        }
+        let requestsWhileTyping = await firstTransport.payloads.count
+        try require(requestsWhileTyping == 1,
+                    "Typing a pending answer must preserve it without submitting another model request")
+        // Drop the session without its window-close save. The on-disk draft
+        // must already be durable when a crash interrupts an unfinished answer.
+        first = nil
+        let secondTransport = ConversationTransport(), second = fixture.session(secondTransport)
+        second.attach(to: fixture.editor)
+        try require(second.instruction == "Three seconds." && second.awaitsClarification &&
+                    second.notice == "How long should that movement take?",
+                    "Reopening without suspend restores the newest typed answer with its pending question")
+        second.instruction = "Take four seconds."
+        second.submit(editor: fixture.editor, playhead: 9.6, regionID: nil, editID: nil)
+        try await wait { await secondTransport.payloads.count == 1 }
+        await secondTransport.reply(0, try fixture.movement(second, delay: 1, seconds: 4))
+        try await wait { !second.isBusy }
+        try require(second.errorMessage == nil && second.instruction.isEmpty && !second.awaitsClarification &&
+                    fixture.editor.project.state.zoom(at: 7) == fixture.box2.rect.framing(),
+                    "An immediate submission completes the restored instruction using its actual answer")
+        try await Task.sleep(for: .milliseconds(350))
+        let archive = DirectorConversation(storageURL: fixture.storage)
+        try require(archive.draftInstruction.isEmpty && archive.question == nil && archive.conflict == nil &&
+                    outcomes(archive.messages()).last?["status"] as? String == "applied",
+                    "An older typing debounce cannot resurrect a completed answer or pending question")
+        second.suspend()
     }
 
     static func checkDraftUndoRedoAndNewBranch() throws {

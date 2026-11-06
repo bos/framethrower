@@ -3,12 +3,15 @@ import SwiftUI
 
 @MainActor
 final class EditorAssistantSession: ObservableObject {
-    @Published var instruction = ""
+    @Published var instruction = "" {
+        didSet { if instruction != oldValue { scheduleDraftSave() } }
+    }
     @Published private(set) var isBusy = false
     @Published private(set) var notice: String?
     @Published private(set) var errorMessage: String?
     let projectID = UUID()
     private var task: Task<Void, Never>?
+    private var draftSaveTask: Task<Void, Never>?
     private var generation = UUID()
     private var clarification: DirectorPendingQuestion?
     private var framingConflict: DirectorPendingConflict?
@@ -34,7 +37,7 @@ final class EditorAssistantSession: ObservableObject {
         self.persistsConversation = persistsConversation ?? (transport == nil || conversationStorageURL != nil)
         self.conversationStorageURL = conversationStorageURL
     }
-    deinit { task?.cancel() }
+    deinit { task?.cancel(); draftSaveTask?.cancel() }
 
     func attach(to editor: ProjectEditor) {
         guard observedEditor !== editor else { return }
@@ -342,9 +345,19 @@ final class EditorAssistantSession: ObservableObject {
         persist()
     }
     private func persist() {
+        draftSaveTask?.cancel(); draftSaveTask = nil
         conversation.question = clarification; conversation.conflict = framingConflict
         conversation.draftInstruction = instruction
         if !conversation.save() { record("conversation_save_failed", details: [:]) }
+    }
+    private func scheduleDraftSave() {
+        draftSaveTask?.cancel()
+        guard conversation.storageURL != nil else { return }
+        draftSaveTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(200)) }
+            catch { return }
+            self?.persist()
+        }
     }
     private func record(_ event: String, requestID: UUID? = nil, details: [String: Any]) {
         _ = diagnostics?.record(event, sessionID: projectID, requestID: requestID, details: details)

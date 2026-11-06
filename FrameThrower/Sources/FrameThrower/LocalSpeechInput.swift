@@ -256,6 +256,8 @@ final class LocalSpeechInput: ObservableObject {
 struct LocalVoiceButton: View {
     @ObservedObject var speech: LocalSpeechInput
     var purpose = "Dictate an edit"
+    var finishPurpose = "Finish dictation"
+    var onBegin: () -> Void = {}
     let onTranscript: (String) -> Void
 
     var body: some View {
@@ -264,6 +266,7 @@ struct LocalVoiceButton: View {
                 if speech.phase == .listening {
                     if let text = await speech.finish() { onTranscript(text) }
                 } else if speech.phase == .idle {
+                    onBegin()
                     await speech.start()
                 } else {
                     await speech.cancel()
@@ -274,8 +277,8 @@ struct LocalVoiceButton: View {
                 .frame(width: 18, height: 18)
                 .foregroundStyle(speech.phase == .listening ? Color.red : Color.primary)
         }
-        .help(speech.phase == .listening ? "Finish dictation" : speech.phase == .idle ? purpose + " using on-device speech recognition" : "Cancel dictation")
-        .accessibilityLabel(speech.phase == .listening ? "Finish dictation" : speech.phase == .idle ? purpose : "Cancel dictation")
+        .help(speech.phase == .listening ? finishPurpose : speech.phase == .idle ? purpose + " using on-device speech recognition" : "Cancel dictation")
+        .accessibilityLabel(speech.phase == .listening ? finishPurpose : speech.phase == .idle ? purpose : "Cancel dictation")
     }
 }
 

@@ -133,7 +133,7 @@ struct ProjectEditorView: View {
                     playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
                         regionID: selectedRegionID, editID: selectedEditID)
-                })
+                }, onVoiceBegin: { playback.pause() })
                 .inspectorColumnWidth(min: 280, ideal: 300, max: 360)
         }
         .onChange(of: directorMode) { _, active in

@@ -19,9 +19,10 @@ final class EditorAssistantSession: ObservableObject {
     }) { self.transport = transport }
     deinit { task?.cancel() }
 
-    func appendDictation(_ transcript: String) {
+    @discardableResult
+    func appendDictation(_ transcript: String) -> Bool {
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { return false }
         // Read the current draft when recognition finishes, so typing while
         // listening is preserved along with the text that preceded dictation.
         if instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -30,6 +31,7 @@ final class EditorAssistantSession: ObservableObject {
             let separator = instruction.last?.isWhitespace == true ? "" : " "
             instruction += separator + text
         }
+        return true
     }
 
     func submit(editor: ProjectEditor, playhead: Double, regionID: UUID?, editID: UUID?) {
@@ -133,6 +135,7 @@ struct EditorAssistantPanel: View {
     let onRemoveRegion: (UUID) -> Void
     var onShowOriginalFrame: (UUID) -> Void = { _ in }
     let onSubmit: () -> Void
+    var onVoiceBegin: () -> Void = {}
     @StateObject private var instructionSpeech = LocalSpeechInput()
     @State private var namingRegionID: UUID?
     @State private var nameDraft = ""
@@ -163,7 +166,9 @@ struct EditorAssistantPanel: View {
                 .accessibilityLabel("Editing instruction")
                 .help("For example: At Edit A, zoom into Box 1. Then smoothly zoom out and into Box 2 at Edit B.")
             HStack {
-                LocalVoiceButton(speech: instructionSpeech) { text in session.appendDictation(text) }
+                LocalVoiceButton(speech: instructionSpeech, finishPurpose: "Finish and apply instruction", onBegin: onVoiceBegin) { text in
+                    if session.appendDictation(text) { onSubmit() }
+                }
                     .disabled(session.isBusy)
                 Text("On-device").font(.caption).foregroundStyle(.secondary)
                 Spacer()
@@ -171,7 +176,7 @@ struct EditorAssistantPanel: View {
                     ProgressView().controlSize(.small)
                     Button { session.cancel() } label: { Image(systemName: "xmark") }
                         .help("Cancel the local editing request.").accessibilityLabel("Cancel edit request")
-                } else {
+                } else if instructionSpeech.phase == .idle {
                     Button(action: onSubmit) { Image(systemName: "arrow.up.circle.fill") }
                         .buttonStyle(.borderless).font(.title2)
                         .disabled(session.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || instructionSpeech.phase != .idle)
@@ -179,6 +184,7 @@ struct EditorAssistantPanel: View {
                         .accessibilityLabel("Apply edit instruction")
                 }
             }
+            .frame(minHeight: 28)
             speechStatus(instructionSpeech)
             if let message = session.errorMessage {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)

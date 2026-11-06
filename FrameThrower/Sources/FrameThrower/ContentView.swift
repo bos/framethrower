@@ -39,11 +39,23 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
             RecorderWorkspace {
                 captureCard
             } recordingControls: {
                 recordingBar
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Originals", selection: $model.recordingQuality) {
+                        Text("High quality").tag(RecordingQuality.highQuality)
+                        Text("Smaller files").tag(RecordingQuality.compact)
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(captureLocked)
+                    .help("High quality saves ProRes video and uncompressed audio for editing. Smaller files saves H.264 video. Export creates a separate compressed copy.")
+                    if let estimate = model.recordingStorageEstimate {
+                        Text(estimate).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .help("Estimated screen-video storage at the selected resolution; camera and audio use additional space. Static screens may use less.")
+                    }
+                }
             } recordings: {
                 if showRecording { recordingSummary }
             }
@@ -56,6 +68,18 @@ struct ContentView: View {
         .background(colorScheme == .dark ? Color(white: 0.105) : Color(red: 0.965, green: 0.960, blue: 0.949))
         .tint(RecorderStyle.accent)
         .frame(minWidth: 1000, minHeight: 780)
+        .navigationTitle("New Recording")
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { model.chooseProject() } label: { Label("Open Recording", systemImage: "folder") }
+                    .labelStyle(.iconOnly)
+                    .disabled(captureLocked || model.isAnyUploadActive)
+                    .help("Open a recording project (⌘O)")
+                SettingsLink { Label("Accounts", systemImage: "person.crop.circle") }
+                    .labelStyle(.iconOnly)
+                    .help("Manage Google Drive and Slack accounts")
+            }
+        }
         .onAppear {
             model.restoreLastProject()
             model.loadTokens()
@@ -80,39 +104,6 @@ struct ContentView: View {
         .task(id: "\(model.lastRecordingURL?.path ?? ""):\(model.isRecording)") {
             await loadClipDetails()
         }
-    }
-
-    private var header: some View {
-        HStack(spacing: 11) {
-            Image(systemName: "viewfinder")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(RecorderStyle.accent)
-                .frame(width: 38, height: 38)
-                .background(RecorderStyle.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
-            Text("FrameThrower")
-                .font(.system(size: 19, weight: .semibold))
-                .tracking(-0.6)
-            Spacer()
-            Button { model.chooseProject() } label: {
-                Label("Open…", systemImage: "folder")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(captureLocked || model.isAnyUploadActive)
-            SettingsLink {
-                Label("Accounts", systemImage: "person.crop.circle")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.primary.opacity(0.045), in: Capsule())
-            }
-            .buttonStyle(.plain)
-            .help("Manage Google Drive and Slack accounts")
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 12)
     }
 
     private var captureCard: some View {

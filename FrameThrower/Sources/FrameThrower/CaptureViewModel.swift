@@ -54,6 +54,9 @@ final class CaptureViewModel: ObservableObject {
     @Published var isRecording = false {
         didSet { updateSourceRefreshScheduling() }
     }
+    @Published var recordingQuality: RecordingQuality = .highQuality {
+        didSet { userDefaults.set(recordingQuality.rawValue, forKey: "capture.quality") }
+    }
     @Published var isUploading = false
     @Published private(set) var uploadProgressFraction = 0.0
     @Published private(set) var isUploadProgressVisible = false
@@ -119,6 +122,7 @@ final class CaptureViewModel: ObservableObject {
 
     init(userDefaults: UserDefaults = .standard, recordingDirectories: [URL]? = nil) {
         self.userDefaults = userDefaults
+        recordingQuality = RecordingQuality(rawValue: userDefaults.string(forKey: "capture.quality") ?? "") ?? .highQuality
         if let recordingDirectories {
             recordingLibrary = RecordingLibrary(defaults: userDefaults, directories: recordingDirectories)
         } else {
@@ -135,6 +139,38 @@ final class CaptureViewModel: ObservableObject {
 
     var isCameraReadyForCapture: Bool {
         !camera.isPreparing && (camera.selectedDeviceID == nil || camera.isReady)
+    }
+    var recordingStorageEstimate: String? {
+        guard recordingQuality == .highQuality else { return nil }
+        let frame: CGRect
+        switch captureKind {
+        case .window:
+            guard let selectedWindow else { return nil }
+            frame = selectedWindow.frame
+        case .display:
+            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return nil }
+            frame = display.display.frame
+        case .area:
+            guard let display = displays.first(where: { $0.id == selectedDisplayID }) else { return nil }
+            frame = area.rect.intersection(display.display.frame)
+        }
+        guard !frame.isNull, frame.width.isFinite, frame.height.isFinite, frame.width > 0, frame.height > 0 else { return nil }
+        let screen = NSScreen.screens.max { left, right in
+            func coverage(_ screen: NSScreen) -> CGFloat {
+                guard let id = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber else { return 0 }
+                let intersection = CGDisplayBounds(id.uint32Value).intersection(frame)
+                return intersection.isNull ? 0 : intersection.width * intersection.height
+            }
+            return coverage(left) < coverage(right)
+        }
+        let scale = screen?.backingScaleFactor ?? 1
+        let width = max(2, Int(frame.width * scale))
+        let height = max(2, Int(frame.height * scale))
+        // ProRes LT is variable bitrate; 1.64 bits/pixel/frame is its typical
+        // 1080p rate, scaled to the selected source's backing resolution.
+        let bytes = Int64(Double(width) * Double(height) * 60 * 1.64 / 8 * 60)
+        let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        return "About \(size)/min · \(width) × \(height), 60 fps"
     }
     @Published var initialCameraPlacement = PIPPlacement()
     @Published var projectEditor: ProjectEditor?
@@ -155,6 +191,8 @@ final class CaptureViewModel: ObservableObject {
     private var exportedURL: URL?
 
     private let recorder = ScreenRecorder()
+    private var activeCaptureID: UUID?
+    private var pendingCaptureFailure: (id: UUID, message: String)?
     private let cursorRecorder = CursorRecorder()
     private var activeCursorCapture = false
     private var activeScreenStartHostTime: Double?
@@ -967,16 +1005,27 @@ final class CaptureViewModel: ObservableObject {
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         isCaptureBusy = true
-        defer { isCaptureBusy = false }
+        defer { isCaptureBusy = false; finishPendingCaptureFailure() }
         refreshMicrophones()
         if recordMicrophoneAudio {
             guard await ensureMicrophonePermission() else { return }
         }
 
         do {
+            let captureID = UUID()
+            activeCaptureID = captureID
+            pendingCaptureFailure = nil
+            recorder.setUnexpectedFailureHandler { [weak self] error in
+                Task { @MainActor [weak self] in
+                    guard let self, self.activeCaptureID == captureID else { return }
+                    self.pendingCaptureFailure = (captureID, error.localizedDescription)
+                    self.finishPendingCaptureFailure()
+                }
+            }
+            let quality = recordingQuality
             let filter = try await selectedFilter()
             let configuration = try makeConfiguration(filter: filter)
-            let outputURL = try makeOutputURL()
+            let outputURL = try makeOutputURL(quality: quality)
             activeRecordingURL = outputURL
             activeCameraURL = nil
             activeCameraOffset = 0
@@ -986,14 +1035,14 @@ final class CaptureViewModel: ObservableObject {
             if camera.selectedDeviceID != nil {
                 let url = outputURL.deletingPathExtension().appendingPathExtension("camera.mov")
                 activeCameraURL = url
-                cameraStart = try await camera.startRecording(to: url)
+                cameraStart = try await camera.startRecording(to: url, quality: quality)
             }
             if let source = cursorCaptureSource(filter: filter, configuration: configuration) {
                 activeCursorCapture = cursorRecorder.start(source: source)
             }
             // Keep the baked cursor if mouse-only metadata capture cannot start.
             configuration.showsCursor = !activeCursorCapture
-            let screenStart = try await recorder.start(filter: filter, configuration: configuration, outputURL: outputURL)
+            let screenStart = try await recorder.start(filter: filter, configuration: configuration, outputURL: outputURL, quality: quality)
             activeScreenStartHostTime = screenStart
             if let cameraStart { activeCameraOffset = cameraStart - screenStart }
             lastDriveFileURL = nil
@@ -1005,6 +1054,8 @@ final class CaptureViewModel: ObservableObject {
             lastRecordingURL = outputURL
             log(cameraStart == nil ? "Recording started." : "Recording screen and camera independently.")
         } catch {
+            activeCaptureID = nil
+            pendingCaptureFailure = nil
             cursorRecorder.cancel()
             activeCursorCapture = false
             activeScreenStartHostTime = nil
@@ -1016,10 +1067,22 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
+    private func finishPendingCaptureFailure() {
+        guard !isCaptureBusy, isRecording, let failure = pendingCaptureFailure,
+              activeCaptureID == failure.id else { return }
+        pendingCaptureFailure = nil
+        Task { @MainActor [weak self] in
+            guard let self, self.activeCaptureID == failure.id, self.isRecording, !self.isCaptureBusy else { return }
+            self.log(failure.message, level: .error)
+            await self.stopRecording()
+        }
+    }
+
     func stopRecording() async {
         guard isRecording, !isCaptureBusy else { return }
         isCaptureBusy = true
         defer { isCaptureBusy = false }
+        defer { activeCaptureID = nil; pendingCaptureFailure = nil }
         var failures: [String] = []
         do { try await recorder.stop() } catch { failures.append(error.localizedDescription) }
         cursorRecorder.stopCollecting()
@@ -1075,7 +1138,7 @@ final class CaptureViewModel: ObservableObject {
             recordingLibrary.register(project: editor.project, at: editor.url, restoreRemoved: true)
             userDefaults.set(url.path, forKey: "editor.lastProject")
             requestProjectEditor()
-            log("Recording saved. Review, trim, and arrange your camera before sharing.")
+            log("Recording saved.")
         } catch {
             log("Sources are safe at \(outputURL.path), but project creation failed: \(error.localizedDescription)", level: .error)
         }
@@ -1423,6 +1486,8 @@ final class CaptureViewModel: ObservableObject {
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.queueDepth = 6
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        configuration.sampleRate = 48_000
+        configuration.channelCount = 2
         let scale = Double(filter.pointPixelScale)
         let pixelSize: (Double) -> Int = { points in
             let raw = max(2, Int((points * scale).rounded()))
@@ -1475,12 +1540,12 @@ final class CaptureViewModel: ObservableObject {
         return configuration
     }
 
-    private func makeOutputURL() throws -> URL {
+    private func makeOutputURL(quality: RecordingQuality) throws -> URL {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let filename = "Screencast-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).mp4"
+        let filename = "Screencast-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).\(quality.fileExtension)"
 
         let directory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)
             .first ?? FileManager.default.temporaryDirectory

@@ -10,7 +10,7 @@ struct FrameThrowerApp: App {
             ContentView(model: model)
         }
         .defaultSize(width: 1100, height: 820)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
         .commands {
             ProjectEditingCommands()
             CommandGroup(after: .newItem) { OpenProjectMenu(model: model) }

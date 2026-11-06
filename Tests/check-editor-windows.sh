@@ -4,7 +4,7 @@ repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 check_dir=$(mktemp -d -t framethrower-window-check)
 trap 'rm -rf "$check_dir"' EXIT
 sources=()
-for name in CursorRecording CaptureViewModel Models RecordingProject RecordingLibrary CameraRecorder ScreenRecorder \
+for name in CursorRecording CaptureViewModel Models RecordingQuality ScreenMasterWriter RecordingProject RecordingLibrary CameraRecorder ScreenRecorder \
   ProjectRenderer PIPVideoCompositor AreaSelection WindowSelection OAuth \
   DriveUploader SlackAPI KeychainStore; do
   sources+=("$repo_dir/FrameThrower/Sources/FrameThrower/$name.swift")

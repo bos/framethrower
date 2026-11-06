@@ -7,6 +7,7 @@ struct RecordingProjectChecks {
         try checkPlacementGeometry()
         checkShapeAndCropGeometry()
         checkInteractiveGeometry()
+        checkEditingTime()
         checkTransitions()
         try checkPersistence()
         try checkShapeHistoryAndLegacyDecoding()
@@ -141,6 +142,40 @@ struct RecordingProjectChecks {
         near(centered.moved(by: CGSize(width: 0, height: 30), in: landscape, shape: .rectangle, aspectRatio: 2).y,
              0.75, "Free rectangle crop pan uses its own aspect")
         precondition(centered.moved(by: .zero, in: .zero, shape: .circle) == centered)
+    }
+
+    static func checkEditingTime() {
+        let project = RecordingProject(screenFilename: "screen.mp4", duration: 10)
+        let before = project
+        near(project.editingTime(at: 0), 0, "First source frame")
+        near(project.editingTime(at: 1.025), 1, "Edit maps to the currently visible source frame")
+        near(project.editingTime(at: 1.04), 31.0 / 30.0, "Edit maps to the next visible source frame")
+        near(project.editingTime(at: 10), 299.0 / 30.0, "Source end maps to final actual output frame")
+        near(project.editingTime(at: 100), 299.0 / 30.0, "Beyond-source edit clamps to final frame")
+        near(project.editingTime(at: -1), 0, "Before-source edit clamps to first frame")
+        near(project.editingTime(at: .nan), 0, "Nonfinite position defaults to first frame")
+        near(project.editingTime(at: .infinity), 0, "Infinite position defaults to first frame")
+        near(project.editingTime(at: 1.025, frameDuration: 1.0 / 60), 61.0 / 60,
+             "Frame mapping follows the renderer's actual frame duration")
+        for invalidDuration in [0, -1, Double.nan, Double.infinity, Double.leastNonzeroMagnitude] {
+            near(project.editingTime(at: 1.025, frameDuration: invalidDuration), 1,
+                 "Invalid or unrepresentable frame duration falls back to 30 fps")
+        }
+        let fractional = RecordingProject(screenFilename: "screen.mp4", duration: 0.081)
+        near(fractional.editingTime(at: 0.081), 2.0 / 30,
+             "Fractional final frame remains editable without moving outside the source")
+        let single = RecordingProject(screenFilename: "screen.mp4", duration: 1.0 / 30)
+        near(single.editingTime(at: single.duration), 0, "One-frame source end maps to frame zero")
+        let tiny = RecordingProject(screenFilename: "screen.mp4", duration: 0.000_001)
+        near(tiny.editingTime(at: tiny.duration), 0, "Sub-frame source remains editable at its first frame")
+        var trimmed = project
+        trimmed.state.trimStart = 1.01
+        trimmed.state.trimEnd = 1.02
+        near(trimmed.editingTime(at: trimmed.state.trimStart), 1,
+             "A trim boundary can display a frame whose source timestamp precedes the trim")
+        near(trimmed.editingTime(at: trimmed.state.trimEnd), 1,
+             "Sub-frame trims edit the visible source frame")
+        precondition(project == before, "Computing an editing time cannot modify history or project state")
     }
 
     static func checkTransitions() {

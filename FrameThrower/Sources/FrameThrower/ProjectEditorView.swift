@@ -20,7 +20,7 @@ struct ProjectEditorView: View {
 
     private var state: EditState { editor.project.state }
     private var point: PIPKeyframe? { state.pipKeyframes.first { $0.id == selectedPoint } }
-    private var placement: PIPPlacement { dragPlacement ?? state.placement(at: playback.time) }
+    private var placement: PIPPlacement { dragPlacement ?? state.placement(at: playback.editingTime) }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -85,13 +85,13 @@ struct ProjectEditorView: View {
                                     resizeHandle(canvas: canvas)
                                 }
                                 .offset(x: rect.minX, y: rect.minY)
-                                .gesture(DragGesture(minimumDistance: 2)
+                                .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("recordingCanvas"))
                                     .onChanged { value in
                                         guard resizeOrigin == nil else { return }
                                         if dragOrigin == nil {
                                             playback.pause()
-                                            dragOrigin = state.placement(at: playback.time)
-                                            dragTime = playback.time
+                                            dragOrigin = state.placement(at: playback.editingTime)
+                                            dragTime = playback.editingTime
                                         }
                                         guard var next = dragOrigin else { return }
                                         next.x += value.translation.width / max(1, canvas.width - rect.width)
@@ -109,6 +109,7 @@ struct ProjectEditorView: View {
                                 .accessibilityLabel("Camera position. Drag to move, or use the corner buttons below.")
                         }
                     }
+                    .coordinateSpace(name: "recordingCanvas")
                 if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -259,8 +260,8 @@ struct ProjectEditorView: View {
                 HStack {
                     Text("Point time: \(point.time, specifier: "%.2f") s").font(.caption).monospacedDigit()
                     Button("Move point to playhead") {
-                        updateSelected { $0.time = playback.time }
-                    }.font(.caption).disabled(playback.time < 0.001 || abs(playback.time - point.time) < 0.001)
+                        updateSelected { $0.time = playback.editingTime }
+                    }.font(.caption).disabled(playback.editingTime <= 0 || abs(playback.editingTime - point.time) < 0.001)
                     Text("Smooth movement ends at this point.").font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -277,11 +278,11 @@ struct ProjectEditorView: View {
             .offset(x: 7, y: 7)
             .help(placement.shape == .rectangle ? "Drag to change camera width and height" : "Drag to resize camera")
             .accessibilityLabel("Resize camera")
-            .highPriorityGesture(DragGesture(minimumDistance: 1).onChanged { value in
+            .highPriorityGesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("recordingCanvas")).onChanged { value in
                 if resizeOrigin == nil {
                     playback.pause()
-                    resizeOrigin = state.placement(at: playback.time)
-                    dragTime = playback.time
+                    resizeOrigin = state.placement(at: playback.editingTime)
+                    dragTime = playback.editingTime
                 }
                 guard let origin = resizeOrigin else { return }
                 dragPlacement = origin.resized(by: value.translation, in: canvas, cameraAspect: playback.cameraAspect)
@@ -294,7 +295,7 @@ struct ProjectEditorView: View {
 
     private func openFraming() {
         playback.pause()
-        framingTime = playback.time
+        framingTime = playback.editingTime
         cameraFrame = nil
         cameraFrameError = nil
         isFramingPresented = true
@@ -312,6 +313,8 @@ struct ProjectEditorView: View {
     private func setPlacement(_ next: PIPPlacement, at time: Double, name: String) {
         playback.pause()
         var edited = state
+        let time = editor.project.editingTime(at: time,
+            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
         let existing = edited.pipKeyframes.first { abs($0.time - time) < 0.001 }
         let keyframe = PIPKeyframe(id: existing?.id ?? UUID(), time: existing?.time ?? time, placement: next,
             transition: existing?.transition ?? transition, duration: existing?.duration ?? transitionDuration)

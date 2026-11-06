@@ -52,7 +52,7 @@ struct CameraFramingPopover: View {
                             .background(PIPWindowShape(shape: placement.shape).fill(.white.opacity(0.08)))
                             .frame(width: crop.width * scale, height: crop.height * scale)
                             .offset(x: crop.minX * scale, y: crop.minY * scale)
-                            .gesture(DragGesture(minimumDistance: 1).onChanged { value in
+                            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("cameraCropSource")).onChanged { value in
                                 if dragOrigin == nil { dragOrigin = placement.crop }
                                 guard let origin = dragOrigin else { return }
                                 draft = origin.moved(
@@ -65,6 +65,7 @@ struct CameraFramingPopover: View {
                             })
                             .accessibilityLabel("Camera crop. Drag to adjust framing.")
                     }
+                    .coordinateSpace(name: "cameraCropSource")
                     .clipped()
                     .background(.black)
                 HStack {

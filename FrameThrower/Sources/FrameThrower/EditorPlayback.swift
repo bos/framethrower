@@ -19,6 +19,12 @@ final class EditorPlayback: ObservableObject {
     private var observer: Any?
     private var generation = 0
     private var bounds = 0.0...1.0
+    private var sourceDuration = 0.0
+    private var editFrameDuration = 1.0 / 30.0
+
+    var editingTime: Double {
+        RecordingProject.editingTime(at: time, duration: sourceDuration, frameDuration: editFrameDuration)
+    }
 
     init() {
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
@@ -39,6 +45,7 @@ final class EditorPlayback: ObservableObject {
         generation += 1
         let request = generation
         let snapshot = editor.project
+        sourceDuration = snapshot.duration
         let position = min(max(time, snapshot.state.trimStart), snapshot.state.trimEnd)
         player.pause()
         isPlaying = false
@@ -58,6 +65,7 @@ final class EditorPlayback: ObservableObject {
             cameraAspect = rendered.cameraAspect
             bounds = snapshot.state.trimStart...snapshot.state.trimEnd
             renderedProject = rendered
+            editFrameDuration = rendered.videoComposition.frameDuration.seconds
             let generator = AVAssetImageGenerator(asset: rendered.asset)
             generator.videoComposition = rendered.videoComposition
             generator.requestedTimeToleranceBefore = .zero

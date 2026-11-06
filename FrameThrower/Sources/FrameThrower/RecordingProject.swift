@@ -228,6 +228,23 @@ struct RecordingProject: Codable, Equatable, Sendable {
         self.redoHistory = redoHistory
     }
 
+    /// Geometry edits belong to the source frame visible at the playhead. In
+    /// particular, the exclusive source end maps to the final output frame,
+    /// rather than creating an edit that can never appear in an export.
+    func editingTime(at position: Double, frameDuration: Double = 1.0 / 30.0) -> Double {
+        Self.editingTime(at: position, duration: duration, frameDuration: frameDuration)
+    }
+
+    static func editingTime(at position: Double, duration: Double, frameDuration: Double = 1.0 / 30.0) -> Double {
+        guard duration.isFinite, duration > 0 else { return 0 }
+        let candidate = frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30.0
+        let interval = (duration / candidate).isFinite ? candidate : 1.0 / 30.0
+        let bounded = position.isFinite ? min(max(position, 0), duration) : 0
+        let frameIndex = floor(bounded / interval)
+        let lastIndex = max(0, ceil(duration / interval) - 1)
+        return min(duration, max(0, min(frameIndex, lastIndex) * interval))
+    }
+
     func validate() throws {
         guard version == 1 else { throw ProjectError.invalid("Unsupported project version: \(version).") }
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {

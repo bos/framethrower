@@ -249,9 +249,10 @@ private struct LocalEditPlannerChecks {
         init() throws {
             project = RecordingProject(screenFilename: "original.mov", duration: 12)
             project.state.regions = [a, b]
+            project.references.register(state: project.state)
             context = LocalEditContext(recording: EditorCommandContext(projectID: projectID,
                 revision: try EditorCommandDispatcher.revision(for: project), duration: project.duration,
-                state: project.state), playhead: 0, selectedRegionID: a.id, selectedEditID: nil,
+                state: project.state, references: project.references), playhead: 0, selectedRegionID: a.id, selectedEditID: nil,
                 videoProcessingAvailable: false)
         }
     }

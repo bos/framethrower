@@ -22,11 +22,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-MODEL_REPOSITORY = "Qwen/Qwen3-4B-GGUF"
-MODEL_REVISION = "bc640142c66e1fdd12af0bd68f40445458f3869b"
-MODEL_FILENAME = "Qwen3-4B-Q4_K_M.gguf"
-MODEL_BYTES = 2_497_280_256
-MODEL_SHA256 = "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+MODEL_REPOSITORY = "Qwen/Qwen3-8B-GGUF"
+MODEL_REVISION = "7c41481f57cb95916b40956ab2f0b139b296d974"
+MODEL_FILENAME = "Qwen3-8B-Q4_K_M.gguf"
+MODEL_BYTES = 5_027_783_488
+MODEL_SHA256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+VERIFIED_MODELS = {
+    MODEL_FILENAME: (MODEL_BYTES, MODEL_SHA256),
+    # Retain the smaller pinned model for explicit diagnostic comparisons.
+    "Qwen3-4B-Q4_K_M.gguf": (2_497_280_256, "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"),
+}
 
 
 def cache_directory() -> Path:
@@ -38,13 +43,17 @@ def default_model_path() -> Path:
 
 
 def verify_model(path: Path) -> None:
-    if path.stat().st_size != MODEL_BYTES:
+    expected = VERIFIED_MODELS.get(path.name.removesuffix(".download"))
+    if expected is None:
+        raise ValueError("Choose a pinned, verified local model")
+    expected_bytes, expected_sha256 = expected
+    if path.stat().st_size != expected_bytes:
         raise ValueError("Model size does not match the pinned official download")
     digest = hashlib.sha256()
     with path.open("rb") as source:
         while chunk := source.read(4 * 1024 * 1024):
             digest.update(chunk)
-    if digest.hexdigest() != MODEL_SHA256:
+    if digest.hexdigest() != expected_sha256:
         raise ValueError("Model checksum does not match the pinned official download")
 
 
@@ -82,7 +91,7 @@ def install_model() -> Path:
                 os.fsync(output.fileno())
     verify_model(partial)
     partial.replace(target)
-    (target.parent / "Qwen3-4B.manifest.json").write_text(json.dumps({
+    (target.parent / "Qwen3-8B.manifest.json").write_text(json.dumps({
         "repository": MODEL_REPOSITORY, "revision": MODEL_REVISION,
         "filename": MODEL_FILENAME, "bytes": MODEL_BYTES, "sha256": MODEL_SHA256,
         "license": "Apache-2.0", "model_card": f"https://huggingface.co/{MODEL_REPOSITORY}",
@@ -171,7 +180,7 @@ class LocalModelServer:
             "--host", "127.0.0.1", "--port", str(port), "--api-key-file", str(key_path),
             "--offline", "--no-mmproj", "--fit", "off",
             "--threads", "4", "--threads-batch", "4", "--poll", "0",
-            "--ctx-size", "4096", "--parallel", "1", "--cache-ram", "0",
+            "--ctx-size", "8192", "--parallel", "1", "--cache-ram", "0",
             "--jinja", "--chat-template-kwargs", '{"enable_thinking":false}',
             "--no-webui", "--no-ui-mcp-proxy", "--no-warmup",
         ]
@@ -184,9 +193,10 @@ class LocalModelServer:
                        if not k.startswith(("LLAMA_", "GGML_", "OPENAI_", "ANTHROPIC_"))}
         environment.update(HF_HUB_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1", DO_NOT_TRACK="1")
         (self.log_dir / "runtime.json").write_text(json.dumps({
-            "backend": self.backend, "model": MODEL_FILENAME, "model_sha256": MODEL_SHA256,
+            "backend": self.backend, "model": self.model_path.name,
+            "model_sha256": VERIFIED_MODELS[self.model_path.name][1],
             "runtime": self.server_binary, "endpoint": self.client.endpoint,
-            "threads": 4, "context_tokens": 4096, "offline": True,
+            "threads": 4, "context_tokens": 8192, "offline": True,
             "gpu_layers": "all" if self.backend == "metal" else 0,
         }, indent=2) + "\n")
         self.log_file = (self.log_dir / "server.log").open("wb")

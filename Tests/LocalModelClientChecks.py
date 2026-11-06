@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Network-boundary checks using only a temporary loopback HTTP server."""
 import http.server
+import hashlib
 import json
 from pathlib import Path
 import sys
 import threading
+import tempfile
 import unittest
+from unittest import mock
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Tools"))
-from local_model import LocalModelClient
+from local_model import LocalModelClient, VERIFIED_MODELS, verify_model
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -33,6 +36,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class LocalModelClientChecks(unittest.TestCase):
+    def test_pinned_weights_and_partial_download_validation(self):
+        contents = b"verified fixture"
+        specification = (len(contents), hashlib.sha256(contents).hexdigest())
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                VERIFIED_MODELS, {"fixture.gguf": specification}, clear=True):
+            for name in ["fixture.gguf", "fixture.gguf.download"]:
+                path = Path(directory) / name
+                path.write_bytes(contents)
+                verify_model(path)
+                path.write_bytes(b"x" * len(contents))
+                with self.assertRaises(ValueError):
+                    verify_model(path)
+                path.write_bytes(contents + b"x")
+                with self.assertRaises(ValueError):
+                    verify_model(path)
+            unknown = Path(directory) / "unknown.gguf"
+            unknown.write_bytes(contents)
+            with self.assertRaises(ValueError):
+                verify_model(unknown)
+
     def test_only_numeric_loopback(self):
         for endpoint in ("http://example.invalid:1234", "http://localhost:1234", "https://127.0.0.1:1234",
                          "http://192.168.1.2:1234", "http://127.0.0.1", "http://u:p@127.0.0.1:1234",

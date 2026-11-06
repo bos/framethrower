@@ -24,9 +24,10 @@ enum EditorCommand: Codable, Equatable, Sendable {
     case fullFrame(time: Double, motion: EditorCommandMotion = EditorCommandMotion())
     case holdFraming(time: Double)
     case reviseFraming(editID: UUID, regionID: UUID)
+    case moveBetweenEdits(fromEditID: UUID, toEditID: UUID, regionID: UUID)
     case labelRegion(regionID: UUID, note: String)
 
-    private enum Key: String, CodingKey { case action, regionID, time, motion, editID, note }
+    private enum Key: String, CodingKey { case action, regionID, time, motion, editID, fromEditID, toEditID, note }
     private struct AnyKey: CodingKey {
         var stringValue: String
         var intValue: Int? { nil }
@@ -59,6 +60,11 @@ enum EditorCommand: Codable, Equatable, Sendable {
             allowed = ["action", "regionID", "note"]
             self = .labelRegion(regionID: try values.decode(UUID.self, forKey: .regionID),
                                 note: try values.decode(String.self, forKey: .note))
+        case "moveBetweenEdits":
+            allowed = ["action", "fromEditID", "toEditID", "regionID"]
+            self = .moveBetweenEdits(fromEditID: try values.decode(UUID.self, forKey: .fromEditID),
+                                    toEditID: try values.decode(UUID.self, forKey: .toEditID),
+                                    regionID: try values.decode(UUID.self, forKey: .regionID))
         default:
             throw EditorCommandError.invalid("The requested editing action is not supported.")
         }
@@ -91,6 +97,11 @@ enum EditorCommand: Codable, Equatable, Sendable {
             try values.encode("labelRegion", forKey: .action)
             try values.encode(regionID, forKey: .regionID)
             try values.encode(note, forKey: .note)
+        case let .moveBetweenEdits(fromEditID, toEditID, regionID):
+            try values.encode("moveBetweenEdits", forKey: .action)
+            try values.encode(fromEditID, forKey: .fromEditID)
+            try values.encode(toEditID, forKey: .toEditID)
+            try values.encode(regionID, forKey: .regionID)
         }
     }
 }
@@ -107,6 +118,7 @@ struct EditorCommandContext: Codable, Equatable, Sendable {
     var revision: String
     var duration: Double
     var state: EditState
+    var references = EditorReferences()
 }
 
 enum EditorCommandError: LocalizedError {
@@ -137,7 +149,8 @@ enum EditorCommandDispatcher {
     static func context(editor: ProjectEditor, projectID: UUID) throws -> EditorCommandContext {
         guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
         return EditorCommandContext(projectID: projectID, revision: try revision(for: editor.project),
-                                    duration: editor.project.duration, state: editor.project.state)
+                                    duration: editor.project.duration, state: editor.project.state,
+                                    references: editor.project.references)
     }
 
     static func prepare(_ batch: EditorCommandBatch, for project: RecordingProject,
@@ -209,6 +222,37 @@ enum EditorCommandDispatcher {
                 }
                 next.regions[index].note = note
                 try next.regions[index].validate(duration: project.duration)
+            case let .moveBetweenEdits(fromEditID, toEditID, regionID):
+                let edits = next.timedEdits(includeCamera: true)
+                guard let from = edits.first(where: { $0.id == fromEditID }),
+                      let to = edits.first(where: { $0.id == toEditID }),
+                      to.time - from.time >= 0.1 else {
+                    throw EditorCommandError.invalid("Choose two different edits with room for a smooth movement between them.")
+                }
+                guard !next.zoomKeyframes.contains(where: { $0.time > from.time && $0.time < to.time }) else {
+                    throw EditorCommandError.invalid("There are framing edits between those edits. Choose adjacent framing edits or revise the intervening edits first.")
+                }
+                if to.zoomID == nil,
+                   let crossing = next.zoomKeyframes.first(where: { $0.time > to.time }),
+                   crossing.transition == .smooth, crossing.time - crossing.duration < to.time {
+                    throw EditorCommandError.invalid("An existing framing movement crosses the destination edit. Revise that movement before adding this path.")
+                }
+                let target = try region(regionID).rect.framing()
+                let midpoint = from.time + (to.time - from.time) / 2
+                let duration = midpoint - from.time
+                // Materialize an unchanged starting view for a reference-only
+                // or camera-only edit. No earlier interpolation is rewritten.
+                if from.zoomID == nil {
+                    let crossing = next.zoomKeyframes.first { $0.time > from.time }
+                    if let crossing, crossing.transition == .smooth,
+                       crossing.time - crossing.duration < from.time {
+                        throw EditorCommandError.invalid("An existing framing movement crosses the starting edit. Revise that movement before adding this path.")
+                    }
+                    put(next.zoom(at: from.time), at: from.time, motion: EditorCommandMotion(transition: .jump))
+                }
+                put(ZoomPlacement(), at: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: duration))
+                let existing = next.zoomKeyframes.first { $0.id == to.zoomID }
+                put(target, at: to.time, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: existing)
             }
         }
         var candidate = project

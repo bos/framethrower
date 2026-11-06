@@ -86,9 +86,9 @@ struct LocalModelHTTPClient: Sendable {
 /// are scoped: completion, errors, and cancellation all terminate that process.
 actor LocalModelRuntime {
     static let shared = LocalModelRuntime()
-    static let modelFilename = "Qwen3-4B-Q4_K_M.gguf"
-    static let modelSHA256 = "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
-    static let modelBytes = 2_497_280_256
+    static let modelFilename = "Qwen3-8B-Q4_K_M.gguf"
+    static let modelSHA256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
+    static let modelBytes = 5_027_783_488
 
     private var activeRequest: UUID?
 
@@ -203,7 +203,7 @@ private final class LocalModelProcess: @unchecked Sendable {
             "--model", modelURL.path, "--alias", "framethrower-local",
             "--host", "127.0.0.1", "--port", String(port), "--api-key-file", keyURL.path,
             "--offline", "--no-mmproj", "--fit", "off", "--threads", "4", "--threads-batch", "4", "--poll", "0",
-            "--ctx-size", "4096", "--parallel", "1", "--cache-ram", "0", "--jinja",
+            "--ctx-size", "8192", "--parallel", "1", "--cache-ram", "0", "--jinja",
             "--chat-template-kwargs", "{\"enable_thinking\":false}", "--no-webui", "--no-ui-mcp-proxy", "--no-warmup",
             "--device", "MTL0", "--n-gpu-layers", "all", "--op-offload"]
         var environment = ProcessInfo.processInfo.environment.filter { key, _ in

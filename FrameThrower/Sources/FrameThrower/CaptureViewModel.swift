@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import AVFoundation
 import CoreGraphics
 import Foundation
@@ -98,6 +99,15 @@ final class CaptureViewModel: ObservableObject {
     }
 
     let camera = CameraRecorder()
+    private var cameraChanges: AnyCancellable?
+
+    init() {
+        cameraChanges = camera.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+    }
+
+    var isCameraReadyForCapture: Bool {
+        !camera.isPreparing && (camera.selectedDeviceID == nil || camera.isReady)
+    }
     @Published var initialCameraPlacement = PIPPlacement()
     @Published var projectEditor: ProjectEditor?
     @Published var isProjectEditorPresented = false
@@ -891,7 +901,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
+        guard !isRecording, !isCaptureBusy, !isAnyUploadActive, isCameraReadyForCapture else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         isCaptureBusy = true
@@ -952,8 +962,21 @@ final class CaptureViewModel: ObservableObject {
         lastRecordingURL = outputURL
         do {
             let duration = try await AVURLAsset(url: outputURL).load(.duration).seconds
+            var cameraFilename: String?
+            if let cameraURL = activeCameraURL {
+                do {
+                    let asset = AVURLAsset(url: cameraURL)
+                    guard try await !asset.loadTracks(withMediaType: .video).isEmpty,
+                          try await asset.load(.duration).seconds > 0 else {
+                        throw CameraRecordingError.noFrames
+                    }
+                    cameraFilename = cameraURL.lastPathComponent
+                } catch {
+                    failures.append("Camera video was unavailable; the screen recording and any camera file were kept. " + error.localizedDescription)
+                }
+            }
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
-                cameraFilename: activeCameraURL?.lastPathComponent,
+                cameraFilename: cameraFilename,
                 cameraOffset: activeCameraOffset, duration: duration)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
             let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")

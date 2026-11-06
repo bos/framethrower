@@ -13,6 +13,7 @@ enum CameraRecordingError: LocalizedError {
     case configurationFailed
     case noFrames
     case alreadyRecording
+    case timedOut
     case recordingFailed(String)
 
     var errorDescription: String? {
@@ -27,6 +28,8 @@ enum CameraRecordingError: LocalizedError {
             return "The camera did not deliver video. Check its connection and privacy shutter."
         case .alreadyRecording:
             return "The camera is already recording."
+        case .timedOut:
+            return "The camera encoder did not finish in time. Any captured media has been kept."
         case let .recordingFailed(message):
             return "Camera recording failed: \(message)"
         }
@@ -170,6 +173,8 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     private var runtimeObserver: (any NSObjectProtocol)?
     private var interruptedObserver: (any NSObjectProtocol)?
     private var isFinishing = false
+    private var finishOperation: UUID?
+    private var finishContinuation: CheckedContinuation<Void, any Error>?
 
     override init() {
         super.init()
@@ -293,14 +298,16 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
                 }
                 self.trackWriter = nil
                 self.isFinishing = true
+                let operation = UUID()
+                self.finishOperation = operation
+                self.finishContinuation = continuation
+                self.queue.asyncAfter(deadline: .now() + 15) {
+                    self.resolveFinish(operation: operation, result: .failure(CameraRecordingError.timedOut))
+                }
                 trackWriter.finish { result in
                     self.queue.async {
-                        self.isFinishing = false
-                        if let priorError {
-                            continuation.resume(throwing: priorError)
-                        } else {
-                            continuation.resume(with: result)
-                        }
+                        self.resolveFinish(operation: operation,
+                            result: priorError.map { .failure($0) } ?? result)
                     }
                 }
             }
@@ -311,14 +318,16 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         let message = error.localizedDescription
         queue.async {
             if self.outputURL != nil { self.fail(CameraRecordingError.recordingFailed(message)) }
-            self.reportError?(message)
+            else { self.reportError?(message) }
         }
     }
 
     func shutDown() {
         queue.async {
             self.fail(CameraRecordingError.unavailable)
-            self.trackWriter?.cancel()
+            // Finish an accepted take instead of cancelling it: cancellation
+            // can discard an already-created source file.
+            self.trackWriter?.finish { _ in }
             self.trackWriter = nil
             self.outputURL = nil
             self.session.stopRunning()
@@ -339,6 +348,14 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         } catch {
             fail(error)
         }
+    }
+
+    private func resolveFinish(operation: UUID, result: Result<Void, any Error>) {
+        guard finishOperation == operation, let continuation = finishContinuation else { return }
+        finishOperation = nil
+        finishContinuation = nil
+        isFinishing = false
+        continuation.resume(with: result)
     }
 
     private func fail(_ error: any Error) {
@@ -372,7 +389,9 @@ final class CameraTrackWriter: @unchecked Sendable {
     /// Returns true only when this sample was actually accepted by the encoder.
     @discardableResult
     func append(_ sample: CMSampleBuffer, hostTime: Double) throws -> Bool {
-        guard !isFinishing, hostTime.isFinite, CMSampleBufferDataIsReady(sample) else {
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard !isFinishing, hostTime.isFinite, timestamp.isNumeric,
+              timestamp.seconds.isFinite, CMSampleBufferDataIsReady(sample) else {
             throw CameraRecordingError.noFrames
         }
         if writer == nil {
@@ -400,7 +419,7 @@ final class CameraTrackWriter: @unchecked Sendable {
         }
         guard input.isReadyForMoreMediaData else { return false }
         if firstHostTime == nil {
-            writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sample))
+            writer.startSession(atSourceTime: timestamp)
         }
         guard input.append(sample) else { throw writer.error ?? CameraRecordingError.noFrames }
         if firstHostTime == nil { firstHostTime = hostTime }

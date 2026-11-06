@@ -105,6 +105,11 @@ struct CameraRecordingChecks {
             try invalid.append(sample(at: .zero), hostTime: .nan)
             throw CheckError.failed("invalid synchronization timestamp should fail")
         } catch is CameraRecordingError {}
+        let invalidSource = CameraTrackWriter(url: directory.appendingPathComponent("invalid-source.mov"))
+        do {
+            try invalidSource.append(sample(at: .invalid), hostTime: 1)
+            throw CheckError.failed("invalid source presentation timestamp should fail")
+        } catch is CameraRecordingError {}
         print("Camera recording checks passed (synthetic video, timeline, source preservation, and failures).")
     }
 }

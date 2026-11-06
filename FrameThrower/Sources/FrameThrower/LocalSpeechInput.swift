@@ -94,11 +94,28 @@ enum SpeechAssetReadiness: String, Sendable {
 }
 
 @available(macOS 26, *)
+enum AppleSpeechConfiguration {
+    // Dictation preserves spoken timing in native command tests. Avoid the
+    // shortForm hint: on this OS it can leave short utterances volatile even
+    // after finalization. Long dictation still ends when the user presses Stop.
+    // Tentative words are displayed, while only true final results are returned.
+    static var preset: DictationTranscriber.Preset {
+        var preset = DictationTranscriber.Preset.longDictation
+        preset.reportingOptions.insert(.volatileResults)
+        return preset
+    }
+
+    static func transcriber(locale: Locale) -> DictationTranscriber {
+        DictationTranscriber(locale: locale, preset: preset)
+    }
+}
+
+@available(macOS 26, *)
 @MainActor
 enum AppleSpeechAssetPreparation {
     private static let logger = Logger(subsystem: "com.example.screencast", category: "speech-setup")
 
-    static func prepare(_ transcriber: SpeechTranscriber, locale: Locale) async throws {
+    static func prepare(_ transcriber: any SpeechModule, locale: Locale) async throws {
         try await SpeechAssetReadiness.prepare(status: {
             let state = await AssetInventory.status(forModules: [transcriber])
             let mapped: SpeechAssetReadiness
@@ -276,12 +293,11 @@ private final class AppleLocalSpeechSession: LocalSpeechSession {
 
     func start(onResult: @escaping @MainActor (SpeechTranscript.Segment) -> Void,
                onFailure: @escaping @MainActor (String) -> Void) async throws {
-        guard SpeechTranscriber.isAvailable else { throw LocalSpeechError.unavailable }
-        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: .current) else {
+        guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: .current) else {
             throw LocalSpeechError.unsupportedLocale
         }
         try Task.checkCancellation()
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        let transcriber = AppleSpeechConfiguration.transcriber(locale: locale)
         try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
         try Task.checkCancellation()
         guard !stopped else { throw CancellationError() }

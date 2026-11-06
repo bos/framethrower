@@ -9,26 +9,56 @@ private enum NativeSpeechFailure: Error { case failed(String) }
 /// audio, writes an audio file, or constructs a media decoder/encoder.
 @main @MainActor
 struct NativeSpeechTranscriptionChecks {
-    static func main() async throws {
+    static func main() async {
+        do { try await check() }
+        catch {
+            FileHandle.standardError.write(Data("Native speech check failed: \(error)\n".utf8))
+            Darwin.exit(1)
+        }
+    }
+
+    private static func check() async throws {
         DispatchQueue.global().asyncAfter(deadline: .now() + 45) {
             FileHandle.standardError.write(Data("Native speech check exceeded 45 seconds; no microphone was opened.\n".utf8))
             Darwin.exit(1)
         }
-        guard #available(macOS 26, *), SpeechTranscriber.isAvailable,
-              let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else {
+        guard #available(macOS 26, *),
+              let locale = await DictationTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US")) else {
             throw NativeSpeechFailure.failed("Native on-device English recognition is unavailable")
         }
-        guard await SpeechTranscriber.installedLocales.contains(where: { $0.identifier == locale.identifier }) else {
+        guard await DictationTranscriber.installedLocales.contains(where: { $0.identifier == locale.identifier }) else {
             throw NativeSpeechFailure.failed("This check requires existing local speech assets; no download was started")
         }
         guard let voice = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.language == "en-US" && $0.quality == .default }) else {
             throw NativeSpeechFailure.failed("No installed local English voice is available for synthetic test input")
         }
-        let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
+        FileHandle.standardOutput.write(Data("Synthetic voice: \(voice.name) (\(voice.identifier)); production short-command dictation.\n".utf8))
+        let commands = [
+            ("Zoom into box one.", #"(?is)\bzoom\W+into\W+box\W+(?:one|1)\b"#),
+            ("One second from now, I want you to pan from box one, zoom out, and into box two after three seconds.",
+             #"(?is)\b(?:one|1)\W+second\W+from\W+now\b.*\bpan\W+from\W+box\W+(?:one|1)\b.*\bzoom\W+out\b.*\binto\W+box\W+(?:two|2)\b.*\bafter\W+(?:three|3)\W+seconds\b"#),
+            ("Twelve seconds from now, pan from box two to box one over two seconds.",
+             #"(?is)\b(?:twelve|12)\W+seconds\W+from\W+now\b.*\bpan\W+from\W+box\W+(?:two|2)\W+to\W+box\W+(?:one|1)\b.*\bover\W+(?:two|2)\W+seconds\b"#),
+            ("Two seconds from now, pan from box one to box two over twelve seconds.",
+             #"(?is)\b(?:two|2)\W+seconds\W+from\W+now\b.*\bpan\W+from\W+box\W+(?:one|1)\W+to\W+box\W+(?:two|2)\b.*\bover(?:\W+(?:twelve|12)|12)\W+seconds\b"#)
+        ]
+        for (source, requiredMeaning) in commands {
+            let final = try await transcribe(source, locale: locale, voice: voice)
+            FileHandle.standardOutput.write(Data("Synthetic command transcript: \(final)\n".utf8))
+            guard final.range(of: requiredMeaning, options: .regularExpression) != nil else {
+                throw NativeSpeechFailure.failed("Native final transcription lost command targets, action order, or relative timing. Input: \(source); actual: \(final)")
+            }
+        }
+        print("Native speech transcription passed (four commands preserving targets, action order, and one/two/three/twelve-second timing; existing local TTS → production PCM converter → production on-device DictationTranscriber; no microphone, playback, audio file, or video).")
+    }
+
+    @available(macOS 26, *)
+    private static func transcribe(_ source: String, locale: Locale, voice: AVSpeechSynthesisVoice) async throws -> String {
+        let transcriber = AppleSpeechConfiguration.transcriber(locale: locale)
         try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
         let synthesizer = AVSpeechSynthesizer()
         defer { synthesizer.stopSpeaking(at: .immediate) }
-        let utterance = AVSpeechUtterance(string: "Zoom into box one.")
+        let utterance = AVSpeechUtterance(string: source)
         utterance.voice = voice
         let synthesized = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SynthesizedPCM, any Error>) in
             let collection = SynthesizedPCM(continuation: continuation)
@@ -63,12 +93,8 @@ struct NativeSpeechTranscriptionChecks {
             try await analyzer.start(inputSequence: stream)
             try await analyzer.finalizeAndFinishThroughEndOfInput()
             let final = try await resultTask.value
-            let words = Set(final.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
             guard failures.messages.isEmpty else { throw NativeSpeechFailure.failed("Production PCM converter reported a failure") }
-            guard words.contains("zoom"), words.contains("box"), words.contains("one") || words.contains("1") else {
-                throw NativeSpeechFailure.failed("Native final transcription did not recognize the distinct synthetic command words")
-            }
-            print("Native speech transcription passed (existing local TTS → production PCM converter → on-device SpeechAnalyzer → finalized command words; no microphone, playback, audio file, or video).")
+            return final
         } catch {
             resultTask.cancel()
             await analyzer.cancelAndFinishNow()

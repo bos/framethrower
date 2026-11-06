@@ -1,4 +1,5 @@
 import Foundation
+import Speech
 
 @MainActor
 private final class MockSpeechSession: LocalSpeechSession {
@@ -25,6 +26,14 @@ private final class MockSpeechSession: LocalSpeechSession {
 struct LocalSpeechChecks {
     @MainActor
     static func main() async {
+        if #available(macOS 26, *) {
+            let preset = AppleSpeechConfiguration.preset
+            expect(preset.reportingOptions == [.volatileResults],
+                   "partial words remain available without less accurate frequent finalization")
+            expect(preset.transcriptionOptions == DictationTranscriber.Preset.longDictation.transcriptionOptions &&
+                   preset.contentHints.isEmpty && preset.attributeOptions.isEmpty,
+                   "command dictation retains Apple's punctuation without short-form finalization or unused attributes")
+        }
         var transcript = SpeechTranscript()
         transcript.receive(.init(start: 0, duration: 1, text: "zoom it", isFinal: false))
         transcript.receive(.init(start: 0, duration: 1.2, text: "zoom into this box", isFinal: false))

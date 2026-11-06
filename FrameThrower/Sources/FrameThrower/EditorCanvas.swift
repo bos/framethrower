@@ -286,11 +286,12 @@ final class EditorCanvasView: NSView {
         if zoom.scale > 1, dx.isFinite, dy.isFinite, dx != 0 || dy != 0 {
             beginTrackpad(.pan)
             // AppKit has already applied the user's natural-scroll preference.
-            // Its positive vertical delta is up; this canvas has a downwards Y.
+            // Convert deltas into source viewport offsets. Moving the viewport
+            // center translates the visible image in the opposite direction.
             let units = event.hasPreciseScrollingDeltas ? 1.0 : 10.0
             let next = ZoomPlacement(scale: zoom.scale,
-                x: zoom.x - dx * units / (canvasRect.width * zoom.scale),
-                y: zoom.y + dy * units / (canvasRect.height * zoom.scale)).clamped
+                x: zoom.x + dx * units / (canvasRect.width * zoom.scale),
+                y: zoom.y - dy * units / (canvasRect.height * zoom.scale)).clamped
             previewTrackpad(next)
         }
         if event.momentumPhase.contains(.ended) ||

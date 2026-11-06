@@ -13,6 +13,7 @@ private final class TrackpadEvent: NSEvent {
     var dx = 0.0
     var dy = 0.0
     var precise = true
+    var inverted = false
     var position = CGPoint.zero
     override var type: NSEvent.EventType { kind }
     override var phase: NSEvent.Phase { eventPhase }
@@ -21,6 +22,7 @@ private final class TrackpadEvent: NSEvent {
     override var scrollingDeltaX: CGFloat { dx }
     override var scrollingDeltaY: CGFloat { dy }
     override var hasPreciseScrollingDeltas: Bool { precise }
+    override var isDirectionInvertedFromDevice: Bool { inverted }
     override var locationInWindow: NSPoint { position }
 }
 
@@ -76,8 +78,8 @@ struct EditorTrackpadChecks {
         event.dy = 30
         let beforePan = canvas.zoom
         canvas.scrollWheel(with: event)
-        let pan = ZoomPlacement(scale: 2, x: beforePan.x - 40 / 1600, y: beforePan.y + 30 / 900)
-        try near(canvas.zoom, pan, "two-finger pan uses both axes and AppKit scroll direction")
+        let pan = ZoomPlacement(scale: 2, x: beforePan.x + 40 / 1600, y: beforePan.y - 30 / 900)
+        try near(canvas.zoom, pan, "positive AppKit deltas advance horizontal source offset and reduce vertical source offset")
         configure(beforePan)
         try near(canvas.zoom, pan, "stale frames cannot reset an active pan")
         event.eventPhase = .ended
@@ -94,7 +96,7 @@ struct EditorTrackpadChecks {
         event.momentum = .ended
         event.dx = 0; event.dy = 0
         canvas.scrollWheel(with: event)
-        try near(canvas.zoom, ZoomPlacement(scale: 2, x: pan.x - 40 / 1600, y: pan.y - 30 / 900), "momentum continues pan without losing its accumulated viewport")
+        try near(canvas.zoom, ZoomPlacement(scale: 2, x: pan.x + 40 / 1600, y: pan.y + 30 / 900), "momentum continues the native pan direction without losing its accumulated viewport")
         try require(commits.count == 3, "momentum finishes with one callback")
 
         event.momentum = []
@@ -102,7 +104,10 @@ struct EditorTrackpadChecks {
         event.precise = false
         event.dx = 10000; event.dy = 10000
         canvas.scrollWheel(with: event)
-        try near(canvas.zoom, ZoomPlacement(scale: 2, x: 0.25, y: 0.75), "legacy wheel panning is bounded to the source")
+        try near(canvas.zoom, ZoomPlacement(scale: 2, x: 0.75, y: 0.25), "legacy wheel panning uses the same direction and is bounded to the source")
+        event.dx = -10000; event.dy = -10000
+        canvas.scrollWheel(with: event)
+        try near(canvas.zoom, ZoomPlacement(scale: 2, x: 0.25, y: 0.75), "negative wheel deltas reverse both axes and clamp at opposite source edges")
         event.kind = .magnify
         event.eventPhase = .began
         event.amount = 100
@@ -148,6 +153,18 @@ struct EditorTrackpadChecks {
             if type == .leftMouseDown { canvas.mouseDown(with: mouse) } else { canvas.mouseUp(with: mouse) }
         }
         try require(cancels == 2, "a no-op mouse click cannot discard an earlier draft")
+        for inverted in [false, true] {
+            configure(ZoomPlacement(scale: 2))
+            event.kind = .scrollWheel
+            event.position = canvas.convert(CGPoint(x: 400, y: 225), to: nil)
+            event.eventPhase = []
+            event.precise = true
+            event.inverted = inverted
+            event.dx = 30; event.dy = 20
+            canvas.scrollWheel(with: event)
+            try near(canvas.zoom, ZoomPlacement(scale: 2, x: 0.5 + 30 / 1600, y: 0.5 - 20 / 900),
+                     "AppKit's delivered deltas must not be inverted a second time for the macOS scroll preference")
+        }
         print("Editor trackpad checks passed (anchored pinch, two-axis pan/momentum, stale frames, bounds, Escape, disabled states, and stable native preview).")
     }
 

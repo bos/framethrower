@@ -59,6 +59,7 @@ struct ProjectEditorView: View {
         .frame(minWidth: 820, idealWidth: 940, maxWidth: .infinity,
                minHeight: 760, idealHeight: 780, maxHeight: .infinity)
         .background(.background)
+        .background(EditorDraftLifecycle(editor: editor).frame(width: 0, height: 0))
         .navigationTitle(editor.displayName)
         .task { await playback.rebuild(editor: editor) }
         .onChange(of: editor.project.state) { _, _ in

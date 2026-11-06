@@ -211,6 +211,8 @@ Automated checks run without camera hardware or connected accounts:
   and deceleration, constant-speed cruise, bounded source zooms, and legacy defaults.
 - `Tests/check-edit-draft.sh`: combined same-time edits, grouped retiming/removal,
   one-step undo/redo, failed-save recovery, ramp persistence, and immutable originals.
+- `Tests/check-editor-draft-lifecycle.sh`: failed-save veto for Close and Quit,
+  preserved pending edits, delegate forwarding, and successful save boundaries.
 - `Tests/check-editor-trackpad.sh`: native pinch/pan/momentum, pointer anchoring,
   bounded zoom, stale configuration, and cancellation.
 - `Tests/check-cursor-recording.sh`: mouse coordinates, precise click events and

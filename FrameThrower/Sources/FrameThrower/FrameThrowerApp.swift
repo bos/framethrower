@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct FrameThrowerApp: App {
+    @NSApplicationDelegateAdaptor(EditorDraftApplicationDelegate.self) private var draftApplicationDelegate
     @StateObject private var model = CaptureViewModel()
 
     var body: some Scene {

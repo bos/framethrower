@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import AppKit
+import Darwin
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -156,7 +157,8 @@ enum CoreMediaRelinker {
         defer { try? output.close() }
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
-        let expected = (try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        let original = try CopySourceSnapshot(descriptor: input.fileDescriptor)
+        let expected = UInt64(original.size)
         var copied: UInt64 = 0
         var lastProgress = ContinuousClock.now
         progress(0)
@@ -174,13 +176,52 @@ enum CoreMediaRelinker {
                 lastProgress = .now
             }
         }
-        guard copied == expected else { throw RecoveryError.changedSource }
+        // Equal byte counts do not prove a stable original: a writer can edit
+        // in place or atomically replace its path with another same-size file.
+        guard copied == expected,
+              try CopySourceSnapshot(descriptor: input.fileDescriptor) == original,
+              (try? CopySourceSnapshot(url: source)) == original else { throw RecoveryError.changedSource }
         try output.synchronize()
         try output.close()
         try Task.checkCancellation()
         progress(0.95)
         completed = true
         return staged
+    }
+
+    private struct CopySourceSnapshot: Equatable {
+        let device: Int64
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+
+        init(descriptor: Int32) throws {
+            var information = stat()
+            guard Darwin.fstat(descriptor, &information) == 0 else {
+                throw RecoveryError.copyFailed(String(cString: strerror(errno)))
+            }
+            try self.init(information)
+        }
+
+        init(url: URL) throws {
+            var information = stat()
+            guard url.path.withCString({ Darwin.lstat($0, &information) }) == 0 else { throw RecoveryError.changedSource }
+            try self.init(information)
+        }
+
+        private init(_ information: stat) throws {
+            guard information.st_mode & S_IFMT == S_IFREG, information.st_size >= 0 else { throw RecoveryError.invalidChoice }
+            device = Int64(information.st_dev)
+            inode = UInt64(information.st_ino)
+            size = information.st_size
+            modifiedSeconds = Int64(information.st_mtimespec.tv_sec)
+            modifiedNanoseconds = Int64(information.st_mtimespec.tv_nsec)
+            changedSeconds = Int64(information.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(information.st_ctimespec.tv_nsec)
+        }
     }
 }
 

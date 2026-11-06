@@ -63,15 +63,29 @@ struct CapturePreview: View {
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .overlay {
-                        if model.captureKind == .area, let imageDisplayFrame {
-                            AreaPreviewEditor(
-                                area: $model.area,
-                                displayFrame: imageDisplayFrame,
-                                isEditable: !captureLocked
-                            )
+                        GeometryReader { proxy in
+                            ZStack(alignment: .topLeading) {
+                                if model.captureKind == .area, let imageDisplayFrame {
+                                    AreaPreviewEditor(
+                                        area: $model.area,
+                                        displayFrame: imageDisplayFrame,
+                                        isEditable: !captureLocked
+                                    )
+                                }
+                                if model.camera.selectedDeviceID != nil {
+                                    InitialCameraPreview(camera: model.camera,
+                                        placement: $model.initialCameraPlacement,
+                                        recordingRect: InitialCameraPreviewGeometry.recordingRect(
+                                            area: model.captureKind == .area ? model.area.rect : nil,
+                                            display: imageDisplayFrame, in: proxy.size),
+                                        locked: captureLocked)
+                                }
+                            }
+                            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+                            .coordinateSpace(name: "mainInitialCameraCanvas")
                         }
                     }
-                    .padding(24)
+                    .padding(12)
                     .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
                     .accessibilityLabel(model.captureKind == .area
                         ? "Full display preview with the recording area highlighted"

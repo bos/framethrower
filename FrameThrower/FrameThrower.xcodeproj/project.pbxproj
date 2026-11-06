@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0DA60B5ECB363F697D65472B /* RecordingTitleEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B7A08447970D31081CF851F /* RecordingTitleEditor.swift */; };
+		0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */; };
 		20038457D5FA2C5D0E037802 /* SlackAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B02FAC8C4CE33A644C90D03 /* SlackAPI.swift */; };
 		26BC0545D234B3A03FB2725F /* CameraSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6840E3AAEFC0329B397E930 /* CameraSetupView.swift */; };
 		27F3F0DB81E8955E54E16625 /* ScreenRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266C5CA13CA133D15B080420 /* ScreenRecorder.swift */; };
@@ -56,6 +57,7 @@
 		2B7A08447970D31081CF851F /* RecordingTitleEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingTitleEditor.swift; sourceTree = "<group>"; };
 		36ACB61C84F04DE05285C1AA /* OAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuth.swift; sourceTree = "<group>"; };
 		3D91E6293B3F47CD92BE79E4 /* EditorPlayback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorPlayback.swift; sourceTree = "<group>"; };
+		406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InitialCameraPreviewGeometry.swift; sourceTree = "<group>"; };
 		4370A1AA27EA8518D9E26D61 /* DriveUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveUploader.swift; sourceTree = "<group>"; };
 		4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorCanvas.swift; sourceTree = "<group>"; };
 		4A422B6A5EA766959C6AC727 /* FrameThrower.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrameThrower.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -113,6 +115,7 @@
 				4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */,
 				3D91E6293B3F47CD92BE79E4 /* EditorPlayback.swift */,
 				F658B134CC765957233533CB /* FrameThrowerApp.swift */,
+				406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */,
 				7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */,
 				D36B84B4B1F8D344D22C3892 /* Models.swift */,
 				36ACB61C84F04DE05285C1AA /* OAuth.swift */,
@@ -238,6 +241,7 @@
 				50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */,
 				6F3D6454ECB2F457499AC3C2 /* EditorPlayback.swift in Sources */,
 				D48CD70601AD09B0BEEA52D0 /* FrameThrowerApp.swift in Sources */,
+				0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */,
 				667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */,
 				485B2C647E5B8415DED8C557 /* Models.swift in Sources */,
 				2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */,

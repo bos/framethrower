@@ -13,3 +13,12 @@ doing so can trigger macOS “application is not open anymore” dialogs. Check
 process exit through read-only process inspection, replace the installed build,
 then acquire a fresh app handle to launch and inspect it. Do not retry stale
 handles or batch a post-quit inspection with the Quit action.
+
+# Temporary video-driver interlock
+
+Keep `MediaProcessing.isSuspended` enabled while the video-scaling driver is
+unstable. Do not run capture, video fixture creation, decoding, encoding,
+compositing, scaling, or the blocked media test scripts. Do not remove or bypass
+the source and test interlocks without Bryan explicitly authorizing it. Compile
+builds and tests of models, files, text controls, and the suspended editor are
+permitted. Use empty or vector previews for UI work.

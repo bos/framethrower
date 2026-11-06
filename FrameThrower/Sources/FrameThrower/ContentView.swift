@@ -18,6 +18,7 @@ struct ContentView: View {
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var canRecord: Bool {
+        guard !MediaProcessing.isSuspended else { return false }
         guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, model.isCameraReadyForCapture else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
@@ -314,6 +315,7 @@ struct ContentView: View {
                         }
                         Text(recordingStatus)
                             .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(MediaProcessing.isSuspended ? .secondary : .primary)
                             .lineLimit(2)
                     }
                 }
@@ -413,7 +415,7 @@ struct ContentView: View {
             HStack(alignment: .center, spacing: 12) {
                 Button {
                     if model.projectEditor != nil { model.requestProjectEditor() }
-                    else if let url = model.lastRecordingURL { NSWorkspace.shared.open(url) }
+                    else if !MediaProcessing.isSuspended, let url = model.lastRecordingURL { NSWorkspace.shared.open(url) }
                 } label: {
                     Image(systemName: "play.fill")
                         .font(.system(size: 15))
@@ -422,6 +424,7 @@ struct ContentView: View {
                         .background(RecorderStyle.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
                 }
                 .buttonStyle(.plain)
+                .disabled(MediaProcessing.isSuspended && model.projectEditor == nil)
                 .help("Review and edit recording")
                 .accessibilityLabel("Review and edit recording")
                 VStack(alignment: .leading, spacing: 4) {
@@ -539,6 +542,7 @@ struct ContentView: View {
     private var recordingStatus: String? {
         if model.isCaptureBusy { return model.isRecording ? "Finishing recording…" : "Starting recording…" }
         if model.isRecording { return "Recording" }
+        if MediaProcessing.isSuspended { return MediaProcessing.statusMessage }
         if let remaining = model.countdownRemainingSeconds { return "Recording starts in \(remaining)s" }
         if !model.hasScreenRecordingPermission { return "Screen recording permission required" }
         if model.camera.isPreparing { return "Starting camera…" }
@@ -666,6 +670,7 @@ struct ContentView: View {
            let bytes = attributes[.size] as? Int64 {
             clipSize = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
+        guard !MediaProcessing.isSuspended else { return }
         if let duration = try? await AVURLAsset(url: url).load(.duration) {
             guard !Task.isCancelled else { return }
             clipDuration = duration.seconds

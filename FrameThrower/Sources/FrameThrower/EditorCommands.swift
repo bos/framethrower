@@ -17,10 +17,10 @@ struct EditorFileCommands: Commands {
                 .disabled(actions == nil || actions?.isBusy == true)
             Button("Save Video…") { actions?.saveVideo() }
                 .keyboardShortcut("e", modifiers: .command)
-                .disabled(actions == nil || actions?.isBusy == true)
+                .disabled(MediaProcessing.isSuspended || actions == nil || actions?.isBusy == true)
             Button("Share Video…") { actions?.shareVideo() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
-                .disabled(actions == nil || actions?.isBusy == true)
+                .disabled(MediaProcessing.isSuspended || actions == nil || actions?.isBusy == true)
             Divider()
             Button("Rename Recording…") { actions?.rename?() }
                 .disabled(actions?.rename == nil || actions?.isBusy == true)

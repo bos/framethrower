@@ -67,6 +67,7 @@ final class ScreenMasterWriter: @unchecked Sendable {
          readiness: (@Sendable (Track) -> Bool)? = nil,
          onFirstVideo: @escaping @Sendable (Double) -> Void,
          onFailure: @escaping @Sendable (any Error) -> Void) throws {
+        try MediaProcessing.requireEnabled()
         guard width > 0, height > 0, !audioTracks.contains(.video),
               maximumPendingSamples > 0, maximumPendingBytes.map({ $0 > 0 }) ?? true,
               startupReorderWindow.isFinite, startupReorderWindow >= 0 else { throw MasterRecordingError.unsupportedFormat }

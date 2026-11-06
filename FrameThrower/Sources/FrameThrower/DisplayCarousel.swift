@@ -37,7 +37,12 @@ struct DisplayCarousel: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 10)
 
-                if model.displays.isEmpty {
+                if MediaProcessing.isSuspended {
+                    Text(MediaProcessing.statusMessage)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.displays.isEmpty {
                     ContentUnavailableView("No displays available", systemImage: "display")
                         .foregroundStyle(.white.opacity(0.65))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -99,6 +104,13 @@ struct DisplayCarousel: View {
 
     @MainActor
     private func refreshPreviews() async {
+        guard !MediaProcessing.isSuspended else {
+            images = [:]
+            failedDisplays = []
+            isLoading = false
+            sourcePreviews.clear()
+            return
+        }
         guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess() else {
             images = [:]
             sourcePreviews.clear()

@@ -14,6 +14,7 @@
 		20C5FF01DFB50F8BB4020F39 /* ScreenMasterWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C13D6D3BD67DEADECF4C615B /* ScreenMasterWriter.swift */; };
 		26BC0545D234B3A03FB2725F /* CameraSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6840E3AAEFC0329B397E930 /* CameraSetupView.swift */; };
 		27F3F0DB81E8955E54E16625 /* ScreenRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 266C5CA13CA133D15B080420 /* ScreenRecorder.swift */; };
+		2A90439380D14DC1F9FC3CBB /* MediaProcessing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76D0B9D32FDB084A40056FA3 /* MediaProcessing.swift */; };
 		2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36ACB61C84F04DE05285C1AA /* OAuth.swift */; };
 		323105BF10991A94F95A197F /* StatusChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD520E85E319DD599528423A /* StatusChip.swift */; };
 		3926CB2F05E2D44AD38392DB /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6581FEB23256078CAFBAD45C /* CameraPreview.swift */; };
@@ -74,6 +75,7 @@
 		61AE4578ECBAB11E12BB2339 /* Resources */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources; sourceTree = SOURCE_ROOT; };
 		6581FEB23256078CAFBAD45C /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
 		6CF655690A9E839FF2C6B1E0 /* RecordingProject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingProject.swift; sourceTree = "<group>"; };
+		76D0B9D32FDB084A40056FA3 /* MediaProcessing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProcessing.swift; sourceTree = "<group>"; };
 		7A4E06FDE65D150A87029E9A /* CursorZoomSuggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorZoomSuggestions.swift; sourceTree = "<group>"; };
 		7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		7DD2537A645D90E8DF5E74A8 /* CaptureViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureViewModel.swift; sourceTree = "<group>"; };
@@ -133,6 +135,7 @@
 				F658B134CC765957233533CB /* FrameThrowerApp.swift */,
 				406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */,
 				7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */,
+				76D0B9D32FDB084A40056FA3 /* MediaProcessing.swift */,
 				F7BBDA26D39F807470DE77BD /* MissingMediaRecovery.swift */,
 				D36B84B4B1F8D344D22C3892 /* Models.swift */,
 				36ACB61C84F04DE05285C1AA /* OAuth.swift */,
@@ -266,6 +269,7 @@
 				D48CD70601AD09B0BEEA52D0 /* FrameThrowerApp.swift in Sources */,
 				0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */,
 				667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */,
+				2A90439380D14DC1F9FC3CBB /* MediaProcessing.swift in Sources */,
 				70D9CFDED690FA8FBECE816C /* MissingMediaRecovery.swift in Sources */,
 				485B2C647E5B8415DED8C557 /* Models.swift in Sources */,
 				2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */,

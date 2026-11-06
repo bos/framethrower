@@ -10,6 +10,7 @@ for name in DisplayCarousel CaptureSourcePreviews AreaPreviewEditor RecorderStyl
   sources+=("$repo_dir/FrameThrower/Sources/FrameThrower/$name.swift")
 done
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
   -target "$(uname -m)-apple-macos15.0" \
   "${sources[@]}" "$repo_dir/Tests/DisplayCarouselChecks.swift" \
   -o "$check_dir/check-display-carousel"

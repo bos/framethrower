@@ -45,6 +45,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     @discardableResult
     func start(filter: SCContentFilter, configuration: SCStreamConfiguration,
                outputURL: URL, quality: RecordingQuality = .compact) async throws -> Double {
+        try MediaProcessing.requireEnabled()
         try callbackQueue.sync { guard stream == nil else { throw RecorderError.alreadyRecording } }
         if quality == .highQuality { configuration.colorSpaceName = CGColorSpace.sRGB }
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -151,6 +152,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     /// that movie timeline. H.264 reordering is bounded to sixteen pictures;
     /// inspecting the first thirty-two samples includes the first display frame.
     static func firstVideoPresentationTime(in url: URL) async throws -> Double {
+        try MediaProcessing.requireEnabled()
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw RecorderError.noFramesCaptured

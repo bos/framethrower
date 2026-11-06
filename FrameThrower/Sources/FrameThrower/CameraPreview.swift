@@ -30,6 +30,10 @@ final class CameraPreviewView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func setSession(_ session: AVCaptureSession) {
+        guard !MediaProcessing.isSuspended else {
+            previewLayer.session = nil
+            return
+        }
         if previewLayer.session !== session { previewLayer.session = session }
         if let connection = previewLayer.connection, connection.isVideoMirroringSupported {
             if connection.automaticallyAdjustsVideoMirroring { connection.automaticallyAdjustsVideoMirroring = false }

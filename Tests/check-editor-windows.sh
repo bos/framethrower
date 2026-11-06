@@ -10,6 +10,7 @@ for name in CursorRecording CaptureViewModel Models RecordingQuality ScreenMaste
   sources+=("$repo_dir/FrameThrower/Sources/FrameThrower/$name.swift")
 done
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
   -target "$(uname -m)-apple-macos15.0" \
   "${sources[@]}" "$repo_dir/Tests/EditorWindowChecks.swift" \
   -o "$check_dir/check-editor-windows"

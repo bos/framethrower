@@ -127,6 +127,7 @@ enum CoreMediaRelinker {
             }
             duration = try await withTaskCancellationHandler { try await read.value } onCancel: { read.cancel() }
         case .movie:
+            try MediaProcessing.requireEnabled()
             let asset = AVURLAsset(url: url)
             guard let track = try await asset.loadTracks(withMediaType: .video).first else { throw RecoveryError.noVideo }
             let size = try await track.load(.naturalSize)

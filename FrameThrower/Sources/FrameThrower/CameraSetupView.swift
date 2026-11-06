@@ -50,7 +50,16 @@ struct InitialCameraPreview: View {
     var body: some View {
         let rect = InitialCameraPreviewGeometry.cameraRect(placement, in: recordingRect)
         if recordingRect.width > 0, recordingRect.height > 0 {
-            CameraPreview(session: camera.session)
+            Group {
+                if MediaProcessing.isSuspended {
+                    Image(systemName: "video.slash")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .help(MediaProcessing.statusMessage)
+                } else {
+                    CameraPreview(session: camera.session)
+                }
+            }
                 .background(.black)
                 .frame(width: rect.width, height: rect.height)
                 .overlay { Rectangle().strokeBorder(.white.opacity(0.8), lineWidth: 1) }
@@ -63,8 +72,8 @@ struct InitialCameraPreview: View {
                     placement = InitialCameraPreviewGeometry.moved(origin, by: value.translation, in: recordingRect)
                 }.onEnded { _ in origin = nil })
                 .allowsHitTesting(!locked)
-                .accessibilityLabel("Live camera preview. Drag to set initial position.")
-                .help("Drag the camera picture to move it within the recording.")
+                .accessibilityLabel(MediaProcessing.isSuspended ? "Camera preview disabled" : "Live camera preview. Drag to set initial position.")
+                .help(MediaProcessing.isSuspended ? MediaProcessing.statusMessage : "Drag the camera picture to move it within the recording.")
                 .onChange(of: locked) { _, locked in if locked { origin = nil } }
         }
     }
@@ -89,7 +98,8 @@ struct CameraInputPicker: View {
                 }
             }
             .tint(camera.selectedDeviceID == nil ? Color.secondary : RecorderStyle.accent)
-            .disabled(locked || camera.isPreparing)
+            .disabled(MediaProcessing.isSuspended || locked || camera.isPreparing)
+            .help(MediaProcessing.isSuspended ? MediaProcessing.statusMessage : "Choose the camera to record.")
             if camera.isPreparing { ProgressView().controlSize(.small) }
         }
         .lineLimit(1)

@@ -6,6 +6,7 @@ enum EditorMovieFixtures {
     enum FixtureError: Error { case failed(String) }
 
     static func make(at url: URL, width: Int, height: Int, duration: Int, camera: Bool) async throws {
+        try MediaProcessing.requireEnabled()
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,

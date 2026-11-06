@@ -65,6 +65,7 @@ final class EditorPlayback: ObservableObject {
     }
 
     init() {
+        guard !MediaProcessing.isSuspended else { return }
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
                                                    queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
@@ -100,6 +101,18 @@ final class EditorPlayback: ObservableObject {
         renderedProject = nil
         isLoading = true
         errorMessage = nil
+        if MediaProcessing.isSuspended {
+            // Keep source-time editing and geometry usable without opening a
+            // movie, constructing a composition, or attaching a decoder.
+            player.replaceCurrentItem(with: nil)
+            sourceSize = CGSize(width: 1920, height: 1080)
+            screenSize = PresentationGeometry(sourceSize: sourceSize, presentation: snapshot.state.presentation).outputSize
+            editFrameDuration = snapshot.captureFrameDuration ?? 1.0 / 30
+            committedState = snapshot.state
+            stillFrame = nil
+            isLoading = false
+            return
+        }
         do {
             let rendered = try await ProjectRenderer.makePreview(project: snapshot,
                 directory: editor.url.deletingLastPathComponent())
@@ -163,6 +176,7 @@ final class EditorPlayback: ObservableObject {
     /// the isolated paused frame only after its final native seek completes.
     func seek(_ position: Double) {
         guard !isClosed else { return }
+        if MediaProcessing.isSuspended { time = bounded(position, to: sourceBounds); return }
         if isLoading {
             time = bounded(position, to: sourceBounds)
             return
@@ -184,6 +198,7 @@ final class EditorPlayback: ObservableObject {
 
     func scrub(to position: Double) {
         guard !isClosed else { return }
+        if MediaProcessing.isSuspended { time = bounded(position, to: bounds); return }
         let position = bounded(position, to: bounds)
         if isLoading { time = position; return }
         guard renderedProject != nil else { return }
@@ -350,6 +365,12 @@ final class EditorPlayback: ObservableObject {
     /// Transient paused composition used while a gesture is in progress. The
     /// durable project, AVPlayerItem, playhead, and source geometry stay intact.
     func preview(_ state: EditState) {
+        if MediaProcessing.isSuspended {
+            guard !isClosed else { return }
+            draftState = state
+            screenSize = PresentationGeometry(sourceSize: sourceSize, presentation: state.presentation).outputSize
+            return
+        }
         guard !isClosed, !isLoading, !isScrubbing,
               let renderedProject, draftState != state else { return }
         if seekInFlight || pendingSeek != nil {
@@ -394,6 +415,14 @@ final class EditorPlayback: ObservableObject {
     /// Restore the committed frame immediately when available, then refresh it
     /// through the same renderer. Any in-flight draft becomes ineligible.
     func cancelPreview() {
+        if MediaProcessing.isSuspended {
+            draftState = nil
+            pendingDraftState = nil
+            if let committedState {
+                screenSize = PresentationGeometry(sourceSize: sourceSize, presentation: committedState.presentation).outputSize
+            }
+            return
+        }
         guard !isClosed, isPreviewing else { return }
         discardPreview(restoringFrame: true)
         updateStillFrame()

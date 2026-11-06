@@ -81,7 +81,7 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
     }
 
     private let queue = DispatchQueue(label: "framethrower.pip-compositor")
-    private let composer = PIPFrameComposer()
+    private lazy var composer = PIPFrameComposer()
     private let cancellationLock = NSLock()
     private var cancellationGeneration = 0
 
@@ -94,6 +94,10 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
     func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) { }
 
     func startRequest(_ asyncVideoCompositionRequest: AVAsynchronousVideoCompositionRequest) {
+        guard !MediaProcessing.isSuspended else {
+            asyncVideoCompositionRequest.finish(with: MediaProcessing.Suspended())
+            return
+        }
         cancellationLock.lock()
         let pending = PendingRequest(request: asyncVideoCompositionRequest, generation: cancellationGeneration)
         // Enqueue under the same lock as the epoch snapshot. Otherwise a
@@ -351,7 +355,7 @@ final class LivePreviewSources: @unchecked Sendable {
     private let camera: CVPixelBuffer?
     private let instruction: PIPCompositionInstruction
     private let sourceTime: CMTime
-    private let composer = PIPFrameComposer()
+    private lazy var composer = PIPFrameComposer()
     private let queue = DispatchQueue(label: "framethrower.live-frame-render")
 
     fileprivate init(time: CMTime, sourceTime: CMTime, screen: CVPixelBuffer?, camera: CVPixelBuffer?,
@@ -368,6 +372,7 @@ final class LivePreviewSources: @unchecked Sendable {
     /// Full, oriented camera source for the framing editor. It shares the
     /// frozen native decode and GPU queue; no independent decoder is opened.
     func cameraImage(maximumSize: CGSize = CGSize(width: 1920, height: 1080)) async throws -> CGImage? {
+        try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
         guard camera != nil, let geometry = instruction.cameraGeometry,
               sourceTime.seconds >= instruction.cameraStart, sourceTime.seconds < instruction.cameraEnd else { return nil }
@@ -398,6 +403,7 @@ final class LivePreviewSources: @unchecked Sendable {
     }
 
     func render(applying state: EditState, maximumSize: CGSize) async throws -> CGImage {
+        try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
         let image: CGImage = try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in

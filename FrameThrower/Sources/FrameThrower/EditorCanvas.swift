@@ -121,9 +121,17 @@ final class EditorCanvasView: NSView {
                    presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if playerLayer.player !== player { playerLayer.player = player }
-        stillLayer.contents = image
-        stillLayer.isHidden = image == nil
+        if MediaProcessing.isSuspended {
+            playerLayer.player = nil
+            playerLayer.isHidden = true
+            stillLayer.contents = nil
+            stillLayer.isHidden = true
+        } else {
+            if playerLayer.player !== player { playerLayer.player = player }
+            playerLayer.isHidden = false
+            stillLayer.contents = image
+            stillLayer.isHidden = image == nil
+        }
         self.sourceSize = nativeSourceSize ?? sourceSize
         self.presentation = presentation
         self.cameraAspect = cameraAspect

@@ -37,6 +37,7 @@ final class VideoExportSession: ObservableObject {
     }
 
     func begin(editor: ProjectEditor, sharing: Bool, anchor: NSView? = nil) {
+        guard !MediaProcessing.isSuspended else { errorMessage = MediaProcessing.statusMessage; return }
         guard !isBusy else { return }
         shareAnchor = anchor
         guard EditorSaveRouting.save(editor: editor, window: window) else { errorMessage = editor.errorMessage; return }
@@ -137,7 +138,7 @@ struct VideoActionsMenu: NSViewRepresentable {
 
     func makeNSView(context: Context) -> VideoActionsMenuButton { VideoActionsMenuButton(frame: .zero) }
     func updateNSView(_ button: VideoActionsMenuButton, context: Context) {
-        button.configure(isEnabled: context.environment.isEnabled && !isUnavailable && !session.isBusy && editor != nil,
+        button.configure(isEnabled: !MediaProcessing.isSuspended && context.environment.isEnabled && !isUnavailable && !session.isBusy && editor != nil,
             name: editor?.displayName,
             save: { [weak button] in
                 guard let editor else { return }

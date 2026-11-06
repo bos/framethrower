@@ -126,6 +126,12 @@ struct ProjectEditorView: View {
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) },
             presentation: canvasPresentation, nativeSourceSize: playback.sourceSize)
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
+            .overlay {
+                if MediaProcessing.isSuspended {
+                    Text(MediaProcessing.statusMessage).font(.callout).foregroundStyle(.secondary)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay { if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) } }
             .overlay {
                 if playback.errorMessage != nil {

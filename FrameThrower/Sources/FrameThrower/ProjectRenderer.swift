@@ -73,6 +73,7 @@ enum ProjectRenderer {
     }
 
     static func makePreview(project: RecordingProject, directory: URL) async throws -> RenderedProject {
+        try MediaProcessing.requireEnabled()
         try project.validate()
         let screenAsset = AVURLAsset(url: directory.appendingPathComponent(project.screenFilename))
         guard let screenSource = try await screenAsset.loadTracks(withMediaType: .video).first else {
@@ -183,6 +184,7 @@ enum ProjectRenderer {
     /// Decode the current screen/camera source pair once for a frozen playhead.
     /// The cache belongs to this preparation, never to exports or other times.
     static func prepareLiveSources(_ rendered: RenderedProject, at time: CMTime) async throws -> LivePreviewSources {
+        try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
         guard time.seconds.isFinite, time >= .zero, time < rendered.asset.duration else {
             throw RenderError.invalidTrim
@@ -225,12 +227,14 @@ enum ProjectRenderer {
     /// reopened or decoded, and the original screen is exposed as PIP moves.
     static func renderLivePreview(_ sources: LivePreviewSources, applying state: EditState,
                                   maximumSize: CGSize = CGSize(width: 1920, height: 1080)) async throws -> CGImage {
-        try await sources.render(applying: state, maximumSize: maximumSize)
+        try MediaProcessing.requireEnabled()
+        return try await sources.render(applying: state, maximumSize: maximumSize)
     }
 
     /// A raw, oriented source frame for repositioning the nondestructive crop.
     /// `at` is in screen-source seconds, independent of the editable trim.
     static func cameraFrame(project: RecordingProject, directory: URL, at seconds: Double) async throws -> CGImage? {
+        try MediaProcessing.requireEnabled()
         try project.validate()
         guard let filename = project.cameraFilename, seconds.isFinite else { return nil }
         let asset = AVURLAsset(url: directory.appendingPathComponent(filename))
@@ -249,6 +253,7 @@ enum ProjectRenderer {
                        preset: VideoExportPreset = .fullResolution,
                        replaceExisting: Bool = false,
                        progress: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) async throws {
+        try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
         let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }.map {
             directory.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()

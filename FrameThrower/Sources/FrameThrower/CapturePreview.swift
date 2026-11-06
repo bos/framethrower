@@ -47,7 +47,7 @@ struct CapturePreview: View {
                    requested: previewRequested, locked: captureLocked, visible: previewVisible)
     }
 
-    private var currentImage: NSImage? { imageSource == source ? image : nil }
+    private var currentImage: NSImage? { !MediaProcessing.isSuspended && imageSource == source ? image : nil }
 
     var body: some View {
         ZStack {
@@ -98,7 +98,7 @@ struct CapturePreview: View {
                     Text(placeholder)
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.55))
-                    if model.hasScreenRecordingPermission && hasSource && !automaticallyUpdates && !isEnabled && !previewRequested {
+                    if !MediaProcessing.isSuspended && model.hasScreenRecordingPermission && hasSource && !automaticallyUpdates && !isEnabled && !previewRequested {
                         Button { previewRequested = true } label: {
                             Text("Show preview")
                                 .font(.system(size: 11, weight: .medium))
@@ -132,7 +132,7 @@ struct CapturePreview: View {
             .padding(12)
         }
         .overlay(alignment: .topTrailing) {
-            if !automaticallyUpdates && model.hasScreenRecordingPermission && hasSource && !captureLocked {
+            if !MediaProcessing.isSuspended && !automaticallyUpdates && model.hasScreenRecordingPermission && hasSource && !captureLocked {
                 Button {
                     previewRequested = true
                     refreshID += 1
@@ -157,6 +157,7 @@ struct CapturePreview: View {
     }
 
     private var placeholder: String {
+        if MediaProcessing.isSuspended { return MediaProcessing.statusMessage }
         if !model.hasScreenRecordingPermission { return "Allow screen recording to see a preview" }
         if !hasSource { return model.captureKind == .window ? "Choose a window" : "Choose a display" }
         if !automaticallyUpdates && !isEnabled && !previewRequested { return "Preview not loaded" }
@@ -167,6 +168,14 @@ struct CapturePreview: View {
 
     @MainActor
     private func refreshPreview() async {
+        guard !MediaProcessing.isSuspended else {
+            image = nil
+            imageSource = nil
+            imageDisplayFrame = nil
+            isLoading = false
+            sourcePreviews.clear()
+            return
+        }
         guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess(), let requestedSource = source else {
             image = nil
             imageSource = nil

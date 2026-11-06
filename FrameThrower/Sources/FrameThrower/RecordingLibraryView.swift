@@ -358,7 +358,7 @@ final class RecordingThumbnailCache {
     }
 
     func thumbnail(for url: URL) async -> CGImage? {
-        guard url.isFileURL, !Task.isCancelled else { return nil }
+        guard !MediaProcessing.isSuspended, url.isFileURL, !Task.isCancelled else { return nil }
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         let key = url.standardizedFileURL.path + ":" + String(describing: attributes?[.size]) + ":" + String(describing: attributes?[.modificationDate])
         if let result = cached[key] { touch(key); return result.image }

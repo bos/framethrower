@@ -54,6 +54,7 @@ final class CameraRecorder: ObservableObject {
     private var observers: [any NSObjectProtocol] = []
 
     init() {
+        guard !MediaProcessing.isSuspended else { return }
         refreshDevices()
         engine.reportError = { [weak self] message in
             Task { @MainActor [weak self] in
@@ -76,6 +77,7 @@ final class CameraRecorder: ObservableObject {
     }
 
     func refreshDevices() {
+        guard !MediaProcessing.isSuspended else { devices = []; return }
         devices = Self.discover().map { CameraDevice(id: $0.uniqueID, name: $0.localizedName) }
         if let selectedDeviceID, !devices.contains(where: { $0.id == selectedDeviceID }) {
             isReady = false
@@ -85,6 +87,12 @@ final class CameraRecorder: ObservableObject {
     }
 
     func selectDevice(_ id: String?) async {
+        guard !MediaProcessing.isSuspended else {
+            selectedDeviceID = nil
+            isReady = false
+            errorMessage = id == nil ? nil : MediaProcessing.statusMessage
+            return
+        }
         guard !isRecording else { return }
         selectionGeneration += 1
         let generation = selectionGeneration
@@ -122,6 +130,7 @@ final class CameraRecorder: ObservableObject {
     /// Returns the host-clock timestamp of the first frame written, not the time
     /// this method was called. Use it to align the independent screen track.
     func startRecording(to url: URL, quality: RecordingQuality = .compact) async throws -> Double {
+        try MediaProcessing.requireEnabled()
         guard selectedDeviceID != nil, isReady, !isPreparing else {
             throw CameraRecordingError.unavailable
         }
@@ -199,6 +208,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func configure(id: String?) async throws {
+        try MediaProcessing.requireEnabled()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
@@ -255,7 +265,8 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func startRecording(to url: URL, quality: RecordingQuality) async throws -> Double {
-        try await withCheckedThrowingContinuation { continuation in
+        try MediaProcessing.requireEnabled()
+        return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
                     continuation.resume(throwing: CameraRecordingError.alreadyRecording)
@@ -392,6 +403,7 @@ final class CameraTrackWriter: @unchecked Sendable {
     /// Returns true only when this sample was actually accepted by the encoder.
     @discardableResult
     func append(_ sample: CMSampleBuffer, hostTime: Double) throws -> Bool {
+        try MediaProcessing.requireEnabled()
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
         guard !isFinishing, hostTime.isFinite, timestamp.isNumeric,
               timestamp.seconds.isFinite, CMSampleBufferDataIsReady(sample) else {

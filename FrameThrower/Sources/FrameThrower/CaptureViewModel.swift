@@ -311,6 +311,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startSourceAutoRefresh() {
+        guard !MediaProcessing.isSuspended else { return }
         guard !isSourceRefreshConfigured else { return }
         isSourceRefreshConfigured = true
         isAppActive = NSApp.isActive
@@ -1001,6 +1002,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecording() async {
+        guard !MediaProcessing.isSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isAnyUploadActive, isCameraReadyForCapture else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
@@ -1230,6 +1232,7 @@ final class CaptureViewModel: ObservableObject {
 
     /// Both destinations use this exact snapshot, never the unedited screen file.
     private func recordingForSharing() async throws -> URL {
+        try MediaProcessing.requireEnabled()
         guard let editor = projectEditor else {
             guard let source = resolveRecordingURL() else { throw ProjectError.invalid("Record something first.") }
             return source
@@ -1250,6 +1253,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecordingAfterDelay(seconds: Int) async {
+        guard !MediaProcessing.isSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }

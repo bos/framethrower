@@ -31,6 +31,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var onCancelMoveEdit: () -> Void = {}
     var onDeselectEdit: () -> Void = {}
     var onCancelEdit: () -> Void = {}
+    var fitRequest: UUID?
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -51,6 +52,7 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onCancelMoveEdit = onCancelMoveEdit
         view.onDeselectEdit = onDeselectEdit
         view.onCancelEdit = onCancelEdit
+        view.fit(request: fitRequest)
     }
 }
 
@@ -112,6 +114,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var drag: Drag?
     private var scrubTime: Double?
     private var keyboardFocus = false
+    private var lastFitRequest: UUID?
     private var railWidth: CGFloat { max(1, bounds.width - 24) }
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
@@ -127,6 +130,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim. Purple diamonds below the track mark edits. Click to select an edit; drag to change its time. Click empty space below the track to leave the edit. Escape cancels unfinished edits and clears selection. Pinch to zoom the timeline; scroll with two fingers to navigate time.")
     }
     required init?(coder: NSCoder) { nil }
+
+    func fit(request: UUID?) {
+        guard let request, request != lastFitRequest else { return }
+        lastFitRequest = request
+        setViewport(start: 0, span: duration)
+    }
 
     func x(for time: Double) -> CGFloat {
         12 + CGFloat((min(max(time, 0), max(0, duration)) - visibleStart) / max(visibleDuration, .leastNonzeroMagnitude)) * railWidth

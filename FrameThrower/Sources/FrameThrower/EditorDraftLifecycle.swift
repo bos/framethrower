@@ -32,6 +32,10 @@ final class EditorDraftLifecycleView: NSView {
 
     func attach() {
         guard let window else { detach(); return }
+        // The toolbar already contains the editable recording title. Keep the
+        // actual NSWindow title for Window menus and restoration, not a second
+        // visible copy beside it.
+        window.titleVisibility = .hidden
         if attachedWindow === window, window.delegate === proxy { return }
         detach()
         let proxy = EditorDraftWindowDelegate(editor: editor, original: window.delegate)

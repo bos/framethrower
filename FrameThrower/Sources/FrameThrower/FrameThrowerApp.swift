@@ -14,6 +14,7 @@ struct FrameThrowerApp: App {
         .commands {
             ProjectEditingCommands()
             CommandGroup(after: .newItem) { OpenProjectMenu(model: model) }
+            EditorFileCommands()
         }
 
         WindowGroup("Edit recording", id: "editor", for: URL.self) { $url in
@@ -77,26 +78,6 @@ private final class EditorWindowSession: ObservableObject {
     }
 }
 
-private struct ProjectEditingCommands: Commands {
-    @FocusedObject private var editor: ProjectEditor?
-    @FocusedObject private var library: RecordingLibrary?
-
-    var body: some Commands {
-        CommandGroup(replacing: .undoRedo) {
-            if let editor { ProjectUndoMenu(editor: editor) }
-            else if let library {
-                Button(library.canUndoRemoval ? "Undo remove recording" : "Undo") { _ = library.restoreLastRemoved() }
-                    .keyboardShortcut("z", modifiers: .command).disabled(!library.canUndoRemoval)
-                Button("Redo") { }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(true)
-            }
-            else {
-                Button("Undo") { }.keyboardShortcut("z", modifiers: .command).disabled(true)
-                Button("Redo") { }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(true)
-            }
-        }
-    }
-}
-
 private struct OpenProjectMenu: View {
     @ObservedObject var model: CaptureViewModel
     @Environment(\.openWindow) private var openWindow
@@ -112,12 +93,3 @@ private struct OpenProjectMenu: View {
     }
 }
 
-private struct ProjectUndoMenu: View {
-    @ObservedObject var editor: ProjectEditor
-    var body: some View {
-        Button(editor.canUndo ? "Undo " + editor.undoName : "Undo") { editor.undo() }
-            .keyboardShortcut("z", modifiers: .command).disabled(!editor.canUndo)
-        Button(editor.canRedo ? "Redo " + editor.redoName : "Redo") { editor.redo() }
-            .keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!editor.canRedo)
-    }
-}

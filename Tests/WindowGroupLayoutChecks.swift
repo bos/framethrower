@@ -28,14 +28,19 @@ struct WindowGroupLayoutChecks: App {
     var body: some Scene {
         WindowGroup("WindowGroup layout regression") {
             Group {
-                if let editor = probe.editor { ProjectEditorView(editor: editor) }
+                if let editor = probe.editor { ProjectEditorView(editor: editor).focusedSceneObject(editor) }
                 else { ProgressView("Preparing synthetic recording…").frame(width: 940, height: 780) }
             }
+            .preferredColorScheme(probe.reviewColorScheme)
             .task { await probe.run() }
         }
         .defaultSize(width: 940, height: 780)
         .windowStyle(.titleBar)
         .windowResizability(.contentMinSize)
+        .commands {
+            EditorFileCommands()
+            ProjectEditingCommands()
+        }
     }
 }
 
@@ -43,11 +48,18 @@ struct WindowGroupLayoutChecks: App {
 private final class WindowGroupLayoutProbe: ObservableObject {
     enum ProbeError: Error { case failed(String) }
     @Published var editor: ProjectEditor?
+    @Published var reviewColorScheme: ColorScheme?
     private var started = false
 
     func run() async {
         guard !started else { return }
         started = true
+        // An Objective-C exception swallowed by AppKit must fail this check,
+        // rather than leave a detached native test process running indefinitely.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 90) {
+            FileHandle.standardError.write(Data("WINDOWGROUP LAYOUT FAILURE: exceeded 90-second runtime limit\n".utf8))
+            Darwin.exit(1)
+        }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -77,23 +89,43 @@ private final class WindowGroupLayoutProbe: ObservableObject {
                 throw ProbeError.failed("editor window for title synchronization")
             }
             let beforeRename = measure(window: window, host: host, canvas: canvas, timeline: timeline)
-            guard editor.rename(to: "Renamed recording " + String(repeating: "long name ", count: 12)) else {
-                throw ProbeError.failed("rename the recording")
+            try inspectToolbar(window: window, host: host, name: editor.displayName)
+            guard let frame = window.contentView?.superview,
+                  let title: RecordingTitleField = find(in: frame) else {
+                throw ProbeError.failed("recording name missing from the native window toolbar")
+            }
+            title.beginRenaming()
+            guard title.isRenaming, let titleEditor = title.currentEditor() as? NSTextView else {
+                throw ProbeError.failed("native toolbar name did not enter renaming")
+            }
+            let renamed = "Renamed recording " + String(repeating: "long name ", count: 12)
+            titleEditor.string = renamed
+            _ = title.control(title, textView: titleEditor, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+            guard editor.displayName == renamed.trimmingCharacters(in: .whitespaces) else {
+                throw ProbeError.failed("Return in the toolbar name did not rename the recording")
             }
             try await titleMatches(editor, window: window)
+            try await inspectNativeTextUndo(editor, window: window, title: title)
+            output("Native text Undo/Redo scope checks passed.")
             try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
                              baseline: beforeRename, context: "renamed recording", compareScrolls: false)
-            guard editor.undo(), editor.project.state == project.state else {
+            try performToolbarAction("Undo", window: window)
+            try await waitUntil("native toolbar Undo reverses renaming") { editor.project.title == project.title }
+            guard editor.project.state == project.state else {
                 throw ProbeError.failed("undo rename without changing video edits")
             }
             try await titleMatches(editor, window: window)
+            try inspectToolbar(window: window, host: host, name: editor.displayName)
+            try await inspectSaveCommands(editor, window: window, host: host, canvas: canvas)
+            output("Native Save command and chooser checks passed.")
             try await inspectCombinedEditing(editor, window: window, host: host, canvas: canvas, timeline: timeline)
+            await renderSyntheticWindow(window: window, host: host, timeline: timeline)
             guard try Data(contentsOf: directory.appendingPathComponent("screen.mp4")) == screenBytes,
                   try Data(contentsOf: directory.appendingPathComponent("camera.mp4")) == cameraBytes else {
                 throw ProbeError.failed("combined edits changed original media")
             }
             try? FileManager.default.removeItem(at: directory)
-            output("WindowGroup layout checks passed (real scene, stable Play/trim/scrub, shared names, combined drafts, diamond moves/X deletion, numeric duration, blank-lane deselection, Escape cancellation, and fixed transition geometry).")
+            output("WindowGroup layout checks passed (native toolbar/rename, stable Play/trim/scrub, combined drafts, diamond moves/X deletion, numeric duration, deselection/Escape, and Canvas aspect/gesture/Undo integration).")
             Darwin.exit(0)
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -110,6 +142,282 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    private func segmentLabels(_ control: NSSegmentedControl) -> [String] {
+        (0..<control.segmentCount).compactMap { control.label(forSegment: $0) }
+    }
+
+    private func findInspector(in host: NSView) -> NSSegmentedControl? {
+        findAll(NSSegmentedControl.self, in: host).first {
+            segmentLabels($0) == ["Zoom", "Pointer", "Camera", "Canvas"]
+        }
+    }
+
+    private func toolbarItems(in window: NSWindow) -> [NSToolbarItem] {
+        func flatten(_ item: NSToolbarItem) -> [NSToolbarItem] {
+            [item] + ((item as? NSToolbarItemGroup)?.subitems.flatMap(flatten) ?? [])
+        }
+        return window.toolbar?.items.flatMap(flatten) ?? []
+    }
+
+    private func inspectToolbar(window: NSWindow, host: NSView, name: String) throws {
+        guard let toolbar = window.toolbar else { throw ProbeError.failed("editor has no native window toolbar") }
+        let items = toolbarItems(in: window)
+        for label in ["Undo", "Redo"] {
+            guard items.contains(where: { $0.label == label || $0.paletteLabel == label }) else {
+                throw ProbeError.failed("native toolbar lacks the standard \(label) action")
+            }
+        }
+        guard toolbar.displayMode != .labelOnly else { throw ProbeError.failed("toolbar actions must use their standard icons") }
+        guard let frame = window.contentView?.superview else { throw ProbeError.failed("missing native window frame") }
+        guard let share: VideoActionsMenuButton = find(in: frame), !share.isDescendant(of: host),
+              share.imagePosition == .imageOnly && share.menu?.items.first?.image != nil &&
+              share.menu?.items.map(\.title) == ["Share", "Save Video…", "Share Video…"] else {
+            throw ProbeError.failed("the native toolbar must contain an icon-only Share menu with separate Save and Share actions")
+        }
+        let titles = findAll(RecordingTitleField.self, in: frame)
+        guard titles.count == 1, titles[0].stringValue == name, !titles[0].isDescendant(of: host),
+              findAll(RecordingTitleField.self, in: host).isEmpty else {
+            throw ProbeError.failed("recording name must appear once in the native toolbar, without a duplicate content header")
+        }
+        guard !(titles[0].cell is NSSearchFieldCell) else {
+            throw ProbeError.failed("the recording name must not become a search control in the toolbar")
+        }
+        let visibleTitles = findAll(NSTextField.self, in: frame).filter {
+            $0.stringValue == name && !$0.isHiddenOrHasHiddenAncestor && $0.bounds.width > 0 && $0.bounds.height > 0
+        }
+        guard visibleTitles.count == 1 else {
+            throw ProbeError.failed("the window presents the recording name twice: \(visibleTitles.map { String(describing: type(of: $0)) })")
+        }
+    }
+
+    private func performToolbarAction(_ label: String, window: NSWindow) throws {
+        guard let item = toolbarItems(in: window).first(where: { $0.label == label || $0.paletteLabel == label }) else {
+            throw ProbeError.failed("missing toolbar action \(label)")
+        }
+        if let action = item.action, NSApplication.shared.sendAction(action, to: item.target, from: item) { return }
+        guard let view = item.view else { throw ProbeError.failed("toolbar action \(label) has no native action or view") }
+        if let button: NSButton = find(in: view), let action = button.action,
+           button.sendAction(action, to: button.target) { return }
+        let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        window.sendEvent(mouse(.leftMouseDown, at: center, in: view, window: window))
+        window.sendEvent(mouse(.leftMouseUp, at: center, in: view, window: window))
+    }
+
+    private func command(_ title: String, prefix: Bool = false) -> (menu: NSMenu, index: Int, item: NSMenuItem)? {
+        func search(_ menu: NSMenu) -> (NSMenu, Int, NSMenuItem)? {
+            menu.update()
+            for (index, item) in menu.items.enumerated() {
+                if prefix ? item.title.hasPrefix(title) : item.title == title { return (menu, index, item) }
+                if let submenu = item.submenu, let result = search(submenu) { return result }
+            }
+            return nil
+        }
+        return NSApplication.shared.mainMenu.flatMap(search)
+    }
+
+    private func performCommand(_ title: String, prefix: Bool = false) throws {
+        guard let entry = command(title, prefix: prefix), entry.item.isEnabled else {
+            throw ProbeError.failed("native menu command '\(title)' is missing or disabled")
+        }
+        entry.menu.performActionForItem(at: entry.index)
+    }
+
+    private func preserveNameForToolbarClick(_ label: String, title: RecordingTitleField, window: NSWindow) throws {
+        guard let item = toolbarItems(in: window).first(where: { $0.label == label || $0.paletteLabel == label }),
+              let view = item.view, let marker: EditorTextUndoTargetView = find(in: view),
+              marker.window === window, marker.bounds.width > 0 && marker.bounds.height > 0 else {
+            throw ProbeError.failed("the actual \(label) toolbar control lacks a native text-undo target")
+        }
+        let point = CGPoint(x: marker.bounds.midX, y: marker.bounds.midY)
+        title.cancelForOutsideClick(mouse(.leftMouseDown, at: point, in: marker, window: window))
+        guard title.isRenaming, window.firstResponder === title.currentEditor() else {
+            throw ProbeError.failed("the outside-click monitor cancelled name editing before toolbar \(label)")
+        }
+    }
+
+    private func inspectNativeTextUndo(_ editor: ProjectEditor, window: NSWindow, title: RecordingTitleField) async throws {
+        window.makeKeyAndOrderFront(nil)
+        let before = editor.project
+        title.beginRenaming()
+        guard let text = title.currentEditor() as? NSTextView, text.isFieldEditor, text.allowsUndo else {
+            throw ProbeError.failed("toolbar name lacks an undo-enabled native field editor")
+        }
+        let oldName = text.string
+        text.insertText("Native menu typing draft", replacementRange: NSRange(location: NSNotFound, length: 0))
+        text.breakUndoCoalescing()
+        let menuClick = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
+            eventNumber: 1, clickCount: 1, pressure: 1)!
+        guard menuClick.window == nil else { throw ProbeError.failed("menu-tracking fixture unexpectedly has a window") }
+        title.cancelForOutsideClick(menuClick)
+        guard title.isRenaming else { throw ProbeError.failed("menu tracking must keep the native name editor active") }
+        let activeMenu = NSApplication.shared.keyWindow === window
+        if !activeMenu { output("Native menu dispatch unavailable without a key window; testing associated-window toolbar routing.") }
+        try await Task.sleep(for: .milliseconds(50))
+        if activeMenu {
+            try await waitUntil("native Undo command becomes available for name typing") {
+                command("Undo", prefix: true)?.item.isEnabled == true
+            }
+            try performCommand("Undo", prefix: true)
+        } else {
+            try preserveNameForToolbarClick("Undo", title: title, window: window)
+            try performToolbarAction("Undo", window: window)
+        }
+        try await waitUntil("native menu Undo changes letters without undoing recording edits") {
+            text.string == oldName && title.isRenaming && editor.project == before
+        }
+        guard text.undoManager?.canRedo == true && EditorUndoRouting.canRedo(editor: editor, window: window) else {
+            throw ProbeError.failed("native name Undo did not create text Redo history")
+        }
+        if activeMenu { try performCommand("Redo", prefix: true) }
+        else {
+            try preserveNameForToolbarClick("Redo", title: title, window: window)
+            try performToolbarAction("Redo", window: window)
+        }
+        try await waitUntil("Redo control must restore draft letters when the associated native manager can redo") {
+            text.string == "Native menu typing draft" && title.isRenaming && editor.project == before
+        }
+        text.undoManager?.removeAllActions()
+        NotificationCenter.default.post(name: NSControl.textDidChangeNotification, object: title)
+        try await Task.sleep(for: .milliseconds(50))
+        if activeMenu {
+            try await waitUntil("empty text undo stack must not fall through to recording history") {
+                command("Undo", prefix: true)?.item.isEnabled == false && editor.project == before
+            }
+        } else {
+            try performToolbarAction("Undo", window: window)
+            // Dispatching to a disabled toolbar item can resign a field in an
+            // inactive test window. That may expose recording Undo afterward,
+            // but the click itself must never mutate the recording history.
+            guard editor.project == before,
+                  !title.isRenaming || !EditorUndoRouting.canUndo(editor: editor, window: window) else {
+                throw ProbeError.failed("an empty native text stack fell through to recording history")
+            }
+        }
+        if title.isRenaming { title.cancelOperation(nil) }
+        try await waitUntil("cancel typing restores recording command routing") {
+            !title.isRenaming && EditorUndoRouting.canUndo(editor: editor, window: window)
+        }
+    }
+
+    private func inspectSaveCommands(_ editor: ProjectEditor, window: NSWindow, host: NSView, canvas: EditorCanvasView) async throws {
+        window.makeKeyAndOrderFront(nil)
+        guard let timeline: RecordingTimelineView = find(in: host) else { throw ProbeError.failed("missing timeline for Save boundary") }
+        let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+        let shortcuts: [(String, String, NSEvent.ModifierFlags)] = [
+            ("Save Recording", "s", .command), ("Save Video…", "e", .command),
+            ("Share Video…", "e", [.command, .shift])
+        ]
+        for (title, key, modifiers) in shortcuts {
+            guard let entry = command(title), entry.item.keyEquivalent == key,
+                  entry.item.keyEquivalentModifierMask.intersection([.command, .shift, .option, .control]) == modifiers else {
+                throw ProbeError.failed("native File command '\(title)' lacks its expected keyboard shortcut")
+            }
+        }
+        let before = editor.project
+        guard let frame = window.contentView?.superview, let title: RecordingTitleField = find(in: frame) else {
+            throw ProbeError.failed("missing native name field for Save validation")
+        }
+        title.beginRenaming()
+        guard let text = title.currentEditor() as? NSTextView else { throw ProbeError.failed("native name field editor missing before Save") }
+        text.string = "   "
+        var chooserCalls = 0, renderCalls = 0
+        let invalidSession = VideoExportSession(requiresProgressPresentation: false,
+            chooser: { _, _, _ in chooserCalls += 1; return nil },
+            renderer: { _, _, _, _, _, _ in renderCalls += 1 })
+        invalidSession.window = window
+        invalidSession.begin(editor: editor, sharing: false)
+        guard !invalidSession.isBusy && invalidSession.errorMessage != nil && title.isRenaming &&
+              chooserCalls == 0 && renderCalls == 0 && editor.project == before else {
+            throw ProbeError.failed("an invalid active name must block export before destination selection or rendering")
+        }
+        title.cancelOperation(nil)
+        try await Task.sleep(for: .milliseconds(50))
+        var pending = before.state
+        pending.zoomKeyframes = [ZoomKeyframe(time: 2, scale: 1.8)]
+        guard editor.updateDraft(pending, at: 2) else { throw ProbeError.failed("prepare pending edit for native Save") }
+        let activeMenu = NSApplication.shared.keyWindow === window
+        if activeMenu { try performCommand("Save Recording") }
+        else if !EditorSaveRouting.save(editor: editor, window: window) { throw ProbeError.failed("associated-window Save failed") }
+        try await waitUntil("native Save Recording finalizes one pending edit") {
+            editor.draftState == nil && editor.project.state == pending &&
+                editor.project.undoHistory.count == before.undoHistory.count + 1 && canvas.allowsZoomEditing
+        }
+        if activeMenu { try performCommand("Undo", prefix: true) }
+        else { try performToolbarAction("Undo", window: window) }
+        try await waitUntil("native Undo reverses the saved pending edit") {
+            editor.project.state == before.state && canvas.allowsZoomEditing
+        }
+        let beforePanel = editor.project
+        let profile = UserDefaults.standard.string(forKey: "export.preset")
+        guard let share: VideoActionsMenuButton = find(in: frame),
+              let menu = share.menu, let saveIndex = menu.items.firstIndex(where: { $0.title == "Save Video…" }) else {
+            throw ProbeError.failed("missing native Save Video action")
+        }
+        if activeMenu { try performCommand("Save Video…") }
+        else { menu.performActionForItem(at: saveIndex) }
+        try await waitUntil("Save Video opens a native sheet on this editor window") {
+            window.attachedSheet is NSSavePanel
+        }
+        guard let panel = window.attachedSheet as? NSSavePanel,
+              let accessory = panel.accessoryView,
+              let size: NSPopUpButton = find(in: accessory),
+              size.itemTitles == VideoExportPreset.allCases.map(\.title),
+              panel.nameFieldStringValue == editor.displayName + ".mp4" || panel.nameFieldStringValue == editor.displayName else {
+            throw ProbeError.failed("native Save panel must use the recording name and offer all video size profiles")
+        }
+        try await waitUntil("a visible Save chooser must lock re-entry from toolbar and File commands") {
+            !share.isEnabled && (!activeMenu || command("Save Video…")?.item.isEnabled == false)
+        }
+        size.selectItem(at: VideoExportPreset.allCases.count - 1)
+        panel.cancel(nil)
+        try await waitUntil("cancelling native Save restores toolbar actions") {
+            window.attachedSheet == nil && share.isEnabled
+        }
+        guard editor.project == beforePanel && UserDefaults.standard.string(forKey: "export.preset") == profile else {
+            throw ProbeError.failed("cancelled Save must preserve project history and the previously chosen output profile")
+        }
+        try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+            baseline: baseline, context: "native Save chooser cancellation", compareScrolls: false)
+    }
+
+    /// Snapshot only this test's own synthetic window. This never reads the
+    /// desktop, capture-source previews, user recordings, or other app windows.
+    private func renderSyntheticWindow(window: NSWindow, host: NSView, timeline: RecordingTimelineView) async {
+        guard let directoryPath = ProcessInfo.processInfo.environment["FRAMETHROWER_REVIEW_SNAPSHOTS"] else { return }
+        let directory = URL(fileURLWithPath: directoryPath, isDirectory: true)
+        let appearance = window.appearance
+        let colorScheme = reviewColorScheme
+        let contentSize = host.frame.size
+        defer { reviewColorScheme = colorScheme; window.appearance = appearance; window.setContentSize(contentSize) }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if let marker = timeline.edits.first {
+                let point = CGPoint(x: timeline.x(for: marker.time), y: 47)
+                timeline.mouseDown(with: mouse(.leftMouseDown, at: point, in: timeline, window: window))
+                timeline.mouseUp(with: mouse(.leftMouseUp, at: point, in: timeline, window: window))
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            for (name, mode) in [("light", NSAppearance.Name.aqua), ("dark", NSAppearance.Name.darkAqua)] {
+                reviewColorScheme = name == "light" ? .light : .dark
+                window.appearance = NSAppearance(named: mode)
+                for width in [820.0, 940.0] {
+                    window.setContentSize(CGSize(width: width, height: 780))
+                    try await Task.sleep(for: .milliseconds(150))
+                    guard let frame = window.contentView?.superview else { continue }
+                    frame.layoutSubtreeIfNeeded()
+                    guard let bitmap = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { continue }
+                    frame.cacheDisplay(in: frame.bounds, to: bitmap)
+                    if let png = bitmap.representation(using: .png, properties: [:]) {
+                        let url = directory.appendingPathComponent("editor-\(name)-\(Int(width)).png")
+                        try png.write(to: url)
+                        output("Synthetic native window render: \(url.path)")
+                    }
+                }
+            }
+        } catch { output("Synthetic native window renders unavailable: \(error)") }
     }
 
     private func inspectWindow() async throws {
@@ -134,17 +442,19 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             try await Task.sleep(for: .milliseconds(150))
             let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
             output("WindowGroup baseline at width \(width): \(baseline)")
-            guard let inspector = findAll(NSSegmentedControl.self, in: host).first(where: { $0.segmentCount == 3 }),
+            guard let inspector = findInspector(in: host),
                   let action = inspector.action else {
                 throw ProbeError.failed("missing native Zoom/Pointer/Camera inspector control")
             }
-            for segment in [1, 2, 0] {
+            for segment in [1, 2, 3, 0] {
                 inspector.selectedSegment = segment
                 guard inspector.sendAction(action, to: inspector.target) else {
                     throw ProbeError.failed("inspector segment action was not delivered")
                 }
                 try await Task.sleep(for: .milliseconds(80))
-                let cameraShapeVisible = findAll(NSSegmentedControl.self, in: host).contains { $0.segmentCount == 4 }
+                let cameraShapeVisible = findAll(NSSegmentedControl.self, in: host).contains {
+                    segmentLabels($0).contains("Original") && segmentLabels($0).contains("Circle")
+                }
                 guard cameraShapeVisible == (segment == 2) else {
                     throw ProbeError.failed("inspector selection did not change the production controls")
                 }
@@ -263,11 +573,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             editor.draftState == nil && editor.project.state == draft &&
                 editor.project.undoHistory.count == before.undoHistory.count + 1 && timeline.selectedEditID == nil
         }
-        guard let title: RecordingTitleField = find(in: host) else { throw ProbeError.failed("native title anchor for Undo") }
-        let titleRect = host.convert(title.bounds, from: title)
-        let undoCenter = CGPoint(x: titleRect.maxX + 32, y: titleRect.midY)
-        window.sendEvent(mouse(.leftMouseDown, at: undoCenter, in: host, window: window))
-        window.sendEvent(mouse(.leftMouseUp, at: undoCenter, in: host, window: window))
+        try performToolbarAction("Undo", window: window)
         try await waitUntil("Undo restores both zoom and camera together") {
             editor.project.state == initial && editor.project.undoHistory.count == before.undoHistory.count &&
                 canvas.allowsZoomEditing
@@ -311,6 +617,73 @@ private final class WindowGroupLayoutProbe: ObservableObject {
         }
         try await waitUntil("undo deletion rebuilds editor") { canvas.allowsZoomEditing }
         try await inspectSelectionLifecycle(editor, window: window, host: host, canvas: canvas, timeline: timeline)
+        try await inspectCanvasPresentation(editor, window: window, host: host, canvas: canvas, timeline: timeline)
+    }
+
+    private func inspectCanvasPresentation(_ editor: ProjectEditor, window: NSWindow, host: NSView,
+                                           canvas: EditorCanvasView, timeline: RecordingTimelineView) async throws {
+        guard let inspector = findInspector(in: host), let action = inspector.action else {
+            throw ProbeError.failed("missing Canvas inspector tab")
+        }
+        inspector.selectedSegment = 3
+        guard inspector.sendAction(action, to: inspector.target) else { throw ProbeError.failed("Canvas tab action failed") }
+        try await Task.sleep(for: .milliseconds(50))
+        guard let aspect = findAll(NSSegmentedControl.self, in: host).first(where: {
+            segmentLabels($0) == ["Source", "16:9", "9:16", "Square"]
+        }), let aspectAction = aspect.action else {
+            throw ProbeError.failed("Canvas inspector did not expose its native aspect selector")
+        }
+        let before = editor.project
+        let playhead = timeline.playhead
+        let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+        aspect.selectedSegment = 2
+        guard aspect.sendAction(aspectAction, to: aspect.target) else { throw ProbeError.failed("portrait aspect action failed") }
+        try await waitUntil("Canvas aspect selection updates the rendered output") {
+            editor.project.state.presentation.aspect == .portrait && canvas.allowsZoomEditing &&
+                abs(canvas.canvasRect.width / canvas.canvasRect.height - 9.0 / 16) < 0.000001
+        }
+        guard editor.draftState == nil && editor.project.undoHistory.count == before.undoHistory.count + 1 &&
+              editor.project.state.zoomKeyframes == before.state.zoomKeyframes &&
+              editor.project.state.pipKeyframes == before.state.pipKeyframes &&
+              abs(canvas.contentRect.width / canvas.contentRect.height - 16.0 / 9) < 0.000001 else {
+            throw ProbeError.failed("Canvas aspect must be one whole-recording edit, preserving source and timed geometry")
+        }
+        var portraitLayout = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+        // Only the intentional output aspect changes; the window, canvas view,
+        // timeline and inspector keep their existing native allocations.
+        portraitLayout.player = baseline.player
+        try assertStable(portraitLayout, baseline: baseline, context: "portrait output preserves editor layout", compareScrolls: false)
+        let portrait = editor.project
+        let touch = IntegratedTrackpadEvent()
+        touch.position = canvas.convert(CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.midY), to: nil)
+        for phase in [NSEvent.Phase.began, .changed, .ended] {
+            touch.eventPhase = phase
+            touch.amount = phase == .ended ? 0 : 0.05
+            canvas.magnify(with: touch)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        guard editor.draftState != nil && editor.project == portrait && editor.editingState.presentation == portrait.state.presentation else {
+            throw ProbeError.failed("pinching the fitted recording must revise framing without changing or persisting the output canvas")
+        }
+        canvas.keyDown(with: NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!)
+        try await waitUntil("Escape cancels framing without reverting the output canvas") {
+            editor.draftState == nil && editor.project == portrait && canvas.allowsZoomEditing
+        }
+        try performToolbarAction("Undo", window: window)
+        try await waitUntil("toolbar Undo restores source canvas without seeking") {
+            editor.project.state == before.state && editor.historyNavigationTime == nil &&
+                abs(timeline.playhead - playhead) < 0.000001 && canvas.allowsZoomEditing
+        }
+        try performToolbarAction("Redo", window: window)
+        try await waitUntil("toolbar Redo restores portrait canvas without seeking") {
+            editor.project.state == portrait.state && editor.historyNavigationTime == nil &&
+                abs(timeline.playhead - playhead) < 0.000001 && canvas.allowsZoomEditing
+        }
+        inspector.selectedSegment = 3
+        guard inspector.sendAction(action, to: inspector.target) else { throw ProbeError.failed("restore Canvas inspector for review") }
+        try await Task.sleep(for: .milliseconds(30))
     }
 
     private func inspectSelectionLifecycle(_ editor: ProjectEditor, window: NSWindow, host: NSView,
@@ -327,7 +700,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             throw ProbeError.failed("prepare smooth selection fixture")
         }
         try await waitUntil("selection fixture becomes ready") { canvas.allowsZoomEditing }
-        guard let inspector = findAll(NSSegmentedControl.self, in: host).first(where: { $0.segmentCount == 3 }),
+        guard let inspector = findInspector(in: host),
               let action = inspector.action else {
             throw ProbeError.failed("missing native inspector for smooth selection")
         }

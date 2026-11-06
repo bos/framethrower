@@ -173,6 +173,19 @@ struct RecordingTitleChecks {
         try require(editingChanges.count % 2 == 0 && editingChanges.enumerated().allSatisfy { $0.element == ($0.offset % 2 == 0) },
                     "every rename begin has one matching end callback")
 
+        field.beginRenaming()
+        text = try nativeEditor(field)
+        text.string = "Saved through Command-S"
+        try require(EditorSaveRouting.save(editor: editor, window: window) &&
+                    !field.isRenaming && editor.displayName == "Saved through Command-S",
+                    "Save commits an active native recording name before persisting the project")
+        await settle()
+        try require(try ProjectEditor.open(url: editor.url).displayName == "Saved through Command-S",
+                    "Save persists the active name to disk")
+        try require(editor.undo() && editor.displayName == "Dinner demo",
+                    "saving an active name creates one reversible rename")
+        field.setTitle(editor.displayName)
+
         field.isEnabled = false
         field.beginRenaming()
         field.mouseDown(with: click(count: 1, field: field, window: window))

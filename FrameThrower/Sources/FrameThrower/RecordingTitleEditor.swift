@@ -1,6 +1,40 @@
 import AppKit
 import SwiftUI
 
+/// Undo controls keep the active text editor alive until their command runs.
+/// Each marker follows its real native view rather than a toolbar label or a
+/// guessed coordinate, and the registry never retains its owning window.
+struct EditorTextUndoTarget: NSViewRepresentable {
+    func makeNSView(context: Context) -> EditorTextUndoTargetView { EditorTextUndoTargetView() }
+    func updateNSView(_ view: EditorTextUndoTargetView, context: Context) { }
+    static func dismantleNSView(_ view: EditorTextUndoTargetView, coordinator: ()) { EditorTextUndoTargets.remove(view) }
+}
+
+@MainActor
+final class EditorTextUndoTargetView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setAccessibilityElement(false)
+        EditorTextUndoTargets.add(self)
+    }
+    required init?(coder: NSCoder) { nil }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+@MainActor
+private enum EditorTextUndoTargets {
+    private static let views = NSHashTable<EditorTextUndoTargetView>.weakObjects()
+    static func add(_ view: EditorTextUndoTargetView) { views.add(view) }
+    static func remove(_ view: EditorTextUndoTargetView) { views.remove(view) }
+    static func contains(_ event: NSEvent) -> Bool {
+        guard let window = event.window else { return false }
+        return views.allObjects.contains { view in
+            view.window === window && !view.isHiddenOrHasHiddenAncestor &&
+                view.bounds.contains(view.convert(event.locationInWindow, from: nil))
+        }
+    }
+}
+
 /// A single click renames; an initial double click opens the recording. Once
 /// editing, normal native text selection and keyboard behavior remain intact.
 struct RecordingTitleEditor: NSViewRepresentable {
@@ -225,6 +259,14 @@ final class RecordingTitleField: NSTextField, NSTextFieldDelegate {
     /// which never become first responder and therefore do not end text editing.
     func cancelForOutsideClick(_ event: NSEvent) {
         guard isRenaming || pendingRename != nil else { return }
+        // Menu-bar tracking has no app window. Preserve active name editing
+        // so Edit commands and Save can act on that text. Switching apps or
+        // windows still cancels through the existing deactivation observers.
+        if event.window == nil {
+            if !isRenaming { cancelRenaming() }
+            return
+        }
+        if isRenaming, EditorTextUndoTargets.contains(event) { return }
         if event.window === window, bounds.contains(convert(event.locationInWindow, from: nil)) { return }
         cancelRenaming()
     }

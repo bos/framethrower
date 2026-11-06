@@ -1,15 +1,19 @@
 import AppKit
+import Combine
 import SwiftUI
 
 private enum EditorInspector: String, CaseIterable {
-    case zoom = "Zoom", pointer = "Pointer", camera = "Camera"
+    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas"
 }
 
 struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
     @StateObject private var playback = EditorPlayback()
+    @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
     @State private var selectedEditID: UUID?
+    @State private var presentationDraft: CanvasPresentation?
+    @State private var timelineFitRequest: UUID?
     @State private var movingEditState: EditState?
     @State private var zoomEaseIn: Double?
     @State private var zoomEaseOut: Double?
@@ -24,11 +28,11 @@ struct ProjectEditorView: View {
     @State private var framingTime = 0.0
     @State private var cameraFrame: CGImage?
     @State private var cameraFrameError: String?
-    @State private var exportError: String?
-    @State private var isExporting = false
+    @StateObject private var exportSession = VideoExportSession()
     @State private var playAfterRebuild = false
 
     private var state: EditState { editor.editingState }
+    private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
     private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil) }
     private var selectedEdit: TimedEdit? { edits.first { $0.id == selectedEditID } }
     private var editTime: Double { selectedEdit?.time ?? editor.draftTime ?? playback.editingTime }
@@ -41,20 +45,12 @@ struct ProjectEditorView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            HStack {
-                RecordingTitleEditor(editor: editor, font: .systemFont(ofSize: 14, weight: .semibold))
-                    .frame(minWidth: 140, idealWidth: 240, maxWidth: 300, minHeight: 24, maxHeight: 24)
-                ProjectUndoButtons(editor: editor)
-                Spacer()
-                Button("Export…") { Task { await export() } }.disabled(isExporting || playback.isLoading)
-            }.frame(height: 24)
             player
             timeline
             inspector
-            if let message = editor.errorMessage ?? playback.errorMessage ?? exportError {
+            if let message = editor.errorMessage ?? playback.errorMessage {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
-            if isExporting { ProgressView("Exporting…") }
         }
         .padding(24)
         .frame(minWidth: 820, idealWidth: 940, maxWidth: .infinity,
@@ -62,6 +58,7 @@ struct ProjectEditorView: View {
         .background(.background)
         .background(EditorDraftLifecycle(editor: editor).frame(width: 0, height: 0))
         .navigationTitle(editor.displayName)
+        .focusedSceneObject(editor)
         .task {
             await playback.rebuild(editor: editor)
             if let time = editor.draftTime, let draft = editor.draftState {
@@ -87,12 +84,31 @@ struct ProjectEditorView: View {
             playback.pause()
             playback.seek(time)
         }
-        .onDisappear { _ = editor.finishDraft(); playback.close() }
+        .onDisappear { exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             _ = editor.finishDraft()
         }
         .onExitCommand { if movingEditState != nil { cancelMove() } else { cancelDraft() } }
-        .disabled(isExporting)
+        .toolbarRole(.editor)
+        .toolbar(removing: .title)
+        .toolbar {
+            ToolbarItemGroup(placement: .navigation) { ProjectUndoButtons(editor: editor) }
+            ToolbarItem(placement: .principal) {
+                RecordingTitleEditor(editor: editor, renameRequest: editorRenameRequest, font: .systemFont(ofSize: 13, weight: .semibold))
+                    .frame(minWidth: 140, idealWidth: 240, maxWidth: 320, minHeight: 24, maxHeight: 24)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                VideoActionsMenu(editor: editor, session: exportSession,
+                    isUnavailable: playback.isLoading, onSelect: { playback.pause() })
+                    .frame(width: 28, height: 24)
+            }
+        }
+        .modifier(VideoExportPresentation(session: exportSession))
+        .focusedSceneValue(\.editorFileActions, EditorFileActions(
+            saveProject: { EditorSaveRouting.save(editor: editor, window: exportSession.window) },
+            saveVideo: { beginExport(sharing: false) }, shareVideo: { beginExport(sharing: true) },
+            rename: { editorRenameRequest = UUID() }, fitTimeline: { timelineFitRequest = UUID() },
+            isBusy: exportSession.isBusy || playback.isLoading))
     }
 
     private var player: some View {
@@ -107,7 +123,8 @@ struct ProjectEditorView: View {
             zoom: zoom, allowsZoomEditing: !playback.isLoading && !playback.isScrubbing,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
-            onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) })
+            onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) },
+            presentation: canvasPresentation, nativeSourceSize: playback.sourceSize)
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay { if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) } }
             .overlay {
@@ -148,12 +165,13 @@ struct ProjectEditorView: View {
                     onMoveEdit: { id, time, final in moveEdit(id, to: time, final: final) },
                     onCancelMoveEdit: { cancelMove() },
                     onDeselectEdit: { deselectEdit() },
-                    onCancelEdit: { cancelDraft() })
+                    onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest)
                     .frame(height: 72)
                     .contextMenu {
                         Button("Hold current framing") { holdCurrentFraming() }
                             .help("Keep this view still until the playhead before a later smooth movement.")
                         Divider()
+                        Button("Fit Timeline") { timelineFitRequest = UUID() }
                         Button("Reset trim") { setTrim(0, editor.project.duration) }
                             .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
                     }
@@ -183,12 +201,27 @@ struct ProjectEditorView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 300, height: 24)
+            .frame(width: 360, height: 24)
             Group {
                 switch selectedInspector {
                 case .zoom: zoomControls
                 case .pointer: pointerControls
                 case .camera: cameraControls
+                case .canvas:
+                    PresentationControls(presentation: canvasPresentation,
+                        onBegin: {
+                            playback.pause()
+                            if editor.finishDraft() { selectedEditID = nil }
+                        }, onPreview: { value in
+                            guard editor.draftState == nil else { return }
+                            presentationDraft = value
+                            var next = state; next.presentation = value
+                            playback.preview(next)
+                        }, onCommit: { value, name in
+                            guard editor.finishDraft() else { return }
+                            var next = editor.project.state; next.presentation = value
+                            if editor.commit(next, name: name) { presentationDraft = nil }
+                        })
                 }
             }
             // Each inspector keeps the same allocation. Controls cannot take
@@ -356,6 +389,7 @@ struct ProjectEditorView: View {
     }
 
     private func cancelDraft() {
+        presentationDraft = nil
         _ = editor.cancelDraft()
         selectedEditID = nil
         playback.cancelPreview()
@@ -400,7 +434,7 @@ struct ProjectEditorView: View {
             }.frame(width: 300, height: 24)
         }
         .disabled(editor.project.cursorFilename == nil)
-        .help(editor.project.cursorFilename == nil ? "Record a new clip to edit its pointer." : "Size and smoothing affect the recorded pointer. Click highlights mark mouse presses.")
+        .help(editor.project.cursorFilename == nil ? "Record a new clip to edit its pointer." : "Pointer settings apply throughout the recording. Click highlights mark mouse presses.")
     }
 
     private func suggestZooms(_ preset: CursorZoomSuggestions.Preset) {
@@ -481,7 +515,8 @@ struct ProjectEditorView: View {
                 Picker("Shape", selection: Binding(get: { placement.shape }, set: { shape in
                     var next = placement
                     if shape == .rectangle {
-                        let frame = placement.frame(in: playback.screenSize, cameraAspect: playback.cameraAspect)
+                        let output = PresentationGeometry(sourceSize: playback.sourceSize, presentation: canvasPresentation).outputSize
+                        let frame = placement.frame(in: output, cameraAspect: playback.cameraAspect)
                         next.aspectRatio = min(5, max(0.2, frame.width / frame.height))
                     }
                     next.shape = shape
@@ -666,31 +701,36 @@ struct ProjectEditorView: View {
         }
     }
 
-    private func export() async {
+    private func beginExport(sharing: Bool) {
         playback.pause()
-        guard editor.finishDraft() else { return }
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = "Explanation.mp4"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        isExporting = true
-        exportError = nil
-        defer { isExporting = false }
-        do {
-            guard editor.save() else { return }
-            try await ProjectRenderer.export(project: editor.project,
-                directory: editor.url.deletingLastPathComponent(), to: url)
-        } catch { exportError = error.localizedDescription }
+        exportSession.begin(editor: editor, sharing: sharing)
     }
+
 }
 
 struct ProjectUndoButtons: View {
     @ObservedObject var editor: ProjectEditor
+    @State private var textRevision = 0
+    private var window: NSWindow? {
+        NSApplication.shared.windows.first { ($0.delegate as? EditorDraftWindowDelegate)?.editor === editor }
+    }
     var body: some View {
+        let _ = textRevision
         Group {
-            Button("Undo") { editor.undo() }.disabled(!editor.canUndo)
-            Button("Redo") { editor.redo() }.disabled(!editor.canRedo)
+            Button { EditorUndoRouting.undo(editor: editor, window: window) } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
+                .labelStyle(.iconOnly).disabled(!EditorUndoRouting.canUndo(editor: editor, window: window))
+                .help("Undo \(EditorUndoRouting.undoName(editor: editor, window: window)) (⌘Z)")
+                .background(EditorTextUndoTarget())
+            Button { EditorUndoRouting.redo(editor: editor, window: window) } label: { Label("Redo", systemImage: "arrow.uturn.forward") }
+                .labelStyle(.iconOnly).disabled(!EditorUndoRouting.canRedo(editor: editor, window: window))
+                .help("Redo \(EditorUndoRouting.redoName(editor: editor, window: window)) (⇧⌘Z)")
+                .background(EditorTextUndoTarget())
         }
+        .onReceive(Publishers.MergeMany([
+            NSControl.textDidBeginEditingNotification, NSControl.textDidChangeNotification,
+            NSControl.textDidEndEditingNotification, Notification.Name.NSUndoManagerDidUndoChange,
+            Notification.Name.NSUndoManagerDidRedoChange, Notification.Name.NSUndoManagerDidCloseUndoGroup
+        ].map { NotificationCenter.default.publisher(for: $0) })) { _ in textRevision &+= 1 }
     }
 }
 
@@ -852,4 +892,5 @@ struct CommitSlider: View {
         .onChange(of: value) { _, next in if !editing { draft = min(max(next, range.lowerBound), range.upperBound) } }
     }
 }
+
 

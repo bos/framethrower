@@ -404,6 +404,23 @@ their descriptions record what they verify when media processing is enabled.
 
 Automated checks run without camera hardware or connected accounts:
 
+- `Tests/check-director-conversation.sh`: ordered dialogue and real tool results,
+  manual edits, exact Undo/Redo events, persisted questions, fresh selections,
+  frozen timing anchors, failed-save preservation, and compact history snapshots.
+- `Tests/check-director-diagnostics.sh`: correlated private traces, bounded
+  rotation, valid JSON truncation, permissions, and nonfatal write failures.
+- `Tests/check-director-voice-integration.sh`: generated in-memory speech through
+  the native recognizer and text model, actual framing edits, conflict answers,
+  exact timing, and atomic Undo/Redo. Requires installed local assets; never
+  opens a microphone, plays sound, or constructs a video asset.
+- `Tests/check-editor-inspector-layout.sh`: all inspector tabs, selected and
+  deselected edits, fixed preview/timeline geometry, and canceled slider rollback
+  with metadata-only previews. UI fixtures use in-memory Director sessions.
+- `Tests/check-recording-audio.sh`: gain/fade curves, trim behavior, legacy
+  migration, validation, persistence, Undo/Redo, and unchanged original bytes.
+- `Tests/check-pointer-recovery.sh`: same-size source mutations, atomic path
+  replacement, exact stable copies, staging cleanup, and no-overwrite publication
+  using temporary pointer JSON while movie recovery remains suspended.
 - `Tests/check-recording-masters.sh`: synthetic ProRes/PCM tracks, first-frame
   timing, separate audio, bounded backpressure, interrupted capture, and final frames.
 - `Tests/check-project-recovery.sh`: journal restoration, coalescing, stale/corrupt

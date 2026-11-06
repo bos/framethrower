@@ -119,7 +119,10 @@ The playhead, trim handles, and edit diamonds have separate hit targets. Click a
 diamond to select its edit and inspect that frame; drag it to change its time.
 The matching item below gets an outline and scrolls into view. Its **×** removes
 the entire edit, including screen and camera changes at that time. Neighboring
-edits cannot be overwritten by dragging.
+edits cannot be overwritten by dragging. Click empty space in the edit lane to
+save the pending adjustments and deselect without moving the playhead. Escape
+cancels pending adjustments and deselects. Mouse clicks leave no full-timeline
+focus border; keyboard navigation uses a small cue beneath the playhead.
 
 The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**
 controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
@@ -131,8 +134,11 @@ draft; Undo followed by Redo can recover it.
 
 **Jump** applies framing instantly. **Smooth** accelerates, moves at constant
 speed, then decelerates to a stop at the edit's time. Duration controls total
-movement time; **Accelerate** and **Decelerate** control the two ramps in seconds.
-Drag the visual strip's boundaries to adjust them directly. Ramps cannot overlap.
+movement time as an editable number of seconds. Transition controls appear only
+for a selected edit. Drag the visual strip's left and right boundary bars to adjust
+acceleration and deceleration; their tooltips report the ramp times. Ramps cannot
+overlap. Right-click the timeline for **Hold current framing** when you need an
+unchanged view before a later movement.
 The strip and the selected edit's timeline band show the effective transition,
 shortened when the previous edit leaves less time available. Screen and camera
 use the same motion curve, with separate settings for each component of an edit.
@@ -228,7 +234,8 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-native-preview-sources.sh`: native playback pixel parity, bounded
   source-frame ownership, full camera framing, and live zoom/PIP/pointer drafts.
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, separate
-  hit targets, draggable edit diamonds, pinch navigation, transition bands, bounds, and keyboard seeking.
+  hit targets, draggable edit diamonds, empty-space deselection, Escape routing,
+  mouse/keyboard focus cues, pinch navigation, transition bands, and bounds.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
 - `Tests/check-capture-lifecycle.sh`: bounded SDK callbacks, event ordering, media
   finalization, and retry isolation.

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum EditorInspector: String, CaseIterable {
@@ -124,9 +125,14 @@ struct ProjectEditorView: View {
                     onSelectEdit: { selectEdit($0) },
                     frameDuration: frameDuration,
                     onMoveEdit: { id, time, final in moveEdit(id, to: time, final: final) },
-                    onCancelMoveEdit: { cancelMove() })
+                    onCancelMoveEdit: { cancelMove() },
+                    onDeselectEdit: { deselectEdit() },
+                    onCancelEdit: { cancelDraft() })
                     .frame(height: 72)
                     .contextMenu {
+                        Button("Hold current framing") { holdCurrentFraming() }
+                            .help("Keep this view still until the playhead before a later smooth movement.")
+                        Divider()
                         Button("Reset trim") { setTrim(0, editor.project.duration) }
                             .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
                     }
@@ -212,32 +218,7 @@ struct ProjectEditorView: View {
                 .help(playback.cursorRecording == nil ? "Zoom suggestions need a new recording with pointer tracking." : "Suggest editable zoom changes around recorded mouse clicks. Replaces existing changes; Undo restores them.")
                 Spacer(minLength: 0)
             }.frame(height: 24)
-            HStack(spacing: 12) {
-                Picker("Movement", selection: Binding(get: { zoomPoint?.transition ?? zoomTransition }, set: { value in
-                    zoomTransition = value
-                    updateZoomPoint { $0.transition = value }
-                })) {
-                    Text("Jump").tag(PIPTransition.jump)
-                    Text("Smooth").tag(PIPTransition.smooth)
-                }
-                .frame(width: 185)
-                .help("Jump switches instantly at the change's time. Smooth moves into that view over the chosen duration. Without a selection, this sets the movement for new changes.")
-                CommitSlider(title: "Duration", value: zoomPoint?.duration ?? zoomDuration, range: 0.1...3, valueSuffix: " s",
-                    begin: { playback.pause() }) { value in
-                    zoomDuration = value
-                    updateZoomPoint { $0.duration = value }
-                }
-                .frame(width: 240)
-                .opacity((zoomPoint?.transition ?? zoomTransition) == .smooth ? 1 : 0)
-                .disabled((zoomPoint?.transition ?? zoomTransition) != .smooth)
-                .accessibilityHidden((zoomPoint?.transition ?? zoomTransition) != .smooth)
-                .help("How many seconds the view takes to reach this zoom change. The movement finishes at the change's time.")
-                Button { setZoom(zoom, at: editTime, name: "Edit") } label: { Image(systemName: "plus.diamond") }
-                    .accessibilityLabel("Add edit")
-                    .help("Remember this framing at the playhead, even if it matches the preceding view.")
-                Spacer(minLength: 0)
-            }.frame(height: 24)
-            rampControls(camera: false)
+            transitionControls(camera: false)
         }
     }
 
@@ -304,6 +285,20 @@ struct ProjectEditorView: View {
         playback.seek(edit.time)
     }
 
+    private func deselectEdit() {
+        playback.pause()
+        guard editor.finishDraft() else { return }
+        selectedEditID = nil
+    }
+
+    private func holdCurrentFraming() {
+        let time = editTime
+        let screen = zoom
+        let camera = placement
+        setZoom(screen, at: time, name: "Edit")
+        if editor.project.cameraFilename != nil { setPlacement(camera, at: time, name: "Edit") }
+    }
+
     private func removeEdit(_ edit: TimedEdit) {
         playback.pause()
         guard editor.finishDraft() else { return }
@@ -335,11 +330,13 @@ struct ProjectEditorView: View {
         movingEditState = nil
         _ = editor.cancelDraft()
         if let selectedEdit { playback.seek(selectedEdit.time) }
+        selectedEditID = nil
         playback.cancelPreview()
     }
 
     private func cancelDraft() {
         _ = editor.cancelDraft()
+        selectedEditID = nil
         playback.cancelPreview()
     }
 
@@ -523,26 +520,10 @@ struct ProjectEditorView: View {
                     setPlacement(next, at: editTime, name: "Resize camera")
                 }.frame(width: 180)
                     .help("Resize the camera overlay at the current video time. Drag any camera corner to resize it directly.")
-                Picker("Movement", selection: Binding(get: { point?.transition ?? transition }, set: { value in
-                    transition = value
-                    updateSelected { $0.transition = value }
-                })) {
-                    Text("Jump").tag(PIPTransition.jump)
-                    Text("Smooth").tag(PIPTransition.smooth)
-                }.frame(width: 155)
-                    .help("Jump switches instantly at the camera change's time. Smooth moves and resizes the camera into that view over the chosen duration.")
-                CommitSlider(title: "Duration", value: point?.duration ?? transitionDuration, range: 0.1...3, valueSuffix: " s", begin: { playback.pause() }) { value in
-                    transitionDuration = value
-                    updateSelected { $0.duration = value }
-                }
-                    .frame(width: 170)
-                    .opacity((point?.transition ?? transition) == .smooth ? 1 : 0)
-                    .disabled((point?.transition ?? transition) != .smooth)
-                    .accessibilityHidden((point?.transition ?? transition) != .smooth)
-                    .help("How many seconds the camera takes to reach this change. The movement finishes at the change's time.")
+
             }
             .frame(height: 24)
-            rampControls(camera: true)
+            transitionControls(camera: true)
         }
     }
 
@@ -601,35 +582,53 @@ struct ProjectEditorView: View {
         _ = editor.updateDraft(edited, at: selected.time)
     }
 
-    private func rampControls(camera: Bool) -> some View {
+    private func transitionControls(camera: Bool) -> some View {
         let mode = camera ? point?.transition ?? transition : zoomPoint?.transition ?? zoomTransition
         let requested = camera ? point?.duration ?? transitionDuration : zoomPoint?.duration ?? zoomDuration
         let previous = camera ? state.pipKeyframes.last(where: { $0.time < editTime })?.time ?? 0
                               : state.zoomKeyframes.last(where: { $0.time < editTime })?.time ?? 0
         let span = max(0, min(requested, editTime - previous))
-        let easeIn = camera ? point?.easeIn ?? cameraEaseIn : zoomPoint?.easeIn ?? zoomEaseIn
-        let easeOut = camera ? point?.easeOut ?? cameraEaseOut : zoomPoint?.easeOut ?? zoomEaseOut
+        let hasComponent = camera ? point != nil : zoomPoint != nil
+        let easeIn = camera ? point?.easeIn : zoomPoint?.easeIn
+        let easeOut = camera ? point?.easeOut : zoomPoint?.easeOut
         let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 16) {
-                CommitSlider(title: "Accelerate", value: ramps.easeIn, range: 0...max(0.001, span), valueSuffix: " s",
-                    begin: { playback.pause() }, preview: { setRamp($0, camera: camera, incoming: true, span: span, other: ramps.easeOut) }) {
-                    setRamp($0, camera: camera, incoming: true, span: span, other: ramps.easeOut)
-                }.frame(width: 255)
-                CommitSlider(title: "Decelerate", value: ramps.easeOut, range: 0...max(0.001, span), valueSuffix: " s",
-                    begin: { playback.pause() }, preview: { setRamp($0, camera: camera, incoming: false, span: span, other: ramps.easeIn) }) {
-                    setRamp($0, camera: camera, incoming: false, span: span, other: ramps.easeIn)
-                }.frame(width: 255)
-                Spacer(minLength: 0)
-            }.frame(height: 24)
-            MotionRampStrip(duration: span, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
-                change: { incoming, value in setRamp(value, camera: camera, incoming: incoming, span: span, other: incoming ? ramps.easeOut : ramps.easeIn) })
-                .frame(width: 526, height: 24)
-                .help("Drag the two boundaries to adjust acceleration and deceleration. The middle section moves at constant speed. The strip shows the available time before this edit.")
+        return Group {
+            if selectedEdit != nil && hasComponent && editTime > previous {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        Picker("Movement", selection: Binding(get: { mode }, set: { value in
+                            if camera { transition = value; updateSelected { $0.transition = value } }
+                            else { zoomTransition = value; updateZoomPoint { $0.transition = value } }
+                        })) {
+                            Text("Jump").tag(PIPTransition.jump)
+                            Text("Smooth").tag(PIPTransition.smooth)
+                        }
+                        .frame(width: 185)
+                        .help("Jump applies this edit instantly. Smooth accelerates, moves at steady speed, and decelerates to arrive at this edit.")
+                        if mode == .smooth {
+                            Text("Duration").font(.caption)
+                            MotionDurationField(value: requested, maximum: max(editor.project.duration, requested), change: { value in
+                                if camera { transitionDuration = value; updateSelected { $0.duration = value } }
+                                else { zoomDuration = value; updateZoomPoint { $0.duration = value } }
+                            }, cancel: { cancelDraft() })
+                                .frame(width: 64, height: 24)
+                                .help("Total movement time in seconds. The previous edit limits how much of this time is available.")
+                            Text("s").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                    }.frame(height: 24)
+                    if mode == .smooth {
+                        MotionRampStrip(duration: span, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
+                            change: { incoming, value in setRamp(value, camera: camera, incoming: incoming, span: span, other: incoming ? ramps.easeOut : ramps.easeIn) })
+                            .frame(width: 526, height: 32)
+                            .help("Drag the left boundary to adjust acceleration, or the right boundary to adjust deceleration. The middle moves at steady speed. The strip shows the time available before this edit.")
+                    }
+                }
+            }
         }
-        .opacity(mode == .smooth ? 1 : 0)
-        .disabled(mode != .smooth || span <= 0)
-        .accessibilityHidden(mode != .smooth)
+        // Keep selection changes from moving the recording or timeline.
+        .frame(height: 64, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func setRamp(_ value: Double, camera: Bool, incoming: Bool, span: Double, other: Double) {
@@ -689,35 +688,118 @@ private struct MotionRampStrip: View {
             let outgoing = CGFloat(1 - easeOut / span) * width
             ZStack(alignment: .topLeading) {
                 Path { path in
-                    path.move(to: CGPoint(x: 6, y: 21))
+                    path.move(to: CGPoint(x: 6, y: 26))
                     for sample in 0...100 {
                         let time = Double(sample) / 100 * span
                         let speed: Double
                         if easeIn > 0 && time < easeIn { speed = (1 - cos(.pi * time / easeIn)) / 2 }
                         else if easeOut > 0 && time > span - easeOut { speed = (1 - cos(.pi * (span - time) / easeOut)) / 2 }
                         else { speed = 1 }
-                        path.addLine(to: CGPoint(x: 6 + CGFloat(sample) / 100 * width, y: 21 - 17 * speed))
+                        path.addLine(to: CGPoint(x: 6 + CGFloat(sample) / 100 * width, y: 26 - 20 * speed))
                     }
-                    path.addLine(to: CGPoint(x: width + 6, y: 21))
+                    path.addLine(to: CGPoint(x: width + 6, y: 26))
                     path.closeSubpath()
                 }.fill(Color.purple.opacity(0.3))
                 ForEach([true, false], id: \.self) { incomingHandle in
-                    Image(systemName: "diamond.fill").font(.system(size: 11))
-                        .foregroundStyle(.purple)
-                        .frame(width: 20, height: 24)
-                        .position(x: 6 + (incomingHandle ? incoming : outgoing), y: 12)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.purple)
+                        .frame(width: 4, height: 24)
+                        .frame(width: 20, height: 32)
                         .contentShape(Rectangle())
+                        .position(x: 6 + (incomingHandle ? incoming : outgoing), y: 16)
                         .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("motionRamp")).onChanged { value in
                             let fraction = min(1, max(0, (value.location.x - 6) / width))
                             change(incomingHandle, Double(incomingHandle ? fraction : 1 - fraction) * duration)
                         })
-                        .accessibilityLabel(incomingHandle ? "Acceleration boundary" : "Deceleration boundary")
+                        .help("\(incomingHandle ? "Acceleration" : "Deceleration"): \(String(format: "%.2f", incomingHandle ? easeIn : easeOut)) seconds. Drag to adjust.")
+                        .accessibilityElement()
+                        .accessibilityLabel(incomingHandle ? "Acceleration" : "Deceleration")
+                        .accessibilityValue("\(String(format: "%.2f", incomingHandle ? easeIn : easeOut)) seconds")
+                        .accessibilityAdjustableAction { direction in
+                            let value = incomingHandle ? easeIn : easeOut
+                            switch direction {
+                            case .increment: change(incomingHandle, min(duration, value + 0.01))
+                            case .decrement: change(incomingHandle, max(0, value - 0.01))
+                            @unknown default: break
+                            }
+                        }
                 }
             }
             .coordinateSpace(name: "motionRamp")
         }
-        .accessibilityElement(children: .ignore)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Transition speed: acceleration, constant speed, deceleration")
+    }
+}
+
+/// A numeric duration updates the current edit's draft, never its undo history.
+struct MotionDurationField: NSViewRepresentable {
+    let value: Double
+    let maximum: Double
+    var change: (Double) -> Void
+    var cancel: () -> Void
+
+    func makeNSView(context: Context) -> MotionDurationTextField { MotionDurationTextField() }
+    func updateNSView(_ field: MotionDurationTextField, context: Context) {
+        field.configure(value: value, maximum: maximum, change: change, cancel: cancel)
+    }
+}
+
+@MainActor
+final class MotionDurationTextField: NSTextField, NSTextFieldDelegate {
+    private var value = 0.4
+    private var maximum = 3.0
+    private var change: ((Double) -> Void)?
+    private var cancel: (() -> Void)?
+    private var separator: String { Locale.current.decimalSeparator ?? "." }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        delegate = self
+        alignment = .right
+        font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        isBezeled = true
+        bezelStyle = .roundedBezel
+        setAccessibilityLabel("Duration")
+        setAccessibilityHelp("Movement duration in seconds. Return accepts the number; Escape cancels the unfinished edit.")
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func configure(value: Double, maximum: Double, change: @escaping (Double) -> Void, cancel: @escaping () -> Void) {
+        self.value = value
+        self.maximum = maximum
+        self.change = change
+        self.cancel = cancel
+        if currentEditor() == nil { restoreNumber() }
+    }
+
+    private func restoreNumber() {
+        stringValue = String(format: "%.2f", value).replacingOccurrences(of: ".", with: separator)
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        let draft = (currentEditor() as? NSTextView)?.string ?? stringValue
+        guard let next = Double(draft.replacingOccurrences(of: separator, with: ".")),
+              next.isFinite, next >= 0.01, next <= maximum else { return }
+        value = next
+        change?(next)
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) { restoreNumber() }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            cancel?()
+            window?.makeFirstResponder(nil)
+            return true
+        }
+        if selector == #selector(NSResponder.insertNewline(_:)) {
+            controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: self))
+            window?.makeFirstResponder(nil)
+            restoreNumber()
+            return true
+        }
+        return false
     }
 }
 

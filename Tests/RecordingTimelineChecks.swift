@@ -25,7 +25,7 @@ private final class TimelineGestureEvent: NSEvent {
 struct RecordingTimelineChecks {
     @MainActor static func main() {
         _ = NSApplication.shared
-        let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 680, height: 100),
+        let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 680, height: 100),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         let timeline = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 624, height: 72))
@@ -174,14 +174,74 @@ struct RecordingTimelineChecks {
         _ = timeline.accessibilityPerformIncrement()
         precondition(scrubPhases.suffix(2) == ["begin", "end"], "Accessible seek finishes its scrub")
 
+        reset(start: 0, end: 10, playhead: 4)
+        func rendering() -> NSBitmapImageRep {
+            guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: timeline.bounds) else {
+                fatalError("Could not render timeline focus cue")
+            }
+            timeline.cacheDisplay(in: timeline.bounds, to: bitmap)
+            return bitmap
+        }
+        func changedPixels(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) -> [CGPoint] {
+            let sx = Double(second.pixelsWide) / timeline.bounds.width
+            let sy = Double(second.pixelsHigh) / timeline.bounds.height
+            var points: [CGPoint] = []
+            for x in 0..<second.pixelsWide {
+                for y in 0..<second.pixelsHigh {
+                    guard let a = first.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                          let b = second.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                    if abs(a.redComponent - b.redComponent) > 0.05 ||
+                       abs(a.greenComponent - b.greenComponent) > 0.05 ||
+                       abs(a.blueComponent - b.blueComponent) > 0.05 ||
+                       abs(a.alphaComponent - b.alphaComponent) > 0.05 {
+                        points.append(CGPoint(x: Double(x) / sx, y: Double(y) / sy))
+                    }
+                }
+            }
+            return points
+        }
+        window.makeFirstResponder(nil)
+        let unfocused = rendering()
+        let mouseFocusPoint = CGPoint(x: timeline.x(for: 4), y: 6)
+        down(mouseFocusPoint); up(mouseFocusPoint)
+        let mouseFocused = rendering()
+        precondition(window.firstResponder === timeline && timeline.focusRingType == .none,
+                     "Timeline mouse focus must retain keyboard operability without a default focus ring")
+        precondition(changedPixels(unfocused, mouseFocused).isEmpty,
+                     "A mouse click must not paint a large focus border or other focus decoration")
+        let keyboardAnchor = NSTextField(frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        window.contentView!.addSubview(keyboardAnchor)
+        keyboardAnchor.nextKeyView = timeline
+        timeline.nextKeyView = keyboardAnchor
+        window.orderFront(nil)
+        window.makeFirstResponder(keyboardAnchor)
+        window.selectKeyView(following: keyboardAnchor)
+        precondition(window.firstResponder === timeline, "Tab navigation can focus the timeline")
+        let keyboardPixels = changedPixels(mouseFocused, rendering())
+        precondition(!keyboardPixels.isEmpty && keyboardPixels.allSatisfy {
+            abs($0.x - timeline.x(for: 4)) <= 8 && $0.y >= 34 && $0.y <= 38
+        }, "Keyboard focus gets only a small cue below the playhead, never a whole-timeline border")
+        key(124)
+        near(seeks.last, 4.1, "The keyboard-focused timeline remains arrow-key operable")
+        down(CGPoint(x: timeline.x(for: 4.1), y: 6)); up(CGPoint(x: timeline.x(for: 4.1), y: 6))
+        let afterMouse = rendering()
+        window.makeFirstResponder(nil)
+        precondition(changedPixels(afterMouse, rendering()).isEmpty,
+                     "A later mouse click clears the keyboard-only cue")
+        keyboardAnchor.removeFromSuperview()
+
         let edit = RecordingTimelineMarker(id: UUID(), time: 5,
             help: "Edit at 5 seconds: zoom 2×. Click to select; drag to move.")
         var selectedEdits: [UUID] = []
         var moves: [(UUID, Double, Bool)] = []
         var cancellations = 0
+        var deselections = 0
+        var cancelledEdits = 0
         timeline.onSelectEdit = { selectedEdits.append($0) }
         timeline.onMoveEdit = { moves.append(($0, $1, $2)) }
         timeline.onCancelMoveEdit = { cancellations += 1 }
+        timeline.onDeselectEdit = { deselections += 1 }
+        timeline.onCancelEdit = { cancelledEdits += 1 }
         reset(start: 0, end: 10, playhead: 4)
         let height = timeline.intrinsicContentSize.height
         timeline.edits = [edit]
@@ -279,13 +339,29 @@ struct RecordingTimelineChecks {
         down(markerPoint)
         key(53)
         up(markerPoint)
-        precondition(selectedEdits.isEmpty && moves.isEmpty && cancellations == 1,
-                     "Escape before the drag threshold cancels the pending click without selection")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && cancellations == 1 && cancelledEdits == 1,
+                     "Escape before the drag threshold cancels unfinished edits and deselects without moving")
+        key(53)
+        precondition(cancelledEdits == 2 && cancellations == 1 && deselections == 0,
+                     "Escape with no active drag cancels unfinished edits rather than finalizing them")
 
         reset(start: 0, end: 10, playhead: 4)
-        gesture(from: CGPoint(x: timeline.x(for: 8), y: 47), to: CGPoint(x: timeline.x(for: 9), y: 47))
-        precondition(seeks.isEmpty && trims.isEmpty && moves.isEmpty,
-                     "Empty edit-lane space cannot accidentally scrub or trim")
+        let blank = CGPoint(x: timeline.x(for: 8), y: 47)
+        down(blank)
+        precondition(deselections == 0 && seeks.isEmpty,
+                     "Pressing blank edit-lane space does not seek or finalize before mouse-up")
+        up(blank)
+        precondition(deselections == 1 && seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "Blank edit-lane click deselects exactly once without moving the playhead")
+        selectedEdits = []
+        gesture(from: blank, to: markerPoint)
+        precondition(deselections == 2 && selectedEdits.isEmpty && seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "A drag that starts in blank space stays inert even when it ends over a diamond")
+        down(blank)
+        key(53)
+        up(blank)
+        precondition(deselections == 2 && cancelledEdits == 3,
+                     "Escape during a blank-lane press cancels instead of finalizing and later mouse-up stays inert")
 
         let bounded = RecordingTimelineMarker(id: UUID(), time: 1.015, help: "Camera edit",
             minimumTime: 1.0 / 30, maximumTime: 10 - 1.0 / 30)
@@ -447,7 +523,7 @@ struct RecordingTimelineChecks {
         near(timeline.visibleStart, 5, "A fresh selection reveals the edit again")
 
         window.close()
-        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, separate edit lane, selection on release, grouped edit moves, neighbor limits, cancellation, locked drag targets, trackpad timeline navigation, zoomed time precision, selected transition bands, and deliberate selection reveal.")
+        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, separate edit lane, selection on release, grouped edit moves, neighbor limits, cancellation, locked drag targets, trackpad timeline navigation, zoomed time precision, selected transition bands, deliberate selection reveal, blank-lane deselection, Escape cancellation, and understated keyboard focus.")
     }
 
     static func near(_ actual: Double?, _ expected: Double, _ message: String) {

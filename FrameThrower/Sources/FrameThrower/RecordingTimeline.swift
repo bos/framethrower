@@ -29,6 +29,8 @@ struct RecordingTimeline: NSViewRepresentable {
     var frameDuration: Double = 1.0 / 30
     var onMoveEdit: (UUID, Double, Bool) -> Void = { _, _, _ in }
     var onCancelMoveEdit: () -> Void = {}
+    var onDeselectEdit: () -> Void = {}
+    var onCancelEdit: () -> Void = {}
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -47,6 +49,8 @@ struct RecordingTimeline: NSViewRepresentable {
         view.frameDuration = frameDuration
         view.onMoveEdit = onMoveEdit
         view.onCancelMoveEdit = onCancelMoveEdit
+        view.onDeselectEdit = onDeselectEdit
+        view.onCancelEdit = onCancelEdit
     }
 }
 
@@ -88,9 +92,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var frameDuration = 1.0 / 30 { didSet { if frameDuration != oldValue { constrainViewport() } } }
     var onMoveEdit: ((UUID, Double, Bool) -> Void)?
     var onCancelMoveEdit: (() -> Void)?
+    var onDeselectEdit: (() -> Void)?
+    var onCancelEdit: (() -> Void)?
     private var tooltipText: [Int: String] = [:]
 
-    private enum Interaction: Equatable { case start, end, scrub, edit(UUID) }
+    private enum Interaction: Equatable { case start, end, scrub, edit(UUID), emptyEditLane }
     private struct Drag {
         var interaction: Interaction
         var originX: CGFloat
@@ -105,6 +111,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
     private var drag: Drag?
     private var scrubTime: Double?
+    private var keyboardFocus = false
     private var railWidth: CGFloat { max(1, bounds.width - 24) }
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
@@ -113,10 +120,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        focusRingType = .none
         setAccessibilityElement(true)
         setAccessibilityRole(.slider)
         setAccessibilityLabel("Recording timeline")
-        setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim. Purple diamonds below the track mark edits. Click to select an edit; drag to change its time. Escape cancels a drag. Pinch to zoom the timeline; scroll with two fingers to navigate time.")
+        setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim. Purple diamonds below the track mark edits. Click to select an edit; drag to change its time. Click empty space below the track to leave the edit. Escape cancels unfinished edits and clears selection. Pinch to zoom the timeline; scroll with two fingers to navigate time.")
     }
     required init?(coder: NSCoder) { nil }
 
@@ -217,11 +225,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             }
         }
         drawTimeTicks()
-        if window?.firstResponder === self {
-            NSColor.keyboardFocusIndicatorColor.setStroke()
-            let focus = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
-            focus.lineWidth = 2
-            focus.stroke()
+        if keyboardFocus, window?.firstResponder === self, markerIsVisible(current) {
+            NSColor.keyboardFocusIndicatorColor.setFill()
+            NSBezierPath(roundedRect: CGRect(x: cursorX - 7, y: 35, width: 14, height: 2),
+                         xRadius: 1, yRadius: 1).fill()
         }
     }
 
@@ -324,10 +331,28 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
     }
 
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            keyboardFocus = NSApplication.shared.currentEvent?.type == .keyDown ||
+                (window?.keyViewSelectionDirection ?? .directSelection) != .directSelection
+            needsDisplay = true
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { keyboardFocus = false; needsDisplay = true }
+        return resigned
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard duration.isFinite, duration > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) else { return }
+        keyboardFocus = false
+        needsDisplay = true
         window?.makeFirstResponder(self)
         onInteractionBegan?()
         if point.y >= 38 && point.y < 56 {
@@ -346,6 +371,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 drag = Drag(interaction: .edit(marker.id), originX: point.x, originTime: marker.time,
                             start: trimStart, end: trimEnd, editTime: marker.time,
                             minimumTime: minimum, maximumTime: maximum, movable: marker.movable && minimum <= maximum)
+            } else {
+                drag = Drag(interaction: .emptyEditLane, originX: point.x, originTime: playhead,
+                            start: trimStart, end: trimEnd)
             }
             return
         }
@@ -372,6 +400,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let point = convert(event.locationInWindow, from: nil)
         let next = drag.originTime + Double((point.x - drag.originX) / railWidth) * visibleDuration
         switch drag.interaction {
+        case .emptyEditLane: break
         case .scrub: seek(next)
         case .start: drag.start = min(max(next, 0), drag.end - minimumLength)
         case .end: drag.end = max(min(next, duration), drag.start + minimumLength)
@@ -394,6 +423,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         self.drag = nil
         scrubTime = nil
         switch drag.interaction {
+        case .emptyEditLane: onDeselectEdit?()
         case .scrub: onScrubEnded?()
         case .start, .end:
             if drag.start != trimStart || drag.end != trimEnd { onTrim?(drag.start, drag.end) }
@@ -404,16 +434,23 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         needsDisplay = true
     }
 
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53, let drag {
-            self.drag = nil
-            scrubTime = nil
-            if case .edit = drag.interaction, drag.hasMoved { onCancelMoveEdit?() }
-            if drag.interaction == .scrub { onScrubEnded?() }
-            needsDisplay = true
-            return
+    override func cancelOperation(_ sender: Any?) {
+        let active = drag
+        drag = nil
+        scrubTime = nil
+        if let active, case .edit = active.interaction, active.hasMoved {
+            onCancelMoveEdit?()
+        } else {
+            if active?.interaction == .scrub { onScrubEnded?() }
+            onCancelEdit?()
         }
+        needsDisplay = true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { cancelOperation(nil); return }
         guard event.keyCode == 123 || event.keyCode == 124 else { super.keyDown(with: event); return }
+        keyboardFocus = true
         onInteractionBegan?()
         let step = event.modifierFlags.contains(.shift) ? 1.0 : 0.1
         onScrubBegan?()
@@ -428,6 +465,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     override func accessibilityPerformDecrement() -> Bool { accessibleSeek(-0.1) }
 
     private func accessibleSeek(_ delta: Double) -> Bool {
+        keyboardFocus = true
         onInteractionBegan?()
         onScrubBegan?()
         seek(playhead + delta)

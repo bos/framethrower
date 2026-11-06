@@ -93,7 +93,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
                 throw ProbeError.failed("combined edits changed original media")
             }
             try? FileManager.default.removeItem(at: directory)
-            output("WindowGroup layout checks passed (real scene, stable Play/trim/scrub, shared names, combined native zoom/camera drafts, one-step undo, diamond moves, and inline X deletion).")
+            output("WindowGroup layout checks passed (real scene, stable Play/trim/scrub, shared names, combined drafts, diamond moves/X deletion, numeric duration, blank-lane deselection, Escape cancellation, and fixed transition geometry).")
             Darwin.exit(0)
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -310,6 +310,138 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             throw ProbeError.failed("Undo must restore the whole removed edit")
         }
         try await waitUntil("undo deletion rebuilds editor") { canvas.allowsZoomEditing }
+        try await inspectSelectionLifecycle(editor, window: window, host: host, canvas: canvas, timeline: timeline)
+    }
+
+    private func inspectSelectionLifecycle(_ editor: ProjectEditor, window: NSWindow, host: NSView,
+                                           canvas: EditorCanvasView, timeline: RecordingTimelineView) async throws {
+        guard let edit = editor.project.state.timedEdits(includeCamera: true).first else {
+            throw ProbeError.failed("missing edit for selection lifecycle fixture")
+        }
+        var smooth = editor.project.state
+        if let index = smooth.zoomKeyframes.firstIndex(where: { $0.id == edit.zoomID }) {
+            smooth.zoomKeyframes[index].transition = .smooth
+            smooth.zoomKeyframes[index].duration = 0.8
+        }
+        guard editor.commit(smooth, name: "Prepare smooth selection fixture") else {
+            throw ProbeError.failed("prepare smooth selection fixture")
+        }
+        try await waitUntil("selection fixture becomes ready") { canvas.allowsZoomEditing }
+        guard let inspector = findAll(NSSegmentedControl.self, in: host).first(where: { $0.segmentCount == 3 }),
+              let action = inspector.action else {
+            throw ProbeError.failed("missing native inspector for smooth selection")
+        }
+        inspector.selectedSegment = 0
+        guard inspector.sendAction(action, to: inspector.target) else {
+            throw ProbeError.failed("could not select zoom inspector")
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+
+        func select() async throws {
+            let diamond = CGPoint(x: timeline.x(for: edit.time), y: 47)
+            timeline.mouseDown(with: mouse(.leftMouseDown, at: diamond, in: timeline, window: window))
+            timeline.mouseUp(with: mouse(.leftMouseUp, at: diamond, in: timeline, window: window))
+            try await waitUntil("selected edit exposes its native transition duration") {
+                timeline.selectedEditID == edit.id && abs(timeline.playhead - edit.time) < 0.000001 &&
+                    canvas.allowsZoomEditing && canvas.stillLayer.contents != nil &&
+                    (find(in: host) as MotionDurationTextField?) != nil
+            }
+            try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                             baseline: baseline, context: "show selected transition", compareScrolls: false)
+        }
+        func pinch() async throws {
+            let touch = IntegratedTrackpadEvent()
+            touch.position = canvas.convert(CGPoint(x: canvas.canvasRect.midX, y: canvas.canvasRect.midY), to: nil)
+            for phase in [NSEvent.Phase.began, .changed, .ended] {
+                touch.eventPhase = phase
+                touch.amount = phase == .ended ? 0 : 0.05
+                canvas.magnify(with: touch)
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            try await waitUntil("pinch revises selected edit as one pending draft") {
+                editor.draftState != nil && canvas.stillLayer.contents != nil
+            }
+        }
+        func escape() -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                isARepeat: false, keyCode: 53)!
+        }
+
+        try await select()
+        let beforeBlank = editor.project
+        guard let duration: MotionDurationTextField = find(in: host) else {
+            throw ProbeError.failed("selected smooth edit lacks native duration input")
+        }
+        duration.stringValue = "1.25"
+        duration.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: duration))
+        try await waitUntil("numeric duration refines selected edit without saving") {
+            editor.draftState?.zoomKeyframes.first(where: { $0.id == edit.zoomID })?.duration == 1.25 &&
+                editor.project == beforeBlank
+        }
+        let afterDuration = editor.draftState
+        for invalid in ["0", "NaN"] {
+            duration.stringValue = invalid
+            duration.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: duration))
+            try await Task.sleep(for: .milliseconds(30))
+            guard editor.draftState == afterDuration && editor.project == beforeBlank else {
+                throw ProbeError.failed("invalid duration '\(invalid)' changed the edit or its saved history")
+            }
+        }
+        try await pinch()
+        guard let draft = editor.draftState else { throw ProbeError.failed("missing draft before blank-lane click") }
+        guard editor.project == beforeBlank,
+              draft.zoomKeyframes.first(where: { $0.id == edit.zoomID })?.duration == 1.25 else {
+            throw ProbeError.failed("pinch must retain numeric duration in the same unsaved edit")
+        }
+        let playheadBeforeBlank = timeline.playhead
+        let sourceTimeBeforeBlank = canvas.playerLayer.player?.currentTime().seconds ?? -.infinity
+        let blank = CGPoint(x: timeline.x(for: 3.5), y: 47)
+        timeline.mouseDown(with: mouse(.leftMouseDown, at: blank, in: timeline, window: window))
+        timeline.mouseUp(with: mouse(.leftMouseUp, at: blank, in: timeline, window: window))
+        try await waitUntil("blank edit lane finalizes and deselects without scrubbing") {
+            editor.draftState == nil && timeline.selectedEditID == nil &&
+                editor.project.state == draft && editor.project.undoHistory.count == beforeBlank.undoHistory.count + 1 &&
+                canvas.allowsZoomEditing && canvas.stillLayer.contents != nil
+        }
+        guard abs(timeline.playhead - playheadBeforeBlank) < 0.000001,
+              abs((canvas.playerLayer.player?.currentTime().seconds ?? -.infinity) - sourceTimeBeforeBlank) < 0.000001 else {
+            throw ProbeError.failed("blank edit-lane deselection must keep the playhead and source frame")
+        }
+        guard (find(in: host) as MotionDurationTextField?) == nil else {
+            throw ProbeError.failed("deselected transition duration remains in the native accessibility hierarchy")
+        }
+        try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                         baseline: baseline, context: "blank-lane deselection hides transitions", compareScrolls: false)
+
+        try await select()
+        let beforeEscape = editor.project
+        try await pinch()
+        canvas.keyDown(with: escape())
+        try await waitUntil("Escape discards draft and deselects the edit") {
+            editor.draftState == nil && timeline.selectedEditID == nil && editor.project == beforeEscape &&
+                canvas.allowsZoomEditing && canvas.stillLayer.contents != nil
+        }
+        guard (find(in: host) as MotionDurationTextField?) == nil else {
+            throw ProbeError.failed("Escape must remove transition controls from the native hierarchy")
+        }
+        try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                         baseline: baseline, context: "Escape cancels and hides transitions", compareScrolls: false)
+
+        try await select()
+        let beforeCleanEscape = editor.project
+        guard editor.draftState == nil else { throw ProbeError.failed("selection alone created a draft") }
+        timeline.keyDown(with: escape())
+        try await waitUntil("Escape deselects a clean edit without history mutation") {
+            timeline.selectedEditID == nil && editor.draftState == nil && editor.project == beforeCleanEscape
+        }
+        guard (find(in: host) as MotionDurationTextField?) == nil else {
+            throw ProbeError.failed("clean Escape must hide transition controls")
+        }
+        try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+                         baseline: baseline, context: "clean Escape leaves geometry fixed", compareScrolls: false)
     }
 
     private func waitUntil(_ context: String, condition: () -> Bool) async throws {

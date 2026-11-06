@@ -27,6 +27,8 @@ struct DirectorConversationChecks {
         try checkDraftUndoRedoAndNewBranch()
         try await checkCompactProjectSnapshot()
         try await checkLiveUIAlongsideInstructionAnchor()
+        try await checkDraftSaveFailure()
+        try checkSpeechFailureTrace()
         print("Director conversation checks passed (ordered user/tool/result turns, real manual changes and Undo/Redo, authoritative current state, interleaved failures, bounded complete tool groups, persisted questions/conflicts and fresh-session scope; no model, mic, app, or media).")
     }
 
@@ -393,5 +395,68 @@ struct DirectorConversationChecks {
                         "Original timing stays frozen unless the latest answer explicitly selects the live playhead")
             session.suspend()
         }
+    }
+
+    static func checkDraftSaveFailure() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let transport = ConversationTransport(), session = fixture.session(transport)
+        session.attach(to: fixture.editor)
+        let saved = fixture.editor.project
+        var draft = saved.state
+        draft.cursorStyle.size = 2
+        try require(fixture.editor.updateDraft(draft, at: 1), "Begin a manual draft before the request")
+        let files = FileManager.default
+        try files.removeItem(at: fixture.editor.url)
+        try files.createDirectory(at: fixture.editor.url, withIntermediateDirectories: false)
+        let instruction = "Pan from Box 1 to Box 2 over the next three seconds."
+        session.instruction = instruction
+        session.submit(editor: fixture.editor, playhead: 1, regionID: nil, editID: nil)
+        let requests = await transport.payloads.count
+        try require(requests == 0 && !session.isBusy && session.instruction == instruction &&
+                    session.errorMessage != nil && session.errorMessage == fixture.editor.errorMessage,
+                    "Failed draft persistence preserves input and exposes the actual failure before inference")
+        try require(fixture.editor.project == saved && fixture.editor.draftState == draft &&
+                    (try files.contentsOfDirectory(at: fixture.editor.url, includingPropertiesForKeys: nil)).isEmpty,
+                    "A failed preflight changes neither saved state, manual draft, nor the obstructing disk fixture")
+        let messages = session.conversation.messages()
+        try require(messages.first?["content"] as? String == instruction &&
+                    events(messages).contains { $0["status"] as? String == "rejected" && $0["applied"] as? Bool == false && $0["error"] as? String == session.errorMessage },
+                    "The conversation receives the actual rejected outcome, rather than losing the request")
+        let trace = try String(contentsOf: fixture.logger.logURL, encoding: .utf8).split(separator: "\n").compactMap { object(String($0)) }
+        let user = trace.last { $0["event"] as? String == "user_request" }
+        let rejected = trace.last { $0["event"] as? String == "tool_result" }
+        try require(user?["request_id"] as? String != nil && user?["request_id"] as? String == rejected?["request_id"] as? String,
+                    "Local diagnostics correlate the user instruction and its actual failed result")
+        _ = fixture.editor.cancelDraft()
+        session.suspend()
+    }
+
+    static func checkSpeechFailureTrace() throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let session = fixture.session(ConversationTransport())
+        session.attach(to: fixture.editor)
+        session.beginVoiceInstruction()
+        session.recordSpeechState(phase: "preparing", recognizer: "Apple DictationTranscriber",
+                                  status: "Preparing on-device dictation", error: nil)
+        session.recordSpeechState(phase: "idle", recognizer: "Apple DictationTranscriber",
+                                  status: nil, error: "The microphone was disconnected.")
+        let rows = try String(contentsOf: fixture.logger.logURL, encoding: .utf8).split(separator: "\n").compactMap { object(String($0)) }
+        guard let started = rows.first(where: { $0["event"] as? String == "speech_started" }) else {
+            throw ConversationCheckFailure.failed("Speech start not logged")
+        }
+        let states = rows.filter { $0["event"] as? String == "speech_state" }
+        try require(states.count == 2 && states.allSatisfy { $0["request_id"] as? String == started["request_id"] as? String } &&
+                    started["request_id"] as? String != nil,
+                    "Speech backend selection and failure remain correlated with the actual voice interaction")
+        let preparing = states[0]["details"] as? [String: Any]
+        let failed = states[1]["details"] as? [String: Any]
+        try require(preparing?["phase"] as? String == "preparing" && preparing?["recognizer"] as? String == "Apple DictationTranscriber" &&
+                    preparing?["status"] as? String == "Preparing on-device dictation" && failed?["phase"] as? String == "idle" &&
+                    failed?["recognizer"] as? String == "Apple DictationTranscriber" && failed?["error"] as? String == "The microphone was disconnected.",
+                    "Diagnostic records retain the recognizer and concrete error rather than a generic missing transcript")
+        try require(!fixture.editor.canUndo, "Speech diagnostic events cannot modify the recording")
+        session.suspend()
     }
 }

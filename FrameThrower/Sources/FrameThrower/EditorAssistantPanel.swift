@@ -93,6 +93,14 @@ final class EditorAssistantSession: ObservableObject {
         record("speech_hypothesis", requestID: speechID, details: ["text": text, "phase": phase])
     }
 
+    func recordSpeechState(phase: String, recognizer: String, status: String?, error: String?) {
+        guard let speechID else { return }
+        var details: [String: Any] = ["phase": phase, "recognizer": recognizer]
+        if let status { details["status"] = status }
+        if let error { details["error"] = error }
+        record("speech_state", requestID: speechID, details: details)
+    }
+
     @discardableResult
     func appendDictation(_ transcript: String) -> Bool {
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -147,7 +155,13 @@ final class EditorAssistantSession: ObservableObject {
             finish(token, response: nil, outcome: ["status": "rejected", "error": errorMessage ?? ""])
             return
         }
-        guard editor.finishDraft() else { return }
+        guard editor.finishDraft() else {
+            errorMessage = editor.errorMessage ?? "The current edit could not be saved. Your instruction has not been applied."
+            notice = nil
+            conversation.begin(text, requestID: token)
+            finish(token, response: nil, outcome: ["status": "rejected", "error": errorMessage ?? "", "applied": false])
+            return
+        }
         do {
             let recording = try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
             let pendingConflict = framingConflict

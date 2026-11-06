@@ -253,6 +253,13 @@ MP4, separate from the originals. Confirmed replacement of an exported file occu
 only after rendering completes; cancellation leaves an existing destination intact.
 Command-S saves pending edits, including a name being edited.
 
+**File → Duplicate Recording** (Shift-Command-S) opens an independent project
+beside the original, including pending edits. The copy has its own name and a
+fresh Undo history. The original's file, history, pending edits, and recovery
+journal stay unchanged. Both projects use the same original screen, camera, and
+pointer files; footage is not copied. Duplication also works when an outside
+project change prevents saving the original.
+
 Projects stay in the list if their media is missing. Open one and use **Locate…**
 to copy the original file back into its project folder. The chosen source is left
 unchanged, and existing files are never overwritten by this recovery action.

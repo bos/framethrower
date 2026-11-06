@@ -89,6 +89,8 @@ struct EditorWindowChecks {
         try require(restoredSecond.undo(), "undo second window after restart")
         try require(restoredFirst.project.state == trimmed,
                     "restored second-window undo must not alter the restored first window")
+        try require(restoredSecond.redo() && restoredSecond.project == second.project,
+                    "restore the on-disk baseline before resuming the older app-model fixture")
 
         try require(model.recordingLibrary.entries.count == 2,
                     "resolving multiple saved recordings must retain every library row")
@@ -157,9 +159,53 @@ struct EditorWindowChecks {
         try expectFailure("missing project must fail cleanly") {
             _ = try model.editor(for: directory.appendingPathComponent("missing.framethrower"))
         }
+        try checkDuplicate(first, other: second, model: model, defaults: defaults)
         try require(!model.isRecording && !model.camera.isPreparing,
                     "opening editor sessions must not activate screen or camera capture")
-        print("Editor window checks passed (canonical session identity, independent windows and undo histories, restart recovery, and failed-open recovery).")
+        print("Editor window checks passed (canonical session identity, independent windows and undo histories, restart recovery, failed-open recovery, focused-editor duplication, busy gates, shared originals, preserved draft/journal and missing-open-URL reservation).")
+    }
+
+    private static func checkDuplicate(_ original: ProjectEditor, other: ProjectEditor, model: CaptureViewModel,
+                                       defaults: UserDefaults) throws {
+        var pending = original.editingState
+        pending.audio.volume = 0.45
+        try require(original.updateDraft(pending, at: 1) && original.flushRecovery(), "prepare pending focused-editor duplicate")
+        let baseline = original.project
+        let projectBytes = try Data(contentsOf: original.url)
+        let journalBytes = try Data(contentsOf: original.recoveryURL)
+        model.projectEditor = other
+        let request = model.editorOpenRequest
+        model.isUploading = true
+        try require(!model.canDuplicateRecording, "upload must disable duplication")
+        model.duplicateRecording(original)
+        model.isUploading = false
+        model.countdownRemainingSeconds = 1
+        try require(!model.canDuplicateRecording, "countdown must disable duplication")
+        model.duplicateRecording(original)
+        model.countdownRemainingSeconds = nil
+        try require(model.editorOpenRequest == request && model.projectEditor === other,
+                    "busy duplicate must not create or open a different recording")
+        model.duplicateRecording(original)
+        guard let copy = model.projectEditor else { throw WindowCheckError.failed("Duplicate did not register its editor") }
+        try require(copy !== original && copy !== other && copy.project.state == pending && copy.project.undoHistory.isEmpty && !copy.canUndo,
+                    "duplicate must use its focused editor's visible draft, independently of the recorder's current project")
+        try require(model.editorOpenRequest?.url == copy.url && model.editorOpenRequest?.id != request?.id &&
+                    defaults.string(forKey: "editor.lastProject") == copy.url.path &&
+                    model.lastRecordingURL == original.mediaURL(for: original.project.screenFilename),
+                    "duplicate must request its own window while sharing the same original sources")
+        try require(try model.editor(for: copy.url) === copy && model.recordingLibrary.entries.contains { $0.id == copy.url },
+                    "duplicate must reuse its new registered session and enter the ordinary library")
+        try FileManager.default.removeItem(at: copy.url)
+        model.duplicateRecording(original)
+        guard let next = model.projectEditor else { throw WindowCheckError.failed("Second duplicate did not open") }
+        try require(next !== copy && next.url != copy.url && next.url.lastPathComponent == "recording copy 2.framethrower" &&
+                    (try model.editor(for: copy.url)) === copy,
+                    "an externally deleted copy with an open session must keep its URL reserved")
+        try require(next.rename(to: "Independent copy") && model.recordingLibrary.entries.contains { $0.id == next.url && $0.displayName == "Independent copy" },
+                    "the duplicate's own edits must update its own library row")
+        try require(original.project == baseline && original.draftState == pending && original.draftTime == 1 &&
+                    (try Data(contentsOf: original.url)) == projectBytes && (try Data(contentsOf: original.recoveryURL)) == journalBytes,
+                    "creating and editing duplicates changed the original editor, project or journal")
     }
 
     private static func fixture(in directory: URL, duration: Double) throws -> URL {

@@ -1212,6 +1212,16 @@ final class CaptureViewModel: ObservableObject {
         openProject(at: url, present: true)
     }
 
+    var canDuplicateRecording: Bool {
+        !isRecording && !isCountdownActive && !isCaptureBusy && !isAnyUploadActive
+    }
+
+    func duplicateRecording(_ editor: ProjectEditor) {
+        guard canDuplicateRecording, let copy = editor.duplicate(avoiding: Array(projectEditors.keys)) else { return }
+        registerProjectEditor(copy)
+        openProject(at: copy.url, present: true)
+    }
+
     @discardableResult
     func selectRecordingForSharing(at url: URL) -> Bool {
         guard !isRecording, !isCountdownActive, !isCaptureBusy, !isAnyUploadActive else { return false }

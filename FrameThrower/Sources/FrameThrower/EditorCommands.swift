@@ -15,6 +15,10 @@ struct EditorFileCommands: Commands {
             Button("Save Recording") { actions?.saveProject() }
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(actions == nil || actions?.isBusy == true)
+            Button("Duplicate Recording") { actions?.duplicate?() }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(actions?.duplicate == nil || actions?.isBusy == true)
+                .help("Create an independent project with the current edits and a fresh Undo history. The copy uses the same source files.")
             Button("Save Video…") { actions?.saveVideo() }
                 .keyboardShortcut("e", modifiers: .command)
                 .disabled(MediaProcessing.isSuspended || actions == nil || actions?.isBusy == true)

@@ -256,6 +256,7 @@ struct EditorFileActions {
     var shareVideo: () -> Void
     var rename: (() -> Void)? = nil
     var fitTimeline: (() -> Void)? = nil
+    var duplicate: (() -> Void)? = nil
     var isBusy: Bool
 }
 private struct EditorFileActionsKey: FocusedValueKey { typealias Value = EditorFileActions }

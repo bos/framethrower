@@ -8,6 +8,8 @@ private enum EditorInspector: String, CaseIterable {
 
 struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
+    var onDuplicate: ((ProjectEditor) -> Void)?
+    var isDuplicateUnavailable: Bool
     @StateObject private var playback = EditorPlayback()
     @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
@@ -47,8 +49,11 @@ struct ProjectEditorView: View {
     private var frameDuration: Double { playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30 }
 
     init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false,
-         assistant: EditorAssistantSession? = nil) {
+         assistant: EditorAssistantSession? = nil,
+         onDuplicate: ((ProjectEditor) -> Void)? = nil, isDuplicateUnavailable: Bool = false) {
         self.editor = editor
+        self.onDuplicate = onDuplicate
+        self.isDuplicateUnavailable = isDuplicateUnavailable
         _assistant = StateObject(wrappedValue: assistant ?? EditorAssistantSession())
         _directorMode = State(initialValue: directorModeInitiallyEnabled)
     }
@@ -149,6 +154,9 @@ struct ProjectEditorView: View {
             saveProject: { EditorSaveRouting.save(editor: editor, window: exportSession.window) },
             saveVideo: { beginExport(sharing: false) }, shareVideo: { beginExport(sharing: true) },
             rename: { editorRenameRequest = UUID() }, fitTimeline: { timelineFitRequest = UUID() },
+            duplicate: isDuplicateUnavailable || assistant.isBusy ? nil : onDuplicate.map { callback in
+                { playback.pause(); callback(editor) }
+            },
             isBusy: exportSession.isBusy || playback.isLoading))
     }
 

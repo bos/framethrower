@@ -1087,6 +1087,73 @@ final class ProjectEditor: ObservableObject {
         return persist(project)
     }
 
+    /// Duplicate the visible edit without saving, finishing, or cancelling any
+    /// work in this editor. Originals remain adjacent shared source files.
+    func duplicate(avoiding projectURLs: [URL] = []) -> ProjectEditor? {
+        do {
+            var snapshot = project
+            snapshot.state = editingState
+            snapshot.undoHistory = []
+            snapshot.redoHistory = []
+            snapshot.references = references
+            snapshot.ensureReferences()
+            try snapshot.validate()
+            let directory = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+            let stem = url.deletingPathExtension().lastPathComponent
+            let normalizedTitle = String(displayName.unicodeScalars.filter { $0.properties.generalCategory != .control })
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let title = normalizedTitle.isEmpty ? "Recording" : normalizedTitle
+            // Reserve original names even when their files are currently
+            // missing. A copy or its future journal must never become a source.
+            var reserved = [url.lastPathComponent, recoveryURL.lastPathComponent] +
+                [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }
+            // A deleted project can still own an open window and journal.
+            // Its URL must not be reused for a new independent document.
+            reserved += projectURLs.filter {
+                $0.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath() == directory
+            }.flatMap { [$0.lastPathComponent, $0.appendingPathExtension("recovery").lastPathComponent] }
+            for index in 1...10_000 {
+                let suffix = index == 1 ? " copy" : " copy \(index)"
+                let filename = Self.filenamePrefix(stem, bytes: 255 - ".recovery".utf8.count - suffix.utf8.count - ".framethrower".utf8.count)
+                    + suffix + ".framethrower"
+                let destination = directory.appendingPathComponent(filename)
+                let journal = destination.appendingPathExtension("recovery")
+                guard !reserved.contains(where: {
+                    filename.compare($0, options: .caseInsensitive) == .orderedSame ||
+                    journal.lastPathComponent.compare($0, options: .caseInsensitive) == .orderedSame
+                }), (try? FileManager.default.attributesOfItem(atPath: journal.path)) == nil,
+                (try? FileManager.default.attributesOfItem(atPath: destination.path)) == nil else { continue }
+                snapshot.title = String(title.prefix(256 - suffix.count)).trimmingCharacters(in: .whitespaces) + suffix
+                try RecordingProject.validateTitle(snapshot.title)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let data = try encoder.encode(snapshot)
+                do { try Self.publishNewProject(data, at: destination) }
+                catch ProjectCreationError.destinationExists { continue }
+                let copy = ProjectEditor(project: snapshot, url: destination)
+                copy.savedProjectDigest = Self.digest(data)
+                copy.savedProjectByteCount = data.count
+                return copy
+            }
+            throw ProjectError.invalid("Too many copies already exist beside this recording. Rename or move an older copy, then try again.")
+        } catch {
+            errorMessage = "The recording could not be duplicated. " + error.localizedDescription
+            return nil
+        }
+    }
+
+    private static func filenamePrefix(_ value: String, bytes maximum: Int) -> String {
+        var result = ""
+        var bytes = 0
+        for character in value {
+            let count = String(character).utf8.count
+            guard bytes + count <= maximum else { break }
+            result.append(character)
+            bytes += count
+        }
+        return result.isEmpty || result == "." || result == ".." ? "Recording" : result
+    }
+
     func dismissError() { errorMessage = nil }
 
     /// Coalesce samples without postponing protection throughout a long drag.
@@ -1276,16 +1343,23 @@ final class ProjectEditor: ObservableObject {
             // A new recording has no saved baseline. Publish a staged sibling
             // exclusively, so even a destination appearing during the write
             // cannot be replaced by this first save.
-            let staged = url.deletingLastPathComponent().appendingPathComponent(".framethrower-save-\(UUID().uuidString).partial")
-            defer { try? FileManager.default.removeItem(at: staged) }
-            try data.write(to: staged, options: .withoutOverwriting)
-            do { try FileManager.default.linkItem(at: staged, to: url) }
-            catch {
-                if (try? FileManager.default.attributesOfItem(atPath: url.path)) != nil {
-                    throw ProjectError.invalid("A file or folder already exists at \(url.path). Open the existing project or choose a different project location.")
-                }
-                throw error
+            do { try Self.publishNewProject(data, at: url) }
+            catch ProjectCreationError.destinationExists {
+                throw ProjectError.invalid("A file or folder already exists at \(url.path). Open the existing project or choose a different project location.")
             }
+        }
+    }
+
+    private enum ProjectCreationError: Error { case destinationExists }
+
+    private static func publishNewProject(_ data: Data, at url: URL) throws {
+        let staged = url.deletingLastPathComponent().appendingPathComponent(".framethrower-save-\(UUID().uuidString).partial")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try data.write(to: staged, options: .withoutOverwriting)
+        do { try FileManager.default.linkItem(at: staged, to: url) }
+        catch {
+            if (try? FileManager.default.attributesOfItem(atPath: url.path)) != nil { throw ProjectCreationError.destinationExists }
+            throw error
         }
     }
 }

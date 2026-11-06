@@ -48,7 +48,8 @@ private struct ProjectEditorWindow: View {
     var body: some View {
         Group {
             if let editor = session.editor {
-                ProjectEditorView(editor: editor)
+                ProjectEditorView(editor: editor, onDuplicate: { model.duplicateRecording($0) },
+                                  isDuplicateUnavailable: !model.canDuplicateRecording)
                     .focusedSceneObject(editor)
             } else {
                 ContentUnavailableView("Cannot open recording", systemImage: "exclamationmark.triangle",

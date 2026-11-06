@@ -59,9 +59,25 @@ struct RecordingRowChecks {
         try await Task.sleep(for: .seconds(NSEvent.doubleClickInterval + 0.05))
         try require(opened == 1 && removed == 1 && !title.isRenaming,
                     "double-clicking the name must open once without row background stealing or starting rename")
+        title.beginRenaming()
+        for _ in 0..<10 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(20))
+        try require(title.isRenaming && !button.isEnabled,
+                    "row removal must be disabled and hidden throughout name editing")
+        button.performClick(nil)
+        try require(removed == 1, "the removal control cannot dismiss a row while its name is being edited")
+        guard let editing = window.fieldEditor(false, for: title) as? NSTextView else {
+            throw RowCheckError.failed("rename field editor")
+        }
+        editing.string = "Uncommitted name"
+        _ = title.control(title, textView: editing, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
+        for _ in 0..<10 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(20))
+        try require(!title.isRenaming && button.isEnabled && editor.displayName == "My recording" && removed == 1,
+                    "Escape cancels the name and safely restores the row action")
         try require(try Data(contentsOf: source) == sourceBytes && !editor.canUndo,
                     "row navigation/removal callbacks must not alter media or edit history")
-        print("Recording row checks passed (280pt title width, inactive first-click acceptance, native remove dispatch, and integrated title double-click routing).")
+        print("Recording row checks passed (first-click remove, double-click open, and removal protected throughout rename/cancel).")
     }
 
     private static func mouse(_ type: NSEvent.EventType, target: NSView, window: NSWindow, count: Int) -> NSEvent {

@@ -611,6 +611,8 @@ final class ProjectEditor: ObservableObject {
     @discardableResult
     func save() -> Bool { persist(project) }
 
+    func dismissError() { errorMessage = nil }
+
     private func persist(_ candidate: RecordingProject) -> Bool {
         do {
             try candidate.validate()

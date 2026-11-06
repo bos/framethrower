@@ -68,6 +68,7 @@ struct RecordingLibraryRow: View {
     @State private var renameRequest: UUID?
     @State private var errorMessage: String?
     @State private var isSharingPresented = false
+    @State private var isRenaming = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -75,6 +76,10 @@ struct RecordingLibraryRow: View {
                 if let editor {
                     RecordingTitleEditor(editor: editor, renameRequest: renameRequest, onOpen: onOpen,
                         onBeginEditing: { onSelectEditor(editor); errorMessage = nil },
+                        onEditingChanged: { editing in
+                            isRenaming = editing
+                            if !editing { errorMessage = nil }
+                        },
                         onRenameError: { errorMessage = $0 })
                         .frame(height: 24)
                 } else {
@@ -83,6 +88,10 @@ struct RecordingLibraryRow: View {
                 }
                 RecordingRemoveButton(name: entry.displayName, action: onRemove)
                     .frame(width: 24, height: 24)
+                    .opacity(isRenaming ? 0 : 1)
+                    .disabled(isRenaming)
+                    .allowsHitTesting(!isRenaming)
+                    .accessibilityHidden(isRenaming)
             }
             HStack(spacing: 8) {
                 Text(errorMessage ?? details)

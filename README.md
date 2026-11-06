@@ -77,13 +77,15 @@ available source selection. A window that has closed requires choosing a new one
    access is requested only when you select a camera. Choose **Off** to stop it.
 5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
-   A separate editor window opens when capture finishes; use **Edit…** to reopen
+   A separate editor window opens when capture finishes; double-click its row to reopen
    it. The recorder stays usable, and each project's editor has its own undo history.
 
 The recordings list shows projects in Movies and projects opened from other
 folders, newest first. Scroll the list for older recordings. Click a name to
 rename it; double-click a row to open its editor. The editor's header and window
 title use the same saved name, and its header also supports inline renaming.
+Return saves a name; Escape or clicking outside cancels. The X inside the name
+field clears its draft, and the row removal button stays hidden during renaming.
 Renaming supports undo/redo and keeps the original media filenames.
 
 Record and Stop stay above the list in the side panel. The main capture preview
@@ -182,7 +184,8 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-recording-library.sh`: discovery, imported projects, canonical
   identity, removal/restore across restart, stale scans, and source preservation.
 - `Tests/check-recording-title.sh`: native single/double click, inline editing,
-  Enter/Escape, focus transfer, validation, and rename undo/redo.
+  Return saves, Escape/outside clicks cancel, draft clearing, focus transfer,
+  validation, and rename undo/redo.
 - `Tests/check-recorder-workspace.sh`: preview minimum size, stable capture
   geometry with changing history, and Record above the recordings list.
 - `Tests/check-initial-camera-preview.sh`: camera placement within the main

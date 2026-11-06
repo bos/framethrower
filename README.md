@@ -156,3 +156,9 @@ build alone does not verify capture permissions or authenticated uploads.
 legacy-prefixed recording (or a supplied path) to the configured `bos` Slack DM
 using the app's saved Slack token. Running it sends a real message.
 
+
+## Deferred improvements
+
+- Automatically detect and center an off-center face when the PIP crop is smaller
+  than the full camera image. Keep the full source, retain manual framing overrides,
+  and make automatic framing reversible through the existing edit history.

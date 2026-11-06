@@ -66,7 +66,7 @@ struct EditorInspectorLayoutChecks {
             guard editor.project.state == project.state else { throw Failure.failed("Tool switching changed project edits") }
             window.close()
         }
-        print("Editor inspector layout checks passed (slider Escape/release/next-drag rollback, all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).")
+        FileHandle.standardOutput.write(Data("Editor inspector layout checks passed (slider Escape/release/next-drag rollback, all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).\n".utf8))
     }
 
     private static func cancelledSliderGesture(in directory: URL) throws {

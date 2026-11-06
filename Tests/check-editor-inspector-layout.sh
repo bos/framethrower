@@ -15,4 +15,9 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   -target "$(uname -m)-apple-macos15.0" \
   "$@" "$repo_dir/Tests/EditorInspectorLayoutChecks.swift" \
   -o "$check_dir/check-editor-inspector-layout"
-"$check_dir/check-editor-inspector-layout"
+"$check_dir/check-editor-inspector-layout" > "$check_dir/result.log" 2>&1 || {
+  cat "$check_dir/result.log"
+  exit 1
+}
+cat "$check_dir/result.log"
+rg -q '^Editor inspector layout checks passed' "$check_dir/result.log"

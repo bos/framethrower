@@ -3,6 +3,11 @@ import Combine
 import SwiftUI
 
 @MainActor
+final class EditorFrameStore: ObservableObject {
+    @Published var image: CGImage?
+}
+
+@MainActor
 final class EditorPlayback: ObservableObject {
     let player = AVPlayer()
     @Published private(set) var time = 0.0
@@ -11,13 +16,19 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var screenSize = CGSize(width: 16, height: 9)
     @Published private(set) var cameraAspect = 16.0 / 9.0
     @Published private(set) var errorMessage: String?
-    @Published private(set) var stillFrame: CGImage?
+    let frameStore = EditorFrameStore()
+    private(set) var stillFrame: CGImage? {
+        get { frameStore.image }
+        set { frameStore.image = newValue }
+    }
+    @Published private(set) var isScrubbing = false
     private var renderedProject: RenderedProject?
     private let stillRequests = LatestStillFrameQueue<CGImage>()
     private var committedState: EditState?
     private var liveSources: LiveStillFrameCache?
     private var isClosed = false
     private var observer: Any?
+    private var itemStatusObservation: NSKeyValueObservation?
     private var generation = 0
     private var bounds = 0.0...1.0
     private var sourceDuration = 0.0
@@ -26,6 +37,10 @@ final class EditorPlayback: ObservableObject {
     private var draftGeneration: UInt64 = 0
     private var committedStillFrame: CGImage?
     private var committedStillTime: Double?
+    private var seekGeneration: UInt64 = 0
+    private var seekInFlight = false
+    private var pendingSeek: CMTime?
+    private var scrubGestureActive = false
 
     var isPreviewing: Bool { draftState != nil }
 
@@ -37,7 +52,8 @@ final class EditorPlayback: ObservableObject {
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
                                                    queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
-                guard let self, !self.isClosed, self.draftState == nil else { return }
+                guard let self, !self.isClosed, self.draftState == nil,
+                      !self.isScrubbing, !self.seekInFlight, self.pendingSeek == nil else { return }
                 self.time = time.seconds.isFinite ? time.seconds : 0
                 self.isPlaying = self.player.rate > 0
                 if self.time >= self.bounds.upperBound {
@@ -50,6 +66,8 @@ final class EditorPlayback: ObservableObject {
     func rebuild(editor: ProjectEditor) async {
         guard !isClosed else { return }
         generation += 1
+        itemStatusObservation = nil
+        invalidateSeeks()
         let request = generation
         let snapshot = editor.project
         sourceDuration = snapshot.duration
@@ -71,7 +89,11 @@ final class EditorPlayback: ObservableObject {
             guard request == generation, !Task.isCancelled else { return }
             let item = AVPlayerItem(asset: rendered.asset)
             item.videoComposition = rendered.videoComposition
+            // A seek is not visually complete until the custom compositor has
+            // produced its frame. Otherwise the next chase can starve display.
+            item.seekingWaitsForVideoCompositionRendering = true
             item.forwardPlaybackEndTime = CMTime(seconds: snapshot.state.trimEnd, preferredTimescale: 600)
+            observeStatus(of: item, generation: request)
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
             cameraAspect = rendered.cameraAspect
@@ -91,21 +113,112 @@ final class EditorPlayback: ObservableObject {
         }
     }
 
+    private func observeStatus(of item: AVPlayerItem, generation request: Int) {
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isClosed, request == self.generation,
+                      self.player.currentItem === item, item.status == .failed else { return }
+                let message = item.error?.localizedDescription ?? "The recording could not be played."
+                guard self.errorMessage != message else { return }
+                self.player.pause()
+                if self.isPlaying { self.isPlaying = false }
+                self.isLoading = false
+                self.invalidateSeeks()
+                self.invalidateStillFrames()
+                self.renderedProject = nil
+                self.errorMessage = message
+            }
+        }
+    }
+
+    /// A normal seek uses the same chasing pipeline as scrubbing, and restores
+    /// the isolated paused frame only after its final native seek completes.
     func seek(_ position: Double) {
-        guard !isClosed, !isLoading || renderedProject != nil else { return }
+        guard !isClosed, !isLoading, renderedProject != nil else { return }
+        scrubGestureActive = false
+        requestSeek(position)
+    }
+
+    func beginScrubbing() {
+        guard !isClosed, !isLoading, renderedProject != nil else { return }
+        player.pause()
+        if isPlaying { isPlaying = false }
         discardPreview(restoringFrame: false)
-        time = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : bounds.lowerBound
+        scrubGestureActive = true
+        if !isScrubbing { isScrubbing = true }
+        clearPausedFrameForSeek()
+    }
+
+    func scrub(to position: Double) {
+        guard !isClosed, !isLoading, renderedProject != nil else { return }
+        if !scrubGestureActive { beginScrubbing() }
+        requestSeek(position)
+    }
+
+    func endScrubbing() {
+        guard !isClosed, isScrubbing else { return }
+        scrubGestureActive = false
+        finishSeekIfSettled()
+    }
+
+    private func requestSeek(_ position: Double) {
+        discardPreview(restoringFrame: false)
+        clearPausedFrameForSeek()
+        let requested = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : bounds.lowerBound
+        if time != requested { time = requested }
+        pendingSeek = Self.frameTime(at: requested, bounds: bounds)
+        chaseSeek()
+    }
+
+    private func clearPausedFrameForSeek() {
+        stillRequests.invalidate()
+        liveSources = nil
+        if stillFrame != nil { stillFrame = nil }
+    }
+
+    private func chaseSeek() {
+        guard !seekInFlight, let target = pendingSeek, let item = player.currentItem else { return }
+        pendingSeek = nil
+        seekInFlight = true
+        let request = seekGeneration
+        // Do not cancel an in-flight seek for each mouse event. Let its frame
+        // reach AVPlayerLayer, then chase only the newest requested position.
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isClosed, request == self.seekGeneration,
+                      self.player.currentItem === item else { return }
+                self.seekInFlight = false
+                if let next = self.pendingSeek, CMTimeCompare(next, target) == 0 { self.pendingSeek = nil }
+                if self.pendingSeek != nil { self.chaseSeek() }
+                else { self.finishSeekIfSettled() }
+            }
+        }
+    }
+
+    private func finishSeekIfSettled() {
+        guard !seekInFlight, pendingSeek == nil, !scrubGestureActive else { return }
+        if isScrubbing { isScrubbing = false }
+        if !isPlaying { updateStillFrame() }
+    }
+
+    private func invalidateSeeks() {
+        seekGeneration &+= 1
+        pendingSeek = nil
+        seekInFlight = false
+        scrubGestureActive = false
+        if isScrubbing { isScrubbing = false }
+        // Cancellation is a lifecycle operation, never a mouse-drag operation.
         player.currentItem?.cancelPendingSeeks()
-        player.seek(to: Self.frameTime(at: time, bounds: bounds), toleranceBefore: .zero, toleranceAfter: .zero)
-        updateStillFrame()
     }
 
     func togglePlayback() {
         guard !isClosed, !isLoading, renderedProject != nil else { return }
-        if player.rate > 0 { pause() }
+        if player.rate > 0 || isPlaying { pause() }
         else {
+            let position = time >= bounds.upperBound - 0.03 ? bounds.lowerBound : time
+            invalidateSeeks()
             discardPreview(restoringFrame: false)
-            if time >= bounds.upperBound - 0.03 { seek(bounds.lowerBound) }
+            requestSeek(position)
             stillRequests.invalidate()
             liveSources = nil
             stillFrame = nil
@@ -118,13 +231,14 @@ final class EditorPlayback: ObservableObject {
         let wasPlaying = isPlaying
         player.pause()
         isPlaying = false
-        if wasPlaying { updateStillFrame() }
+        if wasPlaying, !seekInFlight, pendingSeek == nil, !isScrubbing { updateStillFrame() }
     }
 
     /// Transient paused composition used while a gesture is in progress. The
     /// durable project, AVPlayerItem, playhead, and source geometry stay intact.
     func preview(_ state: EditState) {
-        guard !isClosed, !isLoading, let renderedProject, draftState != state else { return }
+        guard !isClosed, !isLoading, !isScrubbing, !seekInFlight, pendingSeek == nil,
+              let renderedProject, draftState != state else { return }
         if draftState == nil {
             player.pause()
             isPlaying = false
@@ -185,15 +299,16 @@ final class EditorPlayback: ObservableObject {
     }
 
     private func updateStillFrame() {
-        guard !isClosed, !isPlaying, draftState == nil,
-              let renderedProject, let committedState else { return }
+        guard !isClosed, !isPlaying, !isScrubbing, !seekInFlight, pendingSeek == nil,
+              draftState == nil, let renderedProject, let committedState else { return }
         let position = Self.frameTime(at: time, bounds: bounds)
         let source = sourceCache(for: renderedProject, at: position)
         stillRequests.request(
             generate: { try await source.image(applying: committedState) },
             cancel: {},
             receive: { [weak self] image in
-                guard let self, !self.isClosed, !self.isPlaying else { return }
+                guard let self, !self.isClosed, !self.isPlaying, !self.isScrubbing,
+                      !self.seekInFlight, self.pendingSeek == nil else { return }
                 self.stillFrame = image
             },
             failure: { [weak self] in self?.stillFrame = nil }
@@ -221,6 +336,8 @@ final class EditorPlayback: ObservableObject {
 
     func close() {
         generation += 1
+        itemStatusObservation = nil
+        invalidateSeeks()
         isClosed = true
         player.pause()
         isPlaying = false
@@ -334,30 +451,3 @@ private final class LiveStillFrameCache {
     }
 }
 
-struct EditorPlayerSurface: NSViewRepresentable {
-    let player: AVPlayer
-    func makeNSView(context: Context) -> PlayerSurface {
-        let view = PlayerSurface()
-        view.playerLayer.player = player
-        return view
-    }
-    func updateNSView(_ view: PlayerSurface, context: Context) { view.playerLayer.player = player }
-
-    final class PlayerSurface: NSView {
-        let playerLayer = AVPlayerLayer()
-        override init(frame: NSRect) {
-            super.init(frame: frame)
-            wantsLayer = true
-            playerLayer.videoGravity = .resizeAspect
-            layer?.addSublayer(playerLayer)
-        }
-        required init?(coder: NSCoder) { nil }
-        override func layout() {
-            super.layout()
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            playerLayer.frame = bounds
-            CATransaction.commit()
-        }
-    }
-}

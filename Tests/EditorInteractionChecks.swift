@@ -3,7 +3,7 @@ import SwiftUI
 
 private enum InteractionCheckError: Error { case failed(String) }
 
-/// Hosts the actual production SwiftUI gestures in an offscreen native window.
+/// Hosts the actual production editor interactions in an offscreen native window.
 /// These tests require no capture permission, camera, or account.
 @main
 @MainActor
@@ -30,10 +30,10 @@ struct EditorInteractionChecks {
         defer { window.close() }
         await settle()
         host.layoutSubtreeIfNeeded()
-        guard let surface: EditorPlayerSurface.PlayerSurface = find(in: host) else {
+        guard let surface: EditorCanvasView = find(in: host) else {
             throw InteractionCheckError.failed("production editor did not create its native player surface")
         }
-        let canvas = host.convert(surface.bounds, from: surface)
+        let canvas = host.convert(surface.canvasRect, from: surface)
         let initial = project.state.pipKeyframes[0].placement
         let originalFrame = initial.frame(in: canvas.size, cameraAspect: 16.0 / 9.0)
         let baselineFittingSize = host.fittingSize
@@ -131,7 +131,7 @@ struct EditorInteractionChecks {
         let cameraAfter = try Data(contentsOf: camera)
         try require(screenAfter == screenBytes && cameraAfter == cameraBytes,
                     "native geometry gestures must preserve source media bytes")
-        print("Editor interaction checks passed (production SwiftUI move/resize/crop gestures, full pointer deltas, single undo groups, persistence, and unchanged sources).")
+        print("Editor interaction checks passed (production move/resize/crop gestures, full pointer deltas, single undo groups, persistence, and unchanged sources).")
     }
 
     private static func checkCrop(in directory: URL) async throws {
@@ -193,7 +193,15 @@ struct EditorInteractionChecks {
             let event = NSEvent.mouseEvent(with: type, location: host.convert(point, to: nil), modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
-            window.sendEvent(event)
+            if let canvas: EditorCanvasView = find(in: host),
+               host.convert(canvas.bounds, from: canvas).contains(point) {
+                switch type {
+                case .leftMouseDown: canvas.mouseDown(with: event)
+                case .leftMouseDragged: canvas.mouseDragged(with: event)
+                case .leftMouseUp: canvas.mouseUp(with: event)
+                default: break
+                }
+            } else { window.sendEvent(event) }
         }
         send(.leftMouseDown, point: start)
         for step in 1...4 {

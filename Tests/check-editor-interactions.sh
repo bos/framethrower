@@ -9,6 +9,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectRenderer.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PIPVideoCompositor.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPlayback.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PIPGeometryViews.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" \

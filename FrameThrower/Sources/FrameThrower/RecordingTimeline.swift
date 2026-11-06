@@ -8,6 +8,8 @@ struct RecordingTimeline: NSViewRepresentable {
     let playhead: Double
     var onInteractionBegan: () -> Void
     var onSeek: (Double) -> Void
+    var onScrubBegan: () -> Void = {}
+    var onScrubEnded: () -> Void = {}
     var onTrim: (Double, Double) -> Void
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
@@ -17,6 +19,8 @@ struct RecordingTimeline: NSViewRepresentable {
         view.trimEnd = trimEnd
         view.playhead = playhead
         view.onInteractionBegan = onInteractionBegan
+        view.onScrubBegan = onScrubBegan
+        view.onScrubEnded = onScrubEnded
         view.onSeek = onSeek
         view.onTrim = onTrim
     }
@@ -33,6 +37,8 @@ final class RecordingTimelineView: NSView {
     var onSeek: ((Double) -> Void)?
     var onTrim: ((Double, Double) -> Void)?
     var onInteractionBegan: (() -> Void)?
+    var onScrubBegan: (() -> Void)?
+    var onScrubEnded: (() -> Void)?
 
     private enum Interaction { case start, end, scrub }
     private struct Drag {
@@ -121,6 +127,7 @@ final class RecordingTimelineView: NSView {
         } else { interaction = .scrub }
         let origin: Double
         if interaction == .scrub {
+            onScrubBegan?()
             // Grab the thumb without a jump; a click elsewhere seeks directly.
             origin = point.y < 12 && abs(point.x - x(for: playhead)) <= 10 ? playhead : time(for: point.x)
             seek(origin)
@@ -147,7 +154,7 @@ final class RecordingTimelineView: NSView {
         self.drag = nil
         scrubTime = nil
         switch drag.interaction {
-        case .scrub: break
+        case .scrub: onScrubEnded?()
         case .start, .end:
             if drag.start != trimStart || drag.end != trimEnd { onTrim?(drag.start, drag.end) }
         }
@@ -158,7 +165,9 @@ final class RecordingTimelineView: NSView {
         guard event.keyCode == 123 || event.keyCode == 124 else { super.keyDown(with: event); return }
         onInteractionBegan?()
         let step = event.modifierFlags.contains(.shift) ? 1.0 : 0.1
+        onScrubBegan?()
         seek(playhead + (event.keyCode == 123 ? -step : step))
+        onScrubEnded?()
         scrubTime = nil
         needsDisplay = true
     }
@@ -169,7 +178,9 @@ final class RecordingTimelineView: NSView {
 
     private func accessibleSeek(_ delta: Double) -> Bool {
         onInteractionBegan?()
+        onScrubBegan?()
         seek(playhead + delta)
+        onScrubEnded?()
         scrubTime = nil
         needsDisplay = true
         return true

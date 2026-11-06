@@ -142,6 +142,7 @@ struct EditorPlaybackChecks {
                     "fractional media end must remain exclusive")
 
         try await draftPreviewChecks()
+        try await scrubbingChecks()
 
         let playback = EditorPlayback()
         playback.close()
@@ -178,6 +179,15 @@ struct EditorPlaybackChecks {
         let size = playback.screenSize
         let aspect = playback.cameraAspect
         var draft = project.state
+        var parentChanges = 0
+        var imageChanges = 0
+        let parentObservation = playback.objectWillChange.sink { parentChanges += 1 }
+        let imageObservation = playback.frameStore.objectWillChange.sink { imageChanges += 1 }
+        playback.preview(draft)
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        await settle()
+        parentChanges = 0
+        imageChanges = 0
         // Simulate a burst of changed events. Only accepted worker items create
         // decoders, while the latest event must eventually move the actual PIP.
         for step in 0..<100 {
@@ -186,6 +196,10 @@ struct EditorPlaybackChecks {
             playback.preview(draft)
         }
         _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+        try require(parentChanges == 0 && imageChanges > 0,
+                    "draft pixels invalidated the parent playback/layout observable")
+        parentObservation.cancel()
+        imageObservation.cancel()
         try require(playback.isPreviewing && !playback.isLoading && !playback.isPlaying,
                     "live gesture entered durable/loading playback state")
         try require(playback.player.currentItem === item && playback.time == position,
@@ -235,6 +249,74 @@ struct EditorPlaybackChecks {
         let cameraAfter = try Data(contentsOf: camera)
         try require(screenAfter == originalScreen && cameraAfter == originalCamera,
                     "draft preview changed original captured media")
+    }
+
+    @MainActor
+    private static func scrubbingChecks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-scrub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await movie(to: directory.appendingPathComponent("screen.mov"), width: 1920, height: 1080, camera: false)
+        try await movie(to: directory.appendingPathComponent("camera.mov"), width: 640, height: 360, camera: true)
+        var project = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 2)
+        project.state.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 0, scale: 0.25)
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("scrub.framethrower"))
+        let playback = EditorPlayback()
+        defer { playback.close() }
+        await playback.rebuild(editor: editor)
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270))
+        guard let item = playback.player.currentItem else { throw PlaybackCheckError.failed("missing native player item") }
+        try require(item.seekingWaitsForVideoCompositionRendering,
+                    "native seek timing must wait for custom-composed frames before chasing the next target")
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
+        output.suppressesPlayerRendering = true
+        item.add(output)
+        defer { item.remove(output) }
+        playback.beginScrubbing()
+        var displayedColors = Set<UInt8>()
+        var displayedFrames = Set<Int>()
+        let target = 1.79
+        for step in 0..<30 {
+            let seconds = 0.05 + Double(step) * 0.06
+            playback.scrub(to: seconds)
+            try require(abs(playback.time - seconds) < 0.000_001,
+                        "native chase overwrote the requested timeline position")
+            try await Task.sleep(for: .milliseconds(16))
+            try require(playback.isScrubbing && playback.stillFrame == nil,
+                        "a stale still covered native video during active scrubbing")
+            let requested = playback.player.currentTime()
+            if output.hasNewPixelBuffer(forItemTime: requested) {
+                var displayed = CMTime.invalid
+                if let buffer = output.copyPixelBuffer(forItemTime: requested, itemTimeForDisplay: &displayed) {
+                    CVPixelBufferLockBaseAddress(buffer, .readOnly)
+                    let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+                    let offset = 540 * CVPixelBufferGetBytesPerRow(buffer) + 960 * 4
+                    displayedColors.insert(bytes[offset + 2])
+                    CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+                    if displayed.seconds.isFinite { displayedFrames.insert(Int((displayed.seconds * 30).rounded())) }
+                }
+            }
+        }
+        try require(displayedColors.count >= 3 && displayedFrames.count >= 3,
+                    "native video remained frozen before mouse-up (colors=\(displayedColors.count), frames=\(displayedFrames.count))")
+        playback.endScrubbing()
+        let deadline = Date().addingTimeInterval(5)
+        while playback.isScrubbing && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        try require(!playback.isScrubbing, "final chasing seek never settled")
+        try require(abs(playback.player.currentTime().seconds - target) < 0.001,
+                    "final native seek missed latest target")
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 480, height: 270))
+        try require(playback.player.currentItem === item, "scrubbing replaced the native player item")
+        playback.beginScrubbing()
+        playback.scrub(to: 0.4)
+        playback.endScrubbing()
+        playback.close()
+        try await Task.sleep(for: .milliseconds(50))
+        try require(playback.stillFrame == nil && !playback.isScrubbing,
+                    "a late native seek restored pixels after close")
+        print("Native scrub output changed before mouse-up (\(displayedFrames.count) frame times, \(displayedColors.count) changing source colors).")
     }
 
     @MainActor
@@ -301,15 +383,15 @@ struct EditorPlaybackChecks {
                 throw PlaybackCheckError.failed("fixture pixel buffer")
             }
             CVPixelBufferLockBaseAddress(buffer, [])
-            let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+            let base = CVPixelBufferGetBaseAddress(buffer)!
             let row = CVPixelBufferGetBytesPerRow(buffer)
             for y in 0..<height {
-                for x in 0..<width {
-                    let offset = y * row + x * 4
-                    bytes[offset] = camera ? 0 : 255
-                    bytes[offset + 1] = camera && x < width / 2 ? 255 : 0
-                    bytes[offset + 2] = camera && x >= width / 2 ? 255 : 0
-                    bytes[offset + 3] = 255
+                let pixels = base.advanced(by: y * row).assumingMemoryBound(to: UInt32.self)
+                if camera {
+                    pixels.initialize(repeating: 0xff00ff00, count: width / 2)
+                    pixels.advanced(by: width / 2).initialize(repeating: 0xffff0000, count: width - width / 2)
+                } else {
+                    pixels.initialize(repeating: 0xff0000ff | UInt32(index * 2) << 16, count: width)
                 }
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])

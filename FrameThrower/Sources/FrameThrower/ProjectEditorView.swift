@@ -3,14 +3,10 @@ import SwiftUI
 struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
     @StateObject private var playback = EditorPlayback()
-    @Environment(\.dismiss) private var dismiss
     @State private var selectedPoint: UUID?
     @State private var transition: PIPTransition = .jump
     @State private var transitionDuration = 0.6
-    @State private var dragOrigin: PIPPlacement?
-    @State private var dragPlacement: PIPPlacement?
     @State private var dragTime = 0.0
-    @State private var resizeOrigin: PIPPlacement?
     @State private var isFramingPresented = false
     @State private var framingTime = 0.0
     @State private var cameraFrame: CGImage?
@@ -20,16 +16,14 @@ struct ProjectEditorView: View {
 
     private var state: EditState { editor.project.state }
     private var point: PIPKeyframe? { state.pipKeyframes.first { $0.id == selectedPoint } }
-    private var placement: PIPPlacement { dragPlacement ?? state.placement(at: playback.editingTime) }
+    private var placement: PIPPlacement { state.placement(at: playback.editingTime) }
 
     var body: some View {
         VStack(spacing: 16) {
             HStack {
-                Text("Edit recording").font(.title2.weight(.semibold))
-                Spacer()
                 ProjectUndoButtons(editor: editor)
+                Spacer()
                 Button("Export…") { Task { await export() } }.disabled(isExporting || playback.isLoading)
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
             player
             timeline
@@ -40,8 +34,8 @@ struct ProjectEditorView: View {
             if isExporting { ProgressView("Exporting…") }
         }
         .padding(24)
-        .frame(minWidth: 820, idealWidth: 940, minHeight: 760, idealHeight: 780)
-        .presentationSizing(.fitted)
+        .frame(minWidth: 820, idealWidth: 940, maxWidth: .infinity,
+               minHeight: 760, idealHeight: 780, maxHeight: .infinity)
         .background(.background)
         .task { await playback.rebuild(editor: editor) }
         .onChange(of: editor.project.state) { _, _ in
@@ -55,63 +49,17 @@ struct ProjectEditorView: View {
     }
 
     private var player: some View {
-        GeometryReader { proxy in
-            let canvas = fittedSize(in: proxy.size)
-            ZStack {
-                Color.black
-                ZStack {
-                    EditorPlayerSurface(player: playback.player)
-                    if !playback.isPlaying, let frame = playback.stillFrame {
-                        Image(decorative: frame, scale: 1).resizable().aspectRatio(contentMode: .fit)
-                    }
-                }
-                    .frame(width: canvas.width, height: canvas.height)
-                    .overlay(alignment: .topLeading) {
-                        if editor.project.cameraFilename != nil, placement.visible {
-                            let rect = placement.frame(in: canvas, cameraAspect: playback.cameraAspect)
-                            ZStack(alignment: .topLeading) {
-                                PIPWindowShape(shape: placement.shape)
-                                    .strokeBorder(.white.opacity(0.9), lineWidth: 1)
-                                    .background(PIPWindowShape(shape: placement.shape).fill(.white.opacity(0.001)))
-                                ForEach(PIPResizeCorner.allCases, id: \.self) { corner in
-                                    resizeHandle(corner: corner, canvas: canvas)
-                                        .position(x: isLeft(corner) ? 0 : rect.width,
-                                                  y: isTop(corner) ? 0 : rect.height)
-                                }
-                            }
-                                .frame(width: rect.width, height: rect.height)
-                                .offset(x: rect.minX, y: rect.minY)
-                                .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("recordingCanvas"))
-                                    .onChanged { value in
-                                        guard resizeOrigin == nil else { return }
-                                        if dragOrigin == nil {
-                                            playback.pause()
-                                            dragOrigin = state.placement(at: playback.editingTime)
-                                            dragTime = playback.editingTime
-                                        }
-                                        guard var next = dragOrigin else { return }
-                                        next.x += value.translation.width / max(1, canvas.width - rect.width)
-                                        next.y += value.translation.height / max(1, canvas.height - rect.height)
-                                        next.x = snap(next.x)
-                                        next.y = snap(next.y)
-                                        previewPlacement(next, at: dragTime)
-                                    }
-                                    .onEnded { _ in
-                                        guard resizeOrigin == nil else { return }
-                                        if let dragPlacement { setPlacement(dragPlacement, at: dragTime, name: "Move camera") }
-                                        dragOrigin = nil
-                                        dragPlacement = nil
-                                    })
-                                .accessibilityLabel("Camera position. Drag to move, or use the corner buttons below.")
-                        }
-                    }
-                    .coordinateSpace(name: "recordingCanvas")
-                if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(height: 310)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        EditorCanvas(player: playback.player, frames: playback.frameStore,
+            sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
+            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing,
+            showsStill: !playback.isPlaying,
+            onBegin: { playback.pause(); dragTime = playback.editingTime },
+            onPreview: { next in playback.preview(applying(next, at: dragTime)) },
+            onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
+            onCancel: { playback.cancelPreview() })
+            .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
+            .overlay { if playback.isLoading { ProgressView().padding().background(.regularMaterial, in: Capsule()) } }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private var timeline: some View {
@@ -125,12 +73,14 @@ struct ProjectEditorView: View {
                 RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
                     trimEnd: state.trimEnd, playhead: playback.time,
                     onInteractionBegan: { playback.pause() },
-                    onSeek: { playback.seek($0) },
+                    onSeek: { playback.scrub(to: $0) },
+                    onScrubBegan: { playback.beginScrubbing() },
+                    onScrubEnded: { playback.endScrubbing() },
                     onTrim: { start, end in setTrim(start, end) })
                     .frame(height: 36)
                     .help("Click or drag to scrub. Drag the blue handles to trim.")
                 Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
-                    .monospacedDigit().font(.caption)
+                    .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
             }
             HStack {
                 Text("Keep \(state.trimStart, specifier: "%.2f")–\(state.trimEnd, specifier: "%.2f") s")
@@ -280,43 +230,6 @@ struct ProjectEditorView: View {
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func isLeft(_ corner: PIPResizeCorner) -> Bool {
-        corner == .topLeft || corner == .bottomLeft
-    }
-
-    private func isTop(_ corner: PIPResizeCorner) -> Bool {
-        corner == .topLeft || corner == .topRight
-    }
-
-    private func resizeHandle(corner: PIPResizeCorner, canvas: CGSize) -> some View {
-        Circle().fill(.white)
-            .overlay { Circle().strokeBorder(.black.opacity(0.55), lineWidth: 1) }
-            .frame(width: 9, height: 9)
-            .frame(width: 24, height: 24)
-            .contentShape(Rectangle())
-            .help("Resize camera")
-            .accessibilityLabel("Resize camera " + (isTop(corner) ? "top " : "bottom ") + (isLeft(corner) ? "left" : "right"))
-            .highPriorityGesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("recordingCanvas")).onChanged { value in
-                if resizeOrigin == nil {
-                    playback.pause()
-                    resizeOrigin = state.placement(at: playback.editingTime)
-                    dragTime = playback.editingTime
-                }
-                guard let origin = resizeOrigin else { return }
-                previewPlacement(origin.resized(by: value.translation, corner: corner,
-                    in: canvas, cameraAspect: playback.cameraAspect), at: dragTime)
-            }.onEnded { _ in
-                if let dragPlacement { setPlacement(dragPlacement, at: dragTime, name: "Resize camera") }
-                resizeOrigin = nil
-                dragPlacement = nil
-            })
-    }
-
-    private func previewPlacement(_ next: PIPPlacement, at time: Double) {
-        dragPlacement = next
-        playback.preview(applying(next, at: time))
-    }
-
     private func applying(_ next: PIPPlacement, at time: Double) -> EditState {
         var edited = state
         let time = editor.project.editingTime(at: time,
@@ -367,17 +280,6 @@ struct ProjectEditorView: View {
         edited.pipKeyframes.append(selected)
         edited.pipKeyframes.sort { $0.time < $1.time }
         editor.commit(edited, name: "Change camera point")
-    }
-
-    private func fittedSize(in space: CGSize) -> CGSize {
-        let scale = min(space.width / playback.screenSize.width, space.height / playback.screenSize.height)
-        return CGSize(width: playback.screenSize.width * scale, height: playback.screenSize.height * scale)
-    }
-
-    private func snap(_ value: Double) -> Double {
-        if value < 0.035 { return 0 }
-        if value > 0.965 { return 1 }
-        return min(max(value, 0), 1)
     }
 
     private func export() async {

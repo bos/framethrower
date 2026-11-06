@@ -145,6 +145,10 @@ Automated checks run without camera hardware or connected accounts:
   finalization, and retry isolation.
 - `Tests/check-editor-interactions.sh`: production editor mouse gestures, exact
   drag deltas, persisted undo/redo, and trim integration.
+- `Tests/check-editor-canvas.sh`: native image orientation, letterboxing, resize
+  handle alignment, and Escape cancellation without an edit.
+- `Tests/check-live-editor-layout.sh`: real 1080p video, changing scrub and live
+  camera pixels, stable canvas/window geometry, and one undo per drag.
 - `Tests/check-editor-windows.sh`: shared project identity, independent window
   histories, reopening, and failed-open recovery.
 - `Tests/check-project-streaming-playback.sh`: real AVPlayer frame output across

@@ -16,6 +16,7 @@
 		485B2C647E5B8415DED8C557 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D36B84B4B1F8D344D22C3892 /* Models.swift */; };
 		4A53D6CBF0FFE3F1F99B7A9A /* CapturePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB5CFC6F84DBC5F3A292EE02 /* CapturePreview.swift */; };
 		4D3C86393CA8F435ED45793C /* PIPGeometryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 195ED7EEA588C1534E5375CA /* PIPGeometryViews.swift */; };
+		50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */; };
 		5DE6C50872135C1523F17FB9 /* WindowSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 010F10320038E81B6F92F45A /* WindowSelection.swift */; };
 		667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */; };
 		67AAAA5AF554D2C21BE34ECE /* RecordingProject.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CF655690A9E839FF2C6B1E0 /* RecordingProject.swift */; };
@@ -48,6 +49,7 @@
 		36ACB61C84F04DE05285C1AA /* OAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuth.swift; sourceTree = "<group>"; };
 		3D91E6293B3F47CD92BE79E4 /* EditorPlayback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorPlayback.swift; sourceTree = "<group>"; };
 		4370A1AA27EA8518D9E26D61 /* DriveUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveUploader.swift; sourceTree = "<group>"; };
+		4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorCanvas.swift; sourceTree = "<group>"; };
 		4A422B6A5EA766959C6AC727 /* FrameThrower.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FrameThrower.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4B02FAC8C4CE33A644C90D03 /* SlackAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlackAPI.swift; sourceTree = "<group>"; };
 		576C7E1DB025530CEFC06FD2 /* DisplayCarousel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayCarousel.swift; sourceTree = "<group>"; };
@@ -93,6 +95,7 @@
 				DD643FF7C65778C3D5A01A54 /* ContentView.swift */,
 				576C7E1DB025530CEFC06FD2 /* DisplayCarousel.swift */,
 				4370A1AA27EA8518D9E26D61 /* DriveUploader.swift */,
+				4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */,
 				3D91E6293B3F47CD92BE79E4 /* EditorPlayback.swift */,
 				F658B134CC765957233533CB /* FrameThrowerApp.swift */,
 				7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */,
@@ -211,6 +214,7 @@
 				6FAD6B2ACDC1A15905CFB4B1 /* ContentView.swift in Sources */,
 				D9D3E9F4ADA65D5739663177 /* DisplayCarousel.swift in Sources */,
 				CD481459319AF75BCBCCD680 /* DriveUploader.swift in Sources */,
+				50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */,
 				6F3D6454ECB2F457499AC3C2 /* EditorPlayback.swift in Sources */,
 				D48CD70601AD09B0BEEA52D0 /* FrameThrowerApp.swift in Sources */,
 				667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */,

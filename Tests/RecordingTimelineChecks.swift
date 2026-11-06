@@ -15,7 +15,13 @@ struct RecordingTimelineChecks {
         var seeks: [Double] = []
         var trims: [(Double, Double)] = []
         var interactions = 0
-        timeline.onSeek = { time in seeks.append(time); timeline.playhead = time }
+        var scrubPhases: [String] = []
+        timeline.onSeek = { time in
+            precondition(scrubPhases.last == "begin", "Every seek must occur inside an active scrub")
+            seeks.append(time); timeline.playhead = time
+        }
+        timeline.onScrubBegan = { scrubPhases.append("begin") }
+        timeline.onScrubEnded = { scrubPhases.append("end") }
         timeline.onTrim = { start, end in
             trims.append((start, end))
             timeline.trimStart = start
@@ -31,6 +37,7 @@ struct RecordingTimelineChecks {
             seeks = []
             trims = []
             interactions = 0
+            scrubPhases = []
         }
         func mouse(_ type: NSEvent.EventType, at point: CGPoint) -> NSEvent {
             NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [],
@@ -59,6 +66,7 @@ struct RecordingTimelineChecks {
         near(seeks.last, 6, "Dragging the track seeks before mouse-up")
         up(CGPoint(x: timeline.x(for: 6), y: 24))
         precondition(trims.isEmpty && interactions == 1, "Scrubbing never creates trim edits")
+        precondition(scrubPhases == ["begin", "end"], "A mouse scrub has one begin and one end")
 
         reset()
         gesture(from: CGPoint(x: timeline.x(for: 5), y: 24), to: CGPoint(x: -100, y: 24))
@@ -76,6 +84,7 @@ struct RecordingTimelineChecks {
         precondition(trims.isEmpty, "Trim drag creates no intermediate undo entries")
         up(CGPoint(x: offCenterStart.x + 120, y: 24))
         precondition(trims.count == 1 && interactions == 1, "A trim drag commits once")
+        precondition(scrubPhases.isEmpty, "Trimming must not start a video scrub")
         near(trims.last?.0, 4, "Off-center grab uses translation without jumping")
         near(trims.last?.1, 8, "Trimming the start preserves the end")
 
@@ -140,6 +149,11 @@ struct RecordingTimelineChecks {
         key(123, shift: true)
         near(seeks.last, 2, "Keyboard scrub clamps to retained start")
         precondition(trims.isEmpty, "Keyboard scrubbing does not create edits")
+
+        precondition(scrubPhases == Array(repeating: ["begin", "end"], count: 6).flatMap { $0 },
+                     "Each keyboard seek must finish its scrub")
+        _ = timeline.accessibilityPerformIncrement()
+        precondition(scrubPhases.suffix(2) == ["begin", "end"], "Accessible seek finishes its scrub")
 
         window.close()
         print("Recording timeline checks passed: shared geometry, continuous scrub, overlap hit targets, trim gesture grouping, clamping, and keyboard seek.")

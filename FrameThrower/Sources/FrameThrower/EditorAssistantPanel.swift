@@ -19,6 +19,19 @@ final class EditorAssistantSession: ObservableObject {
     }) { self.transport = transport }
     deinit { task?.cancel() }
 
+    func appendDictation(_ transcript: String) {
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        // Read the current draft when recognition finishes, so typing while
+        // listening is preserved along with the text that preceded dictation.
+        if instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            instruction = text
+        } else {
+            let separator = instruction.last?.isWhitespace == true ? "" : " "
+            instruction += separator + text
+        }
+    }
+
     func submit(editor: ProjectEditor, playhead: Double, regionID: UUID?, editID: UUID?) {
         guard !isBusy else { return }
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -148,7 +161,7 @@ struct EditorAssistantPanel: View {
                 .accessibilityLabel("Editing instruction")
                 .help("For example: At Edit A, zoom into Box 1. Then smoothly zoom out and into Box 2 at Edit B.")
             HStack {
-                LocalVoiceButton(speech: instructionSpeech) { text in session.instruction = text }
+                LocalVoiceButton(speech: instructionSpeech) { text in session.appendDictation(text) }
                     .disabled(session.isBusy)
                 Text("On-device").font(.caption).foregroundStyle(.secondary)
                 Spacer()

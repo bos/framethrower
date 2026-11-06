@@ -25,6 +25,7 @@ private actor AssistantTransport {
 @MainActor
 struct EditorAssistantSessionChecks {
     static func main() async throws {
+        try checkDictationPreservesDraft()
         try await checkAtomicSubmissionAndBusy()
         try await checkFailurePreservesInstruction()
         try await checkStaleProjectRejection()
@@ -32,7 +33,7 @@ struct EditorAssistantSessionChecks {
         try await checkClarificationFollowup()
         try await checkDismissedClarificationStartsFresh()
         try await checkImmediateHistoryPreservesRedo()
-        print("Editor assistant session checks passed (atomic Undo, busy gating, failure preservation, stale revisions, cancelled late replies, and clarification context).")
+        print("Editor assistant session checks passed (dictation draft preservation, atomic Undo, busy gating, failure preservation, stale revisions, cancelled late replies, and clarification context).")
     }
 
     private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -45,6 +46,45 @@ struct EditorAssistantSessionChecks {
             try await Task.sleep(for: .milliseconds(1))
         }
         throw AssistantCheckError.failed("asynchronous assistant operation timed out")
+    }
+
+    private static func checkDictationPreservesDraft() throws {
+        let session = EditorAssistantSession(transport: { _ in throw FixtureTransportError.failed })
+        session.appendDictation("  Zoom into Box 1.\n")
+        try require(session.instruction == "Zoom into Box 1.",
+                    "dictation fills an empty draft and trims transcript edges")
+
+        session.appendDictation("Then pan to Box 2.")
+        try require(session.instruction == "Zoom into Box 1. Then pan to Box 2.",
+                    "dictation appends to typed or previously dictated instructions")
+
+        session.instruction = "At Edit A, "
+        session.appendDictation("zoom into Box 1.")
+        try require(session.instruction == "At Edit A, zoom into Box 1.",
+                    "dictation respects an existing separating space")
+
+        session.instruction = "At Edit A:\n"
+        session.appendDictation("zoom into Box 1.")
+        try require(session.instruction == "At Edit A:\nzoom into Box 1.",
+                    "dictation preserves a deliberately typed line break")
+
+        session.instruction = "First zoom into Box 1."
+        // Simulate typing while recognition is underway, before completion.
+        session.instruction += " Hold for five seconds."
+        session.appendDictation(" Then zoom out. ")
+        try require(session.instruction == "First zoom into Box 1. Hold for five seconds. Then zoom out.",
+                    "completion appends to the latest draft rather than a listening-start snapshot")
+
+        let existing = session.instruction
+        session.appendDictation("")
+        session.appendDictation(" \n\t ")
+        try require(session.instruction == existing,
+                    "empty recognition cannot clear or alter the current instruction")
+
+        session.instruction = " \n\t "
+        session.appendDictation(" Zoom out. ")
+        try require(session.instruction == "Zoom out.",
+                    "a whitespace-only draft is treated as empty")
     }
 
     private static func checkAtomicSubmissionAndBusy() async throws {

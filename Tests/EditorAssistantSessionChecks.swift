@@ -26,6 +26,7 @@ private actor AssistantTransport {
 struct EditorAssistantSessionChecks {
     static func main() async throws {
         try checkDictationPreservesDraft()
+        try await checkMalformedTimingPreservesDraft()
         try await checkAtomicSubmissionAndBusy()
         try await checkFailurePreservesInstruction()
         try await checkStaleProjectRejection()
@@ -85,6 +86,27 @@ struct EditorAssistantSessionChecks {
         session.appendDictation(" Zoom out. ")
         try require(session.instruction == "Zoom out.",
                     "a whitespace-only draft is treated as empty")
+    }
+
+    private static func checkMalformedTimingPreservesDraft() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        var draft = fixture.editor.project.state
+        draft.cursorStyle.size = 2
+        try require(fixture.editor.updateDraft(draft, at: 0), "begin manual draft before dictation correction")
+        let saved = fixture.editor.project
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let instruction = "12nd from now, pan from Box one into Box 2 after 3 seconds."
+        session.instruction = instruction
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        let requests = await transport.payloads.count
+        try require(requests == 0 && !session.isBusy && session.instruction == instruction,
+                    "unreadable timing retains editable transcript and never invokes a planner")
+        try require(fixture.editor.project == saved && fixture.editor.draftState == draft,
+                    "bad speech timing cannot commit or erase the current draft")
+        try require(session.errorMessage?.contains("12nd from now") == true,
+                    "error identifies the unreadable interval rather than blaming clip length")
     }
 
     private static func checkAtomicSubmissionAndBusy() async throws {

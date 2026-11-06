@@ -165,6 +165,8 @@ struct DurationMoveChecks {
             toRegionID: fixture.target.id, duration: 5)], "named boxes and duration resolve to one complete typed command")
         _ = try plan(reply(fixture, patches: ["start_edit_label": ""]), fixture: fixture,
                      request: "Pan and zoom from Box 1 to Box 2 over five seconds at this edit.")
+        _ = try plan(reply(fixture), fixture: fixture,
+                     request: "At Edit A, pan and zoom from Box 1 to Box 2 over5 seconds.")
         for patch: [String: Any] in [["start_edit_label": "Edit Z"], ["from_box_label": "Box 99"],
                                      ["to_box_label": "Box 99"], ["duration_seconds": 3], ["duration_seconds": 60]] {
             guard case .clarification = try LocalEditPlanner.result(reply(fixture, patches: patch), context: fixture.context, instruction: instruction) else {

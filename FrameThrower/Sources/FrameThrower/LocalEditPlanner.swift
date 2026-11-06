@@ -18,10 +18,24 @@ enum LocalEditResult: Sendable {
 /// The model proposes a small typed plan. It never invokes application methods
 /// directly; the command dispatcher rechecks identity, revision, and all edits.
 enum LocalEditPlanner {
-    static func payload(request: String, context: LocalEditContext) throws -> Data {
+    static func validateInstruction(_ request: String) throws {
         guard !request.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, request.count <= 8_192 else {
             throw EditorCommandError.invalid("Use an instruction of 1–8,192 characters.")
         }
+        // An ordinal is not an interval. In particular, never guess whether a
+        // recognition error such as '12nd from now' meant one or twelve seconds.
+        if let range = request.range(of: "\\b[0-9]+(?:st|nd|rd|th)\\s+from\\s+now\\b",
+                                     options: [.regularExpression, .caseInsensitive]) {
+            throw EditorCommandError.invalid("“\(request[range])” isn’t a time interval. Replace it with the delay you meant, such as “one second from now”.")
+        }
+        if request.range(of: "(?:[-−]\\s*[0-9]+(?:\\.[0-9]+)?|\\b(?:minus|negative)\\s+(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3}))\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\s+from\\s+now\\b",
+                         options: [.regularExpression, .caseInsensitive]) != nil {
+            throw EditorCommandError.invalid("Use a delay of zero or more seconds after the playhead. To start earlier, move the playhead to that time.")
+        }
+    }
+
+    static func payload(request: String, context: LocalEditContext) throws -> Data {
+        try validateInstruction(request)
         // A text model needs region references and the selected edit, not the
         // complete timeline. Bound context independently of project size.
         var regions = Array(context.recording.state.regions.suffix(8))
@@ -86,6 +100,7 @@ enum LocalEditPlanner {
         ]
         let contextText = String(decoding: try JSONSerialization.data(withJSONObject: compact, options: .sortedKeys), as: UTF8.self)
         let guidance = EditorAgentControls.tools(for: request) != nil ? editControlGuidance
+            : usesRelativeBoxMove(request, context: context) ? relativeMoveGuidance
             : usesDurationMove(request, context: context) ? durationGuidance
             : usesNamedReferences(request, context: context) ? namedGuidance : numericGuidance
         let messages: [[String: String]] = [
@@ -101,6 +116,12 @@ enum LocalEditPlanner {
             and selected region references identify visual targets. Never invent IDs.
             Rendering, export, camera capture, and video frame extraction are disabled.
             Labels and framing metadata edits remain available. Do not claim execution.
+            'Now' means the playhead, never the selected edit or wall-clock time.
+            'One second from now' starts at playhead + 1, not at 1 or 12 seconds.
+            In a request with multiple relative times, use the playhead as their
+            shared origin unless a different origin is explicit. 'One second from
+            now ... into Box 2 after three seconds' starts at playhead + 1 and
+            reaches Box 2 at playhead + 3, leaving TWO seconds for movement.
             """],
             ["role": "user", "content": "Editor context:\n" + contextText + "\nInstruction:\n" + request]
         ]
@@ -112,6 +133,7 @@ enum LocalEditPlanner {
     }
 
     static func result(_ data: Data, context: LocalEditContext, instruction: String? = nil) throws -> LocalEditResult {
+        if let instruction { try validateInstruction(instruction) }
         guard data.count <= 262_144,
               let response = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = response["choices"] as? [[String: Any]], choices.count == 1,
@@ -134,12 +156,74 @@ enum LocalEditPlanner {
         if let result = try EditorAgentControls.result(name: name, args: args, context: context, instruction: instruction) { return result }
         guard let project = args["project_id"] as? String, UUID(uuidString: project) == context.recording.projectID,
               args["expected_revision"] as? String == context.recording.revision else { throw EditorCommandError.stale }
+        if let instruction, delayFromPlayhead(in: instruction) != nil,
+           name != "plan_sequence", name != "move_relative" {
+            return .clarification("You requested a new movement after the playhead, but the plan revises an existing edit. Should I add a new movement instead?")
+        }
         if let instruction, usesDurationMove(instruction, context: context), name != "move_for_duration" {
             return .clarification("The plan did not include the requested timed movement. Which edit should it start at, and how long should it take?")
         }
         var commands: [EditorCommand] = []
         let summary: String
         switch name {
+        case "move_relative":
+            try keys(args, ["project_id", "expected_revision", "from_box_label", "to_box_label", "start_delay_seconds", "arrival_seconds", "arrival_origin", "path"])
+            guard let from = args["from_box_label"] as? String, let to = args["to_box_label"] as? String,
+                  let origin = args["arrival_origin"] as? String, ["playhead", "movement_start"].contains(origin),
+                  let path = args["path"] as? String, ["direct", "via_full_frame"].contains(path),
+                  let source = resolveBox(from, context: context), let target = resolveBox(to, context: context) else { throw invalidResponse }
+            if let instruction {
+                for (prefixes, chosen) in [(["from"], source), (["to", "into"], target)] {
+                    let requested = context.recording.state.regions.filter { region in
+                        prefixes.contains { box(region, isMentionedAfter: $0, in: instruction, context: context) }
+                    }
+                    if requested.count == 1, requested[0].id != chosen.id {
+                        let label = context.recording.references.boxLabel(for: requested[0].id) ?? "the requested box"
+                        return .clarification("The plan reversed the box references. Should it move \(prefixes[0]) \(label)?")
+                    }
+                }
+            }
+            let delay = try number(args["start_delay_seconds"]), arrival = try number(args["arrival_seconds"])
+            guard delay >= 0, arrival > 0 else { throw invalidResponse }
+            let start = context.playhead + delay
+            let end = (origin == "playhead" ? context.playhead : start) + arrival
+            let duration = end - start
+            if let instruction, let expectedDelay = delayFromPlayhead(in: instruction), abs(delay - expectedDelay) > 0.000_001 {
+                return .clarification("The plan used a different start delay. Should the movement start \(timeLabel(expectedDelay)) after the playhead?")
+            }
+            if let instruction, let expectedArrival = arrivalDelayFromPlayhead(in: instruction),
+               abs(end - context.playhead - expectedArrival) > 0.000_001 {
+                return .clarification("Should the movement reach \(to) \(timeLabel(expectedArrival)) after the playhead?")
+            }
+            if let instruction, let expectedDuration = requestedDuration(in: instruction), abs(duration - expectedDuration) > 0.000_001 {
+                return .clarification("Should the whole movement take \(timeLabel(expectedDuration))?")
+            }
+            guard start.isFinite, end.isFinite, duration > 0, duration <= 60 else {
+                return .clarification("The arrival must be after the movement starts. When should it reach \(to)?")
+            }
+            guard end < context.recording.duration else {
+                throw EditorCommandError.invalid("The proposed movement starts at \(timeLabel(start)) and ends at \(timeLabel(end)), but this recording ends at \(timeLabel(context.recording.duration)). Choose an earlier start or shorter movement.")
+            }
+            var priorTime = 0.0
+            if let conflict = context.recording.state.zoomKeyframes.first(where: { point in
+                defer { priorTime = point.time }
+                let begins = point.transition == .smooth ? max(priorTime, point.time - point.duration) : point.time
+                return point.time >= start - 0.000_001 && begins <= end + 0.000_001
+            }) {
+                let label = context.recording.references.editLabel(for: conflict.id) ?? "Another edit"
+                return .clarification("\(label) already changes framing during that movement. Should it stay, or should the new movement replace it?")
+            }
+            commands = [.frameRegion(regionID: source.id, time: start, motion: EditorCommandMotion(transition: .jump))]
+            if path == "via_full_frame" {
+                let half = duration / 2
+                commands.append(.fullFrame(time: start + half, motion: EditorCommandMotion(transition: .smooth, duration: half)))
+                commands.append(.frameRegion(regionID: target.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: half)))
+            } else {
+                commands.append(.frameRegion(regionID: target.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: duration)))
+            }
+            let sourceName = context.recording.references.boxLabel(for: source.id) ?? from
+            let targetName = context.recording.references.boxLabel(for: target.id) ?? to
+            summary = "\(sourceName) at \(timeLabel(start)) → " + (path == "via_full_frame" ? "full frame → " : "") + "\(targetName) at \(timeLabel(end))."
         case "move_for_duration":
             try keys(args, ["project_id", "expected_revision", "start_edit_label", "from_box_label", "to_box_label", "duration_seconds", "path"])
             guard let startLabel = args["start_edit_label"] as? String,
@@ -261,6 +345,12 @@ enum LocalEditPlanner {
             try keys(args, ["project_id", "expected_revision", "start_seconds", "steps"])
             var cursor = try number(args["start_seconds"])
             guard cursor >= 0, let steps = args["steps"] as? [[String: Any]], (1...8).contains(steps.count) else { throw invalidResponse }
+            if let instruction, let delay = delayFromPlayhead(in: instruction) {
+                let expected = context.playhead + delay
+                guard expected.isFinite, abs(cursor - expected) < 0.000_001 else {
+                    return .clarification("You asked to start \(timeLabel(delay)) after the playhead at \(timeLabel(context.playhead)). Should the movement start at \(timeLabel(expected))?")
+                }
+            }
             commands.append(.holdFraming(time: cursor))
             for step in steps {
                 try keys(step, ["region_id", "move_seconds", "hold_seconds"])
@@ -277,8 +367,16 @@ enum LocalEditPlanner {
                     else { commands.append(.frameRegion(regionID: try uuid(region), time: cursor, motion: stationary)) }
                 }
             }
+            if let instruction, delayFromPlayhead(in: instruction) != nil,
+               let delay = arrivalDelayFromPlayhead(in: instruction) {
+                let expected = context.playhead + delay
+                guard abs(cursor - expected) < 0.000_001 else {
+                    return .clarification("You asked to arrive \(timeLabel(delay)) after the playhead, at \(timeLabel(expected)), but the plan arrives at \(timeLabel(cursor)). Should the movement finish at \(timeLabel(expected))?")
+                }
+            }
             guard cursor < context.recording.duration else {
-                throw EditorCommandError.invalid("The requested sequence extends past the recording. Choose an earlier time or shorter movement.")
+                let start = try number(args["start_seconds"])
+                throw EditorCommandError.invalid("The proposed movement starts at \(timeLabel(start)) and ends at \(timeLabel(cursor)), but this recording ends at \(timeLabel(context.recording.duration)). Choose an earlier start or shorter movement.")
             }
             // Existing intervening edits would make the spoken sequence false.
             // Ask for an explicit revision rather than silently remove user work.
@@ -295,15 +393,71 @@ enum LocalEditPlanner {
             summary = steps.count == 1 ? "Added a framing movement." : "Added \(steps.count) framing movements."
         default: throw invalidResponse
         }
-        if ["frame_edits", "move_for_duration"].contains(name), let instruction,
+        if ["frame_edits", "move_for_duration", "move_relative", "plan_sequence"].contains(name), let instruction,
            let question = incompleteReferenceQuestion(commands, instruction: instruction, context: context) {
             return .clarification(question)
+        }
+        if name == "plan_sequence", let instruction,
+           instruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:and\\s+)?(?:back\\s+)?(?:in|into)\\b",
+                             options: [.regularExpression, .caseInsensitive]) != nil {
+            let outward = commands.firstIndex { if case .fullFrame = $0 { return true }; return false }
+            guard let outward, commands.suffix(from: outward + 1).contains(where: {
+                if case .frameRegion = $0 { return true }; return false
+            }) else {
+                return .clarification("The plan didn’t zoom out before moving into the next box. Should it show the full frame between the boxes?")
+            }
+        }
+        if name == "move_relative", let instruction,
+           instruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:in|into)\\b|\\bfull\\s+frame\\b",
+                             options: [.regularExpression, .caseInsensitive]) != nil,
+           !commands.contains(where: { if case .fullFrame = $0 { return true }; return false }) {
+            return .clarification("Should it zoom out to the full frame between the boxes?")
         }
         return .commands(EditorCommandBatch(projectID: context.recording.projectID,
             revision: context.recording.revision, commands: commands), summary: summary)
     }
 
     private static var invalidResponse: EditorCommandError { .invalid("The local model returned an invalid editing request. No changes were applied.") }
+
+    private static func timeLabel(_ seconds: Double) -> String {
+        String(format: "%.2f s", seconds)
+    }
+
+    private static func delayFromPlayhead(in request: String) -> Double? {
+        let pattern = "\\b([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\s+from\\s+now\\b"
+        return timeInterval(in: request, pattern: pattern)
+    }
+
+    private static func arrivalDelayFromPlayhead(in request: String) -> Double? {
+        // Explicit movement-relative timing has a different origin and must
+        // remain with the planner rather than being treated as playhead-relative.
+        if request.range(of: "\\bafter\\s+(?:the\\s+)?(?:movement|pan|zoom)\\s+(?:starts?|begins?)\\b|\\bseconds?\\s+after\\s+(?:it|the\\s+movement)\\b",
+                         options: [.regularExpression, .caseInsensitive]) != nil { return nil }
+        let pattern = "\\bafter\\s+([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
+        return timeInterval(in: request, pattern: pattern)
+    }
+
+    private static func timeInterval(in request: String, pattern: String) -> Double? {
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = expression.firstMatch(in: request, range: NSRange(request.startIndex..., in: request)),
+              let range = Range(match.range(at: 1), in: request) else { return nil }
+        let raw = request[range].lowercased()
+        if let value = Double(raw) { return value }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        // A bounded word match can include introductory words ('in one').
+        // Resolve only an exact numeric suffix, longest first.
+        let words = raw.split(separator: " ")
+        for index in words.indices {
+            let suffix = words[index...].joined(separator: " ")
+            if suffix == "a" || suffix == "an" { return 1 }
+            if let value = (0...60).first(where: { formatter.string(from: NSNumber(value: $0)) == suffix }) {
+                return Double(value)
+            }
+        }
+        return nil
+    }
     private static func keys(_ value: [String: Any], _ expected: Set<String>) throws {
         guard Set(value.keys) == expected else { throw invalidResponse }
     }
@@ -448,6 +602,7 @@ enum LocalEditPlanner {
                 "required": properties.keys.sorted(), "additionalProperties": false]]]
     }
     private static func usesNamedReferences(_ request: String, context: LocalEditContext) -> Bool {
+        guard delayFromPlayhead(in: request) == nil else { return false }
         let knownReference = context.recording.state.timedEdits(includeCamera: true).contains {
             context.recording.references.editLabel(for: $0.id).map { mentions($0, in: request) } ?? false
         }
@@ -514,7 +669,8 @@ enum LocalEditPlanner {
         """
 
     private static let numericGuidance = """
-        To revise a selected existing edit, use revise_framing and preserve its time.
+        Use revise_framing only when asked to change the selected existing edit
+        without new timing. A future movement must not revise the selected edit.
         Otherwise use plan_sequence. start_seconds is when movement STARTS. Each
         step moves for move_seconds, then holds for hold_seconds, before the next
         step starts. Use full_frame to show the whole source. Default movement is
@@ -525,10 +681,36 @@ enum LocalEditPlanner {
         then return to full frame over 1 second has TWO steps: first that region
         with move_seconds=0.6 and hold_seconds=3, then full_frame with move_seconds=1
         and hold_seconds=0. Never omit the return step.
+        Preserve the order of requested targets: from Box 1, zoom out, and into
+        Box 2 means Box 1 then full_frame then Box 2. 'After three seconds' is
+        an arrival-time instruction, not a three-second hold. In a request with
+        'from now', its default origin is also the playhead. Start at playhead+1
+        and arrive at playhead+3 means all steps together take TWO seconds.
+        """
+
+    private static let relativeMoveGuidance = """
+        Use move_relative to move FROM one numbered box TO another after a delay
+        from the playhead. Copy the box labels; the app constructs the movement.
+        start_delay_seconds is the delay after the current playhead.
+        arrival_seconds with arrival_origin=playhead is the arrival offset from
+        the SAME playhead. 'One second from now ... into Box 2 after 3 seconds'
+        means start_delay_seconds=1, arrival_seconds=3, arrival_origin=playhead.
+        That leaves TWO seconds for the movement. Never turn arrival time into a hold.
+        If the WHOLE movement takes three seconds, use arrival_seconds=3 and
+        arrival_origin=movement_start. A named or selected edit never overrides now.
+        path=via_full_frame means zoom out then into the destination; the app divides
+        this movement equally. Use direct for a direct pan/zoom without a zoom-out.
+        Ask one clarification for missing boxes or unclear instructions.
         """
 
     private static func tools(for request: String, context: LocalEditContext) -> [[String: Any]] {
         if let controls = EditorAgentControls.tools(for: request) { return controls }
+        if usesRelativeBoxMove(request, context: context) {
+            return tools.filter { tool in
+                let name = (tool["function"] as? [String: Any])?["name"] as? String
+                return name == "move_relative" || name == "ask_clarification"
+            }
+        }
         if usesDurationMove(request, context: context) {
             return tools.filter {
                 guard let name = ($0["function"] as? [String: Any])?["name"] as? String else { return false }
@@ -538,7 +720,7 @@ enum LocalEditPlanner {
         guard usesNamedReferences(request, context: context) else {
             return tools.filter {
                 guard let name = ($0["function"] as? [String: Any])?["name"] as? String else { return false }
-                return name != "frame_edits" && name != "move_for_duration"
+                return name != "frame_edits" && name != "move_for_duration" && name != "move_relative"
             }
         }
         let naming = request.range(of: "\\b(?:label|name|call|rename|note)\\b",
@@ -552,7 +734,8 @@ enum LocalEditPlanner {
         }
     }
     private static func usesDurationMove(_ request: String, context: LocalEditContext) -> Bool {
-        let hasDuration = request.range(of: "\\b(?:over|for|lasting|takes?|in)\\s+(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b",
+        guard delayFromPlayhead(in: request) == nil else { return false }
+        let hasDuration = request.range(of: "\\b(?:over|for|lasting|takes?|in)(?:\\s+|(?=[0-9]))(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         let hasMovement = request.range(of: "\\b(?:pan|zoom|move|transition)\\b", options: [.regularExpression, .caseInsensitive]) != nil
         let formatter = NumberFormatter()
@@ -568,8 +751,37 @@ enum LocalEditPlanner {
         return hasDuration && hasMovement && boxes.count >= 2
     }
 
+    private static func usesRelativeBoxMove(_ request: String, context: LocalEditContext) -> Bool {
+        guard delayFromPlayhead(in: request) != nil,
+              request.range(of: "\\b(?:pan|zoom|move)\\b", options: [.regularExpression, .caseInsensitive]) != nil else { return false }
+        // The box list in context is authoritative. Ask rather than invent a
+        // missing target; the model receives only this action and clarification.
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        return context.recording.state.regions.filter { region in
+            guard let label = context.recording.references.boxLabel(for: region.id) else { return false }
+            if mentions(label, in: request) { return true }
+            guard let number = context.recording.references.boxes[region.id.uuidString],
+                  let words = formatter.string(from: NSNumber(value: number)) else { return false }
+            return mentions("Box " + words, in: request)
+        }.count >= 2
+    }
+
+    private static func box(_ region: EditorRegion, isMentionedAfter prefix: String,
+                            in request: String, context: LocalEditContext) -> Bool {
+        guard let label = context.recording.references.boxLabel(for: region.id) else { return false }
+        if mentions(prefix + " " + label, in: request) { return true }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        guard let number = context.recording.references.boxes[region.id.uuidString],
+              let words = formatter.string(from: NSNumber(value: number)) else { return false }
+        return mentions(prefix + " Box " + words, in: request)
+    }
+
     private static func requestedDuration(in request: String) -> Double? {
-        let pattern = "\\b(?:over|for|lasting|takes?|in)\\s+([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
+        let pattern = "\\b(?:over|for|lasting|takes?|in)(?:\\s+|(?=[0-9]))([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
         guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
         let text = request as NSString
         let formatter = NumberFormatter()
@@ -590,6 +802,13 @@ enum LocalEditPlanner {
     private static var tools: [[String: Any]] {
         let scope: [String: Any] = ["project_id": ["type": "string"], "expected_revision": ["type": "string"]]
         return [
+            function("move_relative", "Move from one numbered box to another after a delay from the playhead. The app builds a smooth direct or zoom-out/zoom-in path. Keep arrival offsets separate from movement durations.", scope.merging([
+                "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],
+                "start_delay_seconds": ["type": "number", "minimum": 0],
+                "arrival_seconds": ["type": "number", "exclusiveMinimum": 0],
+                "arrival_origin": ["type": "string", "enum": ["playhead", "movement_start"]],
+                "path": ["type": "string", "enum": ["direct", "via_full_frame"]]
+            ]) { _, b in b }),
             function("move_for_duration", "Pan and zoom smoothly from one numbered box to another over a duration, starting at a named or selected edit. Both boxes can belong to the same frame. The editor creates the arrival edit automatically. Use direct unless explicitly asked to return to full frame along the way.", scope.merging([
                 "start_edit_label": ["type": "string", "description": "An exact known edit label, or empty to use the selected edit."],
                 "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],

@@ -36,6 +36,8 @@ final class EditorAssistantSession: ObservableObject {
         guard !isBusy else { return }
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        do { try LocalEditPlanner.validateInstruction(text) }
+        catch { errorMessage = error.localizedDescription; notice = nil; return }
         // Canonical history commands are the same immediate actions as the
         // toolbar. In particular, Redo must never finish a draft and thereby
         // erase the very redo branch the user asked to restore.

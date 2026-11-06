@@ -11,7 +11,12 @@ private struct LocalEditPlannerChecks {
         try checkValidation()
         try checkClarificationsAndCollisions()
         try checkPayload()
-        if CommandLine.arguments.contains("--model") { try await checkNativeModel() }
+        try checkRelativeTimingAndPath()
+        try checkRelativeBoxMove()
+        if CommandLine.arguments.contains("--model") {
+            try await checkNativeModel()
+            try await checkNativeRelativeMoves()
+        }
         print("Local edit planner checks passed (movement/hold timing, labels, revisions, strict scope and numbers, clarifications, collision preservation; fake local replies, no model or media).")
     }
 
@@ -174,6 +179,99 @@ private struct LocalEditPlannerChecks {
         try rejects({ _ = try LocalEditPlanner.payload(request: String(repeating: "a", count: 8_193), context: fixture.context) }, "oversized instructions reject before inference")
     }
 
+    private static func checkRelativeTimingAndPath() throws {
+        var fixture = try Fixture()
+        fixture.context.recording.duration = 14.37
+        fixture.context.playhead = 9.6
+        for malformed in ["12nd from now", "1st from now", "3rd from now"] {
+            let text = malformed + ", pan from Box one into Box 2 after 3 seconds."
+            try rejects({ _ = try LocalEditPlanner.payload(request: text, context: fixture.context) },
+                        "malformed relative intervals cannot reach inference")
+            try rejects({ _ = try LocalEditPlanner.result(reply("plan_sequence", sequence(fixture)), context: fixture.context, instruction: text) },
+                        "a model response cannot repair or reinterpret malformed timing")
+        }
+        for negative in ["-1 second from now", "−1 second from now", "minus 1 second from now", "minus one second from now", "minus twenty-one seconds from now", "negative one second from now"] {
+            try rejects({ _ = try LocalEditPlanner.payload(request: negative + ", zoom into Box 1", context: fixture.context) },
+                        "negative relative times must never be converted into positive delays")
+        }
+        func response(start: Double, steps: [[String: Any]]) throws -> Data {
+            try reply("plan_sequence", fixture.scope.merging(["start_seconds": start, "steps": steps]) { _, b in b })
+        }
+        let simple = [["region_id": fixture.a.id.uuidString, "move_seconds": 0.4, "hold_seconds": 0] as [String: Any]]
+        let instruction = "One second from now, zoom into Box 1."
+        let proposed = try batch(LocalEditPlanner.result(response(start: 10.6, steps: simple), context: fixture.context, instruction: instruction))
+        try require(proposed.commands.first == .holdFraming(time: 10.6), "relative delay is added to playhead")
+        for request in [instruction, "In one second from now, zoom into Box 1.", "1 second from now, zoom into Box 1."] {
+            guard case .clarification = try LocalEditPlanner.result(response(start: 9.6, steps: simple), context: fixture.context, instruction: request) else {
+                throw CheckError.failed("lost relative start must clarify instead of silently editing")
+            }
+        }
+        do {
+            _ = try LocalEditPlanner.result(response(start: 14, steps: [["region_id": fixture.a.id.uuidString, "move_seconds": 1, "hold_seconds": 0]]), context: fixture.context)
+            throw CheckError.failed("out-of-range plan accepted")
+        } catch let error as EditorCommandError {
+            try require(error.localizedDescription.contains("14.00 s") && error.localizedDescription.contains("15.00 s") && error.localizedDescription.contains("14.37 s"),
+                        "range error shows proposed start/end and actual clip end")
+        }
+        fixture.context.playhead = 0
+        let request = "One second from now, pan from Box one, zoom out, and into Box 2."
+        let proper: [[String: Any]] = [
+            ["region_id": fixture.a.id.uuidString, "move_seconds": 0.4, "hold_seconds": 0],
+            ["region_id": "full_frame", "move_seconds": 1.3, "hold_seconds": 0],
+            ["region_id": fixture.b.id.uuidString, "move_seconds": 1.3, "hold_seconds": 0]]
+        _ = try batch(LocalEditPlanner.result(response(start: 1, steps: proper), context: fixture.context, instruction: request))
+        for steps in [[proper[0], proper[2], proper[1]], [proper[1], proper[2]]] {
+            guard case .clarification = try LocalEditPlanner.result(response(start: 1, steps: steps), context: fixture.context, instruction: request) else {
+                throw CheckError.failed("wrong outward path or omitted source box must clarify")
+            }
+        }
+    }
+
+    @MainActor
+    private static func checkRelativeBoxMove() throws {
+        var fixture = try Fixture()
+        fixture.project.duration = 14.37
+        fixture.context.recording.duration = 14.37
+        fixture.context.recording.revision = try EditorCommandDispatcher.revision(for: fixture.project)
+        fixture.context.playhead = 9.6
+        let instruction = "One second from now, I want you to pan from Box one, zoom out, and into box 2 after 3 seconds."
+        let arguments: [String: Any] = fixture.scope.merging([
+            "from_box_label": "Box 1", "to_box_label": "Box 2", "start_delay_seconds": 1,
+            "arrival_seconds": 3, "arrival_origin": "playhead", "path": "via_full_frame"
+        ]) { _, b in b }
+        let plan = try batch(LocalEditPlanner.result(reply("move_relative", arguments), context: fixture.context, instruction: instruction))
+        try require(plan.commands == [
+            .frameRegion(regionID: fixture.a.id, time: 10.6, motion: EditorCommandMotion(transition: .jump)),
+            .fullFrame(time: 11.6, motion: EditorCommandMotion(transition: .smooth, duration: 1)),
+            .frameRegion(regionID: fixture.b.id, time: 12.6, motion: EditorCommandMotion(transition: .smooth, duration: 1))
+        ], "one shared playhead origin creates source, outward midpoint and arrival without invented holds")
+        let prepared = try EditorCommandDispatcher.prepare(plan, for: fixture.project, projectID: fixture.projectID)
+        try require(prepared.zoom(at: 10.5).scale == 1 && prepared.zoom(at: 10.6) == fixture.a.rect.framing() &&
+                    prepared.zoom(at: 11.6).scale == 1 && prepared.zoom(at: 12.6) == fixture.b.rect.framing(),
+                    "shared motion interpolation honors each endpoint")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let editor = ProjectEditor(project: fixture.project, url: directory.appendingPathComponent("timing.framethrower"))
+        try require(editor.save(), "save metadata-only fixture")
+        try EditorCommandDispatcher.apply(plan, to: editor, projectID: fixture.projectID)
+        let completed = editor.project.state
+        try require(editor.project.undoHistory.count == 1 && editor.undo() && editor.project.state == fixture.project.state &&
+                    editor.redo() && editor.project.state == completed, "one Undo/Redo covers the whole relative move")
+        for patch: [String: Any] in [["start_delay_seconds": 0], ["arrival_origin": "movement_start"], ["path": "direct"],
+                                    ["from_box_label": "Box 2", "to_box_label": "Box 1"]] {
+            guard case .clarification = try LocalEditPlanner.result(reply("move_relative", arguments.merging(patch) { _, b in b }), context: fixture.context, instruction: instruction) else {
+                throw CheckError.failed("lost delay, wrong origin, or omitted outward motion must clarify")
+            }
+        }
+        for patch: [String: Any] in [["start_delay_seconds": true], ["arrival_seconds": -1], ["arrival_origin": "selected_edit"], ["extra": true]] {
+            try rejects({ _ = try LocalEditPlanner.result(reply("move_relative", arguments.merging(patch) { _, b in b }), context: fixture.context, instruction: instruction) }, "strict relative movement arguments")
+        }
+        let payload = try JSONSerialization.jsonObject(with: LocalEditPlanner.payload(request: instruction, context: fixture.context)) as! [String: Any]
+        let names = (payload["tools"] as! [[String: Any]]).compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+        try require(Set(names) == ["move_relative", "ask_clarification"], "relative box moves use a focused action without hold fields")
+    }
+
     @MainActor
     private static func checkNativeModel() async throws {
         let fixture = try Fixture()
@@ -237,6 +335,57 @@ private struct LocalEditPlannerChecks {
         try require(editor.undo() && editor.project.state == edited, "one Undo reverses the native framing revision")
         try require(editor.redo() && editor.project.state == revised, "one Redo restores the native framing revision")
         print(String(format: "Native Metal planner integration passed (sequence and selected-edit revision, atomic Undo/Redo, %.2f seconds, no media or microphone).", Date().timeIntervalSince(started)))
+    }
+
+    /// Native regression for the reported 14-second-clip failure. Spoken
+    /// offsets share the playhead origin; explicit movement duration does not.
+    /// All source files remain absent: this exercises only text and metadata.
+    @MainActor
+    private static func checkNativeRelativeMoves() async throws {
+        let requests: [(text: String, arrivalOffset: Double)] = [
+            ("One second from now, I want you to pan from Box one, zoom out, and into box 2 after 3 seconds.", 3),
+            ("One second from now, start at Box 1, smoothly zoom out to the full frame, and zoom into Box 2. The entire movement takes three seconds.", 4)
+        ]
+        for (index, request) in requests.enumerated() {
+            for playhead in [0.0, 9.6] {
+                var fixture = try Fixture()
+                fixture.project.duration = 14.37
+                fixture.context.recording.duration = fixture.project.duration
+                fixture.context.recording.revision = try EditorCommandDispatcher.revision(for: fixture.project)
+                fixture.context.playhead = playhead
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-native-relative-" + UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let editor = ProjectEditor(project: fixture.project, url: directory.appendingPathComponent("recording.framethrower"))
+                try require(editor.save(), "save relative native metadata fixture")
+                let payload = try LocalEditPlanner.payload(request: request.text, context: fixture.context)
+                let response = try await LocalModelRuntime.shared.chat(payload: payload)
+                let proposed = try batch(LocalEditPlanner.result(response, context: fixture.context, instruction: request.text))
+                let start = playhead + 1
+                let end = playhead + request.arrivalOffset
+                let midpoint = (start + end) / 2
+                let halfDuration = (end - start) / 2
+                try require(proposed.commands == [
+                    .frameRegion(regionID: fixture.a.id, time: start, motion: EditorCommandMotion(transition: .jump)),
+                    .fullFrame(time: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: halfDuration)),
+                    .frameRegion(regionID: fixture.b.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: halfDuration))
+                ], "native relative move retains exact source, zoom-out, destination, and requested timing")
+                try EditorCommandDispatcher.apply(proposed, to: editor, projectID: fixture.projectID)
+                let applied = editor.project.state
+                try require(applied.zoom(at: start) == fixture.a.rect.framing() &&
+                            applied.zoom(at: midpoint).scale == 1 &&
+                            applied.zoom(at: end) == fixture.b.rect.framing() &&
+                            editor.project.undoHistory.count == 1,
+                            "native relative move applies the complete path as one history entry")
+                try require(try ProjectEditor.open(url: editor.url).project.state == applied,
+                            "native relative move persists exact metadata")
+                try require(editor.undo() && editor.project.state == fixture.project.state,
+                            "one Undo restores the state before the relative request")
+                try require(editor.redo() && editor.project.state == applied,
+                            "one Redo restores the complete relative request")
+                print("Native Metal relative case \(index + 1), playhead \(playhead), passed (exact path/times and durable Undo/Redo; no media).")
+            }
+        }
     }
 
     private struct Fixture {

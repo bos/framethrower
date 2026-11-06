@@ -12,37 +12,41 @@ struct RecordingLibraryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(library.errorMessage ?? "Recordings")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(library.errorMessage == nil ? Color.secondary : Color.red)
-                    .lineLimit(1)
-                    .help(library.errorMessage ?? "Recent recordings")
-                Spacer()
-                if library.canUndoRemoval {
-                    Button("Undo remove") { _ = library.restoreLastRemoved() }
-                        .controlSize(.small)
-                        .disabled(isLocked)
-                        .help("Return the most recently removed recording to this list.")
-                }
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 28)
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(library.entries) { entry in
-                        RecordingLibraryRow(entry: entry, isLocked: isLocked,
-                            editorForURL: editorForURL,
-                            onOpen: { onOpen(entry.projectURL) }, onShare: { onShare(entry.projectURL) },
-                            shareContent: shareContent,
-                            onSelectEditor: { selectedEditor = $0 },
-                            onRemove: { selectedEditor = nil; library.remove(at: entry.projectURL) })
-                        if entry.id != library.entries.last?.id { Divider().padding(.horizontal, 14) }
+            if !library.entries.isEmpty {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(library.entries) { entry in
+                            RecordingLibraryRow(entry: entry, isLocked: isLocked,
+                                editorForURL: editorForURL,
+                                onOpen: { onOpen(entry.projectURL) }, onShare: { onShare(entry.projectURL) },
+                                shareContent: shareContent,
+                                onSelectEditor: { selectedEditor = $0 },
+                                onRemove: { selectedEditor = nil; library.remove(at: entry.projectURL) })
+                            if entry.id != library.entries.last?.id { Divider().padding(.horizontal, 14) }
+                        }
                     }
                 }
+                .frame(maxHeight: CGFloat(library.entries.count) * 68)
+                .scrollIndicators(.automatic)
             }
-            .frame(height: min(132, CGFloat(library.entries.count) * 56))
-            .scrollIndicators(.automatic)
+            if let message = library.errorMessage {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+            }
+            if library.canUndoRemoval {
+                HStack {
+                    Button("Undo removal") { _ = library.restoreLastRemoved() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .disabled(isLocked)
+                        .help("Put the most recently removed recording back in this list. Its files stayed on disk. Command-Z also restores it.")
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+            }
         }
         .modifier(RecorderCard())
         .accessibilityLabel("Recent recordings")
@@ -66,13 +70,8 @@ struct RecordingLibraryRow: View {
     @State private var isSharingPresented = false
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "play.rectangle")
-                .font(.system(size: 22)).foregroundStyle(RecorderStyle.accent)
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2, perform: onOpen)
-                .help("Double-click to edit this recording.")
-            VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
                 if let editor {
                     RecordingTitleEditor(editor: editor, renameRequest: renameRequest, onOpen: onOpen,
                         onBeginEditing: { onSelectEditor(editor); errorMessage = nil },
@@ -82,6 +81,10 @@ struct RecordingLibraryRow: View {
                     Text(entry.displayName).font(.system(size: 12, weight: .medium))
                         .lineLimit(1).frame(height: 24, alignment: .leading)
                 }
+                RecordingRemoveButton(name: entry.displayName, action: onRemove)
+                    .frame(width: 24, height: 24)
+            }
+            HStack(spacing: 8) {
                 Text(errorMessage ?? details)
                     .font(.system(size: 11)).foregroundStyle(errorMessage == nil ? Color.secondary : Color.red)
                     .lineLimit(1)
@@ -89,28 +92,22 @@ struct RecordingLibraryRow: View {
                     .contentShape(Rectangle())
                     .onTapGesture(count: 2, perform: onOpen)
                     .help("Double-click to edit this recording.")
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Button { if onShare() { isSharingPresented = true } } label: {
-                Label("Share…", systemImage: "square.and.arrow.up")
-            }
+                Button { if onShare() { isSharingPresented = true } } label: {
+                    Image(systemName: "square.and.arrow.up").frame(width: 24, height: 20)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Share \(entry.displayName)")
                 .help("Share this recording's current edit.")
                 .popover(isPresented: $isSharingPresented) {
                     // The panel keeps its own upload/cancel validation even
                     // while other library actions are locked during upload.
                     shareContent().environment(\.isEnabled, true)
                 }
-            Button(action: onRemove) {
-                Image(systemName: "xmark").font(.system(size: 10, weight: .medium))
-                    .frame(width: 20, height: 24)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Remove from list. Recording files stay on disk.")
-            .accessibilityLabel("Remove \(entry.displayName) from list")
         }
-        .padding(.horizontal, 14)
-        .frame(height: 55)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(height: 68)
         .background {
             Color.clear.contentShape(Rectangle()).onTapGesture(count: 2, perform: onOpen)
         }
@@ -128,8 +125,6 @@ struct RecordingLibraryRow: View {
                 NSWorkspace.shared.activateFileViewerSelecting(files)
             }
         }
-        .focusable()
-        .onKeyPress(.return) { onOpen(); return .handled }
         .accessibilityAction(named: "Open in editor", onOpen)
         .accessibilityAction(named: "Rename") { renameRequest = UUID() }
         .disabled(isLocked)
@@ -147,4 +142,46 @@ struct RecordingLibraryRow: View {
         if let bytes = entry.fileSize { parts.append(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) }
         return parts.joined(separator: "  ·  ")
     }
+}
+
+/// Plain native buttons accept the first click even in an inactive window.
+/// They do not install a focusable wrapper around the entire recording row.
+struct RecordingRemoveButton: NSViewRepresentable {
+    let name: String
+    var action: () -> Void
+
+    func makeNSView(context: Context) -> RecordingRemoveButtonView {
+        RecordingRemoveButtonView()
+    }
+
+    func updateNSView(_ button: RecordingRemoveButtonView, context: Context) {
+        button.onPress = action
+        button.isEnabled = context.environment.isEnabled
+        button.setAccessibilityLabel("Remove \(name) from list")
+    }
+}
+
+@MainActor
+final class RecordingRemoveButtonView: NSButton {
+    var onPress: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        title = ""
+        image = NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)
+        imagePosition = .imageOnly
+        imageScaling = .scaleProportionallyDown
+        isBordered = false
+        bezelStyle = .inline
+        controlSize = .small
+        contentTintColor = .secondaryLabelColor
+        focusRingType = .none
+        toolTip = "Remove from list. Recording files stay on disk."
+        target = self
+        action = #selector(pressed)
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    @objc private func pressed() { if isEnabled { onPress?() } }
 }

@@ -80,14 +80,18 @@ available source selection. A window that has closed requires choosing a new one
    A separate editor window opens when capture finishes; use **Edit…** to reopen
    it. The recorder stays usable, and each project's editor has its own undo history.
 
-The **Recordings** list shows projects in Movies and projects opened from other
+The recordings list shows projects in Movies and projects opened from other
 folders, newest first. Scroll the list for older recordings. Click a name to
 rename it; double-click a row to open its editor. The editor's header and window
 title use the same saved name, and its header also supports inline renaming.
 Renaming supports undo/redo and keeps the original media filenames.
 
+Record and Stop stay above the list in the side panel. The main capture preview
+keeps its space as recordings are added, and shows the live camera directly over
+the selected recording region. Drag the camera there to position it.
+
 Each row's share button targets that recording. **×** removes a row from the list
-and keeps the project and media files on disk. **Undo remove** (or Command-Z after
+and keeps the project and media files on disk. **Undo removal** below the list (or Command-Z after
 removing a row) restores it, including after restarting the app. Opening a removed
 project explicitly also restores it. The app never deletes recordings because of
 their age; use Finder when you want to delete files permanently.
@@ -179,6 +183,10 @@ Automated checks run without camera hardware or connected accounts:
   identity, removal/restore across restart, stale scans, and source preservation.
 - `Tests/check-recording-title.sh`: native single/double click, inline editing,
   Enter/Escape, focus transfer, validation, and rename undo/redo.
+- `Tests/check-recorder-workspace.sh`: preview minimum size, stable capture
+  geometry with changing history, and Record above the recordings list.
+- `Tests/check-initial-camera-preview.sh`: camera placement within the main
+  recording region, negative display origins, full drag deltas, and clamping.
 - `Tests/check-project-renderer.sh`: pixel-level screen/camera zoom and pan, pointer
   sizing/smoothing/clicks, shape transitions, audio, and preview/export parity.
 - `Tests/check-zoom-model.sh`: shared main/PIP motion, bounded source zooms,

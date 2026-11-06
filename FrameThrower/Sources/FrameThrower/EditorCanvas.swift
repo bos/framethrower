@@ -27,6 +27,7 @@ struct EditorCanvas: NSViewRepresentable {
     var regions: [EditorRegion] = []
     var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID? = nil
+    var onReferenceBegin: () -> Void = {}
     var onDrawRegion: (EditorRegionRect) -> Void = { _ in }
     var onSelectRegion: (UUID?) -> Void = { _ in }
 
@@ -44,6 +45,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.regions = regions
         view.regionLabels = regionLabels
         view.selectedRegionID = selectedRegionID
+        view.onReferenceBegin = onReferenceBegin
         view.onDrawRegion = onDrawRegion
         view.onSelectRegion = onSelectRegion
         view.configure(player: player, image: showsStill ? frames.image : nil,
@@ -60,6 +62,7 @@ final class EditorCanvasView: NSView {
         let label: String
         let frame: CGRect
         let selected: Bool
+        var outsideViewport = false
     }
     let playerLayer = AVPlayerLayer()
     let stillLayer = CALayer()
@@ -72,12 +75,15 @@ final class EditorCanvasView: NSView {
             guard oldValue != scribbleMode else { return }
             if scribbleMode { trackpad = nil; zoomDrag = nil; drag = nil }
             if !scribbleMode { scribbleStart = nil; scribbleDraft = nil; guidePressID = nil }
+            setAccessibilityHelp(scribbleMode ?
+                "Director mode. Drag to draw a reference box; click a box number to select it. Pinch to zoom and use two fingers to pan. Escape cancels an unfinished action." : Self.navigationHelp)
             window?.invalidateCursorRects(for: self)
         }
     }
     var regions: [EditorRegion] = []
     var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID?
+    var onReferenceBegin: (() -> Void)?
     var onDrawRegion: ((EditorRegionRect) -> Void)?
     var onSelectRegion: ((UUID?) -> Void)?
     private var scribbleStart: CGPoint?
@@ -102,6 +108,7 @@ final class EditorCanvasView: NSView {
         didSet { if !allowsZoomEditing { trackpad = nil; zoomDrag = nil } }
     }
     private(set) var zoom = ZoomPlacement()
+    private static let navigationHelp = "Pinch to zoom; use two fingers to pan. Double-click to zoom, or drag a zoomed recording to pan. Drag the camera or its corners to move or resize it. Escape cancels unfinished edits."
     private struct ZoomDrag {
         let point: CGPoint
         let origin: ZoomPlacement
@@ -148,7 +155,7 @@ final class EditorCanvasView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
-        setAccessibilityHelp("Pinch to zoom; use two fingers to pan. Double-click to zoom, or drag a zoomed recording to pan. Drag the camera or its corners to move or resize it. Escape cancels unfinished edits.")
+        setAccessibilityHelp(Self.navigationHelp)
     }
     required init?(coder: NSCoder) { nil }
 
@@ -219,28 +226,31 @@ final class EditorCanvasView: NSView {
         guides.sublayers?.forEach { $0.removeFromSuperlayer() }
         guideBadges = []
         setAccessibilityValue(nil)
-        guard scribbleMode else { return }
+        guard scribbleMode, contentRect.width > 0, contentRect.height > 0 else { return }
         let values = regions.map { ($0.rect, $0.id == selectedRegionID, Optional($0.id)) }
             + (scribbleDraft.map { [($0, true, nil as UUID?)] } ?? [])
         var shapeLayers: [(CALayer, Bool)] = []
         var badgeLayers: [(CALayer, Bool)] = []
         for (region, selected, id) in values {
-            let rect = scribbleGeometry.viewRect(region).intersection(contentRect)
-            guard !rect.isNull, !rect.isEmpty else { continue }
+            let projected = scribbleGeometry.viewRect(region)
+            let rect = projected.intersection(contentRect)
+            let outside = rect.isNull || rect.isEmpty
             let shape = CAShapeLayer()
-            shape.path = CGPath(rect: rect, transform: nil)
+            if !outside { shape.path = CGPath(rect: rect, transform: nil) }
             shape.strokeColor = (selected ? NSColor.controlAccentColor : NSColor.white).cgColor
             shape.fillColor = NSColor.controlAccentColor.withAlphaComponent(selected ? 0.15 : 0.04).cgColor
             shape.lineWidth = selected ? 2 : 1
             shape.lineDashPattern = selected ? nil : [5, 3]
-            shapeLayers.append((shape, selected))
+            if !outside { shapeLayers.append((shape, selected)) }
             if let id, let label = regionLabels[id] {
+                let displayedLabel = outside ? label + " " + offscreenDirection(for: projected) : label
                 let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-                let measured = (label as NSString).size(withAttributes: [.font: font]).width + 14
+                let measured = (displayedLabel as NSString).size(withAttributes: [.font: font]).width + 14
                 let width = min(max(38, measured), contentRect.width)
                 let height = min(22, contentRect.height)
-                let frame = availableBadgeFrame(at: rect.origin, size: CGSize(width: width, height: height))
-                if !frame.intersects(rect) {
+                let origin = outside ? CGPoint(x: projected.midX - width / 2, y: projected.midY - height / 2) : rect.origin
+                let frame = availableBadgeFrame(at: origin, size: CGSize(width: width, height: height))
+                if !outside, !frame.intersects(rect) {
                     let connector = CAShapeLayer()
                     let line = CGMutablePath()
                     let center = CGPoint(x: frame.midX, y: frame.midY)
@@ -259,7 +269,7 @@ final class EditorCanvasView: NSView {
                 badge.borderColor = NSColor.white.cgColor
                 badge.cornerRadius = 4
                 let text = CATextLayer()
-                text.string = label
+                text.string = displayedLabel
                 text.font = font
                 text.fontSize = 11
                 text.alignmentMode = .center
@@ -269,12 +279,30 @@ final class EditorCanvasView: NSView {
                 text.frame = CGRect(x: 4, y: 3, width: max(0, width - 8), height: max(0, height - 4))
                 badge.addSublayer(text)
                 badgeLayers.append((badge, selected))
-                guideBadges.append(GuideBadge(regionID: id, label: label, frame: frame, selected: selected))
+                guideBadges.append(GuideBadge(regionID: id, label: label, frame: frame, selected: selected, outsideViewport: outside))
             }
         }
         for (child, _) in shapeLayers.sorted(by: { !$0.1 && $1.1 }) { guides.addSublayer(child) }
         for (child, _) in badgeLayers.sorted(by: { !$0.1 && $1.1 }) { guides.addSublayer(child) }
-        setAccessibilityValue(guideBadges.map { $0.label + ($0.selected ? ", selected" : "") }.joined(separator: "; "))
+        setAccessibilityValue(guideBadges.map {
+            $0.label + ($0.selected ? ", selected" : "") + ($0.outsideViewport ? ", outside current view" : "")
+        }.joined(separator: "; "))
+    }
+
+    private func offscreenDirection(for rect: CGRect) -> String {
+        let horizontal = rect.maxX <= contentRect.minX ? -1 : rect.minX >= contentRect.maxX ? 1 : 0
+        let vertical = rect.maxY <= contentRect.minY ? -1 : rect.minY >= contentRect.maxY ? 1 : 0
+        switch (horizontal, vertical) {
+        case (-1, -1): return "↖"
+        case (0, -1): return "↑"
+        case (1, -1): return "↗"
+        case (-1, 0): return "←"
+        case (1, 0): return "→"
+        case (-1, 1): return "↙"
+        case (0, 1): return "↓"
+        case (1, 1): return "↘"
+        default: return "↗"
+        }
     }
 
     private func availableBadgeFrame(at point: CGPoint, size: CGSize) -> CGRect {
@@ -322,6 +350,7 @@ final class EditorCanvasView: NSView {
                 guidePressID = badge.regionID
                 return
             }
+            onReferenceBegin?()
             scribbleStart = point
             scribbleDraft = nil
             return
@@ -506,7 +535,7 @@ final class EditorCanvasView: NSView {
     }
 
     private func acceptsTrackpad(_ event: NSEvent) -> Bool {
-        guard !scribbleMode, allowsZoomEditing, drag == nil, zoomDrag == nil,
+        guard allowsZoomEditing, drag == nil, zoomDrag == nil, scribbleStart == nil, guidePressID == nil,
               contentRect.width > 0, contentRect.height > 0 else { return false }
         return trackpad != nil || canvasRect.contains(convert(event.locationInWindow, from: nil))
     }

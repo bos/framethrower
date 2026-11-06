@@ -12,6 +12,7 @@ final class EditorAssistantSession: ObservableObject {
     private var generation = UUID()
     private var clarification: (request: String, question: String, revision: String)?
     private let transport: @Sendable (Data) async throws -> Data
+    var awaitsClarification: Bool { clarification != nil }
 
     init(transport: @escaping @Sendable (Data) async throws -> Data = {
         try await LocalModelRuntime.shared.chat(payload: $0)
@@ -21,7 +22,19 @@ final class EditorAssistantSession: ObservableObject {
     func submit(editor: ProjectEditor, playhead: Double, regionID: UUID?, editID: UUID?) {
         guard !isBusy else { return }
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, editor.finishDraft() else { return }
+        guard !text.isEmpty else { return }
+        // Canonical history commands are the same immediate actions as the
+        // toolbar. In particular, Redo must never finish a draft and thereby
+        // erase the very redo branch the user asked to restore.
+        if performHistoryShortcut(text, editor: editor) { return }
+        if editor.draftState != nil,
+           text.range(of: "\\bredo\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+            cancel()
+            notice = "Finish or undo the current edit before using Redo."
+            errorMessage = nil
+            return
+        }
+        guard editor.finishDraft() else { return }
         do {
             let recording = try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
             let context = LocalEditContext(recording: recording, playhead: playhead,
@@ -40,8 +53,19 @@ final class EditorAssistantSession: ObservableObject {
                     guard let self, self.generation == token else { return }
                     switch try LocalEditPlanner.result(data, context: context, instruction: text) {
                     case let .commands(batch, summary):
-                        try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID)
-                        self.notice = summary
+                        let historyName = "Director: " + String(summary.replacingOccurrences(of: "\n", with: "; ").prefix(140))
+                        try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID, name: historyName)
+                        let previousIDs = Set(recording.state.timedEdits(includeCamera: true).map(\.id))
+                        let added = editor.project.state.timedEdits(includeCamera: true)
+                            .filter { !previousIDs.contains($0.id) }
+                            .compactMap { editor.references.editLabel(for: $0.id) }
+                        self.notice = added.isEmpty ? summary : summary + "\nCreated " + added.joined(separator: ", ") + "."
+                        self.clarification = nil
+                    case let .history(history):
+                        try EditorHistoryDispatcher.apply(history, to: editor, projectID: self.projectID)
+                        let name = (history.action == .undo ? recording.history.undo : recording.history.redo).first ?? "change"
+                        let action = history.action == .undo ? "Undid" : "Redid"
+                        self.notice = history.count == 1 ? "\(action) \(name)." : "\(action) \(history.count) changes in order."
                         self.clarification = nil
                     case let .clarification(question):
                         self.notice = question
@@ -61,7 +85,28 @@ final class EditorAssistantSession: ObservableObject {
 
     func cancel() {
         generation = UUID(); task?.cancel(); task = nil
-        isBusy = false; notice = nil
+        isBusy = false; notice = nil; errorMessage = nil; clarification = nil
+    }
+
+    private func performHistoryShortcut(_ text: String, editor: ProjectEditor) -> Bool {
+        let normalized = text.lowercased().trimmingCharacters(in: .punctuationCharacters)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let undo = ["undo", "undo that", "undo last change", "undo the last change"].contains(normalized)
+        let redo = ["redo", "redo that", "redo last change", "redo the last change"].contains(normalized)
+        guard undo || redo else { return false }
+        cancel()
+        if redo, editor.draftState != nil {
+            notice = "Finish or undo the current edit before using Redo."
+        } else if undo ? editor.canUndo : editor.canRedo {
+            let name = undo ? editor.undoName : editor.redoName
+            let succeeded = undo ? editor.undo() : editor.redo()
+            if succeeded { notice = (undo ? "Undid " : "Redid ") + name + "." }
+            else { errorMessage = editor.errorMessage ?? "The history change could not be saved." }
+        } else {
+            notice = undo ? "Nothing to undo." : "Nothing to redo."
+        }
+        instruction = ""
+        return true
     }
 }
 
@@ -71,6 +116,7 @@ struct EditorAssistantPanel: View {
     let selectedRegionID: UUID?
     let onSelectRegion: (UUID) -> Void
     let onRemoveRegion: (UUID) -> Void
+    var onShowOriginalFrame: (UUID) -> Void = { _ in }
     let onSubmit: () -> Void
     @StateObject private var instructionSpeech = LocalSpeechInput()
     @State private var namingRegionID: UUID?
@@ -95,7 +141,7 @@ struct EditorAssistantPanel: View {
                 .frame(height: min(180, CGFloat(regions.count) * 44 + CGFloat(max(0, regions.count - 1)) * 4))
                 Divider()
             }
-            TextField("What would you like to change?", text: $session.instruction, axis: .vertical)
+            TextField(session.awaitsClarification ? "Your answer…" : "What would you like to change?", text: $session.instruction, axis: .vertical)
                 .textFieldStyle(.roundedBorder).lineLimit(3...6)
                 .onSubmit { if instructionSpeech.phase == .idle { onSubmit() } }
                 .disabled(session.isBusy)
@@ -122,7 +168,15 @@ struct EditorAssistantPanel: View {
             if let message = session.errorMessage {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             } else if let message = session.notice {
-                Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                HStack(alignment: .top) {
+                    Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                    if session.awaitsClarification {
+                        Button { session.cancel() } label: { Image(systemName: "xmark") }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Dismiss question")
+                            .help("Dismiss this question and start a new instruction. Escape also dismisses it.")
+                    }
+                }
             }
             Spacer(minLength: 0)
         }
@@ -141,7 +195,7 @@ struct EditorAssistantPanel: View {
         let label = editor.references.boxLabel(for: region.id) ?? "Box"
         let editLabel = region.editID.flatMap { editor.references.editLabel(for: $0) }
         let editExists = region.editID.flatMap { editor.references.edit(in: editor.editingState, id: $0) } != nil
-        let association = editLabel.map { "· " + $0 + (editExists ? "" : " · removed") }
+        let association = editLabel.map { "from " + $0 + (editExists ? "" : " · removed") }
         let selected = region.id == selectedRegionID
         return HStack(spacing: 4) {
             regionSelectButton(region, label: label, editLabel: editLabel, association: association, selected: selected)
@@ -154,6 +208,9 @@ struct EditorAssistantPanel: View {
         .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2))
         .contextMenu {
+            Button("Go to \(label)'s Frame") { onShowOriginalFrame(region.id) }
+                .help("Move the playhead to the frame where this box was drawn.")
+            Divider()
             Button("Name " + label + "…") { nameDraft = region.note; namingRegionID = region.id }
         }
         .popover(isPresented: Binding(get: { namingRegionID == region.id }, set: { if !$0 { namingRegionID = nil } })) {
@@ -168,9 +225,9 @@ struct EditorAssistantPanel: View {
     }
 
     private func regionSelectButton(_ region: EditorRegion, label: String, editLabel: String?, association: String?, selected: Bool) -> some View {
-        let accessibilityName: String = label + (editLabel.map { " at " + $0 } ?? "")
+        let accessibilityName: String = label + (editLabel.map { ", drawn at " + $0 } ?? "")
         let time: String = String(format: "%.2f", region.time)
-        let tooltip: String = "Select \(label) and show its original frame (\(time) s)."
+        let tooltip: String = "Use \(label) as a reference without moving the playhead. Its original frame (\(time) s) is available from the context menu."
         return Button(action: { onSelectRegion(region.id) }, label: {
             regionButtonLabel(region, label: label, association: association, selected: selected)
         })

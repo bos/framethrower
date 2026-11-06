@@ -30,6 +30,8 @@ struct EditorAssistantSessionChecks {
         try await checkStaleProjectRejection()
         try await checkCancelledLateReply()
         try await checkClarificationFollowup()
+        try await checkDismissedClarificationStartsFresh()
+        try await checkImmediateHistoryPreservesRedo()
         print("Editor assistant session checks passed (atomic Undo, busy gating, failure preservation, stale revisions, cancelled late replies, and clarification context).")
     }
 
@@ -89,6 +91,61 @@ struct EditorAssistantSessionChecks {
         try require(session.instruction == instruction && session.errorMessage == "Fixture transport failed." && session.notice == nil,
                     "transport failure retains the user's request for correction or retry")
         try require(!fixture.editor.canUndo, "transport failure cannot add history")
+    }
+
+    private static func checkDismissedClarificationStartsFresh() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        session.instruction = "Undo your last change."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        let question = try tool("ask_clarification", ["question": "Which change should be undone?"])
+        await transport.succeed(0, data: question)
+        try await waitUntil { !session.isBusy }
+        try require(session.awaitsClarification, "question stays visible while awaiting an answer")
+        session.cancel()
+        try require(!session.awaitsClarification && session.notice == nil, "dismissing a question clears its pending context")
+        session.instruction = "At one second, zoom into this area."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 2 }
+        let data = await transport.payloads[1]
+        let payload = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let messages = payload["messages"] as! [[String: String]]
+        try require(messages.last?["content"]?.contains("Undo your last change") == false,
+                    "fresh framing request cannot be trapped inside an older history clarification")
+        await transport.fail(1)
+        try await waitUntil { !session.isBusy }
+    }
+
+    private static func checkImmediateHistoryPreservesRedo() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        var edited = fixture.editor.project.state
+        edited.zoomKeyframes = [ZoomKeyframe(time: 2, scale: 2)]
+        try require(fixture.editor.commit(edited, name: "Director: Change framing"), "prepare history shortcut")
+        session.instruction = "Undo."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try require(fixture.editor.project.state.zoomKeyframes.isEmpty && fixture.editor.canRedo && !session.isBusy,
+                    "plain Undo is the immediate normal stack action")
+        var draft = fixture.editor.project.state
+        draft.zoomKeyframes = [ZoomKeyframe(time: 3, scale: 1.5)]
+        try require(fixture.editor.updateDraft(draft, at: 3), "make unfinished manual adjustment")
+        let saved = fixture.editor.project
+        session.instruction = "Redo"
+        session.submit(editor: fixture.editor, playhead: 3, regionID: nil, editID: nil)
+        try require(fixture.editor.project == saved && fixture.editor.draftState == draft && !fixture.editor.project.redoHistory.isEmpty,
+                    "Redo never commits an unfinished edit and erases the requested redo branch")
+        try require(fixture.editor.cancelDraft(), "discard test draft")
+        session.instruction = "Redo that"
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try require(fixture.editor.project.state == edited && session.errorMessage == nil,
+                    "Redo restores normal history after the draft is cancelled")
+        let requests = await transport.payloads.count
+        try require(requests == 0, "canonical Undo and Redo do not require model inference")
     }
 
     private static func checkStaleProjectRejection() async throws {

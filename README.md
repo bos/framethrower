@@ -208,10 +208,10 @@ Projects stay in the list if their media is missing. Open one and use **Locate�
 to copy the original file back into its project folder. The chosen source is left
 unchanged, and existing files are never overwritten by this recovery action.
 
-## Local editing instructions and scribbles
+## Director mode
 
-Open the editor's speech-bubble button to type or dictate an editing instruction.
-The pencil button turns on **Scribble** and opens the same sidebar. Drag a box on
+Turn on **Director** in the editor toolbar to draw reference boxes and type or
+dictate editing instructions in one sidebar. Drag a box on
 the preview to identify an area; select it and say “this area” in an instruction.
 Boxes show matching **Box 1**, **Box 2** badges in the preview and sidebar.
 Timeline edits have speakable **Edit A**, **Edit B** references in marker labels,
@@ -219,14 +219,19 @@ edit chips, and the selected-edit preview badge. These references survive
 retiming, insertion, removal, Undo/Redo, recovery, and reopening; they do not
 silently renumber. New edits can therefore have later letters between older edits.
 The box is stored in original source coordinates with the source timestamp and
-the edit selected when drawn. Selecting a saved box returns to its original
-frame; moving the associated edit does not silently move that source frame.
+the edit selected when drawn. Selecting a box preserves the current edit,
+playhead, and unfinished framing adjustments. **Go to Box 1's Frame** in its
+context menu explicitly returns to the frame where it was drawn. Moving the
+associated edit does not silently move that source frame. All references remain
+visible across edit selection in Director mode; offscreen boxes have numbered
+direction badges on the preview boundary.
 If the frame has no edit yet, drawing a box creates its reference mark in the
 same undoable operation. This adds no zoom or camera movement, so the first
 box-first workflow has an Edit A to refer to without changing the footage.
-Scribble mode owns drawing gestures;
-turn it off to pan, pinch, or move the camera. Escape cancels an unfinished box,
-then exits Scribble. An area's X removes its guide and note; Undo restores both.
+Director mode owns left-button drawing gestures. Pinch and two-finger pan still
+refine the current framing. Turn Director off to drag the camera or mouse-pan.
+Escape cancels unfinished drawing or framing first, then exits Director mode.
+A box's X removes its guide and optional name; Undo restores both.
 
 There is one instruction field and one microphone. An optional box name is
 available from its context menu; Return saves, Escape or dismissing cancels.
@@ -235,6 +240,11 @@ visible graphics. Dictation first produces editable text; submitting an instruct
 is a separate action. Apple SpeechAnalyzer runs on-device on supported macOS26+
 hardware/locales. It may download Apple speech assets on first use; audio is
 never sent to a transcription service. There is no cloud speech fallback.
+An absent asset-installation request is a normal result when Apple already has
+the required assets. The app rechecks readiness and lets the recognizer prepare;
+it does not infer a connectivity problem from that optional result. Native
+speech tests feed generated PCM through the production converter and recognizer
+without opening the microphone or playing sound.
 
 Supported instructions add smooth region-to-region framing sequences with timed
 holds, return to full frame, revise the selected edit while preserving its timing,
@@ -244,11 +254,24 @@ path inserts an editable full-frame waypoint halfway between the endpoints,
 using the shared acceleration/deceleration curves. Conflicting intervening edits
 produce a clarification instead of being replaced. Unknown or removed references
 produce a question naming the unresolved edit or box.
+For a direct move without a preexisting endpoint, say “At Edit A, pan and zoom
+from Box 1 to Box 2 over five seconds.” The destination receives its own stable
+edit letter automatically. Pulling back to full frame happens only when requested.
+Conflicts are checked against the affected target: competing screen-framing
+movements are flagged, while camera movement and pointer styling remain intact.
 Each complete request is one normal saved Undo/Redo operation.
 Ambiguous requests ask a question. If a sequence overlaps existing framing edits,
 the assistant asks for an explicit revision instead of silently replacing them.
 Edits made while a request is running invalidate its revision and prevent stale
 results from applying. Escape, the request X, or closing the sidebar cancels it.
+Starting a manual framing or drawing gesture also cancels an in-flight plan.
+
+Human and agent changes share one chronological history. An agent request has one
+descriptive Director entry. **Edit history** beside Undo/Redo shows available
+entries; choosing an older entry includes all newer entries above it. Fresh edits
+clear Redo. The agent can create, move, and remove marks, and invoke the same
+Undo/Redo stack. It cannot selectively skip manual edits to undo an older request.
+Its tool context contains the same ordered history shown in the menu.
 
 Video processing remains suspended. Guides and framing metadata work on the
 placeholder preview; decoding footage, screenshots of footage, visual recognition,
@@ -301,7 +324,9 @@ The native assistant uses an 8,192-token context and Metal on Apple Silicon.
 `EditorCommandBatch` is the provider-independent integration boundary: a version,
 project UUID, expected SHA-256 revision, and ordered typed commands. Supported
 actions are `frameRegion`, `fullFrame`, `holdFraming`, `reviseFraming`,
-`moveBetweenEdits`, and `labelRegion`. Times are original recording seconds; framing timestamps are
+`moveBetweenEdits`, `moveForDuration`, `createEdit`, `moveEdit`, `removeEdit`,
+and `labelRegion`. Shared history requests use `EditorHistoryRequest` and the
+same revision checks. Times are original recording seconds; framing timestamps are
 arrival times and movement duration specifies the preceding transition. Region
 rectangles use normalized top-left source coordinates. The dispatcher validates
 the complete batch before committing, accepts no paths or executable operations,

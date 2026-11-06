@@ -12,6 +12,7 @@ struct LocalEditContext: Codable, Sendable {
 enum LocalEditResult: Sendable {
     case commands(EditorCommandBatch, summary: String)
     case clarification(String)
+    case history(EditorHistoryRequest)
 }
 
 /// The model proposes a small typed plan. It never invokes application methods
@@ -78,10 +79,15 @@ enum LocalEditPlanner {
                           "omitted_edit_count": allEdits.count - edits.count],
             "playhead": context.playhead, "selectedRegionID": context.selectedRegionID?.uuidString as Any? ?? NSNull(),
             "selectedEditID": context.selectedEditID?.uuidString as Any? ?? NSNull(), "selectedEdit": selected,
+            "history": ["undo": Array(context.recording.history.undo.prefix(8)),
+                        "redo": Array(context.recording.history.redo.prefix(8)),
+                        "undo_count": context.recording.history.undo.count, "redo_count": context.recording.history.redo.count],
             "videoProcessingAvailable": context.videoProcessingAvailable
         ]
         let contextText = String(decoding: try JSONSerialization.data(withJSONObject: compact, options: .sortedKeys), as: UTF8.self)
-        let guidance = usesNamedReferences(request, context: context) ? namedGuidance : numericGuidance
+        let guidance = EditorAgentControls.tools(for: request) != nil ? editControlGuidance
+            : usesDurationMove(request, context: context) ? durationGuidance
+            : usesNamedReferences(request, context: context) ? namedGuidance : numericGuidance
         let messages: [[String: String]] = [
             ["role": "system", "content": """
             You control a lossless video editor using exactly one tool call per request.
@@ -125,11 +131,67 @@ enum LocalEditPlanner {
                   question.count <= 600 else { throw invalidResponse }
             return .clarification(question)
         }
+        if let result = try EditorAgentControls.result(name: name, args: args, context: context, instruction: instruction) { return result }
         guard let project = args["project_id"] as? String, UUID(uuidString: project) == context.recording.projectID,
               args["expected_revision"] as? String == context.recording.revision else { throw EditorCommandError.stale }
+        if let instruction, usesDurationMove(instruction, context: context), name != "move_for_duration" {
+            return .clarification("The plan did not include the requested timed movement. Which edit should it start at, and how long should it take?")
+        }
         var commands: [EditorCommand] = []
         let summary: String
         switch name {
+        case "move_for_duration":
+            try keys(args, ["project_id", "expected_revision", "start_edit_label", "from_box_label", "to_box_label", "duration_seconds", "path"])
+            guard let startLabel = args["start_edit_label"] as? String,
+                  let fromLabel = args["from_box_label"] as? String,
+                  let toLabel = args["to_box_label"] as? String,
+                  let path = args["path"] as? String,
+                  ["direct", "via_full_frame"].contains(path),
+                  [startLabel, fromLabel, toLabel].allSatisfy({ $0.count <= 40 }) else { throw invalidResponse }
+            let duration = try number(args["duration_seconds"])
+            guard duration > 0, duration <= 60 else {
+                return .clarification("How long should the movement take? Choose a duration greater than zero and at most 60 seconds.")
+            }
+            if let instruction, let requested = requestedDuration(in: instruction), abs(duration - requested) > 0.000_001 {
+                return .clarification("The plan used a different duration from your instruction. Should the movement take \(requested) seconds?")
+            }
+            let start = startLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? context.selectedEditID.flatMap { id in context.recording.references.edit(in: context.recording.state, id: id) }
+                : resolveEdit(startLabel, context: context)
+            guard let start else {
+                return .clarification(startLabel.isEmpty ? "Which visible edit should the movement start at?" : "I can’t find \(startLabel). Which visible edit should the movement start at?")
+            }
+            guard let source = resolveBox(fromLabel, context: context) else {
+                return .clarification("I can’t find \(fromLabel). Which numbered box should the movement start from?")
+            }
+            guard let target = resolveBox(toLabel, context: context) else {
+                return .clarification("I can’t find \(toLabel). Which numbered box should it arrive at?")
+            }
+            let end = start.time + duration
+            guard end.isFinite, end < context.recording.duration else {
+                return .clarification("The recording ends before that movement can finish. Should it take less time or start at an earlier edit?")
+            }
+            if let conflict = context.recording.state.zoomKeyframes.first(where: {
+                $0.time > start.time + 0.000_001 && $0.time < end - 0.000_001
+            }) {
+                let label = context.recording.references.editLabel(for: conflict.id) ?? "another edit"
+                return .clarification("\(label) already changes screen framing during that movement. Should it stay, or should the new movement replace it?")
+            }
+            if let arrival = context.recording.state.zoomKeyframes.first(where: { abs($0.time - end) < 0.000_001 }),
+               arrival.placement.clamped != target.rect.framing() {
+                let label = context.recording.references.editLabel(for: arrival.id) ?? "Another edit"
+                return .clarification("\(label) already sets a different screen view at the arrival. Which view should remain?")
+            }
+            commands = [.moveForDuration(startEditID: start.id, fromRegionID: source.id, toRegionID: target.id,
+                                         duration: duration, viaFullFrame: path == "via_full_frame")]
+            let formatter = NumberFormatter()
+            formatter.maximumFractionDigits = 2
+            let seconds = formatter.string(from: NSNumber(value: duration)) ?? String(duration)
+            let startName = context.recording.references.editLabel(for: start.id) ?? startLabel
+            let sourceName = context.recording.references.boxLabel(for: source.id) ?? fromLabel
+            let targetName = context.recording.references.boxLabel(for: target.id) ?? toLabel
+            summary = "Added a \(seconds)-second " + (path == "direct" ? "pan and zoom" : "zoom-out and move")
+                + " from \(sourceName) at \(startName) to \(targetName)."
         case "frame_edits":
             try keys(args, ["project_id", "expected_revision", "changes"])
             guard let changes = args["changes"] as? [[String: Any]], (1...8).contains(changes.count) else { throw invalidResponse }
@@ -186,7 +248,7 @@ enum LocalEditPlanner {
             try keys(args, ["project_id", "expected_revision", "region_id", "label"])
             guard let note = args["label"] as? String else { throw invalidResponse }
             commands = [.labelRegion(regionID: try uuid(args["region_id"]), note: note)]
-            summary = "Updated the scribble note."
+            summary = "Updated the box name."
         case "revise_framing":
             try keys(args, ["project_id", "expected_revision", "edit_id", "region_id"])
             let editID = try uuid(args["edit_id"])
@@ -233,7 +295,7 @@ enum LocalEditPlanner {
             summary = steps.count == 1 ? "Added a framing movement." : "Added \(steps.count) framing movements."
         default: throw invalidResponse
         }
-        if name == "frame_edits", let instruction,
+        if ["frame_edits", "move_for_duration"].contains(name), let instruction,
            let question = incompleteReferenceQuestion(commands, instruction: instruction, context: context) {
             return .clarification(question)
         }
@@ -286,6 +348,12 @@ enum LocalEditPlanner {
             case let .reviseFraming(editID, regionID): includedEdits.insert(editID); includedBoxes.insert(regionID)
             case let .moveBetweenEdits(from, to, regionID):
                 includedEdits.formUnion([from, to]); includedBoxes.insert(regionID)
+            case let .moveForDuration(startID, sourceID, targetID, duration, _):
+                includedEdits.insert(startID); includedBoxes.formUnion([sourceID, targetID])
+                if let start = edits.first(where: { $0.id == startID }),
+                   let arrival = edits.first(where: { abs($0.time - start.time - duration) < 0.000_001 }) {
+                    includedEdits.insert(arrival.id)
+                }
             case let .frameRegion(regionID, time, _):
                 includedBoxes.insert(regionID)
                 if let edit = edits.first(where: { abs($0.time - time) < 0.000_001 }) { includedEdits.insert(edit.id) }
@@ -340,6 +408,14 @@ enum LocalEditPlanner {
                 guard let from = resolveEdit(fromName, context: context), let to = resolveEdit(toName, context: context) else { continue }
                 let included = commands.contains { command in
                     if case let .moveBetweenEdits(start, end, _) = command { return start == from.id && end == to.id }
+                    if case let .moveForDuration(start, _, _, duration, viaFullFrame) = command,
+                       start == from.id, abs(from.time + duration - to.time) < 0.000_001 {
+                        // A direct zoom-out into a wider target is also valid;
+                        // an explicit full-frame waypoint must be honored.
+                        let explicitlyFullFrame = instruction.range(of: "\\bfull\\s+frame\\b|\\bzoom\\s+out\\s+(?:and\\s+)?then\\b",
+                            options: [.regularExpression, .caseInsensitive]) != nil
+                        return viaFullFrame || !explicitlyFullFrame
+                    }
                     return false
                 }
                 if !included { return "The plan didn’t include the zoom-out between \(fromName) and \(toName). Should it return to full frame before moving into the destination box?" }
@@ -404,6 +480,39 @@ enum LocalEditPlanner {
         the visible labels if a named reference is missing or ambiguous.
         """
 
+    private static let durationGuidance = """
+        Use move_for_duration when moving from one numbered box to another over
+        a stated duration. The starting edit can be named or selected. Both boxes
+        may have been drawn on the SAME frame; that fully identifies the targets.
+        The editor fits the source box at the starting edit, then pans and changes
+        zoom smoothly together, arriving at the target box after duration_seconds.
+        It creates the arrival edit automatically. Do not ask for a destination
+        edit, timestamp, zoom factor, or confirmation when those references and
+        the duration are supplied. Convert spoken durations such as five seconds
+        to numeric seconds. Empty start_edit_label uses the selected edit.
+        path=direct is the normal coordinated pan and zoom. Use via_full_frame
+        ONLY when the instruction explicitly requests returning to full frame or
+        zooming out and then back into the destination. Zooming directly from a
+        small box to a larger box is still direct, even when called a zoom-out.
+        For example, at Edit A pan and zoom from Box 1 to Box 2 over five seconds
+        uses start_edit_label=Edit A, from_box_label=Box 1, to_box_label=Box 2,
+        duration_seconds=5, path=direct. Unknown references ask one clarification.
+        """
+
+    private static let editControlGuidance = """
+        Use manage_edits to create, move, or remove named edit marks. Existing
+        labels identify stable edits even when their chronological order changes.
+        New marks receive letters automatically; do not invent a new label to
+        reference inside the same request. Resolve relative positions using a
+        known edit plus offset_seconds, or use playhead or start as the base.
+        Undo and redo use change_history on the SAME shared history as the app's
+        normal Undo and Redo. Lists are newest first. Never skip newer manual
+        changes to undo only an older agent request. If the user asks for an older
+        operation below intervening changes, explain which changes would also be
+        undone and ask whether to undo that complete span. Do not claim selective
+        undo. Default undo/redo count is one. Ask when intent or target is unclear.
+        """
+
     private static let numericGuidance = """
         To revise a selected existing edit, use revise_framing and preserve its time.
         Otherwise use plan_sequence. start_seconds is when movement STARTS. Each
@@ -419,8 +528,18 @@ enum LocalEditPlanner {
         """
 
     private static func tools(for request: String, context: LocalEditContext) -> [[String: Any]] {
+        if let controls = EditorAgentControls.tools(for: request) { return controls }
+        if usesDurationMove(request, context: context) {
+            return tools.filter {
+                guard let name = ($0["function"] as? [String: Any])?["name"] as? String else { return false }
+                return name == "move_for_duration" || name == "ask_clarification"
+            }
+        }
         guard usesNamedReferences(request, context: context) else {
-            return tools.filter { ($0["function"] as? [String: Any])?["name"] as? String != "frame_edits" }
+            return tools.filter {
+                guard let name = ($0["function"] as? [String: Any])?["name"] as? String else { return false }
+                return name != "frame_edits" && name != "move_for_duration"
+            }
         }
         let naming = request.range(of: "\\b(?:label|name|call|rename|note)\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
@@ -432,9 +551,51 @@ enum LocalEditPlanner {
             return name == "frame_edits" || name == "ask_clarification" || (naming && name == "label_region")
         }
     }
+    private static func usesDurationMove(_ request: String, context: LocalEditContext) -> Bool {
+        let hasDuration = request.range(of: "\\b(?:over|for|lasting|takes?|in)\\s+(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b",
+            options: [.regularExpression, .caseInsensitive]) != nil
+        let hasMovement = request.range(of: "\\b(?:pan|zoom|move|transition)\\b", options: [.regularExpression, .caseInsensitive]) != nil
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        let boxes = context.recording.state.regions.filter { region in
+            guard let label = context.recording.references.boxLabel(for: region.id) else { return false }
+            if mentions(label, in: request) { return true }
+            guard let number = context.recording.references.boxes[region.id.uuidString],
+                  let words = formatter.string(from: NSNumber(value: number)) else { return false }
+            return mentions("Box " + words, in: request)
+        }
+        return hasDuration && hasMovement && boxes.count >= 2
+    }
+
+    private static func requestedDuration(in request: String) -> Double? {
+        let pattern = "\\b(?:over|for|lasting|takes?|in)\\s+([0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b"
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+        let text = request as NSString
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        let values = expression.matches(in: request, range: NSRange(location: 0, length: text.length)).compactMap { match -> Double? in
+            let raw = text.substring(with: match.range(at: 1)).lowercased()
+                .replacingOccurrences(of: "a period of ", with: "")
+            if let value = Double(raw) { return value }
+            if let value = (0...60).first(where: {
+                formatter.string(from: NSNumber(value: $0))?.lowercased() == raw
+            }) { return Double(value) }
+            return formatter.number(from: raw)?.doubleValue
+        }
+        guard let first = values.first, values.allSatisfy({ abs($0 - first) < 0.000_001 }) else { return nil }
+        return first
+    }
     private static var tools: [[String: Any]] {
         let scope: [String: Any] = ["project_id": ["type": "string"], "expected_revision": ["type": "string"]]
         return [
+            function("move_for_duration", "Pan and zoom smoothly from one numbered box to another over a duration, starting at a named or selected edit. Both boxes can belong to the same frame. The editor creates the arrival edit automatically. Use direct unless explicitly asked to return to full frame along the way.", scope.merging([
+                "start_edit_label": ["type": "string", "description": "An exact known edit label, or empty to use the selected edit."],
+                "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],
+                "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": 60],
+                "path": ["type": "string", "enum": ["direct", "via_full_frame"]]
+            ]) { _, b in b }),
             function("frame_edits", "Fit numbered boxes at named timeline edits, including reference-only marks with no existing zoom. The editor computes zoom/pan and default smooth timing. Include one change per destination edit. Empty from_edit_label revises only that edit; box_label can be full_frame to zoom out there. A named from_edit_label adds a smooth zoom-out to full frame BETWEEN the named edits, then smoothly into the destination box, arriving at edit_label. Labels must exactly match context.", scope.merging([
                 "changes": ["type": "array", "minItems": 1, "maxItems": 8, "items": [
                     "type": "object", "properties": ["edit_label": ["type": "string"],

@@ -25,9 +25,16 @@ enum EditorCommand: Codable, Equatable, Sendable {
     case holdFraming(time: Double)
     case reviseFraming(editID: UUID, regionID: UUID)
     case moveBetweenEdits(fromEditID: UUID, toEditID: UUID, regionID: UUID)
+    case moveForDuration(startEditID: UUID, fromRegionID: UUID, toRegionID: UUID, duration: Double, viaFullFrame: Bool = false)
+    case createEdit(time: Double)
+    case moveEdit(editID: UUID, time: Double)
+    case removeEdit(editID: UUID)
     case labelRegion(regionID: UUID, note: String)
 
-    private enum Key: String, CodingKey { case action, regionID, time, motion, editID, fromEditID, toEditID, note }
+    private enum Key: String, CodingKey {
+        case action, regionID, time, motion, editID, fromEditID, toEditID, note,
+             startEditID, fromRegionID, toRegionID, duration, viaFullFrame
+    }
     private struct AnyKey: CodingKey {
         var stringValue: String
         var intValue: Int? { nil }
@@ -65,6 +72,22 @@ enum EditorCommand: Codable, Equatable, Sendable {
             self = .moveBetweenEdits(fromEditID: try values.decode(UUID.self, forKey: .fromEditID),
                                     toEditID: try values.decode(UUID.self, forKey: .toEditID),
                                     regionID: try values.decode(UUID.self, forKey: .regionID))
+        case "moveForDuration":
+            allowed = ["action", "startEditID", "fromRegionID", "toRegionID", "duration", "viaFullFrame"]
+            self = .moveForDuration(startEditID: try values.decode(UUID.self, forKey: .startEditID),
+                fromRegionID: try values.decode(UUID.self, forKey: .fromRegionID),
+                toRegionID: try values.decode(UUID.self, forKey: .toRegionID),
+                duration: try values.decode(Double.self, forKey: .duration),
+                viaFullFrame: try values.decodeIfPresent(Bool.self, forKey: .viaFullFrame) ?? false)
+        case "createEdit":
+            allowed = ["action", "time"]
+            self = .createEdit(time: try values.decode(Double.self, forKey: .time))
+        case "moveEdit":
+            allowed = ["action", "editID", "time"]
+            self = .moveEdit(editID: try values.decode(UUID.self, forKey: .editID), time: try values.decode(Double.self, forKey: .time))
+        case "removeEdit":
+            allowed = ["action", "editID"]
+            self = .removeEdit(editID: try values.decode(UUID.self, forKey: .editID))
         default:
             throw EditorCommandError.invalid("The requested editing action is not supported.")
         }
@@ -102,6 +125,23 @@ enum EditorCommand: Codable, Equatable, Sendable {
             try values.encode(fromEditID, forKey: .fromEditID)
             try values.encode(toEditID, forKey: .toEditID)
             try values.encode(regionID, forKey: .regionID)
+        case let .moveForDuration(startEditID, fromRegionID, toRegionID, duration, viaFullFrame):
+            try values.encode("moveForDuration", forKey: .action)
+            try values.encode(startEditID, forKey: .startEditID)
+            try values.encode(fromRegionID, forKey: .fromRegionID)
+            try values.encode(toRegionID, forKey: .toRegionID)
+            try values.encode(duration, forKey: .duration)
+            try values.encode(viaFullFrame, forKey: .viaFullFrame)
+        case let .createEdit(time):
+            try values.encode("createEdit", forKey: .action)
+            try values.encode(time, forKey: .time)
+        case let .moveEdit(editID, time):
+            try values.encode("moveEdit", forKey: .action)
+            try values.encode(editID, forKey: .editID)
+            try values.encode(time, forKey: .time)
+        case let .removeEdit(editID):
+            try values.encode("removeEdit", forKey: .action)
+            try values.encode(editID, forKey: .editID)
         }
     }
 }
@@ -119,6 +159,7 @@ struct EditorCommandContext: Codable, Equatable, Sendable {
     var duration: Double
     var state: EditState
     var references = EditorReferences()
+    var history = EditorHistoryState()
 }
 
 enum EditorCommandError: LocalizedError {
@@ -150,7 +191,7 @@ enum EditorCommandDispatcher {
         guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
         return EditorCommandContext(projectID: projectID, revision: try revision(for: editor.project),
                                     duration: editor.project.duration, state: editor.project.state,
-                                    references: editor.project.references)
+                                    references: editor.project.references, history: editor.historyState)
     }
 
     static func prepare(_ batch: EditorCommandBatch, for project: RecordingProject,
@@ -178,7 +219,7 @@ enum EditorCommandDispatcher {
         }
         func region(_ id: UUID) throws -> EditorRegion {
             guard let value = next.regions.first(where: { $0.id == id }) else {
-                throw EditorCommandError.invalid("The selected scribble no longer exists. Select an area and try again.")
+                throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
             }
             return value
         }
@@ -196,6 +237,36 @@ enum EditorCommandDispatcher {
         }
         for command in batch.commands {
             switch command {
+            case let .createEdit(time):
+                guard time.isFinite, time >= 0, time < project.duration else {
+                    throw EditorCommandError.invalid("The edit mark must be inside the recording.")
+                }
+                if !next.timedEdits(includeCamera: true).contains(where: { abs($0.time - time) < 0.000_001 }) {
+                    next.editAnchors.append(EditAnchor(time: time))
+                    next.editAnchors.sort { $0.time < $1.time }
+                }
+            case let .moveEdit(editID, time):
+                guard time.isFinite, time >= 0, time < project.duration else {
+                    throw EditorCommandError.invalid("The edit mark must stay inside the recording.")
+                }
+                let edits = next.timedEdits(includeCamera: true)
+                guard let edit = edits.first(where: { $0.id == editID }) else {
+                    throw EditorCommandError.invalid("The edit mark no longer exists. Select a visible edit and try again.")
+                }
+                guard !edits.contains(where: { $0.id != editID && abs($0.time - time) < 0.000_001 }) else {
+                    throw EditorCommandError.invalid("Another edit already marks that time. Choose a different time.")
+                }
+                // The initial camera placement must remain at zero; timed edits
+                // never include it as a movable component.
+                if edit.cameraID != nil, time == 0 {
+                    throw EditorCommandError.invalid("Move this camera edit after the initial placement at the start of the recording.")
+                }
+                next.move(edit, to: time)
+            case let .removeEdit(editID):
+                guard let edit = next.timedEdits(includeCamera: true).first(where: { $0.id == editID }) else {
+                    throw EditorCommandError.invalid("The edit mark no longer exists. Select a visible edit and try again.")
+                }
+                next.remove(edit)
             case let .frameRegion(regionID, time, motion):
                 try validTime(time)
                 try motion.validate()
@@ -218,7 +289,7 @@ enum EditorCommandDispatcher {
                 put(try region(regionID).rect.framing(), at: edit.time, motion: motion, preserving: original)
             case let .labelRegion(regionID, note):
                 guard let index = next.regions.firstIndex(where: { $0.id == regionID }) else {
-                    throw EditorCommandError.invalid("The selected scribble no longer exists. Select an area and try again.")
+                    throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
                 }
                 next.regions[index].note = note
                 try next.regions[index].validate(duration: project.duration)
@@ -253,6 +324,53 @@ enum EditorCommandDispatcher {
                 put(ZoomPlacement(), at: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: duration))
                 let existing = next.zoomKeyframes.first { $0.id == to.zoomID }
                 put(target, at: to.time, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: existing)
+            case let .moveForDuration(startEditID, fromRegionID, toRegionID, duration, viaFullFrame):
+                guard duration.isFinite, duration > 0, duration <= 60 else {
+                    throw EditorCommandError.invalid("Choose a movement lasting more than zero and at most 60 seconds.")
+                }
+                guard let start = next.timedEdits(includeCamera: true).first(where: { $0.id == startEditID }) else {
+                    throw EditorCommandError.invalid("The starting edit no longer exists. Select a visible edit and try again.")
+                }
+                let end = start.time + duration
+                guard end.isFinite, end < project.duration else {
+                    throw EditorCommandError.invalid("The movement would finish at or past the end of the recording. Choose a shorter duration or an earlier starting edit.")
+                }
+                let source = try region(fromRegionID).rect.framing()
+                let target = try region(toRegionID).rect.framing()
+                let original = next.zoomKeyframes.first { $0.id == start.zoomID }
+                let arrival = next.zoomKeyframes.first { abs($0.time - end) < 0.000_001 }
+                guard !next.zoomKeyframes.contains(where: { $0.time > start.time + 0.000_001 && $0.time < end - 0.000_001 }) else {
+                    throw EditorCommandError.invalid("Another screen-framing edit falls inside this movement. Choose how to handle that edit before adding the movement.")
+                }
+                if let arrival, arrival.placement.clamped != target {
+                    throw EditorCommandError.invalid("A different screen-framing edit already occupies the arrival time. Choose whether to replace it before adding this movement.")
+                }
+                if let following = next.zoomKeyframes.first(where: { $0.time > end + 0.000_001 }),
+                   following.transition == .smooth, following.time - following.duration < end {
+                    throw EditorCommandError.invalid("An existing screen-framing movement crosses the arrival time. Revise that movement before adding this one.")
+                }
+                if original == nil, let crossing = next.zoomKeyframes.first(where: { $0.time > start.time }),
+                   crossing.transition == .smooth, crossing.time - crossing.duration < start.time {
+                    throw EditorCommandError.invalid("An existing screen-framing movement crosses the starting edit. Revise that movement before adding this one.")
+                }
+                // Setting the named start is an explicit revision of that edit.
+                // Preserve its incoming movement; new reference marks start with a cut.
+                let startMotion = original.map {
+                    EditorCommandMotion(transition: $0.transition, duration: $0.duration,
+                        easeIn: $0.easeIn, easeOut: $0.easeOut)
+                } ?? EditorCommandMotion(transition: .jump)
+                put(source, at: start.time, motion: startMotion, preserving: original)
+                if !next.timedEdits(includeCamera: true).contains(where: { abs($0.time - end) < 0.000_001 }) {
+                    next.editAnchors.append(EditAnchor(time: end))
+                    next.editAnchors.sort { $0.time < $1.time }
+                }
+                if viaFullFrame {
+                    let half = duration / 2
+                    put(ZoomPlacement(), at: start.time + half, motion: EditorCommandMotion(transition: .smooth, duration: half))
+                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: half), preserving: arrival)
+                } else {
+                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: arrival)
+                }
             }
         }
         var candidate = project

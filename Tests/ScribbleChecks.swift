@@ -72,6 +72,8 @@ struct ScribbleChecks {
         var selected: UUID?
         var zoomCommits = 0
         var cameraCommits = 0
+        var referenceBegins = 0
+        canvas.onReferenceBegin = { referenceBegins += 1 }
         canvas.onDrawRegion = { drawn.append($0) }
         canvas.onSelectRegion = { selected = $0 }
         canvas.onZoomCommit = { _, _ in zoomCommits += 1 }
@@ -79,6 +81,7 @@ struct ScribbleChecks {
         canvas.scribbleMode = true
         let start = CGPoint(x: 80, y: 90), end = CGPoint(x: 200, y: 180)
         canvas.mouseDown(with: mouse(.leftMouseDown, at: start, canvas: canvas, window: window))
+        try require(referenceBegins == 1, "new reference gestures notify planning cancellation before the first drag sample")
         canvas.mouseDragged(with: mouse(.leftMouseDragged, at: end, canvas: canvas, window: window))
         try require(drawn.isEmpty, "scribble movement is transient until mouse up")
         canvas.mouseUp(with: mouse(.leftMouseUp, at: end, canvas: canvas, window: window))
@@ -112,10 +115,12 @@ struct ScribbleChecks {
                     "badges remain fully visible inside the recording even for clipped edge guides")
         let badge = canvas.guideBadges.first { $0.regionID == edge.id }!
         let badgePoint = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+        let beginsBeforeBadge = referenceBegins
         canvas.mouseDown(with: mouse(.leftMouseDown, at: badgePoint, canvas: canvas, window: window))
         canvas.mouseUp(with: mouse(.leftMouseUp, at: badgePoint, canvas: canvas, window: window))
         try require(selected == edge.id && drawn.count == 1,
                     "clicking a badge outside its small box selects that box instead of drawing another")
+        try require(referenceBegins == beginsBeforeBadge, "selecting an existing reference badge cannot cancel a planning request")
         canvas.selectedRegionID = selected
         configure()
         try require(canvas.guideBadges.first(where: { $0.selected })?.label == "Box 12",
@@ -140,6 +145,21 @@ struct ScribbleChecks {
         configure()
         try require(canvas.guideBadges.map(\.frame) == packed.map(\.frame),
                     "selection changes highlight guides without shifting their number badges")
+
+        let outside = EditorRegion(time: 0, rect: EditorRegionRect(x: 0.9, y: 0.9, width: 0.05, height: 0.05))
+        canvas.regions = [guide, outside]
+        canvas.regionLabels = [guide.id: "Box 1", outside.id: "Box 9"]
+        canvas.selectedRegionID = outside.id
+        configure(zoom: ZoomPlacement(scale: 3))
+        guard let edgeBadge = canvas.guideBadges.first(where: { $0.regionID == outside.id }) else {
+            throw ScribbleCheckError.failed("offscreen reference badge missing")
+        }
+        try require(edgeBadge.outsideViewport && canvas.contentRect.contains(edgeBadge.frame),
+                    "references outside the current zoom remain available as boundary badges")
+        let edgePoint = CGPoint(x: edgeBadge.frame.midX, y: edgeBadge.frame.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, at: edgePoint, canvas: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, at: edgePoint, canvas: canvas, window: window))
+        try require(selected == outside.id, "a boundary badge selects its offscreen reference")
 
         canvas.scribbleMode = false
         configure(zoom: ZoomPlacement(scale: 2))

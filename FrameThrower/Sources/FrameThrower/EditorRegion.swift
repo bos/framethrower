@@ -36,13 +36,13 @@ struct EditorRegion: Codable, Equatable, Identifiable, Sendable {
 
     func validate(duration: Double) throws {
         guard time.isFinite, (0...duration).contains(time), rect.isValid else {
-            throw ProjectError.invalid("A scribble must be inside the recording and the original screen frame.")
+            throw ProjectError.invalid("A box must be inside the recording and the original screen frame.")
         }
         guard note.count <= 4_096,
               !note.unicodeScalars.contains(where: {
                   $0.properties.generalCategory == .control && $0 != "\n" && $0 != "\t"
               }) else {
-            throw ProjectError.invalid("Use a scribble note of at most 4,096 characters without control characters.")
+            throw ProjectError.invalid("Use a box name of at most 4,096 characters without control characters.")
         }
     }
 }

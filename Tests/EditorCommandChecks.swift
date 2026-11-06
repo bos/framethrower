@@ -42,7 +42,9 @@ struct EditorCommandChecks {
     private static func checkCodable() throws {
         let commands: [EditorCommand] = [.frameRegion(regionID: UUID(), time: 1), .holdFraming(time: 4),
             .fullFrame(time: 5), .reviseFraming(editID: UUID(), regionID: UUID()), .labelRegion(regionID: UUID(), note: "Title"),
-            .moveBetweenEdits(fromEditID: UUID(), toEditID: UUID(), regionID: UUID())]
+            .moveBetweenEdits(fromEditID: UUID(), toEditID: UUID(), regionID: UUID()),
+            .moveForDuration(startEditID: UUID(), fromRegionID: UUID(), toRegionID: UUID(), duration: 5),
+            .createEdit(time: 1), .moveEdit(editID: UUID(), time: 2), .removeEdit(editID: UUID())]
         let data = try JSONEncoder().encode(commands)
         try require(try JSONDecoder().decode([EditorCommand].self, from: data) == commands, "every command round trips")
         for json in ["{\"action\":\"runShell\",\"path\":\"/tmp\"}",

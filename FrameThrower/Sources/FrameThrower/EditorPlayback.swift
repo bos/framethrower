@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Combine
 import SwiftUI
 
@@ -13,7 +13,9 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var stillFrame: CGImage?
     private var renderedProject: RenderedProject?
-    private var stillGeneration = 0
+    private let stillRequests = LatestStillFrameQueue<CGImage>()
+    private var imageGenerator: AVAssetImageGenerator?
+    private var isClosed = false
     private var observer: Any?
     private var generation = 0
     private var bounds = 0.0...1.0
@@ -22,7 +24,7 @@ final class EditorPlayback: ObservableObject {
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
                                                    queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, !self.isClosed else { return }
                 self.time = time.seconds.isFinite ? time.seconds : 0
                 self.isPlaying = self.player.rate > 0
                 if self.time >= self.bounds.upperBound {
@@ -33,11 +35,15 @@ final class EditorPlayback: ObservableObject {
     }
 
     func rebuild(editor: ProjectEditor) async {
+        guard !isClosed else { return }
         generation += 1
         let request = generation
         let snapshot = editor.project
         let position = min(max(time, snapshot.state.trimStart), snapshot.state.trimEnd)
-        pause()
+        player.pause()
+        isPlaying = false
+        invalidateStillFrames()
+        renderedProject = nil
         isLoading = true
         errorMessage = nil
         do {
@@ -52,11 +58,18 @@ final class EditorPlayback: ObservableObject {
             cameraAspect = rendered.cameraAspect
             bounds = snapshot.state.trimStart...snapshot.state.trimEnd
             renderedProject = rendered
-            stillFrame = nil
-            seek(position)
+            let generator = AVAssetImageGenerator(asset: rendered.asset)
+            generator.videoComposition = rendered.videoComposition
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            generator.maximumSize = CGSize(width: 1920, height: 1080)
+            imageGenerator = generator
             isLoading = false
+            seek(position)
         } catch {
             guard request == generation, !Task.isCancelled else { return }
+            invalidateStillFrames()
+            renderedProject = nil
             player.replaceCurrentItem(with: nil)
             errorMessage = error.localizedDescription
             isLoading = false
@@ -64,15 +77,21 @@ final class EditorPlayback: ObservableObject {
     }
 
     func seek(_ position: Double) {
-        time = min(max(position, bounds.lowerBound), bounds.upperBound)
-        player.seek(to: CMTime(seconds: time, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        guard !isClosed, !isLoading || renderedProject != nil else { return }
+        time = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : bounds.lowerBound
+        player.currentItem?.cancelPendingSeeks()
+        player.seek(to: Self.frameTime(at: time, bounds: bounds), toleranceBefore: .zero, toleranceAfter: .zero)
         updateStillFrame()
     }
 
     func togglePlayback() {
+        guard !isClosed, !isLoading, renderedProject != nil else { return }
         if player.rate > 0 { pause() }
         else {
             if time >= bounds.upperBound - 0.03 { seek(bounds.lowerBound) }
+            stillRequests.invalidate()
+            imageGenerator?.cancelAllCGImageGeneration()
+            stillFrame = nil
             player.play()
             isPlaying = true
         }
@@ -85,34 +104,110 @@ final class EditorPlayback: ObservableObject {
         if wasPlaying { updateStillFrame() }
     }
 
+    /// CMTime's nanosecond scale keeps the seek strictly inside the retained
+    /// interval, even when that interval is shorter than one video frame.
+    static func frameTime(at position: Double, bounds: ClosedRange<Double>) -> CMTime {
+        let scale: CMTimeScale = 1_000_000_000
+        let lower = CMTime(seconds: bounds.lowerBound, preferredTimescale: scale)
+        let upper = CMTime(seconds: bounds.upperBound, preferredTimescale: scale)
+        let last = CMTimeSubtract(upper, CMTime(value: 1, timescale: scale))
+        let requested = CMTime(seconds: position.isFinite ? position : bounds.lowerBound,
+                               preferredTimescale: scale)
+        return CMTimeMaximum(lower, CMTimeMinimum(requested, last))
+    }
+
     private func updateStillFrame() {
-        stillGeneration += 1
-        let request = stillGeneration
-        guard let renderedProject else { return }
-        // The end boundary is exclusive; show the final retained frame there.
-        let position = max(bounds.lowerBound, min(time, bounds.upperBound - 1.0 / 30))
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let imageGenerator = AVAssetImageGenerator(asset: renderedProject.asset)
-                imageGenerator.videoComposition = renderedProject.videoComposition
-                imageGenerator.requestedTimeToleranceBefore = .zero
-                imageGenerator.requestedTimeToleranceAfter = .zero
-                imageGenerator.maximumSize = CGSize(width: 1920, height: 1080)
-                let frame = try await imageGenerator.image(at: CMTime(seconds: position, preferredTimescale: 600)).image
-                guard request == self.stillGeneration, !self.isPlaying else { return }
-                self.stillFrame = frame
-            } catch { /* AVPlayer remains available if a still cannot be decoded. */ }
-        }
+        guard !isClosed, !isPlaying, let imageGenerator else { return }
+        let position = Self.frameTime(at: time, bounds: bounds)
+        stillRequests.request(
+            generate: { try await imageGenerator.image(at: position).image },
+            cancel: { imageGenerator.cancelAllCGImageGeneration() },
+            receive: { [weak self] image in
+                guard let self, !self.isClosed, !self.isPlaying else { return }
+                self.stillFrame = image
+            },
+            failure: { [weak self] in self?.stillFrame = nil }
+        )
+    }
+
+    private func invalidateStillFrames() {
+        stillRequests.invalidate()
+        imageGenerator?.cancelAllCGImageGeneration()
+        imageGenerator = nil
+        stillFrame = nil
     }
 
     func close() {
         generation += 1
-        pause()
-        stillGeneration += 1
+        isClosed = true
+        player.pause()
+        isPlaying = false
+        isLoading = false
+        invalidateStillFrames()
         renderedProject = nil
         if let observer { player.removeTimeObserver(observer); self.observer = nil }
         player.replaceCurrentItem(with: nil)
+    }
+}
+
+/// There is at most one active decoder operation and one replaceable pending
+/// request. Cancellation alone does not bound work: the next operation begins
+/// only after the active one actually returns. Invalidated results never arrive.
+@MainActor
+final class LatestStillFrameQueue<Output> {
+    private struct Request {
+        let generation: UInt64
+        let generate: @MainActor () async throws -> Output
+        let cancel: @MainActor () -> Void
+        let receive: @MainActor (Output) -> Void
+        let failure: @MainActor () -> Void
+    }
+
+    private var generation: UInt64 = 0
+    private var pending: Request?
+    private var worker: Task<Void, Never>?
+    private var cancelActive: (@MainActor () -> Void)?
+
+    func request(generate: @escaping @MainActor () async throws -> Output,
+                 cancel: @escaping @MainActor () -> Void,
+                 receive: @escaping @MainActor (Output) -> Void,
+                 failure: @escaping @MainActor () -> Void = {}) {
+        generation &+= 1
+        pending = Request(generation: generation, generate: generate, cancel: cancel,
+                          receive: receive, failure: failure)
+        cancelCurrentOperation()
+        guard worker == nil else { return }
+        worker = Task { [weak self] in await self?.run() }
+    }
+
+    func invalidate() {
+        generation &+= 1
+        pending = nil
+        cancelCurrentOperation()
+    }
+
+    private func cancelCurrentOperation() {
+        let cancel = cancelActive
+        cancelActive = nil
+        cancel?()
+    }
+
+    private func run() async {
+        defer { worker = nil }
+        while let request = pending {
+            pending = nil
+            cancelActive = request.cancel
+            do {
+                let output = try await request.generate()
+                cancelActive = nil
+                if request.generation == generation { request.receive(output) }
+            } catch {
+                cancelActive = nil
+                // Remove an obsolete overlay if the current frame cannot be
+                // decoded, leaving AVPlayer visible as the fallback.
+                if request.generation == generation { request.failure() }
+            }
+        }
     }
 }
 

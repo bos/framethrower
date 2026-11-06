@@ -29,6 +29,9 @@ struct RecordingMasterChecks {
             let suffix = audio.isEmpty ? "silent" : audio.count == 1 ? "microphone" : "both"
             try await master(at: directory.appendingPathComponent("\(suffix).mov"), audio: audio)
         }
+        try await reversedArrival(at: directory.appendingPathComponent("reversed-arrival.mov"))
+        try await latePreroll(at: directory.appendingPathComponent("late-preroll.mov"))
+        try await earlyFinish(at: directory.appendingPathComponent("early-finish.mov"))
         try await emptyAudio(at: directory.appendingPathComponent("no-audio-yet.mov"))
         try await staticScreen(at: directory.appendingPathComponent("static.mov"))
         try await shortEncoderBurst(at: directory.appendingPathComponent("burst.mov"))
@@ -106,10 +109,99 @@ struct RecordingMasterChecks {
         for frame in 0..<3 {
             try require(writer.append(try videoSample(at: 100 + Double(frame) / 30), track: .video, hostTime: 500), "silent-start sample refused")
         }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while probe.firstTimes.isEmpty {
+            try require(ContinuousClock.now < deadline, "silent enabled audio tracks cannot indefinitely delay startup")
+            try await Task.sleep(for: .milliseconds(5))
+        }
         try await finish(writer)
         try require(probe.firstTimes == [500] && probe.failureCount == 0, "absent/silent audio tracks cannot block screen recording")
         let tracks = try await AVURLAsset(url: url).loadTracks(withMediaType: .video)
         try require(tracks.count == 1, "silent startup must retain screen video")
+    }
+
+    private static func reversedArrival(at url: URL) async throws {
+        let probe = MasterProbe()
+        let writer = try ScreenMasterWriter(url: url, width: 64, height: 48,
+            audioTracks: [.microphone, .systemAudio], frameDuration: CMTime(value: 1, timescale: 60),
+            onFirstVideo: { probe.firstVideo($0) }, onFailure: { probe.failed($0) })
+        try require(writer.append(try videoSample(at: 100), track: .video, hostTime: 500), "video-first startup sample")
+        try await Task.sleep(for: .milliseconds(10))
+        try require(probe.firstTimes.isEmpty, "video must remain buffered while the short startup reorder window is open")
+        try require(writer.append(try audioSample(at: 99.95, sampleRate: 44_100, channels: 1,
+            values: [0.25]), track: .microphone), "late callback with earlier microphone timestamp")
+        try require(writer.append(try audioSample(at: 99.975, sampleRate: 48_000, channels: 2,
+            values: [0.125, 0.375], nonInterleaved: true), track: .systemAudio), "late system callback with distinct earlier timestamp")
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while probe.firstTimes.isEmpty {
+            try require(ContinuousClock.now < deadline, "bounded startup reorder must eventually encode without Stop")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await finish(writer, end: CMTime(seconds: 100.2, preferredTimescale: 60_000))
+        let asset = AVURLAsset(url: url)
+        let offset = try await ScreenRecorder.firstVideoPresentationTime(in: url)
+        try require(abs(offset - 0.05) < 0.002, "callback arrival order must not discard earlier microphone samples or move the screen origin")
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        try require(audioTracks.count == 2, "reordered audio sources must remain independent")
+        var starts: [Double] = []
+        for track in audioTracks {
+            let values = try await audioPixels(track, in: asset)
+            starts.append(values.start)
+            if values.start < 0.002 {
+                try require(values.left > 0.1 && values.left < 0.3 && abs(values.left - values.right) < 0.001,
+                            "earlier microphone PCM must retain its leading signal")
+            } else {
+                try require(abs(values.left - 0.125) < 0.000001 && abs(values.right - 0.375) < 0.000001,
+                            "earlier system PCM must retain exact leading channel samples")
+            }
+            let segments = try await track.load(.segments)
+            let duration = segments.first(where: { !$0.isEmpty })?.timeMapping.source.duration.seconds ?? 0
+            try require(abs(duration - 1.0 / 30) < 0.002,
+                        "late arrival must not shorten the earlier audio packet")
+        }
+        starts.sort()
+        try require(abs(starts[0]) < 0.002 && abs(starts[1] - 0.025) < 0.002,
+                    "reordering must preserve each audio source's actual leading offset")
+        try require(probe.firstTimes == [500] && probe.failureCount == 0 && writer.bufferUsage.count == 0,
+                    "bounded reorder must report the written host time once, finish cleanly, and release buffers")
+    }
+
+    private static func earlyFinish(at url: URL) async throws {
+        let probe = MasterProbe()
+        let writer = try ScreenMasterWriter(url: url, width: 64, height: 48, audioTracks: [],
+            maximumPendingSamples: 1024, startupReorderWindow: 10,
+            onFirstVideo: { probe.firstVideo($0) }, onFailure: { probe.failed($0) })
+        try require(writer.append(try videoSample(at: 100), track: .video, hostTime: 500), "early Stop fixture")
+        let began = ContinuousClock.now
+        try await finish(writer)
+        try require(began.duration(to: .now) < .seconds(2) && probe.firstTimes == [500] && probe.failureCount == 0,
+                    "Stop must flush immediately instead of waiting for the startup reorder timer")
+    }
+
+    private static func latePreroll(at url: URL) async throws {
+        let probe = MasterProbe()
+        let writer = try ScreenMasterWriter(url: url, width: 64, height: 48, audioTracks: [.microphone],
+            startupReorderWindow: 0, onFirstVideo: { probe.firstVideo($0) }, onFailure: { probe.failed($0) })
+        try require(writer.append(try videoSample(at: 100), track: .video, hostTime: 500), "late-preroll origin picture")
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while probe.firstTimes.isEmpty {
+            try require(ContinuousClock.now < deadline, "late-preroll fixture startup")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try require(writer.append(try audioSample(at: 100 - 1.0 / 30, sampleRate: 48_000, channels: 1,
+            values: [0.125]), track: .microphone), "late preroll packet must not interrupt capture")
+        try require(writer.append(try audioSample(at: 100, sampleRate: 48_000, channels: 1,
+            values: [0.375]), track: .microphone), "post-origin microphone packet must survive late preroll")
+        try await finish(writer, end: CMTime(seconds: 100.2, preferredTimescale: 60_000))
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        try require(tracks.count == 1, "post-origin microphone audio must be retained")
+        let values = try await audioPixels(tracks[0], in: asset)
+        try require(abs(values.start) < 0.002 && values.left > 0.2 && values.left < 0.4 &&
+                    abs(values.left - values.right) < 0.001,
+                    "the finalized origin trims only preroll and preserves subsequent microphone timing and signal: \(values)")
+        try require(probe.failureCount == 0 && writer.bufferUsage.count == 0,
+                    "late preroll must finish normally without retained buffers or false failure notifications")
     }
 
     private static func staticScreen(at url: URL) async throws {

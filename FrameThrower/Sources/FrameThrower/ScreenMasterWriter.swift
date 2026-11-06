@@ -12,9 +12,9 @@ enum MasterRecordingError: LocalizedError {
         switch self {
         case .unsupportedFormat: return "This recording format could not be encoded on this Mac."
         case .invalidSample: return "Capture supplied an invalid media timestamp or format."
-        case .encoderOverloaded: return "The encoder could not keep up. Recording stopped; captured media has been kept. Try smaller originals or a smaller capture area."
-        case .encoderStalled: return "The encoder stopped responding. Any captured media has been kept."
-        case .noVideo: return "No screen video was captured. Any captured audio has been kept."
+        case .encoderOverloaded: return "Recording stopped because the encoder could not keep up. Try Smaller files or a smaller capture area."
+        case .encoderStalled: return "The encoder stopped responding."
+        case .noVideo: return "No screen video was captured."
         }
     }
 }
@@ -23,6 +23,10 @@ enum MasterRecordingError: LocalizedError {
 /// work is serial, and microphone/system audio remain independent PCM tracks.
 /// No capture session or device is created here, so the entire writer can be
 /// exercised with synthetic buffers.
+/// By default the initial batch gets up to 50ms of reordering before encoding;
+/// the origin is its earliest timestamp when the encoder accepts its first sample.
+/// After that bounded window, media preceding the committed origin is preroll:
+/// AVAssetWriter trims that portion while retaining samples after the origin.
 final class ScreenMasterWriter: @unchecked Sendable {
     enum Track: Hashable, Sendable { case video, systemAudio, microphone }
     struct BufferUsage: Sendable { let count: Int; let bytes: Int; let peakCount: Int; let peakBytes: Int }
@@ -37,11 +41,14 @@ final class ScreenMasterWriter: @unchecked Sendable {
     private let readiness: (@Sendable (Track) -> Bool)?
     private let stallTimeout: Double
     private let frameDuration: CMTime
+    private let startupWindow: Double
     // Encoder queue only.
     private var pending: [MasterSample] = []
     private var lastVideo: MasterSample?
     private var lastPTS: [Track: CMTime] = [:]
     private var sessionStart: CMTime?
+    private var startupReleased = false
+    private var startupTimerScheduled = false
     private var firstVideoHostTime: Double?
     private var requestedEnd: CMTime?
     private var closingFrame: CMSampleBuffer?
@@ -55,18 +62,23 @@ final class ScreenMasterWriter: @unchecked Sendable {
     init(url: URL, width: Int, height: Int, audioTracks: Set<Track>,
          frameDuration: CMTime = CMTime(value: 1, timescale: 60),
          maximumPendingSamples: Int = 32, maximumPendingBytes: Int? = nil,
+         startupReorderWindow: Double = 0.05,
          stallTimeout: Double = 2,
          readiness: (@Sendable (Track) -> Bool)? = nil,
          onFirstVideo: @escaping @Sendable (Double) -> Void,
          onFailure: @escaping @Sendable (any Error) -> Void) throws {
         guard width > 0, height > 0, !audioTracks.contains(.video),
-              maximumPendingSamples > 0, maximumPendingBytes.map({ $0 > 0 }) ?? true else { throw MasterRecordingError.unsupportedFormat }
+              maximumPendingSamples > 0, maximumPendingBytes.map({ $0 > 0 }) ?? true,
+              startupReorderWindow.isFinite, startupReorderWindow >= 0 else { throw MasterRecordingError.unsupportedFormat }
         self.onFirstVideo = onFirstVideo
         self.onFailure = onFailure
         self.readiness = readiness
         self.stallTimeout = max(0.01, stallTimeout)
         self.frameDuration = frameDuration.isNumeric && frameDuration.seconds > 0 ? frameDuration : CMTime(value: 1, timescale: 60)
         let byteLimit = try maximumPendingBytes ?? Self.defaultBufferByteLimit(width: width, height: height)
+        let bufferedFrames = min(Double(maximumPendingSamples), Double(byteLimit) / (Double(width) * Double(height) * 4))
+        let burstDuration = max(0, floor(bufferedFrames) - 1) * self.frameDuration.seconds
+        startupWindow = min(startupReorderWindow, burstDuration)
         budget = MasterSampleBudget(maximumCount: maximumPendingSamples, maximumBytes: byteLimit)
         writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var configured: [Track: AVAssetWriterInput] = [:]
@@ -161,6 +173,25 @@ final class ScreenMasterWriter: @unchecked Sendable {
 
     private func drain() {
         guard !encoderFinishStarted else { return }
+        // Capture callbacks from independent audio/video outputs need not
+        // arrive in timestamp order. Hold a short bounded initial batch, never
+        // wait for every enabled track, and let Stop flush it immediately.
+        // Later packets before the finalized origin are normal device preroll,
+        // not a reason to interrupt an otherwise usable recording.
+        if sessionStart == nil, !startupReleased {
+            if finishing || startupWindow == 0 { startupReleased = true }
+            else {
+                if !startupTimerScheduled {
+                    startupTimerScheduled = true
+                    queue.asyncAfter(deadline: .now() + startupWindow) { [weak self] in
+                        guard let self else { return }
+                        self.startupReleased = true
+                        self.drain()
+                    }
+                }
+                return
+            }
+        }
         while let sample = pending.first {
             guard let input = inputs[sample.track], writer.status == .writing else {
                 abortEncoder(writer.error ?? MasterRecordingError.unsupportedFormat)
@@ -176,8 +207,9 @@ final class ScreenMasterWriter: @unchecked Sendable {
             guard input.isReadyForMoreMediaData, readiness?(sample.track) ?? true else { waitForEncoder(); return }
             waitingSince = nil
             if sessionStart == nil {
-                writer.startSession(atSourceTime: sample.pts)
-                sessionStart = sample.pts
+                let earliest = pending.reduce(sample.pts) { CMTimeMinimum($0, $1.pts) }
+                writer.startSession(atSourceTime: earliest)
+                sessionStart = earliest
             }
             guard input.append(sample.buffer) else { abortEncoder(writer.error ?? MasterRecordingError.unsupportedFormat); return }
             lastPTS[sample.track] = sample.pts

@@ -534,6 +534,9 @@ struct RecordingProject: Codable, Equatable, Sendable {
     /// Camera start relative to the first screen frame; negative means the
     /// camera started earlier. This is independent of the editable trim.
     var cameraOffset: Double = 0
+    /// Capture policy is independent of sparse source samples and edit history.
+    /// Older projects omit it and keep their original 30fps render cadence.
+    let captureFrameDuration: Double?
     var duration: Double
     var state: EditState
     var undoHistory: [NamedEditSnapshot] = []
@@ -541,13 +544,15 @@ struct RecordingProject: Codable, Equatable, Sendable {
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
-         undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil) {
+         undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
+         captureFrameDuration: Double? = nil) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
         self.cursorFilename = cursorFilename
         self.title = title
         self.cameraOffset = cameraOffset
+        self.captureFrameDuration = captureFrameDuration
         self.duration = duration
         self.state = state ?? EditState(trimStart: 0, trimEnd: duration,
                                        pipKeyframes: [PIPKeyframe(time: 0, placement: PIPPlacement())])
@@ -596,6 +601,11 @@ struct RecordingProject: Codable, Equatable, Sendable {
         guard version == 1 else { throw ProjectError.invalid("Unsupported project version: \(version).") }
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {
             throw ProjectError.invalid("The recording has an invalid duration or camera offset.")
+        }
+        if let captureFrameDuration {
+            guard captureFrameDuration.isFinite, (1.0 / 120...1.0).contains(captureFrameDuration) else {
+                throw ProjectError.invalid("The recording frame duration must be between 1/120 second and 1 second.")
+            }
         }
         try Self.validateTitle(title)
         for filename in [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }) {

@@ -1064,7 +1064,8 @@ final class CaptureViewModel: ObservableObject {
             }
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
                 cameraFilename: cameraFilename, cursorFilename: cursorFilename,
-                cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration)
+                cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration,
+                captureFrameDuration: 1.0 / 60)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
             let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")
             let editor = ProjectEditor(project: project, url: url)
@@ -1421,6 +1422,7 @@ final class CaptureViewModel: ObservableObject {
             : nil
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.queueDepth = 6
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         let scale = Double(filter.pointPixelScale)
         let pixelSize: (Double) -> Int = { points in
             let raw = max(2, Int((points * scale).rounded()))

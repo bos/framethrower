@@ -153,7 +153,7 @@ enum ProjectRenderer {
         videoComposition.colorTransferFunction = AVVideoTransferFunction_IEC_sRGB
         videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
         videoComposition.renderSize = renderSize
-        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        videoComposition.frameDuration = CMTime(seconds: project.captureFrameDuration ?? 1.0 / 30, preferredTimescale: 60_000)
         videoComposition.instructions = [instruction]
         return RenderedProject(
             asset: composition, videoComposition: videoComposition,

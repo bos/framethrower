@@ -84,6 +84,49 @@ struct WhisperSpeechChecks {
         do { _ = try await blocked.transcribe([Float](repeating: 0.1, count: 1_000_000)); throw CheckFailure.failed("blocked-write timeout ignored") }
         catch WhisperSpeechError.runtimeFailed(let message) { try require(message.contains("too long"), "inference timeout not explained") }
         try require(began.duration(to: .now) < .seconds(2), "timeout stalled while closing a blocked PCM writer")
+        let readyLine = "printf '{\"ready\":true,\"protocol\":1,\"backend\":\"metal\"}\\n'\n"
+        let resultLine = "printf '{\"text\":\"recognized words\"}\\n'\n"
+        let successful = try helper(readyLine + "cat >/dev/null\n" + resultLine, root: root, name: "successful")
+        for _ in 0..<10 {
+            let completed = WhisperSpeechWorker(executable: successful, inferenceTimeout: 1)
+            try await completed.prepare(model: root)
+            let result = try await completed.transcribe([Float](repeating: 0.1, count: 160))
+            try require(result == "recognized words", "exited helper lost its final text")
+        }
+        let unsuccessful = try helper(readyLine + "cat >/dev/null\n" + resultLine + "exit 7\n", root: root, name: "unsuccessful")
+        let failedCompletion = WhisperSpeechWorker(executable: unsuccessful, inferenceTimeout: 1)
+        try await failedCompletion.prepare(model: root)
+        do { _ = try await failedCompletion.transcribe([Float](repeating: 0.1, count: 160)); throw CheckFailure.failed("nonzero helper exit accepted its result") }
+        catch WhisperSpeechError.invalidResponse {}
+        // The result is already written, but this helper deliberately refuses
+        // to exit. Ignoring TERM also exercises the forced-kill cleanup path.
+        let marker = root.appendingPathComponent("result-written")
+        let lingering = try helper(readyLine + "cat >/dev/null\ntrap '' TERM\n" + resultLine + "printf '%s' \"$$\" > \"" + marker.path + "\"\nexec /bin/sleep 20\n", root: root, name: "lingering")
+        let delayed = WhisperSpeechWorker(executable: lingering, inferenceTimeout: 0.15)
+        try await delayed.prepare(model: root)
+        let exitWaitBegan = ContinuousClock.now
+        do { _ = try await delayed.transcribe([Float](repeating: 0.1, count: 160)); throw CheckFailure.failed("post-result exit deadline ignored") }
+        catch WhisperSpeechError.runtimeFailed(let message) { try require(message.contains("too long"), "post-result timeout not explained") }
+        try require(FileManager.default.fileExists(atPath: marker.path), "timeout fixture never supplied a result")
+        try require(exitWaitBegan.duration(to: .now) < .seconds(2), "post-result exit wait exceeded the inference deadline")
+        let timedPID = Int32(try String(contentsOf: marker, encoding: .utf8))!
+        try FileManager.default.removeItem(at: marker)
+        let cancelAfterResult = WhisperSpeechWorker(executable: lingering, inferenceTimeout: 10)
+        try await cancelAfterResult.prepare(model: root)
+        let transcript = Task { try await cancelAfterResult.transcribe([Float](repeating: 0.1, count: 160)) }
+        let markerDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !FileManager.default.fileExists(atPath: marker.path), ContinuousClock.now < markerDeadline { try await Task.sleep(for: .milliseconds(5)) }
+        try require(FileManager.default.fileExists(atPath: marker.path), "cancellation fixture never supplied a result")
+        let cancelledPID = Int32(try String(contentsOf: marker, encoding: .utf8))!
+        let exitCancelBegan = ContinuousClock.now
+        transcript.cancel()
+        do { _ = try await transcript.value; throw CheckFailure.failed("post-result cancellation returned stale text") }
+        catch is CancellationError {}
+        try require(exitCancelBegan.duration(to: .now) < .seconds(2), "post-result cancellation stalled in native process completion")
+        let cleanupDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while (kill(timedPID, 0) == 0 || kill(cancelledPID, 0) == 0), ContinuousClock.now < cleanupDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        try require(kill(timedPID, 0) == -1 && kill(cancelledPID, 0) == -1, "cancelled/timed-out helper remained alive after forced cleanup")
+        print("PASS: immediate/nonzero helper exit, post-result deadline/cancellation, forced process cleanup; no run-loop exit wait")
         print("PASS: bounded protocol, Metal requirement, timeouts, task cancellation, broken-pipe and blocked-write isolation")
     }
     static func fallbackChecks() async throws {

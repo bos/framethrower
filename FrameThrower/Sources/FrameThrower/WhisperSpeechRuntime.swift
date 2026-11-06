@@ -108,6 +108,8 @@ actor LocalSpeechModelStore {
 /// this utterance's helper interrupts native inference as well as Swift waiting.
 final class WhisperSpeechWorker: @unchecked Sendable {
     private let lock = NSLock()
+    private let termination = NSCondition()
+    private var exitStatus: Int32?
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
@@ -145,6 +147,7 @@ final class WhisperSpeechWorker: @unchecked Sendable {
 
     func cancel() {
         lock.lock(); cancelled = true; let previous = process; let writer = input; input = nil; lock.unlock()
+        termination.lock(); termination.broadcast(); termination.unlock()
         // Stop the reader before closing the writer. A large PCM write may be
         // blocked on a full socket; terminating the child releases that write.
         if let previous, previous.isRunning {
@@ -183,6 +186,13 @@ final class WhisperSpeechWorker: @unchecked Sendable {
         defer { try? childInput.close() }
         next.executableURL = executable; next.arguments = ["--model", model.path]
         next.standardInput = childInput; next.standardOutput = outgoing; next.standardError = FileHandle.nullDevice
+        next.terminationHandler = { [weak self] child in
+            guard let self else { return }
+            self.termination.lock()
+            self.exitStatus = child.terminationStatus
+            self.termination.broadcast()
+            self.termination.unlock()
+        }
         lock.lock()
         guard !cancelled, process == nil else { lock.unlock(); throw CancellationError() }
         process = next; input = writer; output = outgoing.fileHandleForReading
@@ -196,11 +206,12 @@ final class WhisperSpeechWorker: @unchecked Sendable {
 
     private func transcribeBlocking(_ samples: [Float]) throws -> String {
         try checkCancellation()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(inferenceTimeout))
         let timeout = DispatchWorkItem { [weak self] in self?.abort("The local speech model took too long to finish dictation.") }
         DispatchQueue.global().asyncAfter(deadline: .now() + inferenceTimeout, execute: timeout)
         defer { timeout.cancel() }
         lock.lock(); let writer = input; let previous = process; lock.unlock()
-        guard let writer, let previous else { throw WhisperSpeechError.runtimeUnavailable }
+        guard let writer, previous != nil else { throw WhisperSpeechError.runtimeUnavailable }
         do {
             var count = UInt32(samples.count).littleEndian
             try withUnsafeBytes(of: &count) { try writer.write(contentsOf: Data($0)) }
@@ -208,13 +219,32 @@ final class WhisperSpeechWorker: @unchecked Sendable {
             try writer.close()
             lock.lock(); input = nil; lock.unlock()
             let result = try readResponse()
-            previous.waitUntilExit(); try checkCancellation()
-            guard previous.terminationStatus == 0, let text = result.text else { throw WhisperSpeechError.invalidResponse }
+            let status = try waitForCompletion(through: deadline)
+            try checkCancellation()
+            guard status == 0, let text = result.text else { throw WhisperSpeechError.invalidResponse }
             return text.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             let original = error
             do { try checkCancellation() } catch { cancel(); throw error }
             cancel(); throw original
+        }
+    }
+
+    /// A JSON result is not the end of the operation: the helper must also
+    /// exit successfully. Foundation's waitUntilExit can spin its run loop even
+    /// after the OS child is gone. This condition wait never enters that API,
+    /// wakes on cancellation, and shares the whole inference deadline.
+    private func waitForCompletion(through deadline: ContinuousClock.Instant) throws -> Int32 {
+        while true {
+            try checkCancellation()
+            if ContinuousClock.now >= deadline {
+                abort("The local speech model took too long to finish dictation.")
+                try checkCancellation()
+            }
+            termination.lock()
+            if let exitStatus { termination.unlock(); return exitStatus }
+            _ = termination.wait(until: Date(timeIntervalSinceNow: 0.02))
+            termination.unlock()
         }
     }
 

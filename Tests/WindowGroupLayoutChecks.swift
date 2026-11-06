@@ -2,6 +2,23 @@
 import AppKit
 import SwiftUI
 
+/// Events target only this test's own native preview, never system input.
+private final class IntegratedTrackpadEvent: NSEvent {
+    var amount = 0.0
+    var dx = 0.0
+    var dy = 0.0
+    var position = CGPoint.zero
+    var eventPhase: NSEvent.Phase = []
+    var momentum: NSEvent.Phase = []
+    override var magnification: CGFloat { amount }
+    override var scrollingDeltaX: CGFloat { dx }
+    override var scrollingDeltaY: CGFloat { dy }
+    override var hasPreciseScrollingDeltas: Bool { true }
+    override var locationInWindow: NSPoint { position }
+    override var phase: NSEvent.Phase { eventPhase }
+    override var momentumPhase: NSEvent.Phase { momentum }
+}
+
 /// A real SwiftUI scene is required here: NSHostingController does not exercise
 /// WindowGroup's content-minimum sizing negotiation and restoration behavior.
 @main
@@ -70,8 +87,13 @@ private final class WindowGroupLayoutProbe: ObservableObject {
                 throw ProbeError.failed("undo rename without changing video edits")
             }
             try await titleMatches(editor, window: window)
+            try await inspectCombinedEditing(editor, window: window, host: host, canvas: canvas, timeline: timeline)
+            guard try Data(contentsOf: directory.appendingPathComponent("screen.mp4")) == screenBytes,
+                  try Data(contentsOf: directory.appendingPathComponent("camera.mp4")) == cameraBytes else {
+                throw ProbeError.failed("combined edits changed original media")
+            }
             try? FileManager.default.removeItem(at: directory)
-            output("WindowGroup layout checks passed (real SwiftUI scene, Play, trim/scrub, synchronized window names, and rename without reflow).")
+            output("WindowGroup layout checks passed (real scene, stable Play/trim/scrub, shared names, combined native zoom/camera drafts, one-step undo, diamond moves, and inline X deletion).")
             Darwin.exit(0)
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -106,6 +128,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
         }
         guard let (window, host, canvas, timeline) = resolved else { throw ProbeError.failed("real editor scene never became ready") }
         try await Task.sleep(for: .milliseconds(300))
+        if ProcessInfo.processInfo.environment["FRAMETHROWER_EDIT_CHECKS_ONLY"] == "1" { return }
         for width in [940.0, 820.0] {
             window.setContentSize(CGSize(width: width, height: 780))
             try await Task.sleep(for: .milliseconds(150))
@@ -160,6 +183,143 @@ private final class WindowGroupLayoutProbe: ObservableObject {
                 }
             }
         }
+    }
+
+    private func inspectCombinedEditing(_ editor: ProjectEditor, window: NSWindow, host: NSView,
+                                        canvas: EditorCanvasView, timeline: RecordingTimelineView) async throws {
+        let zoomID = UUID(), cameraID = UUID()
+        var initial = editor.project.state
+        initial.trimStart = 0
+        initial.trimEnd = 4
+        initial.zoomKeyframes = [ZoomKeyframe(id: zoomID, time: 1, scale: 1.4)]
+        var camera = PIPPlacement()
+        camera.x = 0.6; camera.y = 0.6; camera.scale = 0.25
+        initial.pipKeyframes.append(PIPKeyframe(id: cameraID, time: 1, placement: camera))
+        guard editor.commit(initial, name: "Prepare combined-edit fixture") else {
+            throw ProbeError.failed("prepare combined-edit fixture")
+        }
+        try await waitUntil("combined editor becomes ready") {
+            canvas.allowsZoomEditing && timeline.edits.contains { $0.id == zoomID }
+        }
+        let before = editor.project
+        let savedBytes = try Data(contentsOf: editor.url)
+        let diamond = CGPoint(x: timeline.x(for: 1), y: 47)
+        timeline.mouseDown(with: mouse(.leftMouseDown, at: diamond, in: timeline, window: window))
+        timeline.mouseUp(with: mouse(.leftMouseUp, at: diamond, in: timeline, window: window))
+        try await waitUntil("diamond selection seeks and highlights the existing edit") {
+            timeline.selectedEditID == zoomID && abs(timeline.playhead - 1) < 0.001 &&
+                abs(canvas.zoom.scale - 1.4) < 0.001 && canvas.allowsZoomEditing
+        }
+        let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
+        let touch = IntegratedTrackpadEvent()
+        touch.position = canvas.convert(CGPoint(x: canvas.canvasRect.minX + canvas.canvasRect.width * 0.4,
+            y: canvas.canvasRect.minY + canvas.canvasRect.height * 0.4), to: nil)
+        for phase in [NSEvent.Phase.began, .changed, .ended] {
+            touch.amount = phase == .ended ? 0 : 0.1
+            touch.eventPhase = phase
+            canvas.magnify(with: touch)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        guard editor.draftState != nil, editor.project == before else {
+            throw ProbeError.failed("pinch must create a draft without persisting its finger samples")
+        }
+        let cameraRect = canvas.placement.frame(in: canvas.canvasRect.size, cameraAspect: 16.0 / 9)
+            .offsetBy(dx: canvas.canvasRect.minX, dy: canvas.canvasRect.minY)
+        let cameraCenter = CGPoint(x: cameraRect.midX, y: cameraRect.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, at: cameraCenter, in: canvas, window: window))
+        for delta in [10.0, 20, 30] {
+            canvas.mouseDragged(with: mouse(.leftMouseDragged,
+                at: CGPoint(x: cameraCenter.x + delta, y: cameraCenter.y - delta / 2), in: canvas, window: window))
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        canvas.mouseUp(with: mouse(.leftMouseUp,
+            at: CGPoint(x: cameraCenter.x + 30, y: cameraCenter.y - 15), in: canvas, window: window))
+        try await Task.sleep(for: .milliseconds(30))
+        for phase in [NSEvent.Phase.began, .changed, .ended] {
+            touch.eventPhase = phase
+            touch.dx = phase == .ended ? 0 : 8
+            touch.dy = phase == .ended ? 0 : 6
+            canvas.scrollWheel(with: touch)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        guard let draft = editor.draftState,
+              editor.project == before, try Data(contentsOf: editor.url) == savedBytes,
+              editor.draftTime == 1,
+              draft.zoomKeyframes.count == initial.zoomKeyframes.count,
+              draft.pipKeyframes.count == initial.pipKeyframes.count,
+              draft.zoomKeyframes.first?.id == zoomID,
+              draft.pipKeyframes.last?.id == cameraID,
+              draft.zoomKeyframes.first?.scale != initial.zoomKeyframes.first?.scale,
+              draft.pipKeyframes.last?.placement != initial.pipKeyframes.last?.placement,
+              draft.timedEdits(includeCamera: true).filter({ $0.time == 1 }).count == 1 else {
+            throw ProbeError.failed("zoom, pan, and camera samples must revise the selected IDs in one shared unsaved edit")
+        }
+        try assertStable(measure(window: window, host: host, canvas: canvas, timeline: timeline),
+            baseline: baseline, context: "combined draft", compareScrolls: false)
+        let leave = CGPoint(x: timeline.x(for: 2.4), y: 6)
+        timeline.mouseDown(with: mouse(.leftMouseDown, at: leave, in: timeline, window: window))
+        timeline.mouseUp(with: mouse(.leftMouseUp, at: leave, in: timeline, window: window))
+        try await waitUntil("leaving edit time finalizes one combined edit") {
+            editor.draftState == nil && editor.project.state == draft &&
+                editor.project.undoHistory.count == before.undoHistory.count + 1 && timeline.selectedEditID == nil
+        }
+        guard let title: RecordingTitleField = find(in: host) else { throw ProbeError.failed("native title anchor for Undo") }
+        let titleRect = host.convert(title.bounds, from: title)
+        let undoCenter = CGPoint(x: titleRect.maxX + 32, y: titleRect.midY)
+        window.sendEvent(mouse(.leftMouseDown, at: undoCenter, in: host, window: window))
+        window.sendEvent(mouse(.leftMouseUp, at: undoCenter, in: host, window: window))
+        try await waitUntil("Undo restores both zoom and camera together") {
+            editor.project.state == initial && editor.project.undoHistory.count == before.undoHistory.count &&
+                canvas.allowsZoomEditing
+        }
+        guard editor.redo() else { throw ProbeError.failed("redo combined edit") }
+        try await waitUntil("redo rebuilds the combined edit") {
+            editor.project.state == draft && canvas.allowsZoomEditing && timeline.edits.contains { $0.id == zoomID }
+        }
+        let beforeMove = editor.project
+        let from = CGPoint(x: timeline.x(for: 1), y: 47)
+        let to = CGPoint(x: timeline.x(for: 1.5), y: 47)
+        timeline.mouseDown(with: mouse(.leftMouseDown, at: from, in: timeline, window: window))
+        timeline.mouseDragged(with: mouse(.leftMouseDragged, at: to, in: timeline, window: window))
+        try await Task.sleep(for: .milliseconds(30))
+        guard editor.project == beforeMove, editor.draftState != nil else {
+            throw ProbeError.failed("diamond movement must preview without intermediate persistence")
+        }
+        timeline.mouseUp(with: mouse(.leftMouseUp, at: to, in: timeline, window: window))
+        try await waitUntil("diamond move commits both tracks once") {
+            editor.draftState == nil && editor.project.undoHistory.count == beforeMove.undoHistory.count + 1 &&
+                editor.project.state.zoomKeyframes.first?.time == 1.5 &&
+                editor.project.state.pipKeyframes.last?.time == 1.5 && canvas.allowsZoomEditing
+        }
+        let moved = editor.project
+        guard let strip = findAll(NSScrollView.self, in: host).first,
+              let document = strip.documentView, document.bounds.width > 28 else {
+            throw ProbeError.failed("native edit-strip anchor for inline X")
+        }
+        // This fixture has exactly one edit chip. Its trailing padding is 4pt
+        // and its X target is 20pt wide, so the center is 14pt from its end.
+        let removeCenter = host.convert(CGPoint(x: document.bounds.maxX - 14,
+            y: document.bounds.midY), from: document)
+        window.sendEvent(mouse(.leftMouseDown, at: removeCenter, in: host, window: window))
+        window.sendEvent(mouse(.leftMouseUp, at: removeCenter, in: host, window: window))
+        try await waitUntil("inline X removes both tracks as one edit") {
+            editor.project.undoHistory.count == moved.undoHistory.count + 1 &&
+                editor.project.state.zoomKeyframes.isEmpty && editor.project.state.pipKeyframes.count == 1
+        }
+        guard editor.undo(), editor.project.state == moved.state else {
+            throw ProbeError.failed("Undo must restore the whole removed edit")
+        }
+        try await waitUntil("undo deletion rebuilds editor") { canvas.allowsZoomEditing }
+    }
+
+    private func waitUntil(_ context: String, condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !condition() {
+            guard ContinuousClock.now < deadline else { throw ProbeError.failed(context) }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        // Let production SwiftUI callbacks settle before the next input.
+        try await Task.sleep(for: .milliseconds(30))
     }
 
     private struct Measurements: CustomStringConvertible {

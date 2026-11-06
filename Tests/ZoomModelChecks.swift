@@ -6,6 +6,7 @@ struct ZoomModelChecks {
     static func main() throws {
         checkZoomTiming()
         checkSharedMotionAndGeometry()
+        checkMotionVelocity()
         checkPIPSourceZoom()
         checkViewportBounds()
         try checkPersistenceAndMigration()
@@ -24,7 +25,7 @@ struct ZoomModelChecks {
         state.zoomKeyframes[0].duration = 1
         precondition(state.zoom(at: 1) == ZoomPlacement(), "First smooth zoom starts from implicit identity")
         expect(state.zoom(at: 1.5), ZoomPlacement(scale: 1.5, x: 0.625, y: 0.375), "First smooth zoom midpoint")
-        expect(state.zoom(at: 1.25), ZoomPlacement(scale: 1.15625, x: 0.5390625, y: 0.4609375), "Smoothstep zoom easing")
+        expect(state.zoom(at: 1.25), ZoomPlacement(scale: 1 + 1.0 / 6, x: 0.5 + 0.25 / 6, y: 0.5 - 0.25 / 6), "Zoom reaches cruise speed after accelerating")
         state.zoomKeyframes[0].duration = 10
         expect(state.zoom(at: 1), ZoomPlacement(scale: 1.5, x: 0.625, y: 0.375), "Long first transition clamps to source start")
         state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 2, x: 0.25, y: 0.25, transition: .smooth)]
@@ -45,7 +46,7 @@ struct ZoomModelChecks {
             ZoomKeyframe(time: 0, scale: 2, x: 0.25, y: 0.5),
             ZoomKeyframe(time: 2, scale: 2, x: 0.75, y: 0.5, transition: .smooth, duration: 2)
         ]
-        expect(state.zoom(at: 0.5), ZoomPlacement(scale: 2, x: 0.328125, y: 0.5), "Pan uses the same eased timeline")
+        expect(state.zoom(at: 0.5), ZoomPlacement(scale: 2, x: 1.0 / 3, y: 0.5), "Pan uses the same eased timeline")
         expect(state.zoom(at: 1), ZoomPlacement(scale: 2, x: 0.5, y: 0.5), "Static zoom pans smoothly across source")
         state.zoomKeyframes[0] = ZoomKeyframe(time: 0, scale: 1, x: 0, y: 0)
         state.zoomKeyframes[1] = ZoomKeyframe(time: 2, scale: 2, x: 1, y: 1, transition: .smooth, duration: 2)
@@ -139,7 +140,7 @@ struct ZoomModelChecks {
             }
         }
         near(MotionInterpolation.progress(at: 2.5, from: 0, to: 4, duration: 2, transition: .smooth),
-             0.15625, "Shared curve is smoothstep")
+             1.0 / 6, "Shared curve reaches cruise speed after its first quarter")
         near(MotionInterpolation.progress(at: 3, from: 3, to: 4, duration: 20, transition: .smooth),
              0, "Shared transition starts no earlier than preceding point")
 
@@ -162,6 +163,75 @@ struct ZoomModelChecks {
             let bounded = ViewportGeometry.rect(in: source, size: CGSize(width: 400, height: 200), center: center)
             precondition(bounded.minX >= 0 && bounded.minY >= 0 && bounded.maxX <= source.width && bounded.maxY <= source.height)
         }
+    }
+
+    private static func checkMotionVelocity() {
+        func progress(_ time: Double) -> Double {
+            MotionInterpolation.progress(at: time, from: 0, to: 1, duration: 1, transition: .smooth)
+        }
+        let delta = 0.000_01
+        func velocity(_ time: Double) -> Double {
+            (progress(time + delta) - progress(time - delta)) / (2 * delta)
+        }
+        near(progress(-1), 0, "Smooth motion holds before its beginning")
+        near(progress(2), 1, "Smooth motion holds after arrival")
+        near(velocity(0), 0, "Smooth motion starts at rest")
+        near(velocity(1), 0, "Smooth motion ends at rest")
+        for time in [0.26, 0.35, 0.5, 0.65, 0.74] {
+            near(velocity(time), 4.0 / 3, "Middle half travels at constant speed")
+        }
+        precondition(velocity(0.01) < velocity(0.1) && velocity(0.1) < velocity(0.2),
+                     "Motion gently accelerates before cruising")
+        precondition(velocity(0.8) > velocity(0.9) && velocity(0.9) > velocity(0.99),
+                     "Motion gently decelerates to rest")
+        for boundary in [0.25, 0.75] {
+            precondition(abs(velocity(boundary - delta) - velocity(boundary + delta)) < 0.000_001,
+                         "Velocity stays continuous where acceleration meets cruise")
+        }
+        var previous = 0.0
+        for step in 0...1000 {
+            let time = Double(step) / 1000
+            let current = progress(time)
+            precondition(current >= previous && current >= 0 && current <= 1,
+                         "Motion is bounded and monotonic")
+            near(current + progress(1 - time), 1, "Acceleration and deceleration are symmetric")
+            previous = current
+        }
+        for time in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1] {
+            near(MotionInterpolation.progress(at: 3 + time, from: 3, to: 4, duration: 20, transition: .smooth),
+                 progress(time), "Shortened transitions retain the same acceleration/cruise/deceleration profile")
+        }
+        near(MotionInterpolation.progress(at: 0.999, from: 0, to: 1, duration: 1, transition: .jump),
+             0, "Jump never starts moving early")
+        near(MotionInterpolation.progress(at: 1, from: 0, to: 1, duration: 1, transition: .jump),
+             1, "Jump applies instantly at arrival")
+
+        func custom(_ time: Double, start: Double?, end: Double?) -> Double {
+            MotionInterpolation.progress(at: time, from: 0, to: 1, duration: 1,
+                                         transition: .smooth, easeIn: start, easeOut: end)
+        }
+        let ramps = MotionInterpolation.rampDurations(duration: 1, easeIn: 0.1, easeOut: 0.3)
+        near(ramps.easeIn, 0.1, "Acceleration duration is measured in seconds")
+        near(ramps.easeOut, 0.3, "Deceleration duration is independent")
+        near(custom(0.1, start: 0.1, end: 0.3), 0.0625, "Asymmetric acceleration covers its expected distance")
+        near(custom(0.5, start: 0.1, end: 0.3), 0.5625, "Asymmetric movement retains constant cruise speed")
+        near(custom(0.7, start: 0.1, end: 0.3), 0.8125, "Asymmetric deceleration begins at its chosen time")
+        let shortened = MotionInterpolation.rampDurations(duration: 1, easeIn: 1.2, easeOut: 0.8)
+        near(shortened.easeIn, 0.6, "Oversubscribed acceleration shrinks proportionally")
+        near(shortened.easeOut, 0.4, "Oversubscribed deceleration shrinks proportionally")
+        for step in 0...1000 {
+            let time = Double(step) / 1000
+            near(custom(time, start: 0, end: 0), time, "Zero ramps explicitly request constant speed")
+            near(custom(time, start: 0.1, end: 0.3) + custom(1 - time, start: 0.3, end: 0.1),
+                 1, "Reversing asymmetric ramp lengths reverses the motion")
+            let squeezed = custom(time, start: 1.2, end: 0.8)
+            precondition(squeezed.isFinite && squeezed >= 0 && squeezed <= 1,
+                         "All-ramp movement remains bounded when there is no cruise interval")
+        }
+        let extreme = MotionInterpolation.rampDurations(duration: 1, easeIn: .greatestFiniteMagnitude,
+                                                        easeOut: .greatestFiniteMagnitude)
+        near(extreme.easeIn, 0.5, "Extreme finite ramp durations never overflow")
+        near(extreme.easeOut, 0.5, "Extreme finite ramp durations preserve their ratio")
     }
 
     private static func checkPersistenceAndMigration() throws {

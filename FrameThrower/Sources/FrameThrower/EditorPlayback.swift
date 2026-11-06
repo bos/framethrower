@@ -32,6 +32,7 @@ final class EditorPlayback: ObservableObject {
     private var generation = 0
     private var bounds = 0.0...1.0
     private var sourceDuration = 0.0
+    private var sourceBounds: ClosedRange<Double> { 0...max(0, sourceDuration) }
     private var editFrameDuration = 1.0 / 30.0
     private var draftState: EditState?
     private var pendingDraftState: EditState?
@@ -67,9 +68,9 @@ final class EditorPlayback: ObservableObject {
                                                    queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
                 guard let self, !self.isClosed, self.draftState == nil,
+                      self.isPlaying, !self.isLoading,
                       !self.isScrubbing, !self.seekInFlight, self.pendingSeek == nil else { return }
                 self.time = time.seconds.isFinite ? time.seconds : 0
-                self.isPlaying = self.player.rate > 0
                 if self.time >= self.bounds.upperBound {
                     self.pause()
                 }
@@ -85,7 +86,8 @@ final class EditorPlayback: ObservableObject {
         let request = generation
         let snapshot = editor.project
         sourceDuration = snapshot.duration
-        let position = min(max(time, snapshot.state.trimStart), snapshot.state.trimEnd)
+        bounds = snapshot.state.trimStart...snapshot.state.trimEnd
+        time = bounded(time, to: sourceBounds)
         player.pause()
         isPlaying = false
         // A successful gesture commits this exact draft next. Keep its last
@@ -106,12 +108,18 @@ final class EditorPlayback: ObservableObject {
             // A seek is not visually complete until the custom compositor has
             // produced its frame. Otherwise the next chase can starve display.
             item.seekingWaitsForVideoCompositionRendering = true
-            item.forwardPlaybackEndTime = CMTime(seconds: snapshot.state.trimEnd, preferredTimescale: 600)
+            // Trimming restricts playback/export, not inspection of source-time
+            // edits. Set a playback end only while actually playing.
+            item.forwardPlaybackEndTime = .invalid
             observeStatus(of: item, generation: request)
+            // A user can select/scrub another time while makePreview awaits
+            // media metadata. Honor that newest request instead of a position
+            // captured before the rebuild started.
+            let position = bounded(time, to: sourceBounds)
             // The player may preroll its first frame as soon as the item is
             // attached, before a zero-distance seek asks it to render again.
             rendered.previewFrames.request(at: Self.frameTime(at: position,
-                bounds: snapshot.state.trimStart...snapshot.state.trimEnd))
+                bounds: sourceBounds))
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
             cameraAspect = rendered.cameraAspect
@@ -152,7 +160,12 @@ final class EditorPlayback: ObservableObject {
     /// A normal seek uses the same chasing pipeline as scrubbing, and restores
     /// the isolated paused frame only after its final native seek completes.
     func seek(_ position: Double) {
-        guard !isClosed, !isLoading, renderedProject != nil else { return }
+        guard !isClosed else { return }
+        if isLoading {
+            time = bounded(position, to: sourceBounds)
+            return
+        }
+        guard renderedProject != nil else { return }
         scrubGestureActive = false
         requestSeek(position)
     }
@@ -168,7 +181,10 @@ final class EditorPlayback: ObservableObject {
     }
 
     func scrub(to position: Double) {
-        guard !isClosed, !isLoading, renderedProject != nil else { return }
+        guard !isClosed else { return }
+        let position = bounded(position, to: bounds)
+        if isLoading { time = position; return }
+        guard renderedProject != nil else { return }
         if !scrubGestureActive { beginScrubbing() }
         requestSeek(position)
     }
@@ -182,9 +198,9 @@ final class EditorPlayback: ObservableObject {
     private func requestSeek(_ position: Double) {
         discardPreview(restoringFrame: false)
         clearPausedFrameForSeek()
-        let requested = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : bounds.lowerBound
+        let requested = bounded(position, to: sourceBounds)
         if time != requested { time = requested }
-        pendingSeek = Self.frameTime(at: requested, bounds: bounds)
+        pendingSeek = Self.frameTime(at: requested, bounds: sourceBounds)
         chaseSeek()
     }
 
@@ -222,7 +238,7 @@ final class EditorPlayback: ObservableObject {
             if isScrubbing { isScrubbing = false }
             return
         }
-        let target = Self.frameTime(at: time, bounds: bounds)
+        let target = Self.frameTime(at: time, bounds: sourceBounds)
         let sourceRequest = generation
         let seekRequest = seekGeneration
         nativeFrameTask?.cancel()
@@ -254,7 +270,7 @@ final class EditorPlayback: ObservableObject {
         while ContinuousClock.now < deadline {
             try Task.checkCancellation()
             guard !isClosed, request == generation, seekRequest == seekGeneration,
-                  CMTimeCompare(Self.frameTime(at: time, bounds: bounds), target) == 0,
+                  CMTimeCompare(Self.frameTime(at: time, bounds: sourceBounds), target) == 0,
                   let renderedProject else { throw CancellationError() }
             if let source = renderedProject.previewFrames.sources(at: target) { return source }
             // A layer may attach/preroll just after an otherwise zero-distance
@@ -269,8 +285,8 @@ final class EditorPlayback: ObservableObject {
     func cameraFrame(at position: Double) async throws -> CGImage? {
         guard !isClosed, !isLoading, let renderedProject else { throw CancellationError() }
         pause()
-        let requested = position.isFinite ? min(max(position, bounds.lowerBound), bounds.upperBound) : time
-        let target = Self.frameTime(at: requested, bounds: bounds)
+        let requested = position.isFinite ? bounded(position, to: sourceBounds) : time
+        let target = Self.frameTime(at: requested, bounds: sourceBounds)
         let request = generation
         if renderedProject.previewFrames.sources(at: target) == nil { seek(requested) }
         let seekRequest = seekGeneration
@@ -296,9 +312,10 @@ final class EditorPlayback: ObservableObject {
         guard !isClosed, !isLoading, renderedProject != nil else { return }
         if player.rate > 0 || isPlaying { pause() }
         else {
-            let position = time >= bounds.upperBound - 0.03 ? bounds.lowerBound : time
+            let position = time < bounds.lowerBound || time >= bounds.upperBound - 0.03 ? bounds.lowerBound : time
             invalidateSeeks()
             discardPreview(restoringFrame: false)
+            player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: bounds.upperBound, preferredTimescale: 600)
             requestSeek(position)
             stillRequests.invalidate()
             liveSources = nil
@@ -311,12 +328,13 @@ final class EditorPlayback: ObservableObject {
     func pause() {
         let wasPlaying = isPlaying
         player.pause()
+        player.currentItem?.forwardPlaybackEndTime = .invalid
         isPlaying = false
         guard wasPlaying, !seekInFlight, pendingSeek == nil, !isScrubbing,
               let renderedProject else { return }
         let current = player.currentTime().seconds
         let position = current.isFinite ? min(max(current, bounds.lowerBound), bounds.upperBound) : time
-        let target = Self.frameTime(at: position, bounds: bounds)
+        let target = Self.frameTime(at: position, bounds: sourceBounds)
         if renderedProject.previewFrames.sources(at: target) != nil {
             if time != position { time = position }
             updateStillFrame()
@@ -336,7 +354,7 @@ final class EditorPlayback: ObservableObject {
             pendingDraftState = state
             return
         }
-        let position = Self.frameTime(at: time, bounds: bounds)
+        let position = Self.frameTime(at: time, bounds: sourceBounds)
         guard let source = sourceCache(for: renderedProject, at: position) else {
             // A gesture can begin in the same turn as Pause. Preserve its most
             // recent state while the native exact seek supplies the source pair.
@@ -403,10 +421,14 @@ final class EditorPlayback: ObservableObject {
         return CMTimeMaximum(lower, CMTimeMinimum(requested, last))
     }
 
+    private func bounded(_ position: Double, to range: ClosedRange<Double>) -> Double {
+        position.isFinite ? min(max(position, range.lowerBound), range.upperBound) : range.lowerBound
+    }
+
     private func updateStillFrame() {
         guard !isClosed, !isPlaying, !isScrubbing, !seekInFlight, pendingSeek == nil,
               draftState == nil, let renderedProject, let committedState else { return }
-        let position = Self.frameTime(at: time, bounds: bounds)
+        let position = Self.frameTime(at: time, bounds: sourceBounds)
         guard let source = sourceCache(for: renderedProject, at: position) else {
             if errorMessage == nil { errorMessage = "The paused recording frame could not be prepared." }
             return

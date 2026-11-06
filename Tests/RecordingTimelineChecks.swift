@@ -1,5 +1,24 @@
 import AppKit
 
+// These synthetic events exercise the production handlers inside an offscreen
+// fixture; no system input, recording, or hardware is involved.
+private final class TimelineGestureEvent: NSEvent {
+    var amount = 0.0
+    var dx = 0.0
+    var dy = 0.0
+    var precise = true
+    var position = CGPoint.zero
+    var eventPhase: NSEvent.Phase = []
+    var momentum: NSEvent.Phase = []
+    override var magnification: CGFloat { amount }
+    override var scrollingDeltaX: CGFloat { dx }
+    override var scrollingDeltaY: CGFloat { dy }
+    override var hasPreciseScrollingDeltas: Bool { precise }
+    override var locationInWindow: NSPoint { position }
+    override var phase: NSEvent.Phase { eventPhase }
+    override var momentumPhase: NSEvent.Phase { momentum }
+}
+
 // Run with Tests/check-recording-timeline.sh. Exercises native mouse/keyboard
 // handling offscreen, including the overlapping trim and playhead controls.
 @main
@@ -9,7 +28,7 @@ struct RecordingTimelineChecks {
         let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 680, height: 100),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        let timeline = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 624, height: 48))
+        let timeline = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 624, height: 72))
         window.contentView!.addSubview(timeline)
 
         var seeks: [Double] = []
@@ -155,54 +174,280 @@ struct RecordingTimelineChecks {
         _ = timeline.accessibilityPerformIncrement()
         precondition(scrubPhases.suffix(2) == ["begin", "end"], "Accessible seek finishes its scrub")
 
-        let zoomChange = RecordingTimelineMarker(id: UUID(), time: 5,
-            help: "Zoom change at 5 seconds: 2×. Click to visit and edit this view.")
-        var selectedChanges: [UUID] = []
-        timeline.onSelectZoomChange = { selectedChanges.append($0) }
+        let edit = RecordingTimelineMarker(id: UUID(), time: 5,
+            help: "Edit at 5 seconds: zoom 2×. Click to select; drag to move.")
+        var selectedEdits: [UUID] = []
+        var moves: [(UUID, Double, Bool)] = []
+        var cancellations = 0
+        timeline.onSelectEdit = { selectedEdits.append($0) }
+        timeline.onMoveEdit = { moves.append(($0, $1, $2)) }
+        timeline.onCancelMoveEdit = { cancellations += 1 }
         reset(start: 0, end: 10, playhead: 4)
         let height = timeline.intrinsicContentSize.height
-        timeline.zoomChanges = [zoomChange]
-        let markerPoint = CGPoint(x: timeline.x(for: 5), y: 6)
+        timeline.edits = [edit]
+        let markerPoint = CGPoint(x: timeline.x(for: 5), y: 47)
         down(markerPoint)
+        precondition(selectedEdits.isEmpty && seeks.isEmpty,
+                     "Pressing a diamond must not select or warp the playhead before deciding click versus drag")
         up(markerPoint)
-        precondition(selectedChanges == [zoomChange.id] && seeks.isEmpty && trims.isEmpty,
-                     "Clicking a zoom diamond selects that change without scrubbing or trimming")
-        precondition(timeline.intrinsicContentSize.height == height && height == 36,
-                     "Zoom changes must not grow or rearrange the timeline")
-        func purpleMarkerPixels() -> Int {
+        precondition(selectedEdits == [edit.id] && seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "Releasing a stationary diamond selects that edit without scrubbing, moving, or trimming")
+        precondition(timeline.intrinsicContentSize.height == height && height == 72,
+                     "Edits have a fixed narrow lane independent of selection or marker count")
+        func markerPixels() -> (purple: Int, selectedBorder: Int) {
             guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: timeline.bounds) else {
                 fatalError("Could not render timeline marker")
             }
             timeline.cacheDisplay(in: timeline.bounds, to: bitmap)
             let scaleX = Double(bitmap.pixelsWide) / timeline.bounds.width
-            var purplePixels = 0
-            for x in Int((markerPoint.x - 6) * scaleX)...Int((markerPoint.x + 6) * scaleX) {
-                for y in 0..<bitmap.pixelsHigh {
-                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
-                       color.redComponent > color.greenComponent + 0.1,
-                       color.blueComponent > color.greenComponent + 0.2 { purplePixels += 1 }
+            let scaleY = Double(bitmap.pixelsHigh) / timeline.bounds.height
+            var purple = 0
+            var selectedBorder = 0
+            for x in Int((markerPoint.x - 8) * scaleX)...Int((markerPoint.x + 8) * scaleX) {
+                for y in Int(38 * scaleY)..<Int(56 * scaleY) {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
+                        if color.redComponent > color.greenComponent + 0.1,
+                           color.blueComponent > color.greenComponent + 0.2 { purple += 1 }
+                        if abs(color.redComponent - color.blueComponent) < 0.1,
+                           abs(color.greenComponent - color.blueComponent) < 0.1,
+                           max(color.redComponent, color.greenComponent, color.blueComponent) > 0.75 { selectedBorder += 1 }
+                    }
                 }
             }
-            return purplePixels
+            return (purple, selectedBorder)
         }
-        precondition(purpleMarkerPixels() >= 12,
-                     "Zoom changes must have a visible purple diamond matching the inspector legend")
+        precondition(markerPixels().purple >= 12,
+                     "Edits have visible purple diamonds in their own lane")
 
         reset(start: 0, end: 10, playhead: 5)
-        timeline.selectedZoomChangeID = zoomChange.id
-        precondition(purpleMarkerPixels() >= 12,
-                     "A selected zoom diamond must remain visibly purple when the playhead is at the same time")
-        selectedChanges = []
-        gesture(from: markerPoint, to: CGPoint(x: timeline.x(for: 6), y: 6))
-        near(seeks.last, 6, "The playhead remains draggable over a zoom diamond")
-        precondition(selectedChanges.isEmpty && trims.isEmpty, "A zoom marker cannot steal the playhead hit target")
+        let unselectedPixels = markerPixels()
+        timeline.selectedEditID = edit.id
+        let selectedPixels = markerPixels()
+        precondition(selectedPixels.purple >= 12 && selectedPixels.selectedBorder > unselectedPixels.selectedBorder,
+                     "A selected edit has a strong visible outline, even at the same time as the playhead")
+        selectedEdits = []
+        gesture(from: CGPoint(x: markerPoint.x, y: 6), to: CGPoint(x: timeline.x(for: 6), y: 47))
+        near(seeks.last, 6, "Starting at the top playhead always scrubs, including while crossing the edit lane")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && trims.isEmpty,
+                     "Diamonds cannot steal an active playhead drag")
         reset(start: 5, end: 10, playhead: 7)
-        gesture(from: CGPoint(x: timeline.x(for: 5), y: 24), to: CGPoint(x: timeline.x(for: 6), y: 24))
-        near(trims.last?.0, 6, "The lower trim handle remains draggable beneath a zoom diamond")
-        precondition(selectedChanges.isEmpty && seeks.isEmpty, "Zoom markers cannot steal trim handle hits")
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 24), to: CGPoint(x: timeline.x(for: 6), y: 47))
+        near(trims.last?.0, 6, "Starting at the trim handle always trims, including while crossing the edit lane")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && seeks.isEmpty,
+                     "Diamonds cannot steal an active trim drag")
+
+        reset(start: 0, end: 10, playhead: 5)
+        let offCenterDiamond = CGPoint(x: markerPoint.x + 4, y: 47)
+        down(offCenterDiamond)
+        drag(CGPoint(x: offCenterDiamond.x + 2, y: 47))
+        precondition(moves.isEmpty && selectedEdits.isEmpty, "Tiny click jitter does not move or select the edit")
+        drag(CGPoint(x: offCenterDiamond.x + 30, y: 24))
+        precondition(selectedEdits == [edit.id] && moves.count == 1 && !moves[0].2,
+                     "Crossing the drag threshold selects once and previews the move")
+        near(moves.last?.1, 5.5, "Off-center diamond grab preserves its time offset")
+        drag(CGPoint(x: offCenterDiamond.x + 60, y: 6))
+        precondition(moves.filter(\.2).isEmpty && selectedEdits.count == 1,
+                     "Continuous diamond movement creates no intermediate final edits")
+        up(CGPoint(x: offCenterDiamond.x + 60, y: 6))
+        precondition(moves.count == 3 && moves.filter(\.2).count == 1 && moves.last?.0 == edit.id,
+                     "A diamond drag has exactly one final move callback")
+        near(moves.last?.1, 6, "Diamond movement retains the shared source-time scale")
+        precondition(seeks.isEmpty && trims.isEmpty && scrubPhases.isEmpty,
+                     "A diamond drag never becomes playhead or trim movement while crossing their lanes")
+
+        let previous = RecordingTimelineMarker(id: UUID(), time: 4, help: "Previous edit")
+        let following = RecordingTimelineMarker(id: UUID(), time: 6, help: "Following edit")
+        timeline.edits = [previous, edit, following]
+        timeline.frameDuration = 1.0 / 30
+        moves = []
+        gesture(from: markerPoint, to: CGPoint(x: -100, y: 47))
+        near(moves.last?.1, 4 + 1.0 / 30, "Edit movement stops one frame after the previous edit")
+        moves = []
+        gesture(from: markerPoint, to: CGPoint(x: 900, y: 47))
+        near(moves.last?.1, 6 - 1.0 / 30, "Edit movement stops one frame before the following edit")
+        precondition(timeline.edits == [previous, edit, following], "Previewing a move cannot overwrite or remove neighboring edits")
+
+        moves = []
+        down(markerPoint)
+        drag(CGPoint(x: markerPoint.x + 20, y: 47))
+        key(53)
+        up(CGPoint(x: markerPoint.x + 20, y: 47))
+        precondition(cancellations == 1 && moves.count == 1 && moves.allSatisfy { !$0.2 },
+                     "Escape cancels a diamond move and mouse-up cannot commit it afterward")
+        selectedEdits = []
+        moves = []
+        down(markerPoint)
+        key(53)
+        up(markerPoint)
+        precondition(selectedEdits.isEmpty && moves.isEmpty && cancellations == 1,
+                     "Escape before the drag threshold cancels the pending click without selection")
+
+        reset(start: 0, end: 10, playhead: 4)
+        gesture(from: CGPoint(x: timeline.x(for: 8), y: 47), to: CGPoint(x: timeline.x(for: 9), y: 47))
+        precondition(seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "Empty edit-lane space cannot accidentally scrub or trim")
+
+        let bounded = RecordingTimelineMarker(id: UUID(), time: 1.015, help: "Camera edit",
+            minimumTime: 1.0 / 30, maximumTime: 10 - 1.0 / 30)
+        timeline.edits = [bounded]
+        moves = []
+        let boundedPoint = CGPoint(x: timeline.x(for: bounded.time), y: 47)
+        down(boundedPoint); up(boundedPoint)
+        precondition(moves.isEmpty, "Selecting an off-grid edit preserves its original time")
+        gesture(from: boundedPoint, to: CGPoint(x: -100, y: 47))
+        near(moves.last?.1, 1.0 / 30, "Camera edit minimum time protects the hidden baseline at source zero")
+        gesture(from: boundedPoint, to: CGPoint(x: 900, y: 47))
+        near(moves.last?.1, 10 - 1.0 / 30, "Edit maximum time protects the exclusive source end")
+        timeline.edits = [previous, edit, following]
+        selectedEdits = []; moves = []; seeks = []; trims = []
+
+        let touch = TimelineGestureEvent()
+        func pinch(_ amount: Double, fraction: Double = 0.5) {
+            touch.amount = amount
+            touch.position = timeline.convert(CGPoint(x: 12 + 600 * fraction, y: 24), to: nil)
+            timeline.magnify(with: touch)
+        }
+        func scroll(_ dx: Double, _ dy: Double = 0, precise: Bool = true, momentum: NSEvent.Phase = []) {
+            touch.dx = dx; touch.dy = dy; touch.precise = precise; touch.momentum = momentum
+            touch.position = timeline.convert(CGPoint(x: 312, y: 24), to: nil)
+            timeline.scrollWheel(with: touch)
+        }
+        near(timeline.visibleStart, 0, "Timeline begins at source overview")
+        near(timeline.visibleDuration, 10, "Source overview spans the recording")
+        pinch(1, fraction: 0.25)
+        near(timeline.visibleDuration, 5, "Pinching in doubles timeline magnification")
+        near(timeline.visibleStart, 1.25, "Timeline zoom anchors at the pointer instead of the playhead")
+        near(timeline.x(for: 2.5), 162, "The source time under the pinch center stays fixed")
+        scroll(-60)
+        near(timeline.visibleStart, 1.75, "Precise horizontal scrolling navigates the visible time interval")
+        scroll(0, -120)
+        near(timeline.visibleStart, 2.75, "Vertical scrolling provides a fallback for time navigation")
+        scroll(-60, momentum: .changed)
+        near(timeline.visibleStart, 3.25, "Trackpad momentum continues timeline navigation")
+        scroll(-10000)
+        near(timeline.visibleStart, 5, "Timeline navigation clamps at the recording end")
+        scroll(10000)
+        near(timeline.visibleStart, 0, "Timeline navigation clamps at the recording start")
+        scroll(-1, precise: false)
+        near(timeline.visibleStart, 1.0 / 12, "Mouse-wheel detents use useful navigation units")
+        precondition(seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "Timeline pinch/scroll only navigate the viewport; they cannot edit the project or seek")
+        let savedStart = timeline.visibleStart
+        let savedSpan = timeline.visibleDuration
+        timeline.duration = 10
+        timeline.trimStart = 1
+        timeline.playhead = 3
+        near(timeline.visibleStart, savedStart, "Ordinary view updates preserve the timeline viewport")
+        near(timeline.visibleDuration, savedSpan, "Ordinary view updates preserve timeline magnification")
+
+        pinch(-0.999)
+        pinch(1)
+        near(timeline.visibleStart, 2.5, "Overview can be zoomed around its center")
+        near(timeline.visibleDuration, 5, "Visible span used for precise dragging")
+        timeline.trimStart = 0; timeline.trimEnd = 10; timeline.playhead = 4
+        seeks = []
+        gesture(from: CGPoint(x: timeline.x(for: 4), y: 6),
+                to: CGPoint(x: timeline.x(for: 4) + 60, y: 6))
+        near(seeks.last, 4.5, "Zoomed playhead dragging uses the visible interval")
+        trims = []
+        timeline.trimStart = 4
+        gesture(from: CGPoint(x: timeline.x(for: 4), y: 24),
+                to: CGPoint(x: timeline.x(for: 4) + 60, y: 24))
+        near(trims.last?.0, 4.5, "Zoomed trim dragging uses the visible interval")
+        moves = []
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 47),
+                to: CGPoint(x: timeline.x(for: 5) + 30, y: 47))
+        near(moves.last?.1, 5 + 8.0 / 30, "Zoomed edit dragging uses the visible interval and frame snapping")
+        precondition(moves.last?.2 == true, "Zoomed edit drag retains one final callback")
+
+        let locked = RecordingTimelineMarker(id: UUID(), time: 5, help: "Initial camera edit", movable: false)
+        timeline.edits = [locked]
+        moves = []; selectedEdits = []
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 47),
+                to: CGPoint(x: timeline.x(for: 5) + 100, y: 47))
+        precondition(moves.isEmpty && selectedEdits == [locked.id],
+                     "An initial camera edit can be selected but cannot be moved")
+
+        let beforeMouseDrag = (timeline.visibleStart, timeline.visibleDuration)
+        down(CGPoint(x: timeline.x(for: 5), y: 47))
+        pinch(1)
+        scroll(-100)
+        near(timeline.visibleStart, beforeMouseDrag.0, "Pinch and scroll cannot change time geometry during a mouse drag")
+        near(timeline.visibleDuration, beforeMouseDrag.1, "An active mouse drag locks the timeline viewport")
+        up(CGPoint(x: timeline.x(for: 5), y: 47))
+
+        pinch(1e9)
+        near(timeline.visibleDuration, 4.0 / 30, "Minimum timeline span keeps at least four source frames visible")
+        timeline.duration = 2
+        precondition(timeline.visibleStart >= 0 && timeline.visibleStart + timeline.visibleDuration <= 2,
+                     "Shortening a source constrains an existing zoomed viewport")
+        pinch(-0.999)
+        timeline.duration = 10000
+        near(timeline.visibleDuration, 10000, "Overview follows a changed source duration")
+        pinch(1e9)
+        near(timeline.visibleDuration, 10, "Long recordings cap timeline magnification at one thousand times")
+        timeline.duration = 10
+        pinch(-0.999)
+        timeline.edits = [RecordingTimelineMarker(id: UUID(), time: 1, help: "Outside viewport"), edit]
+        pinch(3, fraction: 0.9)
+        near(timeline.visibleDuration, 2.5, "Timeline supports closer inspection near the source end")
+        selectedEdits = []; moves = []; seeks = []; trims = []
+        down(CGPoint(x: timeline.x(for: 1), y: 47))
+        up(CGPoint(x: timeline.x(for: 1), y: 47))
+        precondition(selectedEdits.isEmpty && moves.isEmpty,
+                     "Offscreen diamonds have no active hit targets")
+        down(CGPoint(x: timeline.x(for: 1), y: 24))
+        up(CGPoint(x: timeline.x(for: 1), y: 24))
+        precondition(seeks.isEmpty && trims.isEmpty, "Offscreen trim or playhead locations cannot receive clicks")
+
+        pinch(-0.999)
+        pinch(1)
+        let band = RecordingTimelineMarker(id: UUID(), time: 6, help: "Smooth edit",
+            transitionStart: 4, easeIn: 0.5, easeOut: 0.5)
+        timeline.edits = [band]
+        timeline.selectedEditID = band.id
+        func purpleBandPixels() -> Int {
+            guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: timeline.bounds) else {
+                fatalError("Could not render selected transition")
+            }
+            timeline.cacheDisplay(in: timeline.bounds, to: bitmap)
+            let sx = Double(bitmap.pixelsWide) / timeline.bounds.width
+            let sy = Double(bitmap.pixelsHigh) / timeline.bounds.height
+            var pixels = 0
+            for x in Int(timeline.x(for: 4.6) * sx)..<Int(timeline.x(for: 5.4) * sx) {
+                for y in Int(41 * sy)..<Int(53 * sy) {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                       color.redComponent > color.greenComponent + 0.02,
+                       color.blueComponent > color.greenComponent + 0.04 { pixels += 1 }
+                }
+            }
+            return pixels
+        }
+        precondition(purpleBandPixels() > 50, "A selected smooth edit displays its ramp/cruise transition band at close scale")
+        timeline.selectedEditID = nil
+        precondition(purpleBandPixels() == 0, "Transition bands belong to the selected edit instead of cluttering every edit")
+        let beforeInvalid = (timeline.visibleStart, timeline.visibleDuration)
+        pinch(.nan)
+        scroll(.infinity)
+        near(timeline.visibleStart, beforeInvalid.0, "Nonfinite navigation events cannot corrupt timeline position")
+        near(timeline.visibleDuration, beforeInvalid.1, "Nonfinite navigation events cannot corrupt timeline magnification")
+
+        let early = RecordingTimelineMarker(id: UUID(), time: 1, help: "Early edit")
+        let late = RecordingTimelineMarker(id: UUID(), time: 9, help: "Late edit")
+        timeline.edits = [early, late]
+        timeline.selectedEditID = late.id
+        near(timeline.visibleStart, 5, "Selecting an offscreen edit reveals its diamond")
+        near(timeline.visibleDuration, 5, "Revealing a selected edit preserves timeline magnification")
+        scroll(1000)
+        near(timeline.visibleStart, 0, "The user can navigate away from a selected diamond")
+        timeline.selectedEditID = late.id
+        near(timeline.visibleStart, 0, "Unchanged selection cannot pull the viewport back during ordinary updates")
+        timeline.selectedEditID = early.id
+        timeline.selectedEditID = late.id
+        near(timeline.visibleStart, 5, "A fresh selection reveals the edit again")
 
         window.close()
-        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, visible zoom diamonds/selection, and playhead/trim hit priority.")
+        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, separate edit lane, selection on release, grouped edit moves, neighbor limits, cancellation, locked drag targets, trackpad timeline navigation, zoomed time precision, selected transition bands, and deliberate selection reveal.")
     }
 
     static func near(_ actual: Double?, _ expected: Double, _ message: String) {

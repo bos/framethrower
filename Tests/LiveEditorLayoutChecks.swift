@@ -100,6 +100,12 @@ struct LiveEditorLayoutChecks {
         }
         native.mouseUp(with: mouse(.leftMouseUp, at: CGPoint(x: start.x + 60, y: start.y + 20), in: host, window: window))
         try await Task.sleep(for: .milliseconds(300))
+        try stable(try layout(host: host, window: window), baseline: baseline, context: "released PIP draft")
+        guard editor.draftState != nil && editor.project.undoHistory.isEmpty else {
+            throw LiveLayoutError.failed("released drag must remain one draft with unchanged saved history")
+        }
+        guard editor.finishDraft() else { throw LiveLayoutError.failed("could not finalize live PIP draft") }
+        try await Task.sleep(for: .milliseconds(300))
         try stable(try layout(host: host, window: window), baseline: baseline, context: "committed PIP drag")
         guard editor.project.undoHistory.count == 1 else {
             throw LiveLayoutError.failed("live drag did not create exactly one committed edit: \(editor.project.undoHistory.map(\.name)), timeline=\(timeline.playhead)")

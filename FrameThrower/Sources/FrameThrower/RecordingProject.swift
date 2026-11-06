@@ -11,14 +11,50 @@ enum MotionInterpolation {
     /// All camera and screen movement arrives at the target timestamp. The
     /// preceding point bounds the start, so smooth transitions never overlap.
     static func progress(at time: Double, from previousTime: Double, to targetTime: Double,
-                         duration: Double, transition: PIPTransition) -> Double {
+                         duration: Double, transition: PIPTransition,
+                         easeIn: Double? = nil, easeOut: Double? = nil) -> Double {
         guard time.isFinite, previousTime.isFinite, targetTime.isFinite else { return 0 }
         if time >= targetTime { return 1 }
         guard transition == .smooth, duration.isFinite, duration > 0 else { return 0 }
         let beginning = max(previousTime, targetTime - duration)
         guard time > beginning, targetTime > beginning else { return 0 }
         let fraction = min(1, max(0, (time - beginning) / (targetTime - beginning)))
-        return fraction * fraction * (3 - 2 * fraction)
+        // Integrate cosine velocity ramps around a constant-speed middle.
+        // Velocity and acceleration stay continuous wherever a ramp is used.
+        let span = targetTime - beginning
+        let ramps = rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
+        let startRamp = ramps.easeIn / span
+        let endRamp = ramps.easeOut / span
+        let distance = 1 - (startRamp + endRamp) / 2
+        func accelerate(_ fraction: Double, ramp: Double) -> Double {
+            (fraction / 2 - ramp / (2 * .pi) * sin(.pi * fraction / ramp)) / distance
+        }
+        if fraction < startRamp { return accelerate(fraction, ramp: startRamp) }
+        if fraction > 1 - endRamp { return 1 - accelerate(1 - fraction, ramp: endRamp) }
+        return (fraction - startRamp / 2) / distance
+    }
+
+    /// Ramp values are seconds within the effective movement interval. If an
+    /// adjacent edit shortens the interval, both ramps shrink proportionally.
+    static func rampDurations(duration: Double, easeIn: Double? = nil,
+                              easeOut: Double? = nil) -> (easeIn: Double, easeOut: Double) {
+        guard duration.isFinite, duration > 0 else { return (0, 0) }
+        func bounded(_ value: Double?) -> Double {
+            guard let value, value.isFinite else { return duration / 4 }
+            return max(0, value)
+        }
+        let start = bounded(easeIn)
+        let end = bounded(easeOut)
+        // Divide first, avoiding overflow when two individually valid durations
+        // are extremely large. The relative lengths are still preserved.
+        let largest = max(start, end)
+        guard largest > 0 else { return (0, 0) }
+        let relativeSum = start / largest + end / largest
+        if largest > duration / relativeSum {
+            return (duration * (start / largest) / relativeSum,
+                    duration * (end / largest) / relativeSum)
+        }
+        return (start, end)
     }
 
     static func blend(_ start: Double, _ end: Double, progress: Double) -> Double {
@@ -227,6 +263,8 @@ struct PIPKeyframe: Codable, Equatable, Identifiable, Sendable {
     /// Smooth transitions arrive at `time`; their beginning is clamped to the
     /// preceding point so transitions never overlap.
     var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
 }
 
 struct ZoomPlacement: Codable, Equatable, Sendable {
@@ -260,6 +298,8 @@ struct ZoomKeyframe: Codable, Equatable, Identifiable, Sendable {
     /// Smooth transitions arrive at `time`, beginning no earlier than the
     /// previous zoom point or the start of the source recording.
     var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
 
     var placement: ZoomPlacement { ZoomPlacement(scale: scale, x: x, y: y) }
 }
@@ -313,7 +353,8 @@ struct EditState: Codable, Equatable, Sendable {
                 continue
             }
             let progress = MotionInterpolation.progress(at: time, from: previousTime, to: point.time,
-                                                        duration: point.duration, transition: point.transition)
+                                                        duration: point.duration, transition: point.transition,
+                                                        easeIn: point.easeIn, easeOut: point.easeOut)
             let target = point.placement.clamped
             return ZoomPlacement(scale: MotionInterpolation.blend(previous.scale, target.scale, progress: progress),
                 x: MotionInterpolation.blend(previous.x, target.x, progress: progress),
@@ -332,7 +373,8 @@ struct EditState: Codable, Equatable, Sendable {
                 continue
             }
             let progress = MotionInterpolation.progress(at: time, from: previous.time, to: point.time,
-                                                        duration: point.duration, transition: point.transition)
+                                                        duration: point.duration, transition: point.transition,
+                                                        easeIn: point.easeIn, easeOut: point.easeOut)
             func blend(_ start: Double, _ end: Double) -> Double {
                 MotionInterpolation.blend(start, end, progress: progress)
             }
@@ -360,6 +402,44 @@ struct EditState: Codable, Equatable, Sendable {
         } else {
             pipKeyframes.append(point)
         }
+        pipKeyframes.sort { $0.time < $1.time }
+    }
+}
+
+/// One selectable moment, combining independently animated screen and camera
+/// properties. Existing files retain their independent tracks and interpolation.
+struct TimedEdit: Identifiable, Equatable {
+    let id: UUID
+    let time: Double
+    let zoomID: UUID?
+    let cameraID: UUID?
+}
+
+extension EditState {
+    func timedEdits(includeCamera: Bool) -> [TimedEdit] {
+        var result = zoomKeyframes.map { TimedEdit(id: $0.id, time: $0.time, zoomID: $0.id, cameraID: nil) }
+        if includeCamera {
+            for camera in pipKeyframes where camera.time > 0 {
+                if let index = result.firstIndex(where: { abs($0.time - camera.time) < 0.000001 }) {
+                    let zoom = result[index]
+                    result[index] = TimedEdit(id: zoom.id, time: zoom.time, zoomID: zoom.zoomID, cameraID: camera.id)
+                } else {
+                    result.append(TimedEdit(id: camera.id, time: camera.time, zoomID: nil, cameraID: camera.id))
+                }
+            }
+        }
+        return result.sorted { $0.time < $1.time }
+    }
+
+    mutating func remove(_ edit: TimedEdit) {
+        zoomKeyframes.removeAll { $0.id == edit.zoomID }
+        pipKeyframes.removeAll { $0.id == edit.cameraID && $0.time > 0 }
+    }
+
+    mutating func move(_ edit: TimedEdit, to time: Double) {
+        if let index = zoomKeyframes.firstIndex(where: { $0.id == edit.zoomID }) { zoomKeyframes[index].time = time }
+        if let index = pipKeyframes.firstIndex(where: { $0.id == edit.cameraID && $0.time > 0 }) { pipKeyframes[index].time = time }
+        zoomKeyframes.sort { $0.time < $1.time }
         pipKeyframes.sort { $0.time < $1.time }
     }
 }
@@ -494,6 +574,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
             guard point.time.isFinite, point.time >= 0, point.time <= duration,
                   point.time > priorTime, identities.insert(point.id).inserted,
                   point.duration.isFinite, point.duration > 0,
+                  [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }),
                   placement.x.isFinite, (0...1).contains(placement.x),
                   placement.y.isFinite, (0...1).contains(placement.y),
                   placement.scale.isFinite, (0.12...0.5).contains(placement.scale),
@@ -513,7 +594,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   point.scale.isFinite, (1...3).contains(point.scale),
                   point.x.isFinite, (0...1).contains(point.x),
                   point.y.isFinite, (0...1).contains(point.y),
-                  point.duration.isFinite, point.duration > 0 else {
+                  point.duration.isFinite, point.duration > 0,
+                  [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
                 throw ProjectError.invalid("Zoom points must have unique, ordered times and valid focal positions, scales, and durations.")
             }
             priorTime = point.time
@@ -535,13 +617,16 @@ enum ProjectError: LocalizedError {
 final class ProjectEditor: ObservableObject {
     @Published private(set) var project: RecordingProject
     @Published private(set) var errorMessage: String?
+    @Published private(set) var draftState: EditState?
+    @Published private(set) var draftTime: Double?
     let url: URL
     private let defaultName: String
 
-    var canUndo: Bool { !project.undoHistory.isEmpty }
-    var canRedo: Bool { !project.redoHistory.isEmpty }
-    var undoName: String { project.undoHistory.last?.name ?? "" }
-    var redoName: String { project.redoHistory.last?.name ?? "" }
+    var editingState: EditState { draftState ?? project.state }
+    var canUndo: Bool { draftState != nil || !project.undoHistory.isEmpty }
+    var canRedo: Bool { draftState == nil && !project.redoHistory.isEmpty }
+    var undoName: String { draftState != nil ? "Edit" : project.undoHistory.last?.name ?? "" }
+    var redoName: String { draftState == nil ? project.redoHistory.last?.name ?? "" : "" }
     var displayName: String { project.title ?? defaultName }
 
     init(project: RecordingProject, url: URL) {
@@ -560,8 +645,61 @@ final class ProjectEditor: ObservableObject {
         url.deletingLastPathComponent().appendingPathComponent(filename)
     }
 
+    /// Finger movements and controls at one source time refine a shared draft.
+    /// Original media, the saved project, and its history remain untouched.
+    @discardableResult
+    func updateDraft(_ state: EditState, at time: Double) -> Bool {
+        guard time.isFinite, (0...project.duration).contains(time) else {
+            errorMessage = "The edit time must be inside the recording."
+            return false
+        }
+        if let draftTime, draftTime != time, !finishDraft() { return false }
+        do {
+            var candidate = project
+            candidate.state = state
+            try candidate.validate()
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+        guard state != project.state else {
+            _ = cancelDraft()
+            errorMessage = nil
+            return true
+        }
+        draftTime = time
+        draftState = state
+        errorMessage = nil
+        return true
+    }
+
+    /// Persist one combined edit only when the user leaves this source time.
+    /// A failed write retains the draft and both history branches for retry.
+    @discardableResult
+    func finishDraft(name: String = "Edit") -> Bool {
+        guard let draftState else { return true }
+        var next = project
+        next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
+        next.redoHistory.removeAll()
+        next.state = draftState
+        guard persist(next) else { return false }
+        self.draftState = nil
+        draftTime = nil
+        return true
+    }
+
+    @discardableResult
+    func cancelDraft() -> Bool {
+        guard draftState != nil else { return false }
+        draftState = nil
+        draftTime = nil
+        errorMessage = nil
+        return true
+    }
+
     @discardableResult
     func commit(_ state: EditState, name: String) -> Bool {
+        guard finishDraft() else { return false }
         guard state != project.state else { return true }
         var next = project
         next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
@@ -578,6 +716,7 @@ final class ProjectEditor: ObservableObject {
             errorMessage = error.localizedDescription
             return false
         }
+        guard finishDraft() else { return false }
         guard title != displayName else { errorMessage = nil; return true }
         var next = project
         next.undoHistory.append(NamedEditSnapshot(name: "Rename recording", state: project.state, title: project.title))
@@ -588,6 +727,16 @@ final class ProjectEditor: ObservableObject {
 
     @discardableResult
     func undo() -> Bool {
+        if let draftState {
+            // Undoing a draft must be reversible too. Save the combined draft
+            // on a new redo branch without adding an intermediate undo entry.
+            var next = project
+            next.redoHistory = [NamedEditSnapshot(name: "Edit", state: draftState, title: project.title)]
+            guard persist(next) else { return false }
+            self.draftState = nil
+            draftTime = nil
+            return true
+        }
         guard let snapshot = project.undoHistory.last else { return false }
         var next = project
         next.undoHistory.removeLast()
@@ -599,6 +748,7 @@ final class ProjectEditor: ObservableObject {
 
     @discardableResult
     func redo() -> Bool {
+        guard draftState == nil else { return false }
         guard let snapshot = project.redoHistory.last else { return false }
         var next = project
         next.redoHistory.removeLast()
@@ -609,7 +759,10 @@ final class ProjectEditor: ObservableObject {
     }
 
     @discardableResult
-    func save() -> Bool { persist(project) }
+    func save() -> Bool {
+        if draftState != nil { return finishDraft() }
+        return persist(project)
+    }
 
     func dismissError() { errorMessage = nil }
 

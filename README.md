@@ -113,13 +113,29 @@ seek by 0.1 seconds; Shift-arrow seeks by one second. Trimming keeps every origi
 frame available. Right-click the timeline for **Reset trim**. Space starts or
 pauses playback.
 
+Pinch over the timeline to zoom its time scale around your fingers; two-finger
+scrolling navigates time. This changes only the timeline view, not the recording.
+The playhead, trim handles, and edit diamonds have separate hit targets. Click a
+diamond to select its edit and inspect that frame; drag it to change its time.
+The matching item below gets an outline and scrolls into view. Its **×** removes
+the entire edit, including screen and camera changes at that time. Neighboring
+edits cannot be overwritten by dragging.
+
 The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**
-controls. Double-click the recording to zoom in at that position or return to
-1×. Drag a zoomed recording to pan. The Zoom slider and timed zoom changes
-support **Jump** and **Smooth** arrivals with adjustable duration. Select a change
-to change its movement or use the current video time; remove it to delete the edit.
-Purple diamonds link each zoom change to its time on the timeline; click a diamond
-or its matching list item to select it. Hover controls for action-specific help.
+controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
+it, including trackpad momentum. Double-click also zooms at that position, and
+mouse dragging pans a zoomed view. Repeated adjustments at the same source time
+refine one combined draft. Selecting an existing edit revises it in place. Leaving
+that time, playing, exporting, or closing saves one undo step. Escape discards the
+draft; Undo followed by Redo can recover it.
+
+**Jump** applies framing instantly. **Smooth** accelerates, moves at constant
+speed, then decelerates to a stop at the edit's time. Duration controls total
+movement time; **Accelerate** and **Decelerate** control the two ramps in seconds.
+Drag the visual strip's boundaries to adjust them directly. Ramps cannot overlap.
+The strip and the selected edit's timeline band show the effective transition,
+shortened when the previous edit leaves less time available. Screen and camera
+use the same motion curve, with separate settings for each component of an edit.
 **Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
 with steady holds and returns to the wider context. Suggestions are ordinary
 editable changes and applying them is one undo step.
@@ -138,13 +154,12 @@ and **Square** and **Circle** crop without stretching. **Framing…** lets you m
 the crop within the full camera image and zoom the camera source independently
 of the PIP window size. Main-view and camera movement share transition timing,
 easing, and viewport bounds. Shape, framing, zoom, size, position, and visibility
-can all change over time. Dragging updates the PIP picture live and commits one
-undo step when released. **Jump** changes placement instantly; **Smooth** eases
+can all change over time. Dragging updates the PIP picture live and joins the shared draft at that time. **Jump** changes placement instantly; **Smooth** eases
 position, size, aspect, and framing toward the change. Shape and visibility switch
 at the change's time.
 
-Every edit, including trim, supports Command-Z and Shift-Command-Z. Each drag is
-one undo step. Edits and history save automatically and survive reopening through
+Every edit, including trim, supports Command-Z and Shift-Command-Z. Moving or
+removing an edit is one undo step; framing adjustments at one time share a step. Edits and history save automatically and survive reopening through
 **Open…**. Editing never overwrites source media. **Export…**, Slack, and Drive all
 render the current edit using the same composition as the preview, creating a
 separate MP4. Export encoding is independent of nondestructive editing.
@@ -192,8 +207,12 @@ Automated checks run without camera hardware or connected accounts:
   recording region, negative display origins, full drag deltas, and clamping.
 - `Tests/check-project-renderer.sh`: pixel-level screen/camera zoom and pan, pointer
   sizing/smoothing/clicks, shape transitions, audio, and preview/export parity.
-- `Tests/check-zoom-model.sh`: shared main/PIP motion, bounded source zooms,
-  legacy defaults, and persisted reversible zoom/pointer edits.
+- `Tests/check-zoom-model.sh`: shared main/PIP motion, configurable acceleration
+  and deceleration, constant-speed cruise, bounded source zooms, and legacy defaults.
+- `Tests/check-edit-draft.sh`: combined same-time edits, grouped retiming/removal,
+  one-step undo/redo, failed-save recovery, ramp persistence, and immutable originals.
+- `Tests/check-editor-trackpad.sh`: native pinch/pan/momentum, pointer anchoring,
+  bounded zoom, stale configuration, and cancellation.
 - `Tests/check-cursor-recording.sh`: mouse coordinates, precise click events and
   dragging, smoothing, source-time alignment, and immutable metadata.
 - `Tests/check-capture-audio-settings.sh`: remembered microphone restoration,
@@ -206,8 +225,8 @@ Automated checks run without camera hardware or connected accounts:
   cancellation, stale-result suppression, and end-exclusive seeking.
 - `Tests/check-native-preview-sources.sh`: native playback pixel parity, bounded
   source-frame ownership, full camera framing, and live zoom/PIP/pointer drafts.
-- `Tests/check-recording-timeline.sh`: native scrub and trim gestures, overlapping
-  hit targets, visible/selectable zoom markers, undo grouping, bounds, and keyboard seeking.
+- `Tests/check-recording-timeline.sh`: native scrub and trim gestures, separate
+  hit targets, draggable edit diamonds, pinch navigation, transition bands, bounds, and keyboard seeking.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
 - `Tests/check-capture-lifecycle.sh`: bounded SDK callbacks, event ordering, media
   finalization, and retry isolation.

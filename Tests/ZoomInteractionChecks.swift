@@ -43,27 +43,30 @@ struct ZoomInteractionChecks {
         canvas.mouseDown(with: mouse(.leftMouseDown, at: zoomPoint, canvas: canvas, window: window, clicks: 2))
         canvas.mouseUp(with: mouse(.leftMouseUp, at: zoomPoint, canvas: canvas, window: window, clicks: 2))
         try await ready(canvas)
-        try zoom(editor.project.state.zoom(at: 0), equals: ZoomPlacement(scale: 2, x: 0.3, y: 0.4), "double-click focal zoom")
-        try require(editor.project.undoHistory.count == 1 && editor.undoName == "Zoom in",
-                    "double-click must persist exactly one zoom edit")
-        try require(editor.project.state.zoomKeyframes.count == 1 && editor.project.state.zoomKeyframes[0].time == 0,
+        try zoom(editor.editingState.zoom(at: 0), equals: ZoomPlacement(scale: 2, x: 0.3, y: 0.4), "double-click focal zoom")
+        try require(editor.draftState != nil && editor.project.undoHistory.isEmpty && editor.project.state.zoomKeyframes.isEmpty,
+                    "double-click refines framing without persisting or adding intermediate undo entries")
+        try require(editor.editingState.zoomKeyframes.count == 1 && editor.editingState.zoomKeyframes[0].time == 0,
                     "zoom gesture must create its point at the current source playhead")
 
         let start = sourcePoint(x: 0.15, y: 0.15, canvas: canvas)
         let delta = CGSize(width: 60, height: 40)
-        let beforePan = editor.project.state.zoom(at: 0)
+        let beforePan = editor.editingState.zoom(at: 0)
         try await drag(canvas, window: window, from: start, by: delta)
         try await ready(canvas)
         let expectedPan = ZoomPlacement(scale: 2,
             x: beforePan.x - delta.width / (canvas.canvasRect.width * 2),
             y: beforePan.y - delta.height / (canvas.canvasRect.height * 2)).clamped
-        try zoom(editor.project.state.zoom(at: 0), equals: expectedPan, "pan follows full pointer delta with correct direction")
-        try require(editor.project.undoHistory.count == 2 && editor.undoName == "Pan recording",
-                    "a pan gesture must persist one undo entry")
+        try zoom(editor.editingState.zoom(at: 0), equals: expectedPan, "pan follows full pointer delta with correct direction")
+        try require(editor.draftState != nil && editor.project.undoHistory.isEmpty && editor.editingState.zoomKeyframes.count == 1,
+                    "double-click and pan at one instant refine the same pending edit")
+        try require(editor.finishDraft() && editor.project.undoHistory.count == 1 && editor.undoName == "Edit",
+                    "leaving the instant persists the combined zoom and pan as one undo entry")
+        try await ready(canvas)
         let reopened = try ProjectEditor.open(url: editor.url)
-        try require(reopened.undo(), "undo pan after reopening")
-        try zoom(reopened.project.state.zoom(at: 0), equals: beforePan, "reopened undo restores pre-pan viewport")
-        try require(reopened.redo(), "redo pan after reopening")
+        try require(reopened.undo(), "undo combined framing after reopening")
+        try zoom(reopened.project.state.zoom(at: 0), equals: ZoomPlacement(), "reopened undo restores the viewport before zoom and pan")
+        try require(reopened.redo(), "redo combined framing after reopening")
         try zoom(reopened.project.state.zoom(at: 0), equals: expectedPan, "reopened redo restores viewport")
 
         let beforeCancel = editor.project
@@ -81,8 +84,12 @@ struct ZoomInteractionChecks {
             let count = editor.project.undoHistory.count
             try await drag(canvas, window: window, from: start, by: CGSize(width: movement, height: movement))
             try await ready(canvas)
-            try zoom(editor.project.state.zoom(at: 0), equals: ZoomPlacement(scale: 2, x: focal, y: focal), "pan clamps the viewport at source edges")
-            try require(editor.project.undoHistory.count == count + 1, "clamped pan remains a single edit")
+            try zoom(editor.editingState.zoom(at: 0), equals: ZoomPlacement(scale: 2, x: focal, y: focal), "pan clamps the viewport at source edges")
+            try require(editor.draftState != nil && editor.project.undoHistory.count == count,
+                        "clamped pan stays pending after finger release")
+            try require(editor.finishDraft() && editor.project.undoHistory.count == count + 1,
+                        "clamped pan remains a single saved edit")
+            try await ready(canvas)
         }
 
         let zoomBeforeCamera = editor.project.state.zoom(at: 0)
@@ -97,25 +104,40 @@ struct ZoomInteractionChecks {
         try require(editor.project.undoHistory.count == count, "camera hit target takes precedence over background double-click zoom")
         try await drag(canvas, window: window, from: cameraCenter, by: CGSize(width: 30, height: -20))
         try await ready(canvas)
-        try require(editor.project.undoHistory.count == count + 1 && editor.undoName == "Move camera",
-                    "camera movement has priority over panning a zoomed recording")
-        try zoom(editor.project.state.zoom(at: 0), equals: zoomBeforeCamera, "moving PIP preserves main viewport")
-        let movedCamera = editor.project.state.pipKeyframes[0].placement
+        try require(editor.draftState != nil && editor.project.undoHistory.count == count,
+                    "camera movement has priority over panning and remains a pending edit")
+        try zoom(editor.editingState.zoom(at: 0), equals: zoomBeforeCamera, "moving PIP preserves main viewport")
+        let pendingCamera = editor.editingState
+        let movedCamera = pendingCamera.pipKeyframes[0].placement
         let movedFrame = movedCamera.frame(in: canvas.canvasRect.size, cameraAspect: 16.0 / 9.0)
             .offsetBy(dx: canvas.canvasRect.minX, dy: canvas.canvasRect.minY)
+        let movedCenter = CGPoint(x: movedFrame.midX, y: movedFrame.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, at: movedCenter, canvas: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, at: movedCenter, canvas: canvas, window: window))
+        try await ready(canvas)
+        try require(editor.draftState == pendingCamera && editor.project.undoHistory.count == count,
+                    "a no-op camera click must preserve the unfinished combined draft")
+        try require(editor.finishDraft() && editor.project.undoHistory.count == count + 1 && editor.undoName == "Edit",
+                    "leaving the camera edit persists exactly one undo entry")
+        try await ready(canvas)
         count = editor.project.undoHistory.count
         try await drag(canvas, window: window, from: CGPoint(x: movedFrame.maxX, y: movedFrame.maxY),
                        by: CGSize(width: 25, height: 10))
         try await ready(canvas)
-        try require(editor.project.undoHistory.count == count + 1 && editor.undoName == "Resize camera",
-                    "PIP corner resizing must remain available while main view is zoomed")
-        try zoom(editor.project.state.zoom(at: 0), equals: zoomBeforeCamera, "resizing PIP preserves main viewport")
+        try require(editor.draftState != nil && editor.project.undoHistory.count == count,
+                    "PIP corner resizing remains available while main view is zoomed and stays pending")
+        try zoom(editor.editingState.zoom(at: 0), equals: zoomBeforeCamera, "resizing PIP preserves main viewport")
+        try require(editor.finishDraft() && editor.project.undoHistory.count == count + 1 && editor.undoName == "Edit",
+                    "leaving the resized framing creates one reversible edit")
+        try await ready(canvas)
 
         canvas.mouseDown(with: mouse(.leftMouseDown, at: zoomPoint, canvas: canvas, window: window, clicks: 2))
         canvas.mouseUp(with: mouse(.leftMouseUp, at: zoomPoint, canvas: canvas, window: window, clicks: 2))
         try await ready(canvas)
-        try zoom(editor.project.state.zoom(at: 0), equals: ZoomPlacement(), "double-click zoom out returns to full recording")
-        try require(editor.undoName == "Zoom out", "zoom-out is a normal reversible edit")
+        try zoom(editor.editingState.zoom(at: 0), equals: ZoomPlacement(), "double-click zoom out returns to full recording")
+        try require(editor.draftState != nil && editor.finishDraft() && editor.undoName == "Edit",
+                    "zoom-out finalizes as a normal reversible framing edit")
+        try await ready(canvas)
         try rect(host.convert(canvas.bounds, from: canvas), equals: baseline, "inspector switches cannot move or resize preview")
         try rect(window.frame, equals: baselineWindow, "zoom/camera inspectors cannot resize editor window")
         let screenAfter = try Data(contentsOf: screenURL), cameraAfter = try Data(contentsOf: cameraURL)

@@ -45,11 +45,13 @@ struct EditorInteractionChecks {
                                       y: canvas.minY + (isBottom ? originalFrame.maxY : originalFrame.minY))
             let resizeDelta = CGSize(width: isRight ? 40 : -40, height: isBottom ? 10 : -10)
             try await drag(in: window, host: host, from: resizeStart, by: resizeDelta)
-            try require(editor.project.undoHistory.count == 1 && editor.undoName == "Resize camera",
-                        "each corner resize must produce one undo entry, without also moving the camera")
+            try require(editor.draftState != nil && editor.project.undoHistory.isEmpty,
+                        "each corner resize stays in one pending draft after release")
             let expectedResize = initial.resized(by: resizeDelta, corner: corner, in: canvas.size, cameraAspect: 16.0 / 9.0)
-            try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedResize,
+            try placement(editor.editingState.pipKeyframes[0].placement, equals: expectedResize,
                           "every resize handle must use the full pointer delta")
+            try require(editor.finishDraft() && editor.project.undoHistory.count == 1 && editor.undoName == "Edit",
+                        "leaving each resized framing produces one undo entry without also moving the camera")
             let reopened = try ProjectEditor.open(url: editor.url)
             try require(reopened.project == editor.project, "native resize and its undo history must survive reopen")
             try require(editor.undo(), "undo native resize")
@@ -65,13 +67,15 @@ struct EditorInteractionChecks {
         let moveStart = CGPoint(x: canvas.minX + originalFrame.midX, y: canvas.minY + originalFrame.midY)
         let moveDelta = CGSize(width: 40, height: -20)
         try await drag(in: window, host: host, from: moveStart, by: moveDelta)
-        try require(editor.project.undoHistory.count == 1 && editor.undoName == "Move camera",
-                    "a move drag must create exactly one undo entry")
+        try require(editor.draftState != nil && editor.project.undoHistory.isEmpty,
+                    "a move drag remains pending without creating intermediate undo entries")
         var expectedMove = initial
         expectedMove.x += moveDelta.width / (canvas.width - originalFrame.width)
         expectedMove.y += moveDelta.height / (canvas.height - originalFrame.height)
-        try placement(editor.project.state.pipKeyframes[0].placement, equals: expectedMove,
+        try placement(editor.editingState.pipKeyframes[0].placement, equals: expectedMove,
                       "moving camera must use the entire pointer delta")
+        try require(editor.finishDraft() && editor.project.undoHistory.count == 1 && editor.undoName == "Edit",
+                    "leaving the moved framing creates exactly one undo entry")
         try require(editor.project.redoHistory.isEmpty, "a new gesture invalidates the prior redo branch")
         let movedReopen = try ProjectEditor.open(url: editor.url)
         try require(movedReopen.undo(), "undo native move after reopening")
@@ -110,14 +114,14 @@ struct EditorInteractionChecks {
         try require(editor.commit(withPoint, name: "Add camera point"), "add first nonzero point for layout check")
         await settle()
         try size(host.fittingSize, equals: baselineFittingSize, "first nonzero point must not grow the editor")
-        guard let pointList: NSScrollView = find(in: host) else {
-            throw InteractionCheckError.failed("production editor did not create its camera point list")
-        }
-        let listRect = host.convert(pointList.bounds, from: pointList)
-        // The first and second point buttons are each approximately 150pt wide.
-        // Select the second to exercise the additional point-time controls.
-        try await drag(in: window, host: host,
-                       from: CGPoint(x: listRect.minX + 210, y: listRect.midY), by: .zero)
+        try require(timeline.edits.count == 1 && timeline.edits[0].time == 5,
+                    "camera changes appear in the shared edit timeline")
+        let editPoint = CGPoint(x: timeline.x(for: 5), y: 47)
+        timeline.mouseDown(with: trimEvent(.leftMouseDown, at: editPoint))
+        timeline.mouseUp(with: trimEvent(.leftMouseUp, at: editPoint))
+        await settle()
+        try require(timeline.selectedEditID == withPoint.pipKeyframes[1].id,
+                    "clicking the camera diamond selects its unified edit")
         try size(host.fittingSize, equals: baselineFittingSize, "selecting a nonzero point must keep stable controls height")
         var smoothPoint = editor.project.state
         smoothPoint.pipKeyframes[1].transition = .smooth
@@ -152,11 +156,13 @@ struct EditorInteractionChecks {
         // heading above it. This point is safely inside its centered crop.
         let center = CGPoint(x: 196, y: 135)
         try await drag(in: window, host: host, from: center, by: CGSize(width: 36, height: 0))
-        try require(editor.project.undoHistory.count == 1 && editor.undoName == "Frame camera",
-                    "crop drag commits once on release")
-        let crop = editor.project.state.pipKeyframes[0].placement.crop
+        try require(editor.draftState != nil && editor.project.undoHistory.isEmpty,
+                    "crop drag refines a pending framing edit after release")
+        let crop = editor.editingState.pipKeyframes[0].placement.crop
         try near(crop.x, 0.7, "crop must use full pointer delta: 36 display pixels = 20 source pixels")
         try near(crop.y, 0.5, "crop axis with no travel must remain unchanged")
+        try require(editor.finishDraft() && editor.project.undoHistory.count == 1 && editor.undoName == "Edit",
+                    "leaving the crop edit commits exactly one undo step")
         let reopened = try ProjectEditor.open(url: editor.url)
         try require(reopened.undo(), "undo crop after reopening")
         try require(reopened.project.state.pipKeyframes[0].placement.crop == PIPCrop(), "crop undo restores center")
@@ -169,10 +175,10 @@ struct EditorInteractionChecks {
         let image: CGImage
         var body: some View {
             CameraFramingPopover(image: image, errorMessage: nil,
-                                 placement: editor.project.state.pipKeyframes[0].placement) { crop in
-                var state = editor.project.state
+                                 placement: editor.editingState.pipKeyframes[0].placement) { crop in
+                var state = editor.editingState
                 state.pipKeyframes[0].placement.crop = crop
-                editor.commit(state, name: "Frame camera")
+                editor.updateDraft(state, at: 0)
             }
         }
     }

@@ -269,7 +269,7 @@ struct RecordingProjectChecks {
         near(midpoint.scale, 0.4, "Smooth midpoint size")
         precondition(!midpoint.visible, "Visibility remains discrete until arrival")
         let early = state.placement(at: 6.5)
-        near(early.x, 0.2 + 0.8 * 0.15625, "Smoothstep easing, not linear motion")
+        near(early.x, 0.2 + 0.8 / 6, "Camera reaches cruise speed after accelerating")
         precondition(state.placement(at: 8) == third)
         precondition(state.placement(at: 100) == third)
 
@@ -296,7 +296,7 @@ struct RecordingProjectChecks {
         near(during.aspectRatio, 1.5, "Free rectangle aspect interpolates")
         near(during.crop.x, 0.5, "Crop X interpolates")
         near(during.crop.y, 0.5, "Crop Y interpolates")
-        near(geometry.placement(at: 6.5).crop.x, 0.15625, "Crop uses smoothstep easing")
+        near(geometry.placement(at: 6.5).crop.x, 1.0 / 6, "Crop uses the same acceleration and cruise profile")
         precondition(geometry.placement(at: 6) == rectangle)
         precondition(geometry.placement(at: 8) == circle)
     }

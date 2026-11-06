@@ -143,6 +143,7 @@ struct EditorPlaybackChecks {
 
         try await draftPreviewChecks()
         try await scrubbingChecks()
+        try await sourceInspectionChecks()
 
         let playback = EditorPlayback()
         playback.close()
@@ -151,7 +152,58 @@ struct EditorPlaybackChecks {
         playback.close()
         try require(playback.stillFrame == nil && !playback.isPlaying && !playback.isLoading,
                     "closed player accepted new playback work")
-        print("Editor playback checks passed (bounded scrubbing/drafts, live camera pixels, cancel/commit, lifecycle invalidation, and exclusive bounds).")
+        print("Editor playback checks passed (bounded scrubbing/drafts, source inspection outside trim, latest rebuild seeks, live camera pixels, lifecycle invalidation, and exclusive bounds).")
+    }
+
+    @MainActor
+    private static func sourceInspectionChecks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-inspection-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await movie(to: directory.appendingPathComponent("screen.mov"), width: 160, height: 120, camera: false)
+        try await movie(to: directory.appendingPathComponent("camera.mov"), width: 80, height: 40, camera: true)
+        var project = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 2)
+        project.state.trimStart = 0.5
+        project.state.trimEnd = 1.4
+        project.state.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 0, scale: 0.25)
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("inspection.framethrower"))
+        let playback = EditorPlayback()
+        let display = HeadlessPlayerDisplay(player: playback.player)
+        defer { display.close(); playback.close() }
+        await playback.rebuild(editor: editor)
+        for position in [0.2, 1.75] {
+            playback.seek(position)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            try require(abs(playback.time - position) < 0.000_001, "paused edit inspection was clamped to trim instead of source time")
+            let cameraFrame = try await playback.cameraFrame(at: position)
+            try require(cameraFrame != nil, "source camera pixels unavailable outside trim")
+            var draft = editor.project.state
+            draft.pipKeyframes[0].placement.x = 1
+            playback.preview(draft)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 0, width: 40, height: 20))
+            try require(abs(playback.time - position) < 0.000_001, "source-time draft rendering moved the inspected playhead")
+            playback.cancelPreview()
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        }
+        await playback.rebuild(editor: editor)
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        try require(abs(playback.time - 1.75) < 0.000_001, "rebuild lost the source-time inspection outside trim")
+        let rebuilding = Task { @MainActor in await playback.rebuild(editor: editor) }
+        await Task.yield()
+        playback.seek(0.15)
+        await rebuilding.value
+        _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+        try require(abs(playback.time - 0.15) < 0.000_001, "the latest seek during rebuild was discarded")
+        playback.togglePlayback()
+        try require(playback.isPlaying && playback.time == 0.5,
+                    "playing after outside inspection must restart inside the retained range")
+        playback.pause()
+        playback.beginScrubbing()
+        playback.scrub(to: 0.1)
+        try require(playback.time == 0.5, "scrubbing must continue to respect the trim start")
+        playback.scrub(to: 1.9)
+        try require(playback.time == 1.4, "scrubbing must continue to respect the trim end")
+        playback.endScrubbing()
     }
 
     @MainActor

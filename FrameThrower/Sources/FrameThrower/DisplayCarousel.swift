@@ -107,7 +107,7 @@ struct DisplayCarousel: View {
 
     @MainActor
     private func refreshPreviews() async {
-        guard model.hasScreenRecordingPermission else {
+        guard model.hasScreenRecordingPermission, CGPreflightScreenCaptureAccess() else {
             images = [:]
             return
         }
@@ -115,7 +115,9 @@ struct DisplayCarousel: View {
         let displayIDs = Set(displays.map(\.id))
         images = images.filter { displayIDs.contains($0.key) }
         failedDisplays = []
-        guard isEnabled, !captureLocked, !displays.isEmpty else { return }
+        // Display thumbnails are part of choosing a source, so they load with
+        // existing permission even before a user clicks a capture control.
+        guard !captureLocked, !displays.isEmpty else { return }
         isLoading = true
         defer { isLoading = false }
 
@@ -125,11 +127,15 @@ struct DisplayCarousel: View {
                 true, onScreenWindowsOnly: true
             )
             try Task.checkCancellation()
+            guard !captureLocked, model.hasScreenRecordingPermission,
+                  CGPreflightScreenCaptureAccess() else { return }
             // Deferred or closed AppKit windows can have a window number of -1.
             let ownWindows = Set(NSApp.windows.compactMap { CGWindowID(exactly: $0.windowNumber) })
             let excluded = content.windows.filter { ownWindows.contains($0.windowID) }
             for display in displays {
                 try Task.checkCancellation()
+                guard !captureLocked, model.hasScreenRecordingPermission,
+                      CGPreflightScreenCaptureAccess() else { return }
                 let filter = SCContentFilter(display: display.display, excludingWindows: excluded)
                 let size = filter.contentRect.size
                 let scale = min(1, 640 / max(size.width, size.height, 1))
@@ -167,6 +173,12 @@ struct DisplayCarouselTile: View {
     var select: () -> Void
     @Environment(\.isEnabled) private var isEnabled
     @State private var isHovered = false
+
+    private var previewStatus: String {
+        if image != nil { return "preview loaded" }
+        if isLoading { return "loading preview" }
+        return failed ? "preview unavailable" : "preview not loaded"
+    }
 
     var body: some View {
         Button(action: select) {
@@ -239,7 +251,7 @@ struct DisplayCarouselTile: View {
         .help("Record \(title)")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
-        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityValue((isSelected ? "Selected" : "Not selected") + ", " + previewStatus)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

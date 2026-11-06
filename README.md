@@ -61,8 +61,9 @@ available source selection. A window that has closed requires choosing a new one
    outside the region to draw a new one, drag inside to move it, or drag a corner
    to resize it. Arrow keys move the focused region by one point (Shift: ten).
    **Choose…** still opens the full-screen selector for precise adjustments.
-   Selecting a source shows a still preview; use its refresh button to update it.
-   Preview capture and permission requests do not run automatically on launch.
+   Display thumbnails load at startup when recording access is already granted;
+   use refresh to update them. Window/area previews load when requested. Permission
+   requests do not run automatically on launch.
 3. Use the audio checkboxes to enable system audio and/or a microphone. Microphone
    capture needs its own macOS permission.
 4. Optionally choose a **Camera**. Its live layout appears inline automatically
@@ -71,7 +72,8 @@ available source selection. A window that has closed requires choosing a new one
    access is requested only when you select a camera. Choose **Off** to stop it.
 5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
-   The review editor opens when capture finishes; use **Edit…** to reopen it.
+   A separate editor window opens when capture finishes; use **Edit…** to reopen
+   it. The recorder stays usable, and each project's editor has its own undo history.
 
 Screen originals are H.264 MP4 files saved as
 `~/Movies/Screencast-<UTC timestamp>-<unique suffix>.mp4`. Camera video is saved
@@ -143,6 +145,8 @@ Automated checks run without camera hardware or connected accounts:
   finalization, and retry isolation.
 - `Tests/check-editor-interactions.sh`: production editor mouse gestures, exact
   drag deltas, persisted undo/redo, and trim integration.
+- `Tests/check-editor-windows.sh`: shared project identity, independent window
+  histories, reopening, and failed-open recovery.
 - `Tests/check-project-streaming-playback.sh`: real AVPlayer frame output across
   camera gaps, timed shapes, and smooth transitions.
 - `Tests/check-area-preview.sh`: area coordinate mapping, native drag interactions,

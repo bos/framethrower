@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: CaptureViewModel
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.openWindow) private var openWindow
     @State private var recordingStartedAt: Date?
     @State private var clipDuration: Double?
     @State private var clipSize = ""
@@ -51,8 +52,8 @@ struct ContentView: View {
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
         }
-        .sheet(isPresented: $model.isProjectEditorPresented) {
-            if let editor = model.projectEditor { ProjectEditorView(editor: editor) }
+        .onChange(of: model.editorOpenRequest) { _, request in
+            if let request { openWindow(id: "editor", value: request.url) }
         }
         .onDisappear { model.stopSourceAutoRefresh() }
         .onOpenURL { SlackCallbackRouter.shared.handle(url: $0) }
@@ -384,7 +385,7 @@ struct ContentView: View {
                 Text(clipSummary).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Edit…") { model.isProjectEditorPresented = true }
+            Button("Edit…") { model.requestProjectEditor() }
                 .disabled(model.projectEditor == nil || captureLocked || model.isAnyUploadActive)
             Button("Share…") { isSharingPresented = true }
                 .disabled(captureLocked)
@@ -401,7 +402,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 12) {
                 Button {
-                    if model.projectEditor != nil { model.isProjectEditorPresented = true }
+                    if model.projectEditor != nil { model.requestProjectEditor() }
                     else if let url = model.lastRecordingURL { NSWorkspace.shared.open(url) }
                 } label: {
                     Image(systemName: "play.fill")
@@ -422,7 +423,7 @@ struct ContentView: View {
                 }
                 Spacer()
                 if model.projectEditor != nil {
-                    Button("Edit…") { model.isProjectEditorPresented = true }
+                    Button("Edit…") { model.requestProjectEditor() }
                         .disabled(model.isAnyUploadActive || captureLocked)
                 }
                 Button {

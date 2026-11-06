@@ -130,7 +130,12 @@ final class CaptureViewModel: ObservableObject {
     }
     @Published var initialCameraPlacement = PIPPlacement()
     @Published var projectEditor: ProjectEditor?
-    @Published var isProjectEditorPresented = false
+    struct EditorOpenRequest: Equatable {
+        let id = UUID()
+        let url: URL
+    }
+    @Published private(set) var editorOpenRequest: EditorOpenRequest?
+    private var projectEditors: [URL: ProjectEditor] = [:]
     @Published private(set) var isCaptureBusy = false
     @Published private(set) var isExporting = false
     private var activeCameraURL: URL?
@@ -1022,8 +1027,9 @@ final class CaptureViewModel: ObservableObject {
             let editor = ProjectEditor(project: project, url: url)
             guard editor.save() else { throw ProjectError.invalid(editor.errorMessage ?? "Could not save the project.") }
             projectEditor = editor
+            projectEditors[canonicalProjectURL(url)] = editor
             userDefaults.set(url.path, forKey: "editor.lastProject")
-            isProjectEditorPresented = true
+            requestProjectEditor()
             log("Recording saved. Review, trim, and arrange your camera before sharing.")
         } catch {
             log("Sources are safe at \(outputURL.path), but project creation failed: \(error.localizedDescription)", level: .error)
@@ -1039,19 +1045,44 @@ final class CaptureViewModel: ObservableObject {
         openProject(at: URL(fileURLWithPath: path), present: false)
     }
 
-    func chooseProject() {
-        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
+    @discardableResult
+    func chooseProject() -> URL? {
+        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return nil }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.message = "Choose a FrameThrower project (.framethrower) to continue editing."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        openProject(at: url, present: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return openProject(at: url, present: true)?.url
     }
 
-    private func openProject(at url: URL, present: Bool) {
+    func editor(for url: URL) throws -> ProjectEditor {
+        let canonical = canonicalProjectURL(url)
+        if let existing = projectEditors[canonical] { return existing }
+        if let current = projectEditor, canonicalProjectURL(current.url) == canonical {
+            projectEditors[canonical] = current
+            return current
+        }
+        let editor = try ProjectEditor.open(url: canonical)
+        projectEditors[canonical] = editor
+        return editor
+    }
+
+    func requestProjectEditor() {
+        guard let projectEditor else { return }
+        let url = canonicalProjectURL(projectEditor.url)
+        projectEditors[url] = projectEditor
+        editorOpenRequest = EditorOpenRequest(url: url)
+    }
+
+    private func canonicalProjectURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    @discardableResult
+    private func openProject(at url: URL, present: Bool) -> ProjectEditor? {
         do {
-            let editor = try ProjectEditor.open(url: url)
+            let editor = try self.editor(for: url)
             let screenURL = editor.mediaURL(for: editor.project.screenFilename)
             guard FileManager.default.fileExists(atPath: screenURL.path) else {
                 throw ProjectError.invalid("Keep the project and its original media files together.")
@@ -1060,9 +1091,13 @@ final class CaptureViewModel: ObservableObject {
             lastRecordingURL = screenURL
             lastDriveFileURL = nil
             lastSlackFileURL = nil
-            userDefaults.set(url.path, forKey: "editor.lastProject")
-            isProjectEditorPresented = present
-        } catch { log("Could not open project: \(error.localizedDescription)", level: .error) }
+            userDefaults.set(editor.url.path, forKey: "editor.lastProject")
+            if present { requestProjectEditor() }
+            return editor
+        } catch {
+            log("Could not open project: \(error.localizedDescription)", level: .error)
+            return nil
+        }
     }
 
     /// Both destinations use this exact snapshot, never the unedited screen file.

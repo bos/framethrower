@@ -4,6 +4,20 @@ A native macOS screen recorder built with SwiftUI and ScreenCaptureKit. Record a
 window, a display, or an area selected by dragging, then optionally upload the
 recording to Google Drive or a Slack person/channel.
 
+## Temporary media suspension
+
+Video processing is currently disabled in source at the user's request because
+of repeated kernel video-scaler hangs. Capture, camera sessions, live source
+previews, video playback, thumbnails, composition, and export are blocked. The
+editor uses an empty preview while timeline edits, canvas geometry, naming,
+project saving, and Undo/Redo remain usable. Existing recordings are untouched.
+
+`MediaProcessing.isSuspended` is fixed to `true`, with no preference or launch
+argument override. Media test scripts stop before compilation with `SKIP` and
+exit status 77; fixture creation also checks the interlock. Do not re-enable
+those paths on this machine without explicit approval. The feature descriptions
+below document the implementation behind this temporary interlock.
+
 ## Requirements
 
 - macOS 15 or later.
@@ -98,9 +112,16 @@ removing a row) restores it, including after restarting the app. Opening a remov
 project explicitly also restores it. The app never deletes recordings because of
 their age; use Finder when you want to delete files permanently.
 
-Screen originals are H.264 MP4 files saved as
-`~/Movies/Screencast-<UTC timestamp>-<unique suffix>.mp4`. Camera video is saved
-separately beside the screen original as `.camera.mov`. New recordings also save
+Choose **High quality** for ProRes 422 LT video and uncompressed 48 kHz PCM
+audio, or **Smaller files** for H.264 capture. The choice is remembered. High-quality
+capture shows an approximate storage rate; camera and audio add to that estimate.
+New recordings render at 60 fps through preview and export, including cursor and
+camera animation over static screen frames. Existing projects retain their prior
+30 fps render cadence. ProRes LT is a high-quality codec, not mathematically lossless video.
+
+Screen originals are saved in `~/Movies` as
+`Screencast-<UTC timestamp>-<unique suffix>.mov` (high quality) or `.mp4` (smaller files).
+Camera video is saved separately beside the screen original as `.camera.mov`. New recordings also save
 mouse motion and clicks in an immutable `.cursor.json` sidecar. A `.framethrower`
 project stores edits and undo history. Keep these files together. The legacy
 filename prefix is retained for compatibility with the upload helper. Local
@@ -124,7 +145,7 @@ save the pending adjustments and deselect without moving the playhead. Escape
 cancels pending adjustments and deselects. Mouse clicks leave no full-timeline
 focus border; keyboard navigation uses a small cue beneath the playhead.
 
-The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**
+The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**, plus **Canvas**
 controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
 it, including trackpad momentum. Double-click also zooms at that position, and
 mouse dragging pans a zoomed view. Repeated adjustments at the same source time
@@ -166,14 +187,31 @@ at the change's time.
 
 Every edit, including trim, supports Command-Z and Shift-Command-Z. Moving or
 removing an edit is one undo step; framing adjustments at one time share a step. Edits and history save automatically and survive reopening through
-**Open…**. Editing never overwrites source media. **Export…**, Slack, and Drive all
-render the current edit using the same composition as the preview, creating a
-separate MP4. Export encoding is independent of nondestructive editing.
+**Open…**. Pending timed edits are also journaled beside the project and restored
+after an unexpected exit. Undo/Redo reveals the affected edit. Editing never
+overwrites source media.
+
+**Canvas** sets the output shape (Source, 16:9, 9:16, or Square), padding, screen
+corner radius, and background color for the whole recording. The full screen image
+fits inside the canvas; camera placement uses the entire output, including margins.
+Preview and export use the same composition.
+
+The toolbar uses Undo, Redo, and Share icons with tooltips. Share offers **Save
+Video…** (Command-E) and **Share Video…** (Shift-Command-E). Save uses a native file
+panel with Full resolution, 1080p, and 720p size choices; Share prepares a video
+for the macOS share picker. Both show progress and Cancel. Output is compressed
+MP4, separate from the originals. Confirmed replacement of an exported file occurs
+only after rendering completes; cancellation leaves an existing destination intact.
+Command-S saves pending edits, including a name being edited.
+
+Projects stay in the list if their media is missing. Open one and use **Locate…**
+to copy the original file back into its project folder. The chosen source is left
+unchanged, and existing files are never overwritten by this recovery action.
 
 ## Accounts and sharing
 
 Open **Accounts** to connect Google Drive or Slack in your browser. After recording,
-click **Share…**, then select a Slack person or channel and click **Send**, or
+use the recording’s Share icon and choose **Upload…**, then select a Slack person or channel and click **Send**, or
 click **Upload** beside Google Drive. Uploads are manual and show progress; successful
 uploads copy their link to the clipboard. Drive uploads create a file in the
 root of your Drive and do not change its sharing permissions.
@@ -196,8 +234,28 @@ Use `Tools/build-debug.sh` for an incremental Debug build without terminal
 indexing; append `CODE_SIGNING_ALLOWED=NO` for a compile-only check. Regenerate the
 Xcode project after adding source files or changing `project.yml`.
 
+The current suspended build can be checked with `Tests/check-media-suspension.sh`
+without opening media or starting capture. Model, project-file, and text-control
+checks also remain available. The media checks below are currently skipped;
+their descriptions record what they verify when media processing is enabled.
+
 Automated checks run without camera hardware or connected accounts:
 
+- `Tests/check-recording-masters.sh`: synthetic ProRes/PCM tracks, first-frame
+  timing, separate audio, bounded backpressure, interrupted capture, and final frames.
+- `Tests/check-project-recovery.sh`: journal restoration, coalescing, stale/corrupt
+  journals, protected sources, failed saves, and history navigation.
+- `Tests/check-presentation-model.sh`, `check-presentation-renderer.sh`, and
+  `check-presentation-canvas.sh`: output geometry, legacy defaults, source fitting,
+  preview/export pixels, and gesture coordinates with padding.
+- `Tests/check-render-cadence.sh`: sparse high-quality masters retain 60 fps
+  preview/export animation; legacy projects retain 30 fps.
+- `Tests/check-video-export.sh`: export sizes, progress, approved replacement,
+  original protection, cancellation, and temporary-file cleanup.
+- `Tests/check-media-recovery.sh`: validated movie/pointer recovery, bounded copies,
+  cancellation, no-overwrite publication, and unchanged sources.
+- `Tests/check-recording-row.sh`: native thumbnail/open/share/remove targets,
+  independent recording actions, export state, and bounded thumbnail decoding.
 - `Tests/check-recording-project.sh`: edit persistence, legacy compatibility,
   undo/redo, resize and crop geometry, and source preservation.
 - `Tests/check-recording-names.sh`: shared names, legacy defaults, persisted
@@ -271,9 +329,6 @@ using the app's saved Slack token. Running it sends a real message.
 
 ## Deferred improvements
 
-- Higher-quality video/audio masters with separately configurable compressed
-  exports. Current screen and camera originals use H.264; nondestructive editing
-  preserves them but does not make the original capture lossless.
 - Automatically detect and center an off-center face when the PIP crop is smaller
   than the full camera image. Keep the full source, retain manual framing overrides,
   and make automatic framing reversible through the existing edit history.

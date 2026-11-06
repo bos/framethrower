@@ -8,7 +8,7 @@ struct FrameThrowerApp: App {
         Window("FrameThrower", id: "recorder") {
             ContentView(model: model)
         }
-        .defaultSize(width: 740, height: 740)
+        .defaultSize(width: 1100, height: 820)
         .windowStyle(.hiddenTitleBar)
         .commands {
             ProjectEditingCommands()

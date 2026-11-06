@@ -40,22 +40,22 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            VStack(spacing: 14) {
+            RecorderWorkspace {
                 captureCard
-                    .frame(maxHeight: .infinity)
+            } recordingControls: {
+                recordingBar
+            } recordings: {
                 if showRecording { recordingSummary }
             }
+            .frame(maxHeight: .infinity)
             .padding(.horizontal, 28)
             .padding(.top, 8)
             .padding(.bottom, 16)
-            recordingBar
-                .padding(.horizontal, 28)
-                .padding(.vertical, 16)
             footer
         }
         .background(colorScheme == .dark ? Color(white: 0.105) : Color(red: 0.965, green: 0.960, blue: 0.949))
         .tint(RecorderStyle.accent)
-        .frame(minWidth: 680, minHeight: model.camera.selectedDeviceID == nil ? 700 : 780)
+        .frame(minWidth: 1000, minHeight: 780)
         .onAppear {
             model.restoreLastProject()
             model.loadTokens()
@@ -112,8 +112,7 @@ struct ContentView: View {
             .help("Manage Google Drive and Slack accounts")
         }
         .padding(.horizontal, 28)
-        .padding(.top, 22)
-        .padding(.bottom, 22)
+        .padding(.vertical, 12)
     }
 
     private var captureCard: some View {
@@ -151,18 +150,20 @@ struct ContentView: View {
             .background(.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
             .disabled(captureLocked)
 
-            if model.captureKind == .display && model.hasScreenRecordingPermission {
+            if model.captureKind == .display && model.camera.selectedDeviceID == nil && model.hasScreenRecordingPermission {
                 DisplayCarousel(model: model, isEnabled: previewEnabled, sourcePreviews: sourcePreviews) {
                     previewEnabled = true
                 }
+                .frame(minHeight: 300, idealHeight: 400, maxHeight: .infinity)
             } else if model.hasScreenRecordingPermission {
                 CapturePreview(model: model,
                     isEnabled: previewEnabled || model.camera.selectedDeviceID != nil,
                     sourcePreviews: sourcePreviews)
+                    .frame(minHeight: 300, idealHeight: 400, maxHeight: .infinity)
             }
 
             if model.hasScreenRecordingPermission {
-                if model.captureKind != .display {
+                if model.captureKind != .display || model.camera.selectedDeviceID != nil {
                     sourceDetails
                         .disabled(captureLocked)
                 }
@@ -206,7 +207,14 @@ struct ContentView: View {
                 .labelsHidden()
                 .disabled(model.windows.isEmpty)
             case .display:
-                EmptyView()
+                Picker("Display", selection: $model.selectedDisplayID) {
+                    ForEach(model.displays) { display in
+                        Text(display.name).tag(Optional(display.id))
+                    }
+                }
+                .labelsHidden()
+                .disabled(model.displays.isEmpty)
+                .help("Choose the display shown in the recording preview.")
             case .area:
                 VStack(alignment: .leading, spacing: 3) {
                     Text(model.displays.first(where: { $0.id == model.selectedDisplayID })?.name ?? "Selected area")
@@ -215,11 +223,8 @@ struct ContentView: View {
                     Text("\(Int(model.area.width)) × \(Int(model.area.height)) points")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                    Text("Drag to draw, move, or resize the area. Choose… for precise on-screen selection.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .help("Drag the area outline to move or resize it. Choose… opens precise on-screen selection.")
                 Spacer()
             }
             if model.captureKind != .display {
@@ -308,14 +313,17 @@ struct ContentView: View {
     }
 
     private var recordingBar: some View {
-        HStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .trailing, spacing: 8) {
+            recordingControl
+            HStack(spacing: 8) {
                 if let recordingStatus {
                     HStack(spacing: 7) {
                         if model.isRecording {
                             Circle().fill(RecorderStyle.accent).frame(width: 6, height: 6)
                         }
-                        Text(recordingStatus).font(.system(size: 14, weight: .medium))
+                        Text(recordingStatus)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(2)
                     }
                 }
                 if let started = recordingStartedAt, model.isRecording {
@@ -324,9 +332,8 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Spacer(minLength: 0)
-            recordingControl
         }
+        .frame(maxWidth: .infinity, alignment: .trailing)
         .padding(.horizontal, 3)
         .padding(.vertical, 2)
     }
@@ -679,6 +686,34 @@ struct ContentView: View {
         case .window: "macwindow"
         case .display: "display"
         case .area: "viewfinder"
+        }
+    }
+}
+
+/// Capture sizing stays independent of the number of saved recordings. The
+/// record action has one stable position above the separately scrolling list.
+struct RecorderWorkspace<Capture: View, Controls: View, Recordings: View>: View {
+    private let capture: Capture
+    private let recordingControls: Controls
+    private let recordings: Recordings
+
+    init(@ViewBuilder capture: () -> Capture,
+         @ViewBuilder recordingControls: () -> Controls,
+         @ViewBuilder recordings: () -> Recordings) {
+        self.capture = capture()
+        self.recordingControls = recordingControls()
+        self.recordings = recordings()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 20) {
+            capture.frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 16) {
+                recordingControls.fixedSize(horizontal: false, vertical: true)
+                recordings.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+            .frame(width: 280)
+            .frame(maxHeight: .infinity, alignment: .top)
         }
     }
 }

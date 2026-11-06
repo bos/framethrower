@@ -9,10 +9,11 @@ struct ContentView: View {
     @State private var clipDuration: Double?
     @State private var clipSize = ""
     @State private var previewEnabled = false
+    @State private var isSharingPresented = false
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var canRecord: Bool {
-        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.camera.isPreparing else { return false }
+        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, model.isCameraReadyForCapture else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
         case .display: return model.selectedDisplayID != nil
@@ -24,29 +25,14 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(spacing: 18) {
-                        captureCard
-                        if showRecording {
-                            recordingCard.id("recording")
-                        } else {
-                            sharingHint
-                        }
-                    }
-                    .padding(.horizontal, 28)
-                    .padding(.top, 8)
-                    .padding(.bottom, 24)
-                }
-                .scrollIndicators(.hidden)
-                .onChange(of: showRecording) { _, visible in
-                    if visible {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo("recording", anchor: .bottom)
-                        }
-                    }
-                }
+            VStack(spacing: 14) {
+                captureCard
+                    .frame(maxHeight: .infinity)
+                if showRecording { recordingSummary }
             }
+            .padding(.horizontal, 28)
+            .padding(.top, 8)
+            .padding(.bottom, 16)
             recordingBar
                 .padding(.horizontal, 28)
                 .padding(.vertical, 16)
@@ -54,7 +40,7 @@ struct ContentView: View {
         }
         .background(colorScheme == .dark ? Color(white: 0.105) : Color(red: 0.965, green: 0.960, blue: 0.949))
         .tint(RecorderStyle.accent)
-        .frame(minWidth: 640, minHeight: 610)
+        .frame(minWidth: 680, minHeight: model.camera.selectedDeviceID == nil ? 700 : 780)
         .onAppear {
             model.restoreLastProject()
             model.loadTokens()
@@ -118,7 +104,7 @@ struct ContentView: View {
     }
 
     private var captureCard: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             HStack(spacing: 4) {
                 ForEach(CaptureSourceKind.allCases) { kind in
                     Button {
@@ -156,7 +142,7 @@ struct ContentView: View {
                 DisplayCarousel(model: model, isEnabled: previewEnabled) {
                     previewEnabled = true
                 }
-            } else {
+            } else if model.hasScreenRecordingPermission {
                 CapturePreview(model: model, isEnabled: previewEnabled)
             }
 
@@ -166,7 +152,7 @@ struct ContentView: View {
                         .disabled(captureLocked)
                 }
             } else {
-                permissionNotice
+                permissionNotice.frame(maxHeight: .infinity)
             }
 
             Divider().opacity(0.6)
@@ -397,16 +383,26 @@ struct ContentView: View {
         }
     }
 
-    private var sharingHint: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "arrow.up.right.square")
-            Text("A clip worth sharing? Send it to Slack or Drive when you're done.")
+    private var recordingSummary: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "play.rectangle")
+                .font(.system(size: 22)).foregroundStyle(RecorderStyle.accent)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Your recording").font(.system(size: 12, weight: .medium))
+                Text(clipSummary).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Edit…") { model.isProjectEditorPresented = true }
+                .disabled(model.projectEditor == nil || captureLocked || model.isAnyUploadActive)
+            Button("Share…") { isSharingPresented = true }
+                .disabled(captureLocked)
+                .popover(isPresented: $isSharingPresented) {
+                    recordingCard.frame(width: 560).padding(16)
+                }
         }
-        .font(.system(size: 11))
-        .foregroundStyle(.secondary)
-        .frame(maxWidth: .infinity)
-        .padding(.top, 10)
-        .padding(.bottom, 4)
+        .controlSize(.small)
+        .padding(14)
+        .modifier(RecorderCard())
     }
 
     private var recordingCard: some View {

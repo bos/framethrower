@@ -17,7 +17,7 @@ struct CapturePreview: View {
         model.captureKind == .window ? model.selectedWindow != nil : model.selectedDisplayID != nil
     }
 
-    private var captureLocked: Bool { model.isRecording || model.isCountdownActive }
+    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
 
     private var selectionKey: String {
         switch model.captureKind {
@@ -80,7 +80,7 @@ struct CapturePreview: View {
                 }
             }
         }
-        .frame(height: 220)
+        .frame(minHeight: 100, idealHeight: 220, maxHeight: .infinity)
         .frame(maxWidth: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(alignment: .topLeading) {

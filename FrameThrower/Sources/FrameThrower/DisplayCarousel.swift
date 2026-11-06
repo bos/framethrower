@@ -13,77 +13,82 @@ struct DisplayCarousel: View {
     @State private var isLoading = false
     @State private var refreshID = 0
 
-    private var captureLocked: Bool { model.isRecording || model.isCountdownActive }
+    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
     private var displayKey: String {
         model.displays.map { "\($0.id):\($0.display.width)x\($0.display.height)" }
             .joined(separator: ",")
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("CHOOSE A DISPLAY")
-                    .font(.system(size: 9, weight: .medium))
-                    .tracking(1.4)
-                Spacer()
-                Button {
-                    onSelect()
-                    refreshID += 1
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: 26, height: 26)
-                        .background(.white.opacity(0.08), in: Circle())
+        GeometryReader { geometry in
+            let imageHeight = max(64, geometry.size.height - 112)
+            VStack(spacing: 0) {
+                HStack {
+                    Text("CHOOSE A DISPLAY")
+                        .font(.system(size: 9, weight: .medium))
+                        .tracking(1.4)
+                    Spacer()
+                    Button {
+                        onSelect()
+                        refreshID += 1
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 11, weight: .medium))
+                            .frame(width: 26, height: 26)
+                            .background(.white.opacity(0.08), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh display previews")
+                    .accessibilityLabel("Refresh display previews")
+                    .disabled(captureLocked || isLoading || model.displays.isEmpty)
                 }
-                .buttonStyle(.plain)
-                .help("Refresh display previews")
-                .accessibilityLabel("Refresh display previews")
-                .disabled(captureLocked || isLoading || model.displays.isEmpty)
-            }
-            .foregroundStyle(.white.opacity(0.65))
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
+                .foregroundStyle(.white.opacity(0.65))
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
 
-            if model.displays.isEmpty {
-                ContentUnavailableView("No displays available", systemImage: "display")
-                    .foregroundStyle(.white.opacity(0.65))
-                    .frame(height: 202)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal) {
-                        HStack(alignment: .top, spacing: 18) {
-                            ForEach(model.displays) { display in
-                                DisplayCarouselTile(
-                                    title: display.name,
-                                    size: display.display.frame.size,
-                                    image: images[display.id],
-                                    isSelected: model.selectedDisplayID == display.id,
-                                    isLoading: isLoading && images[display.id] == nil,
-                                    failed: failedDisplays.contains(display.id)
-                                ) {
-                                    model.selectedDisplayID = display.id
-                                    onSelect()
+                if model.displays.isEmpty {
+                    ContentUnavailableView("No displays available", systemImage: "display")
+                        .foregroundStyle(.white.opacity(0.65))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView(.horizontal) {
+                            HStack(alignment: .top, spacing: 18) {
+                                ForEach(model.displays) { display in
+                                    DisplayCarouselTile(
+                                        title: display.name,
+                                        size: display.display.frame.size,
+                                        imageHeight: imageHeight,
+                                        image: images[display.id],
+                                        isSelected: model.selectedDisplayID == display.id,
+                                        isLoading: isLoading && images[display.id] == nil,
+                                        failed: failedDisplays.contains(display.id)
+                                    ) {
+                                        model.selectedDisplayID = display.id
+                                        onSelect()
+                                    }
+                                    .id(display.id)
                                 }
-                                .id(display.id)
+                            }
+                            .padding(.horizontal, 18)
+                            .padding(.top, 8)
+                            .padding(.bottom, 12)
+                        }
+                        .frame(maxHeight: .infinity)
+                        .defaultScrollAnchor(.center, for: .alignment)
+                        .scrollIndicators(.visible)
+                        .onChange(of: model.selectedDisplayID, initial: true) { _, selected in
+                            guard let selected else { return }
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                                proxy.scrollTo(selected, anchor: .center)
                             }
                         }
-                        .padding(.horizontal, 18)
-                        .padding(.top, 8)
-                        .padding(.bottom, 12)
+                        .disabled(captureLocked)
                     }
-                    .frame(height: 214)
-                    .defaultScrollAnchor(.center, for: .alignment)
-                    .scrollIndicators(.visible)
-                    .onChange(of: model.selectedDisplayID, initial: true) { _, selected in
-                        guard let selected else { return }
-                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
-                            proxy.scrollTo(selected, anchor: .center)
-                        }
-                    }
-                    .disabled(captureLocked)
                 }
             }
         }
+        .frame(minHeight: 176, idealHeight: 244, maxHeight: .infinity)
         .background {
             Color(white: 0.09)
                 .overlay {
@@ -154,6 +159,7 @@ struct DisplayCarousel: View {
 struct DisplayCarouselTile: View {
     var title: String
     var size: CGSize
+    var imageHeight: CGFloat = 132
     var image: NSImage?
     var isSelected: Bool
     var isLoading: Bool
@@ -200,7 +206,7 @@ struct DisplayCarouselTile: View {
                         .foregroundStyle(.white.opacity(0.45))
                     }
                 }
-                .frame(height: 132)
+                .frame(height: imageHeight)
                 .overlay {
                     RoundedRectangle(cornerRadius: 8)
                         .strokeBorder(

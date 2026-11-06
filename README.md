@@ -49,6 +49,9 @@ for normal use so macOS can recognize its recording permissions.
 
 ## Recording
 
+First launch opens in **Display** mode. Later launches remember the last mode and
+available source selection. A window that has closed requires choosing a new one.
+
 1. Grant FrameThrower access in **System Settings > Privacy & Security > Screen &
    System Audio Recording** (called **Screen Recording** on some macOS versions),
    then quit and relaunch the app. Capture controls stay disabled without access.
@@ -62,8 +65,9 @@ for normal use so macOS can recognize its recording permissions.
    Preview capture and permission requests do not run automatically on launch.
 3. Use the audio checkboxes to enable system audio and/or a microphone. Microphone
    capture needs its own macOS permission.
-4. Optionally choose a **Camera**. Its live preview lets you set the initial PIP
-   position and size; camera and microphone selection are independent. Camera
+4. Optionally choose a **Camera**. Its live layout appears inline automatically
+   so you can set its initial PIP position and size. Camera and microphone selection
+   are independent. Camera
    access is requested only when you select a camera. Choose **Off** to stop it.
 5. Click **Record**, or use its arrow for a 5- or 10-second countdown.
    Click **Stop recording** to finish. Command-R starts/stops recording.
@@ -100,7 +104,7 @@ separate MP4. Export encoding is independent of nondestructive editing.
 ## Accounts and sharing
 
 Open **Accounts** to connect Google Drive or Slack in your browser. After recording,
-select a Slack person or channel in the recording card and click **Send**, or
+click **Share…**, then select a Slack person or channel and click **Send**, or
 click **Upload** beside Google Drive. Uploads are manual and show progress; successful
 uploads copy their link to the clipboard. Drive uploads create a file in the
 root of your Drive and do not change its sharing permissions.
@@ -134,6 +138,12 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, overlapping
   hit targets, undo grouping, bounds, and keyboard seeking.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
+- `Tests/check-capture-lifecycle.sh`: bounded SDK callbacks, event ordering, media
+  finalization, and retry isolation.
+- `Tests/check-editor-interactions.sh`: production editor mouse gestures, exact
+  drag deltas, persisted undo/redo, and trim integration.
+- `Tests/check-project-streaming-playback.sh`: real AVPlayer frame output across
+  camera gaps, timed shapes, and smooth transitions.
 - `Tests/check-area-preview.sh`: area coordinate mapping, native drag interactions,
   keyboard nudges, and recording lock using offscreen views.
 
@@ -145,3 +155,4 @@ build alone does not verify capture permissions or authenticated uploads.
 `Tools/slack_upload.swift` is a separate developer helper: it uploads the latest
 legacy-prefixed recording (or a supplied path) to the configured `bos` Slack DM
 using the app's saved Slack token. Running it sends a real message.
+

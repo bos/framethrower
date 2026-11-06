@@ -49,7 +49,7 @@ struct RecordingTitleEditor: NSViewRepresentable {
 }
 
 @MainActor
-final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
+final class RecordingTitleField: NSTextField, NSTextFieldDelegate {
     var onOpen: (() -> Void)?
     var onBeginEditing: (() -> Void)?
     var onEditingChanged: ((Bool) -> Void)?
@@ -60,14 +60,12 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
     private var pendingRename: Task<Void, Never>?
     private var lastRenameRequest: UUID?
     private let cancellationEvents = RenameCancellationEvents()
+    let clearButton = NSButton()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        cell = RecordingTitleCell(textCell: "")
         delegate = self
-        (cell as? NSSearchFieldCell)?.searchButtonCell = nil
-        (cell as? NSSearchFieldCell)?.cancelButtonCell = nil
-        maximumRecents = 0
-        sendsWholeSearchString = true
         isEditable = false
         isSelectable = false
         isBordered = false
@@ -81,11 +79,29 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
         setAccessibilityHelp("Click to rename. Return saves; Escape or clicking outside cancels.")
         setAccessibilityRole(.textField)
         setAccessibilitySubrole(nil)
+        clearButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Clear recording name")
+        clearButton.imagePosition = .imageOnly
+        clearButton.imageScaling = .scaleProportionallyDown
+        clearButton.isBordered = false
+        clearButton.refusesFirstResponder = true
+        clearButton.focusRingType = .none
+        clearButton.contentTintColor = .secondaryLabelColor
+        clearButton.target = self
+        clearButton.action = #selector(clearDraft(_:))
+        clearButton.setAccessibilityLabel("Clear recording name")
+        clearButton.toolTip = "Clear the name."
+        clearButton.isHidden = true
+        addSubview(clearButton)
     }
 
     required init?(coder: NSCoder) { nil }
     deinit { pendingRename?.cancel() }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 24) }
+
+    override func layout() {
+        super.layout()
+        clearButton.frame = CGRect(x: max(0, bounds.width - 22), y: (bounds.height - 20) / 2, width: 20, height: 20)
+    }
 
     func setTitle(_ title: String) {
         committedTitle = title
@@ -142,14 +158,17 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
         drawsBackground = true
         backgroundColor = .textBackgroundColor
         focusRingType = .default
-        if let searchCell = cell as? NSSearchFieldCell {
-            searchCell.resetCancelButtonCell()
-            searchCell.cancelButtonCell?.target = self
-            searchCell.cancelButtonCell?.action = #selector(clearDraft(_:))
-            searchCell.cancelButtonCell?.setAccessibilityLabel("Clear recording name")
-        }
+        (cell as? RecordingTitleCell)?.showsClearButton = true
+        clearButton.isHidden = false
+        clearButton.isEnabled = isEnabled
+        setAccessibilityChildren([clearButton])
+        needsLayout = true
+        layoutSubtreeIfNeeded()
         window?.makeFirstResponder(self)
-        (currentEditor() as? NSTextView)?.selectAll(nil)
+        if let text = currentEditor() as? NSTextView {
+            text.allowsUndo = true
+            text.selectAll(nil)
+        }
         installCancellationEvents()
     }
 
@@ -162,7 +181,9 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
         }
         isRenaming = false
         cancellationEvents.stop()
-        (cell as? NSSearchFieldCell)?.cancelButtonCell = nil
+        (cell as? RecordingTitleCell)?.showsClearButton = false
+        clearButton.isHidden = true
+        setAccessibilityChildren([])
         stringValue = committedTitle
         isEditable = false
         isSelectable = false
@@ -184,11 +205,14 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
 
     @objc func clearDraft(_ sender: Any?) {
         guard isEnabled, isRenaming else { return }
-        stringValue = ""
         if let text = currentEditor() as? NSTextView {
-            text.string = ""
+            guard !text.string.isEmpty else { return }
+            text.breakUndoCoalescing()
+            text.insertText("", replacementRange: NSRange(location: 0, length: (text.string as NSString).length))
+            text.breakUndoCoalescing()
+            text.undoManager?.setActionName("Clear name")
             text.setSelectedRange(NSRange(location: 0, length: 0))
-        }
+        } else { stringValue = "" }
         needsDisplay = true
     }
 
@@ -246,6 +270,85 @@ final class RecordingTitleField: NSSearchField, NSSearchFieldDelegate {
             return true
         }
         return false
+    }
+}
+
+/// A plain title remains a plain text field when AppKit adopts it into a
+/// toolbar. Reserve the trailing clear target only while the name is editable.
+private final class RecordingTitleCell: NSTextFieldCell {
+    var showsClearButton = false
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        var result = super.drawingRect(forBounds: rect)
+        if showsClearButton { result.size.width = max(0, result.width - 22) }
+        return result
+    }
+}
+
+/// A text field owns Undo while its field editor is focused. Missing or empty
+/// native history must never fall through into the recording's edit history.
+@MainActor
+enum EditorUndoRouting {
+    private static func fieldEditor(in window: NSWindow?) -> NSTextView? {
+        guard let text = (window ?? NSApplication.shared.keyWindow)?.firstResponder as? NSTextView,
+              text.isFieldEditor else { return nil }
+        return text
+    }
+
+    static func canUndo(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
+        if let text = fieldEditor(in: window) { return text.undoManager?.canUndo ?? false }
+        return editor.canUndo
+    }
+
+    static func canRedo(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
+        if let text = fieldEditor(in: window) { return text.undoManager?.canRedo ?? false }
+        return editor.canRedo
+    }
+
+    static func undoName(editor: ProjectEditor, window: NSWindow? = nil) -> String {
+        if let text = fieldEditor(in: window) { return text.undoManager?.undoActionName ?? "" }
+        return editor.undoName
+    }
+
+    static func redoName(editor: ProjectEditor, window: NSWindow? = nil) -> String {
+        if let text = fieldEditor(in: window) { return text.undoManager?.redoActionName ?? "" }
+        return editor.redoName
+    }
+
+    @discardableResult
+    static func undo(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
+        if let text = fieldEditor(in: window) {
+            guard let manager = text.undoManager, manager.canUndo else { return false }
+            manager.undo()
+            return true
+        }
+        return editor.undo()
+    }
+
+    @discardableResult
+    static func redo(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
+        if let text = fieldEditor(in: window) {
+            guard let manager = text.undoManager, manager.canRedo else { return false }
+            manager.redo()
+            return true
+        }
+        return editor.redo()
+    }
+}
+
+@MainActor
+enum EditorSaveRouting {
+    @discardableResult
+    static func save(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
+        if let text = (window ?? NSApplication.shared.keyWindow)?.firstResponder as? NSTextView,
+           text.isFieldEditor, let field = text.delegate as? NSTextField {
+            _ = field.delegate?.control?(field, textView: text,
+                doCommandBy: #selector(NSResponder.insertNewline(_:)))
+            // Invalid submitted names remain editable and must not be
+            // silently omitted from a Save command.
+            if let title = field as? RecordingTitleField, title.isRenaming { return false }
+        }
+        return editor.save()
     }
 }
 

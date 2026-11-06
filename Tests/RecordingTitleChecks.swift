@@ -20,6 +20,8 @@ struct RecordingTitleChecks {
         let originalName = editor.displayName
         let field = RecordingTitleField(frame: CGRect(x: 10, y: 45, width: 300, height: 24))
         field.setTitle(originalName)
+        try require(!(field.cell is NSSearchFieldCell) && !field.isBezeled && !field.drawsBackground && field.clearButton.isHidden,
+                    "an inactive recording title must be plain text, not a search field or search pill")
         var opened = 0
         var began = 0
         var editingChanges: [Bool] = []
@@ -68,21 +70,64 @@ struct RecordingTitleChecks {
 
         field.beginRenaming()
         text = try nativeEditor(field)
+        let beforeTyping = editor.project
+        try require(window.firstResponder === text && text.isFieldEditor && text.allowsUndo,
+                    "name typing must use the window's undo-enabled native field editor")
+        text.insertText("Native typing draft", replacementRange: NSRange(location: NSNotFound, length: 0))
+        text.breakUndoCoalescing()
+        try require(text.string == "Native typing draft" && EditorUndoRouting.canUndo(editor: editor, window: window),
+                    "native name typing must register text undo")
+        try require(EditorUndoRouting.undo(editor: editor, window: window) && text.string == "Dinner demo" && editor.project == beforeTyping,
+                    "Undo while typing changes letters without undoing recording edits")
+        try require(EditorUndoRouting.canRedo(editor: editor, window: window) && EditorUndoRouting.redo(editor: editor, window: window) &&
+                    text.string == "Native typing draft" && editor.project == beforeTyping,
+                    "Redo while typing restores only the draft text")
+        text.undoManager?.removeAllActions()
+        try require(!EditorUndoRouting.canUndo(editor: editor, window: window) && !EditorUndoRouting.undo(editor: editor, window: window) && editor.project == beforeTyping,
+                    "empty native undo history must never fall through to recording undo")
+        field.cancelOperation(nil)
+        await settle()
+        try require(EditorUndoRouting.canUndo(editor: editor, window: window) && EditorUndoRouting.undo(editor: editor, window: window) && editor.displayName == originalName,
+                    "leaving the name field restores normal recording undo routing")
+        try require(EditorUndoRouting.redo(editor: editor, window: window) && editor.displayName == "Dinner demo",
+                    "recording redo routing restores the saved name")
+
+        field.beginRenaming()
+        text = try nativeEditor(field)
         text.string = "Draft to clear"
         field.stringValue = text.string
-        guard let searchCell = field.cell as? NSSearchFieldCell,
-              let clear = searchCell.cancelButtonCell, let action = clear.action else {
+        let clear = field.clearButton
+        guard let action = clear.action else {
             throw TitleCheckError.failed("native clear button missing")
         }
-        try require(searchCell.searchButtonCell == nil && clear.target === field, "rename exposes only the native inside clear control")
-        try require(NSApplication.shared.sendAction(action, to: clear.target, from: field), "native clear action is connected")
+        try require(!clear.isHidden && clear.target === field && clear.refusesFirstResponder,
+                    "rename exposes an inside clear button without taking text focus")
+        try require(field.accessibilityChildren()?.contains(where: { ($0 as AnyObject) === clear }) == true,
+                    "the clear button must be available to accessibility while renaming")
+        let drawing = field.cell!.drawingRect(forBounds: field.bounds)
+        try require(drawing.maxX <= clear.frame.minX, "editable text must leave space for the inside clear button")
+        let clearCenter = clear.convert(CGPoint(x: clear.bounds.midX, y: clear.bounds.midY), to: container)
+        let hit = container.hitTest(clearCenter)
+        try require(hit === clear || hit?.isDescendant(of: clear) == true,
+                    "the native text editor must leave the clear button hittable")
+        try require(NSApplication.shared.sendAction(action, to: clear.target, from: clear),
+                    "the native clear button action must be connected")
         try require(field.isRenaming && field.stringValue.isEmpty && text.string.isEmpty && field.currentEditor() === text,
                     "inside X clears only the draft and retains editing focus")
+        let beforeClearUndo = editor.project
+        try require(EditorUndoRouting.undo(editor: editor, window: window) && text.string == "Draft to clear" &&
+                    field.isRenaming && editor.project == beforeClearUndo,
+                    "Undo restores the cleared draft text without changing saved recording history")
+        try require(EditorUndoRouting.redo(editor: editor, window: window) && text.string.isEmpty &&
+                    field.isRenaming && editor.project == beforeClearUndo,
+                    "Redo clears the name again without changing saved recording history")
         text.string = "Uncommitted draft"
         _ = field.control(field, textView: text, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
         await settle()
         try require(!field.isRenaming && field.stringValue == "Dinner demo" && editor.project.undoHistory.count == 1,
                     "Escape restores the name without adding history")
+        try require(clear.isHidden && !field.isBezeled && !field.drawsBackground && !(field.cell is NSSearchFieldCell),
+                    "finishing a rename restores plain title presentation")
 
         field.beginRenaming()
         text = try nativeEditor(field)
@@ -137,7 +182,7 @@ struct RecordingTitleChecks {
         try require(editor.undo() && editor.displayName == originalName, "undo restores the prior recording name")
         try require(editor.redo() && editor.displayName == "Dinner demo", "redo restores the renamed recording")
         try require(try Data(contentsOf: source) == bytes, "renaming never alters original media")
-        print("Recording title checks passed (Enter saves; Escape/outside/focus/deactivation cancel; inside clear; pending clicks; state callbacks; undo/redo; source preservation).")
+        print("Recording title checks passed (plain title; inside clear; native typing undo routing; Enter saves; Escape/outside cancel; pending clicks; persistent undo/redo; source preservation).")
     }
 
     private static func nativeEditor(_ field: RecordingTitleField) throws -> NSTextView {

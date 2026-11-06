@@ -467,6 +467,10 @@ struct EditorAssistantPanel: View {
         .onChange(of: instructionSpeech.transcript) { _, text in
             session.recordSpeechHypothesis(text, phase: String(describing: instructionSpeech.phase))
         }
+        .onChange(of: instructionSpeech.phase) { _, _ in recordSpeechState() }
+        .onChange(of: instructionSpeech.recognizerIdentifier) { _, _ in recordSpeechState() }
+        .onChange(of: instructionSpeech.statusMessage) { _, _ in recordSpeechState() }
+        .onChange(of: instructionSpeech.errorMessage) { _, _ in recordSpeechState() }
         .onExitCommand {
             if instructionSpeech.isActive || session.isBusy || session.awaitsClarification {
                 session.cancel()
@@ -477,6 +481,12 @@ struct EditorAssistantPanel: View {
             session.suspend()
             Task { await instructionSpeech.cancel() }
         }
+    }
+
+    private func recordSpeechState() {
+        session.recordSpeechState(phase: String(describing: instructionSpeech.phase),
+            recognizer: instructionSpeech.recognizerIdentifier,
+            status: instructionSpeech.statusMessage, error: instructionSpeech.errorMessage)
     }
 
     private func regionRow(_ region: EditorRegion) -> some View {

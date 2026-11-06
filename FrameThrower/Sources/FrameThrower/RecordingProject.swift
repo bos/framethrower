@@ -388,10 +388,12 @@ struct EditState: Codable, Equatable, Sendable {
     var cursorStyle: CursorStyle = CursorStyle()
     var presentation: CanvasPresentation = CanvasPresentation()
     var regions: [EditorRegion] = []
+    var editAnchors: [EditAnchor] = []
 
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
-         presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = []) {
+         presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
+         editAnchors: [EditAnchor] = []) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -399,10 +401,11 @@ struct EditState: Codable, Equatable, Sendable {
         self.cursorStyle = cursorStyle
         self.presentation = presentation
         self.regions = regions
+        self.editAnchors = editAnchors
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -416,6 +419,7 @@ struct EditState: Codable, Equatable, Sendable {
         cursorStyle = try values.decodeIfPresent(CursorStyle.self, forKey: .cursorStyle) ?? CursorStyle()
         presentation = try values.decodeIfPresent(CanvasPresentation.self, forKey: .presentation) ?? CanvasPresentation()
         regions = try values.decodeIfPresent([EditorRegion].self, forKey: .regions) ?? []
+        editAnchors = try values.decodeIfPresent([EditAnchor].self, forKey: .editAnchors) ?? []
     }
 
     func zoom(at time: Double) -> ZoomPlacement {
@@ -482,6 +486,13 @@ struct EditState: Codable, Equatable, Sendable {
     }
 }
 
+/// A named timeline reference can precede any visual edit. Drawing a box must
+/// not insert a zoom or alter an existing interpolation merely to name a time.
+struct EditAnchor: Codable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+}
+
 /// One selectable moment, combining independently animated screen and camera
 /// properties. Existing files retain their independent tracks and interpolation.
 struct TimedEdit: Identifiable, Equatable {
@@ -489,6 +500,15 @@ struct TimedEdit: Identifiable, Equatable {
     let time: Double
     let zoomID: UUID?
     let cameraID: UUID?
+    let anchorID: UUID?
+
+    init(id: UUID, time: Double, zoomID: UUID?, cameraID: UUID?, anchorID: UUID? = nil) {
+        self.id = id
+        self.time = time
+        self.zoomID = zoomID
+        self.cameraID = cameraID
+        self.anchorID = anchorID
+    }
 }
 
 extension EditState {
@@ -504,19 +524,49 @@ extension EditState {
                 }
             }
         }
+        for anchor in editAnchors {
+            if let index = result.firstIndex(where: { abs($0.time - anchor.time) < 0.000001 }) {
+                let combined = result[index]
+                result[index] = TimedEdit(id: anchor.id, time: anchor.time, zoomID: combined.zoomID,
+                                         cameraID: combined.cameraID, anchorID: anchor.id)
+            } else {
+                result.append(TimedEdit(id: anchor.id, time: anchor.time, zoomID: nil, cameraID: nil, anchorID: anchor.id))
+            }
+        }
         return result.sorted { $0.time < $1.time }
+    }
+
+    /// A box and its reference mark form one value edit and one undo snapshot.
+    /// Additional boxes on this frame reuse its existing selectable moment.
+    @discardableResult
+    mutating func addRegion(rect: EditorRegionRect, at time: Double, includeCamera: Bool = true) -> EditorRegion {
+        let editID: UUID
+        if let existing = timedEdits(includeCamera: includeCamera).first(where: { abs($0.time - time) < 0.000001 }) {
+            editID = existing.id
+        } else {
+            let anchor = EditAnchor(time: time)
+            editAnchors.append(anchor)
+            editAnchors.sort { $0.time < $1.time }
+            editID = anchor.id
+        }
+        let region = EditorRegion(time: time, rect: rect, editID: editID)
+        regions.append(region)
+        return region
     }
 
     mutating func remove(_ edit: TimedEdit) {
         zoomKeyframes.removeAll { $0.id == edit.zoomID }
         pipKeyframes.removeAll { $0.id == edit.cameraID && $0.time > 0 }
+        editAnchors.removeAll { $0.id == edit.anchorID }
     }
 
     mutating func move(_ edit: TimedEdit, to time: Double) {
         if let index = zoomKeyframes.firstIndex(where: { $0.id == edit.zoomID }) { zoomKeyframes[index].time = time }
         if let index = pipKeyframes.firstIndex(where: { $0.id == edit.cameraID && $0.time > 0 }) { pipKeyframes[index].time = time }
+        if let index = editAnchors.firstIndex(where: { $0.id == edit.anchorID }) { editAnchors[index].time = time }
         zoomKeyframes.sort { $0.time < $1.time }
         pipKeyframes.sort { $0.time < $1.time }
+        editAnchors.sort { $0.time < $1.time }
     }
 }
 
@@ -544,11 +594,12 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var state: EditState
     var undoHistory: [NamedEditSnapshot] = []
     var redoHistory: [NamedEditSnapshot] = []
+    var references = EditorReferences()
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
-         captureFrameDuration: Double? = nil) {
+         captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences()) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
@@ -561,6 +612,39 @@ struct RecordingProject: Codable, Equatable, Sendable {
                                        pipKeyframes: [PIPKeyframe(time: 0, placement: PIPPlacement())])
         self.undoHistory = undoHistory
         self.redoHistory = redoHistory
+        self.references = references
+        ensureReferences()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, screenFilename, cameraFilename, cursorFilename, title, cameraOffset,
+             captureFrameDuration, duration, state, undoHistory, redoHistory, references
+    }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        screenFilename = try values.decode(String.self, forKey: .screenFilename)
+        cameraFilename = try values.decodeIfPresent(String.self, forKey: .cameraFilename)
+        cursorFilename = try values.decodeIfPresent(String.self, forKey: .cursorFilename)
+        title = try values.decodeIfPresent(String.self, forKey: .title)
+        cameraOffset = try values.decodeIfPresent(Double.self, forKey: .cameraOffset) ?? 0
+        captureFrameDuration = try values.decodeIfPresent(Double.self, forKey: .captureFrameDuration)
+        duration = try values.decode(Double.self, forKey: .duration)
+        state = try values.decode(EditState.self, forKey: .state)
+        undoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .undoHistory) ?? []
+        redoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .redoHistory) ?? []
+        references = try values.decodeIfPresent(EditorReferences.self, forKey: .references) ?? EditorReferences()
+        try references.validate()
+        ensureReferences()
+    }
+
+    mutating func ensureReferences(in extraState: EditState? = nil) {
+        references.register(state: state, includeCamera: cameraFilename != nil)
+        if let extraState { references.register(state: extraState, includeCamera: cameraFilename != nil) }
+        for snapshot in undoHistory + redoHistory {
+            references.register(state: snapshot.state, includeCamera: cameraFilename != nil)
+        }
     }
 
     func displayName(projectURL: URL) -> String {
@@ -601,6 +685,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     func validate() throws {
+        try references.validate()
         guard version == 1 else { throw ProjectError.invalid("Unsupported project version: \(version).") }
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {
             throw ProjectError.invalid("The recording has an invalid duration or camera offset.")
@@ -641,6 +726,24 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        guard state.editAnchors.count <= 100_000 else {
+            throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
+        }
+        var priorAnchorTime = -Double.infinity
+        var anchorIdentities = Set<UUID>()
+        for anchor in state.editAnchors {
+            guard anchor.time.isFinite, anchor.time >= 0, anchor.time <= duration,
+                  anchor.time - priorAnchorTime >= 0.000001,
+                  anchorIdentities.insert(anchor.id).inserted else {
+                throw ProjectError.invalid("Reference marks must have unique identities and ordered times inside the recording.")
+            }
+            let componentTimes = [state.zoomKeyframes.first(where: { $0.id == anchor.id })?.time,
+                                  state.pipKeyframes.first(where: { $0.id == anchor.id })?.time].compactMap { $0 }
+            guard componentTimes.allSatisfy({ abs($0 - anchor.time) < 0.000001 }) else {
+                throw ProjectError.invalid("An edit and its reference mark must share the same time.")
+            }
+            priorAnchorTime = anchor.time
+        }
         guard state.regions.count <= 256, Set(state.regions.map(\.id)).count == state.regions.count else {
             throw ProjectError.invalid("Scribbles must have unique identities; keep at most 256 per recording.")
         }
@@ -713,6 +816,7 @@ enum ProjectError: LocalizedError {
 @MainActor
 final class ProjectEditor: ObservableObject {
     @Published private(set) var project: RecordingProject
+    @Published private(set) var references: EditorReferences
     @Published private(set) var errorMessage: String?
     @Published private(set) var draftState: EditState?
     @Published private(set) var draftTime: Double?
@@ -733,6 +837,7 @@ final class ProjectEditor: ObservableObject {
         let baseSHA256: String
         let state: EditState
         let time: Double
+        var references: EditorReferences? = nil
     }
 
     var recoveryURL: URL { url.appendingPathExtension("recovery") }
@@ -745,7 +850,10 @@ final class ProjectEditor: ObservableObject {
     var displayName: String { project.title ?? defaultName }
 
     init(project: RecordingProject, url: URL) {
+        var project = project
+        project.ensureReferences()
         self.project = project
+        references = project.references
         self.url = url
         defaultName = RecordingProject.defaultTitle(screenFilename: project.screenFilename, projectURL: url)
     }
@@ -791,6 +899,7 @@ final class ProjectEditor: ObservableObject {
             return true
         }
         draftTime = time
+        references.register(state: state, includeCamera: project.cameraFilename != nil)
         draftState = state
         errorMessage = protectedRecoveryNotice
         scheduleRecovery()
@@ -932,7 +1041,8 @@ final class ProjectEditor: ObservableObject {
                 protectedRecoveryNotice = message
                 throw ProjectError.invalid(message)
             }
-            let journal = RecoveryJournal(baseSHA256: savedProjectDigest, state: draftState, time: draftTime)
+            let journal = RecoveryJournal(baseSHA256: savedProjectDigest, state: draftState, time: draftTime,
+                                          references: references)
             let data = try JSONEncoder().encode(journal)
             guard data.count <= Self.maximumRecoveryBytes else {
                 throw ProjectError.invalid("The unfinished edit is too large for its recovery file. Save the recording to preserve it.")
@@ -964,6 +1074,8 @@ final class ProjectEditor: ObservableObject {
             }
             var candidate = project
             candidate.state = journal.state
+            if let references = journal.references { try candidate.references.merge(references) }
+            candidate.ensureReferences()
             try candidate.validate()
             ownsRecoveryJournal = true
             guard journal.state != project.state else {
@@ -971,6 +1083,7 @@ final class ProjectEditor: ObservableObject {
                 return
             }
             draftTime = journal.time
+            references = candidate.references
             draftState = journal.state
             recoveryRestored = true
         } catch {
@@ -1024,12 +1137,21 @@ final class ProjectEditor: ObservableObject {
             if let old = oldCamera[id] { times.append(old.time) }
             if let new = newCamera[id] { times.append(new.time) }
         }
+        let oldAnchors = Dictionary(uniqueKeysWithValues: previous.editAnchors.map { ($0.id, $0) })
+        let newAnchors = Dictionary(uniqueKeysWithValues: next.editAnchors.map { ($0.id, $0) })
+        for id in Set(oldAnchors.keys).union(newAnchors.keys) where oldAnchors[id] != newAnchors[id] {
+            if let old = oldAnchors[id] { times.append(old.time) }
+            if let new = newAnchors[id] { times.append(new.time) }
+        }
         historyNavigationTime = preferredTime ?? times.min()
         if historyNavigationTime != nil { historyNavigationToken = UUID() }
     }
 
     private func persist(_ candidate: RecordingProject) -> Bool {
+        var candidate = candidate
         do {
+            try candidate.references.merge(references)
+            candidate.ensureReferences(in: draftState)
             try candidate.validate()
             let target = url.standardizedFileURL.resolvingSymlinksInPath()
             for filename in [candidate.screenFilename, candidate.cameraFilename, candidate.cursorFilename].compactMap({ $0 }) {
@@ -1042,6 +1164,7 @@ final class ProjectEditor: ObservableObject {
             let data = try encoder.encode(candidate)
             try data.write(to: url, options: .atomic)
             project = candidate
+            references = candidate.references
             savedProjectDigest = Self.digest(data)
             errorMessage = clearRecovery() ?? protectedRecoveryNotice
             return true

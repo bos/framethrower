@@ -32,14 +32,14 @@ struct ProjectRecoveryChecks {
                     "recovery waits for its coalescing interval")
         try await Task.sleep(for: .milliseconds(250))
         let recovered = try ProjectEditor.open(url: editor.url)
-        try require(recovered.recoveryRestored && recovered.project == baseline && recovered.draftState == state && recovered.draftTime == 2,
+        try require(recovered.recoveryRestored && recovered.project == baseline && recovered.references == editor.references && recovered.draftState == state && recovered.draftTime == 2,
                     "reopening restores the latest combined draft without rewriting saved history")
         try require(try Data(contentsOf: editor.url) == saved, "journaling cannot change the saved project")
         let journalData = try Data(contentsOf: editor.recoveryURL)
         let journal = try JSONSerialization.jsonObject(with: journalData) as! [String: Any]
-        try require(Set(journal.keys) == Set(["version", "baseSHA256", "state", "time"]) &&
+        try require(Set(journal.keys) == Set(["version", "baseSHA256", "state", "time", "references"]) &&
                     (journal["baseSHA256"] as? String)?.count == 64 && journal["undoHistory"] == nil,
-                    "recovery stores only a version, base digest, pending state, and source time")
+                    "recovery stores only a version, base digest, pending state, source time, and stable references")
         try await Task.sleep(for: .milliseconds(300))
         try require(try Data(contentsOf: editor.recoveryURL) == journalData, "an idle draft does not rewrite its journal repeatedly")
         try require(recovered.undo() && recovered.draftState == nil && recovered.canRedo &&

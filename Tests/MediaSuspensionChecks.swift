@@ -27,6 +27,7 @@ struct MediaSuspensionChecks {
         var next = project.state
         next.presentation.aspect = .portrait
         next.zoomKeyframes = [ZoomKeyframe(time: 4, scale: 2, x: 0.3, y: 0.4)]
+        next.audio = RecordingAudio(isMuted: true, volume: 0.6, fadeIn: 1, fadeOut: 2)
         try require(editor.updateDraft(next, at: 4), "framing remains editable")
         playback.preview(next)
         try require(playback.screenSize.height > playback.screenSize.width && playback.player.currentItem == nil,
@@ -77,7 +78,7 @@ struct MediaSuspensionChecks {
                     "suspended export does not mutate the edited project")
         try require(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("master.mov").path),
                     "suspended capture cannot create an output")
-        print("Media suspension checks passed (no media access; editable timeline/canvas; persistence and Undo/Redo; blocked capture, previews, thumbnails and export).")
+        print("Media suspension checks passed (no media access; editable timeline/canvas/audio; persistence and Undo/Redo; blocked capture, previews, thumbnails and export).")
     }
 
     private static func expectSuspended(_ operation: () async throws -> Void) async {

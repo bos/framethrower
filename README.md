@@ -146,7 +146,7 @@ cancels pending adjustments and deselects. Mouse clicks leave no full-timeline
 focus border; keyboard navigation uses a small cue beneath the playhead.
 
 The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**, plus **Canvas**
-controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
+and **Audio** controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
 it, including trackpad momentum. Double-click also zooms at that position, and
 mouse dragging pans a zoomed view. Repeated adjustments at the same source time
 refine one combined draft. Selecting an existing edit revises it in place. Leaving
@@ -195,6 +195,15 @@ overwrites source media.
 corner radius, and background color for the whole recording. The full screen image
 fits inside the canvas; camera placement uses the entire output, including margins.
 Preview and export use the same composition.
+
+**Audio** controls mute and volume for all original audio tracks together. Fade
+in and fade out run from the kept trim boundaries and can last up to five seconds
+each. If a short trim leaves too little room, both fades shorten proportionally;
+restoring a longer trim restores their requested lengths. Each slider gesture,
+mute change, or **Reset audio** is one undo step. Existing projects keep full
+volume with no fades. Audio edits change only project metadata; source tracks
+and their relative levels stay intact. Playback and export share the same gain
+envelope when media processing is enabled.
 
 The toolbar uses Undo, Redo, and Share icons with tooltips. Share offers **Save
 Video…** (Command-E) and **Share Video…** (Shift-Command-E). Save uses a native file

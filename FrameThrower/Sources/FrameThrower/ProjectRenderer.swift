@@ -41,16 +41,21 @@ struct RenderedProject {
     let sourceSize: CGSize
     let cameraAspect: Double
     let previewFrames: PreviewSourceFrames
+    let audioMix: AVAudioMix?
+    let audioTrackIDs: [CMPersistentTrackID]
 
     init(asset: AVComposition, videoComposition: AVVideoComposition, screenSize: CGSize,
          cameraAspect: Double, sourceSize: CGSize? = nil,
-         previewFrames: PreviewSourceFrames = PreviewSourceFrames()) {
+         previewFrames: PreviewSourceFrames = PreviewSourceFrames(),
+         audioMix: AVAudioMix? = nil, audioTrackIDs: [CMPersistentTrackID] = []) {
         self.asset = asset
         self.videoComposition = videoComposition
         self.screenSize = screenSize
         self.sourceSize = sourceSize ?? screenSize
         self.cameraAspect = cameraAspect
         self.previewFrames = previewFrames
+        self.audioMix = audioMix
+        self.audioTrackIDs = audioTrackIDs
     }
 }
 
@@ -96,6 +101,7 @@ enum ProjectRenderer {
 
         // ScreenCaptureKit may produce independent system and microphone tracks.
         // Preserve all of them, including any source-track leading offset.
+        var audioTrackIDs: [CMPersistentTrackID] = []
         for audioSource in try await screenAsset.loadTracks(withMediaType: .audio) {
             let available = try await audioSource.load(.timeRange)
             let range = CMTimeRangeGetIntersection(wholeRange, otherRange: available)
@@ -104,6 +110,7 @@ enum ProjectRenderer {
                 withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
             ) else { throw RenderError.cannotExport }
             try audioTrack.insertTimeRange(range, of: audioSource, at: range.start)
+            audioTrackIDs.append(audioTrack.trackID)
         }
 
         var cameraAspect = 16.0 / 9.0
@@ -159,7 +166,9 @@ enum ProjectRenderer {
         return RenderedProject(
             asset: composition, videoComposition: videoComposition,
             screenSize: renderSize, cameraAspect: cameraAspect, sourceSize: sourceGeometry.size,
-            previewFrames: previewFrames
+            previewFrames: previewFrames,
+            audioMix: audioMix(for: project.state, trackIDs: audioTrackIDs, duration: duration),
+            audioTrackIDs: audioTrackIDs
         )
     }
 
@@ -178,7 +187,35 @@ enum ProjectRenderer {
         }
         return RenderedProject(asset: rendered.asset, videoComposition: videoComposition,
                                screenSize: outputSize, cameraAspect: rendered.cameraAspect, sourceSize: rendered.sourceSize,
-                               previewFrames: rendered.previewFrames)
+                               previewFrames: rendered.previewFrames,
+                               audioMix: audioMix(for: state, trackIDs: rendered.audioTrackIDs,
+                                                  duration: rendered.asset.duration.seconds),
+                               audioTrackIDs: rendered.audioTrackIDs)
+    }
+
+    /// Source-time ramps preserve independent tracks and any leading gaps.
+    /// Identity settings deliberately leave the original audio pipeline alone.
+    private static func audioMix(for state: EditState, trackIDs: [CMPersistentTrackID],
+                                 duration: Double) -> AVAudioMix? {
+        guard state.audio != RecordingAudio(), !trackIDs.isEmpty else { return nil }
+        let points = state.audio.envelope(trimStart: state.trimStart, trimEnd: min(state.trimEnd, duration))
+        guard let first = points.first else { return nil }
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = trackIDs.map { trackID in
+            let parameters = AVMutableAudioMixInputParameters()
+            parameters.trackID = trackID
+            parameters.setVolume(Float(state.audio.isMuted ? 0 : state.audio.volume), at: .zero)
+            parameters.setVolume(Float(first.volume), at: time(first.time))
+            for (start, end) in zip(points, points.dropFirst()) {
+                let range = CMTimeRange(start: time(start.time), end: time(end.time))
+                if range.duration > .zero {
+                    parameters.setVolumeRamp(fromStartVolume: Float(start.volume), toEndVolume: Float(end.volume),
+                                             timeRange: range)
+                }
+            }
+            return parameters
+        }
+        return mix
     }
 
     /// Decode the current screen/camera source pair once for a frozen playhead.
@@ -289,6 +326,7 @@ enum ProjectRenderer {
             throw RenderError.cannotExport
         }
         exporter.videoComposition = videoComposition
+        exporter.audioMix = rendered.audioMix
         exporter.timeRange = CMTimeRange(start: time(start), duration: time(end - start))
         exporter.shouldOptimizeForNetworkUse = true
         let progressTask = Task { @MainActor in

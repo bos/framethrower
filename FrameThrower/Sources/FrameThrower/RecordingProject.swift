@@ -380,6 +380,50 @@ struct PresentationGeometry: Equatable, Sendable {
     }
 }
 
+/// Master controls apply to every original audio track, retaining their source
+/// offsets and relative levels. Requested fades survive later trim changes.
+struct RecordingAudio: Codable, Equatable, Sendable {
+    var isMuted = false
+    var volume = 1.0
+    var fadeIn = 0.0
+    var fadeOut = 0.0
+
+    static let maximumFade = 5.0
+
+    func validate() throws {
+        guard volume.isFinite, (0...1).contains(volume),
+              [fadeIn, fadeOut].allSatisfy({ $0.isFinite && (0...Self.maximumFade).contains($0) }) else {
+            throw ProjectError.invalid("Audio volume must be between 0 and 100%, and fades between 0 and 5 seconds.")
+        }
+    }
+
+    /// Fades shrink together when a trim leaves less room than requested.
+    /// Keeping this calculation separate from metadata avoids destructive edits
+    /// when a user shortens a trim and then restores it.
+    func effectiveFades(duration: Double) -> (fadeIn: Double, fadeOut: Double) {
+        let ramps = MotionInterpolation.rampDurations(duration: duration, easeIn: fadeIn, easeOut: fadeOut)
+        return (ramps.easeIn, ramps.easeOut)
+    }
+
+    struct Point: Equatable, Sendable {
+        var time: Double
+        var volume: Double
+    }
+
+    /// Linear gain points in source seconds, shared by playback and export.
+    func envelope(trimStart: Double, trimEnd: Double) -> [Point] {
+        guard trimStart.isFinite, trimEnd.isFinite, trimStart >= 0, trimEnd > trimStart else { return [] }
+        let level = isMuted ? 0 : (volume.isFinite ? min(1, max(0, volume)) : 1)
+        let fades = effectiveFades(duration: trimEnd - trimStart)
+        var points = [Point(time: trimStart, volume: fades.fadeIn > 0 ? 0 : level)]
+        if fades.fadeIn > 0 { points.append(Point(time: trimStart + fades.fadeIn, volume: level)) }
+        let outgoing = trimEnd - fades.fadeOut
+        if outgoing > points.last!.time { points.append(Point(time: outgoing, volume: level)) }
+        if trimEnd > points.last!.time { points.append(Point(time: trimEnd, volume: fades.fadeOut > 0 ? 0 : level)) }
+        return points
+    }
+}
+
 struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
@@ -389,11 +433,12 @@ struct EditState: Codable, Equatable, Sendable {
     var presentation: CanvasPresentation = CanvasPresentation()
     var regions: [EditorRegion] = []
     var editAnchors: [EditAnchor] = []
+    var audio = RecordingAudio()
 
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
-         editAnchors: [EditAnchor] = []) {
+         editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio()) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -402,10 +447,11 @@ struct EditState: Codable, Equatable, Sendable {
         self.presentation = presentation
         self.regions = regions
         self.editAnchors = editAnchors
+        self.audio = audio
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -420,6 +466,7 @@ struct EditState: Codable, Equatable, Sendable {
         presentation = try values.decodeIfPresent(CanvasPresentation.self, forKey: .presentation) ?? CanvasPresentation()
         regions = try values.decodeIfPresent([EditorRegion].self, forKey: .regions) ?? []
         editAnchors = try values.decodeIfPresent([EditAnchor].self, forKey: .editAnchors) ?? []
+        audio = try values.decodeIfPresent(RecordingAudio.self, forKey: .audio) ?? RecordingAudio()
     }
 
     func zoom(at time: Double) -> ZoomPlacement {
@@ -740,6 +787,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        try state.audio.validate()
         guard state.editAnchors.count <= 100_000 else {
             throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
         }

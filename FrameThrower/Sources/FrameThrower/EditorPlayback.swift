@@ -119,6 +119,7 @@ final class EditorPlayback: ObservableObject {
             guard request == generation, !Task.isCancelled else { return }
             let item = AVPlayerItem(asset: rendered.asset)
             item.videoComposition = rendered.videoComposition
+            item.audioMix = rendered.audioMix
             // A seek is not visually complete until the custom compositor has
             // produced its frame. Otherwise the next chase can starve display.
             item.seekingWaitsForVideoCompositionRendering = true

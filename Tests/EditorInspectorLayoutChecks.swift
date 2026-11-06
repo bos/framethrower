@@ -25,6 +25,11 @@ struct EditorInspectorLayoutChecks {
             let zoom = ZoomKeyframe(time: 3, scale: 2, transition: .smooth, duration: 1)
             project.state.zoomKeyframes = [zoom]
             project.state.pipKeyframes.append(PIPKeyframe(time: 3, placement: PIPPlacement(), transition: .smooth, duration: 1))
+            // Exercise the extra effective-fade state row inside the same fixed
+            // inspector allocation used by ordinary recording controls.
+            project.state.trimStart = 2
+            project.state.trimEnd = 2.5
+            project.state.audio = RecordingAudio(volume: 0.7, fadeIn: 1, fadeOut: 3)
             let editor = ProjectEditor(project: project, url: directory.appendingPathComponent(UUID().uuidString + ".framethrower"))
             guard editor.save() else { throw Failure.failed("Save metadata-only fixture") }
             let host = NSHostingView(rootView: ProjectEditorView(editor: editor))
@@ -36,7 +41,7 @@ struct EditorInspectorLayoutChecks {
             try await settle(host)
             guard let canvas: EditorCanvasView = find(in: host), let timeline: RecordingTimelineView = find(in: host),
                   let picker = all(NSSegmentedControl.self, in: host).first(where: {
-                      labels($0) == ["Zoom", "Pointer", "Camera", "Canvas"]
+                      labels($0) == ["Zoom", "Pointer", "Camera", "Canvas", "Audio"]
                   }), let action = picker.action else { throw Failure.failed("Production editor controls missing") }
 
             let baseline = frames(window, host, canvas, timeline)
@@ -44,7 +49,7 @@ struct EditorInspectorLayoutChecks {
                 if selected { timeline.onSelectEdit?(zoom.id) }
                 else { timeline.onDeselectEdit?() }
                 try await settle(host)
-                for segment in [2, 1, 3, 0, 2, 0] {
+                for segment in [2, 1, 4, 3, 4, 0, 2, 0] {
                     picker.selectedSegment = segment
                     guard picker.sendAction(action, to: picker.target) else { throw Failure.failed("Tool selection failed") }
                     try await settle(host)
@@ -60,7 +65,7 @@ struct EditorInspectorLayoutChecks {
             guard editor.project.state == project.state else { throw Failure.failed("Tool switching changed project edits") }
             window.close()
         }
-        print("Editor inspector layout checks passed (all four tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).")
+        print("Editor inspector layout checks passed (all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).")
     }
 
     private static func settle(_ host: NSView) async throws {

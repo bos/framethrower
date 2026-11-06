@@ -150,7 +150,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
 
     private func findInspector(in host: NSView) -> NSSegmentedControl? {
         findAll(NSSegmentedControl.self, in: host).first {
-            segmentLabels($0) == ["Zoom", "Pointer", "Camera", "Canvas"]
+            segmentLabels($0) == ["Zoom", "Pointer", "Camera", "Canvas", "Audio"]
         }
     }
 
@@ -444,9 +444,9 @@ private final class WindowGroupLayoutProbe: ObservableObject {
             output("WindowGroup baseline at width \(width): \(baseline)")
             guard let inspector = findInspector(in: host),
                   let action = inspector.action else {
-                throw ProbeError.failed("missing native Zoom/Pointer/Camera inspector control")
+                throw ProbeError.failed("missing native editor inspector control")
             }
-            for segment in [1, 2, 3, 0] {
+            for segment in [1, 2, 3, 4, 0] {
                 inspector.selectedSegment = segment
                 guard inspector.sendAction(action, to: inspector.target) else {
                     throw ProbeError.failed("inspector segment action was not delivered")

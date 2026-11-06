@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 private enum EditorInspector: String, CaseIterable {
-    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas"
+    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas", audio = "Audio"
 }
 
 struct ProjectEditorView: View {
@@ -13,6 +13,7 @@ struct ProjectEditorView: View {
     @State private var selectedInspector: EditorInspector = .zoom
     @State private var selectedEditID: UUID?
     @State private var presentationDraft: CanvasPresentation?
+    @State private var audioGestureTime: Double?
     @State private var timelineFitRequest: UUID?
     @State private var movingEditState: EditState?
     @State private var zoomEaseIn: Double?
@@ -329,7 +330,7 @@ struct ProjectEditorView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 360, height: 24)
+                .frame(width: 420, height: 24)
                 Spacer(minLength: 0)
                 if selectedInspector == .camera { cameraVisibility }
             }
@@ -339,6 +340,7 @@ struct ProjectEditorView: View {
                 case .zoom: zoomControls
                 case .pointer: pointerControls
                 case .camera: cameraControls
+                case .audio: audioControls
                 case .canvas:
                     PresentationControls(presentation: canvasPresentation,
                         onBegin: {
@@ -363,6 +365,80 @@ struct ProjectEditorView: View {
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var audioControls: some View {
+        let fades = state.audio.effectiveFades(duration: state.trimEnd - state.trimStart)
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Toggle("Mute", isOn: Binding(get: { state.audio.isMuted }, set: { muted in
+                    commitAudio(name: muted ? "Mute recording" : "Unmute recording") { $0.isMuted = muted }
+                }))
+                    .toggleStyle(.checkbox)
+                    .help("Mute all recorded audio. The original tracks and volume setting are preserved.")
+                CommitSlider(title: "Volume", value: state.audio.volume * 100, range: 0...100, valueSuffix: "%", valueFormat: "%.0f",
+                    begin: beginAudioGesture,
+                    preview: { value in previewAudio { $0.volume = value / 100 } }) { value in
+                        finishAudioGesture(name: "Change recording volume") { $0.volume = value / 100 }
+                    }
+                    .frame(width: 285)
+                    .help("Adjust every recorded audio track together, keeping their relative levels.")
+                Button("Reset audio") { commitAudio(name: "Reset recording audio") { $0 = RecordingAudio() } }
+                    .disabled(state.audio == RecordingAudio())
+                    .help("Restore full volume, unmute, and remove both fades.")
+                Spacer(minLength: 0)
+            }.frame(height: 24)
+            HStack(spacing: 16) {
+                CommitSlider(title: "Fade in", value: state.audio.fadeIn, range: 0...RecordingAudio.maximumFade,
+                    valueSuffix: " s", begin: beginAudioGesture,
+                    preview: { value in previewAudio { $0.fadeIn = value } }) { value in
+                        finishAudioGesture(name: "Change audio fade in") { $0.fadeIn = value }
+                    }
+                    .frame(width: 285)
+                    .help("Fade from silence at the kept trim start. Fades shorten together when the kept recording is shorter than their combined duration.")
+                CommitSlider(title: "Fade out", value: state.audio.fadeOut, range: 0...RecordingAudio.maximumFade,
+                    valueSuffix: " s", begin: beginAudioGesture,
+                    preview: { value in previewAudio { $0.fadeOut = value } }) { value in
+                        finishAudioGesture(name: "Change audio fade out") { $0.fadeOut = value }
+                    }
+                    .frame(width: 285)
+                    .help("Fade to silence at the kept trim end. Restoring a longer trim restores the requested fade lengths.")
+                Spacer(minLength: 0)
+            }.frame(height: 24)
+            if abs(fades.fadeIn - state.audio.fadeIn) > 0.000001 || abs(fades.fadeOut - state.audio.fadeOut) > 0.000001 {
+                Text("Fades in kept trim: \(fades.fadeIn, specifier: "%.2f") s in, \(fades.fadeOut, specifier: "%.2f") s out")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func beginAudioGesture() {
+        assistant.cancel()
+        playback.pause()
+        audioGestureTime = editor.finishDraft() ? playback.editingTime : nil
+    }
+
+    private func previewAudio(_ change: (inout RecordingAudio) -> Void) {
+        guard let time = audioGestureTime else { return }
+        var next = state
+        change(&next.audio)
+        _ = editor.updateDraft(next, at: time)
+    }
+
+    private func finishAudioGesture(name: String, change: (inout RecordingAudio) -> Void) {
+        guard audioGestureTime != nil else { return }
+        previewAudio(change)
+        _ = editor.finishDraft(name: name)
+        audioGestureTime = nil
+    }
+
+    private func commitAudio(name: String, change: (inout RecordingAudio) -> Void) {
+        assistant.cancel()
+        playback.pause()
+        guard editor.finishDraft() else { return }
+        var next = editor.project.state
+        change(&next.audio)
+        _ = editor.commit(next, name: name)
     }
 
     private var zoomControls: some View {
@@ -531,6 +607,7 @@ struct ProjectEditorView: View {
 
     private func cancelDraft() {
         presentationDraft = nil
+        audioGestureTime = nil
         _ = editor.cancelDraft()
         selectedEditID = nil
         playback.cancelPreview()
@@ -1010,6 +1087,7 @@ struct CommitSlider: View {
     let value: Double
     let range: ClosedRange<Double>
     var valueSuffix: String? = nil
+    var valueFormat = "%.2f"
     var begin: () -> Void = {}
     var preview: ((Double) -> Void)? = nil
     var commit: (Double) -> Void
@@ -1023,7 +1101,7 @@ struct CommitSlider: View {
                 if active { begin() } else { commit(draft) }
             }.accessibilityLabel(title)
             if let valueSuffix {
-                Text("\(editing ? draft : value, specifier: "%.2f")\(valueSuffix)")
+                Text("\(editing ? draft : value, specifier: valueFormat)\(valueSuffix)")
                     .font(.caption).monospacedDigit().frame(width: 45, alignment: .trailing)
             }
         }

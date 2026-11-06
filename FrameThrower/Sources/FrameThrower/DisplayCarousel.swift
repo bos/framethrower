@@ -172,6 +172,15 @@ struct DisplayCarousel: View {
     }
 }
 
+enum DisplayThumbnailGeometry {
+    static func fittedSize(for source: CGSize, maxHeight: CGFloat, maxWidth: CGFloat = 236) -> CGSize {
+        guard source.width.isFinite, source.height.isFinite, source.width > 0, source.height > 0,
+              maxHeight.isFinite, maxWidth.isFinite, maxHeight > 0, maxWidth > 0 else { return .zero }
+        let scale = min(maxWidth / source.width, maxHeight / source.height)
+        return CGSize(width: source.width * scale, height: source.height * scale)
+    }
+}
+
 struct DisplayCarouselTile: View {
     var title: String
     var size: CGSize
@@ -183,6 +192,10 @@ struct DisplayCarouselTile: View {
     var select: () -> Void
     @Environment(\.isEnabled) private var isEnabled
     @State private var isHovered = false
+
+    private var thumbnailSize: CGSize {
+        DisplayThumbnailGeometry.fittedSize(for: image?.size ?? size, maxHeight: imageHeight)
+    }
 
     private var previewStatus: String {
         if image != nil { return "preview loaded" }
@@ -205,54 +218,46 @@ struct DisplayCarouselTile: View {
                         in: Capsule()
                     )
 
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.white.opacity(0.045))
-                    if let image {
+                if let image {
+                    ZStack {
                         Image(nsImage: image)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .clipShape(RoundedRectangle(cornerRadius: 5))
-                            .padding(5)
-                    } else {
-                        VStack(spacing: 7) {
-                            if isLoading {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "display")
-                                    .font(.system(size: 25, weight: .ultraLight))
-                            }
-                            Text(failed ? "Preview unavailable" : "Display preview")
-                                .font(.system(size: 10))
+                    }
+                    .frame(width: thumbnailSize.width, height: thumbnailSize.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(
+                                isSelected ? RecorderStyle.accent : .white.opacity(isHovered ? 0.4 : 0.16),
+                                lineWidth: isSelected ? 2.5 : 1
+                            )
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if isSelected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 22, height: 22)
+                                .background(RecorderStyle.accent, in: Circle())
+                                .padding(8)
                         }
-                        .foregroundStyle(.white.opacity(0.45))
                     }
-                }
-                .frame(height: imageHeight)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(
-                            isSelected ? RecorderStyle.accent : .white.opacity(isHovered ? 0.4 : 0.16),
-                            lineWidth: isSelected ? 2.5 : 1
-                        )
-                }
-                .overlay(alignment: .topTrailing) {
-                    if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 22, height: 22)
-                            .background(RecorderStyle.accent, in: Circle())
-                            .padding(8)
+                    .shadow(color: isSelected ? RecorderStyle.accent.opacity(0.18) : .clear, radius: 9, y: 3)
+                } else {
+                    HStack(spacing: 6) {
+                        if isLoading { ProgressView().controlSize(.small) }
+                        Text(isLoading ? "Loading preview…" : failed ? "Preview unavailable" : "Preview not loaded")
+                            .font(.system(size: 10))
                     }
+                    .foregroundStyle(.white.opacity(0.45))
                 }
-                .shadow(color: isSelected ? RecorderStyle.accent.opacity(0.18) : .clear, radius: 9, y: 3)
 
                 Text("\(Int(size.width)) × \(Int(size.height)) points")
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.4))
             }
-            .frame(width: 236)
+            .frame(width: max(120, thumbnailSize.width))
             .contentShape(Rectangle())
             .opacity(isEnabled ? 1 : 0.65)
         }

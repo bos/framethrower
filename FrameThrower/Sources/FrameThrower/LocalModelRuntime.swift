@@ -161,15 +161,15 @@ actor LocalModelRuntime {
     }
 }
 
-private final class LocalModelProcess: @unchecked Sendable {
+final class LocalModelProcess: @unchecked Sendable {
     let client: LocalModelHTTPClient
     private let process: Process
     private let logFile: FileHandle
     private let keyURL: URL
 
-    init(serverURL: URL, modelURL: URL) throws {
-        let runDirectory = LocalModelRuntime.cacheDirectory.appendingPathComponent("runs/app-" + UUID().uuidString,
-                                                                                 isDirectory: true)
+    init(serverURL: URL, modelURL: URL, runDirectory: URL? = nil) throws {
+        let runDirectory = runDirectory ?? LocalModelRuntime.cacheDirectory.appendingPathComponent("runs/app-" + UUID().uuidString,
+                                                                                                  isDirectory: true)
         try FileManager.default.createDirectory(at: runDirectory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         let token = UUID().uuidString + UUID().uuidString
@@ -246,17 +246,38 @@ private final class LocalModelProcess: @unchecked Sendable {
         // Cleanup runs independently of request cancellation. It cannot be
         // interrupted before terminating the process and deleting its token.
         await Task.detached(priority: .utility) { [self] in
-            if process.isRunning {
-                process.terminate()
-                let deadline = Date().addingTimeInterval(2)
-                while process.isRunning && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
-                if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
-                process.waitUntilExit()
+            defer {
+                LocalModelProcessRegistry.shared.remove(process)
+                try? logFile.close()
+                try? FileManager.default.removeItem(at: keyURL)
             }
-            LocalModelProcessRegistry.shared.remove(process)
-            try? logFile.close()
-            try? FileManager.default.removeItem(at: keyURL)
+            if isProcessRunning {
+                // A child can exit between the state check and this signal.
+                // POSIX kill safely reports ESRCH instead of task-state errors.
+                _ = kill(process.processIdentifier, SIGTERM)
+                await waitForExit(until: .now.advanced(by: .seconds(2)))
+                if isProcessRunning {
+                    _ = kill(process.processIdentifier, SIGKILL)
+                    await waitForExit(until: .now.advanced(by: .seconds(1)))
+                }
+            }
         }.value
+    }
+
+    private var isProcessRunning: Bool {
+        guard process.isRunning else { return false }
+        // Foundation may lag kernel exit notification. An absent PID is done,
+        // even if its Process object has not published that state yet.
+        return kill(process.processIdentifier, 0) == 0 || errno != ESRCH
+    }
+
+    private func waitForExit(until deadline: ContinuousClock.Instant) async {
+        // waitUntilExit() can stall its Foundation run loop after the child is
+        // already gone. Poll without blocking a cooperative thread, using a
+        // monotonic bound for both graceful exit and the forced-kill fallback.
+        while isProcessRunning && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     private static func unusedPort() throws -> UInt16 {

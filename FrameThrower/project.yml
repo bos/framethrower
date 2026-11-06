@@ -44,12 +44,16 @@ targets:
         type: folder
     entitlements:
       path: Resources/FrameThrower.entitlements
+      properties:
+        com.apple.security.device.camera: true
     info:
       path: Resources/Info.plist
       properties:
         CFBundleDisplayName: FrameThrower
         CFBundleName: FrameThrower
         CFBundleIconFile: Resources/FrameThrower.icns
+        NSCameraUsageDescription: FrameThrower records your selected camera as an editable picture-in-picture track.
+        NSCameraUseContinuityCameraType: true
         NSMicrophoneUsageDescription: FrameThrower uses your microphone to add voiceover to recordings.
         CFBundleShortVersionString: "0.1.7"
         CFBundleVersion: "8"

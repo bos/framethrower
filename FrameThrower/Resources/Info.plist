@@ -8,12 +8,12 @@
 	<string>FrameThrower</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconFile</key>
+	<string>Resources/FrameThrower.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
-	<key>CFBundleIconFile</key>
-	<string>Resources/FrameThrower.icns</string>
 	<key>CFBundleName</key>
 	<string>FrameThrower</string>
 	<key>CFBundlePackageType</key>
@@ -37,11 +37,15 @@
 	<string></string>
 	<key>GDriveClientSecret</key>
 	<string></string>
+	<key>NSCameraUsageDescription</key>
+	<string>FrameThrower records your selected camera as an editable picture-in-picture track.</string>
+	<key>NSCameraUseContinuityCameraType</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>FrameThrower uses your microphone to add voiceover to recordings.</string>
 	<key>SlackClientID</key>
 	<string></string>
 	<key>SlackClientSecret</key>
 	<string></string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>FrameThrower uses your microphone to add voiceover to recordings.</string>
 </dict>
 </plist>

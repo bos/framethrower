@@ -576,6 +576,12 @@ struct NamedEditSnapshot: Codable, Equatable, Sendable {
     var title: String? = nil
 }
 
+/// Next action first, matching the normal Undo/Redo controls and model tools.
+struct EditorHistoryState: Codable, Equatable, Sendable {
+    var undo: [String] = []
+    var redo: [String] = []
+}
+
 /// Media filenames are relative to the project. Source media is never opened
 /// for writing by the editor, and history survives saving and reopening.
 struct RecordingProject: Codable, Equatable, Sendable {
@@ -745,7 +751,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
             priorAnchorTime = anchor.time
         }
         guard state.regions.count <= 256, Set(state.regions.map(\.id)).count == state.regions.count else {
-            throw ProjectError.invalid("Scribbles must have unique identities; keep at most 256 per recording.")
+            throw ProjectError.invalid("Boxes must have unique identities; keep at most 256 per recording.")
         }
         for region in state.regions { try region.validate(duration: duration) }
         let presentation = state.presentation
@@ -848,6 +854,11 @@ final class ProjectEditor: ObservableObject {
     var undoName: String { draftState != nil ? "Edit" : project.undoHistory.last?.name ?? "" }
     var redoName: String { draftState == nil ? project.redoHistory.last?.name ?? "" : "" }
     var displayName: String { project.title ?? defaultName }
+    var historyState: EditorHistoryState {
+        EditorHistoryState(
+            undo: (draftState == nil ? [] : ["Edit"]) + project.undoHistory.reversed().map(\.name),
+            redo: draftState == nil ? project.redoHistory.reversed().map(\.name) : [])
+    }
 
     init(project: RecordingProject, url: URL) {
         var project = project
@@ -962,42 +973,43 @@ final class ProjectEditor: ObservableObject {
     }
 
     @discardableResult
-    func undo() -> Bool {
-        if let draftState {
-            // Undoing a draft must be reversible too. Save the combined draft
-            // on a new redo branch without adding an intermediate undo entry.
-            var next = project
-            next.redoHistory = [NamedEditSnapshot(name: "Edit", state: draftState, title: project.title)]
-            let time = draftTime
-            guard persist(next) else { return false }
-            navigateHistory(from: draftState, to: project.state, preferredTime: time)
-            self.draftState = nil
-            draftTime = nil
-            recoveryRestored = false
-            return true
-        }
-        guard let snapshot = project.undoHistory.last else { return false }
+    func undo(count: Int = 1) -> Bool {
+        guard count > 0, count <= project.undoHistory.count + (draftState == nil ? 0 : 1) else { return false }
         var next = project
-        next.undoHistory.removeLast()
-        next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
-        next.state = snapshot.state
-        next.title = snapshot.title
-        let previous = project.state
+        let previous = editingState
+        var remaining = count
+        if let draftState {
+            // The unfinished gesture is the next stack entry, just as with
+            // Command-Z. A failed write retains it and both history branches.
+            next.redoHistory = [NamedEditSnapshot(name: "Edit", state: draftState, title: project.title)]
+            remaining -= 1
+        }
+        for _ in 0..<remaining {
+            guard let snapshot = next.undoHistory.popLast() else { return false }
+            next.redoHistory.append(NamedEditSnapshot(name: snapshot.name, state: next.state, title: next.title))
+            next.state = snapshot.state
+            next.title = snapshot.title
+        }
+        let preferredTime = draftState != nil && count == 1 ? draftTime : nil
         guard persist(next) else { return false }
-        navigateHistory(from: previous, to: next.state)
+        draftState = nil
+        draftTime = nil
+        recoveryRestored = false
+        navigateHistory(from: previous, to: next.state, preferredTime: preferredTime)
         return true
     }
 
     @discardableResult
-    func redo() -> Bool {
-        guard draftState == nil else { return false }
-        guard let snapshot = project.redoHistory.last else { return false }
+    func redo(count: Int = 1) -> Bool {
+        guard draftState == nil, count > 0, count <= project.redoHistory.count else { return false }
         var next = project
-        next.redoHistory.removeLast()
-        next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: project.state, title: project.title))
-        next.state = snapshot.state
-        next.title = snapshot.title
         let previous = project.state
+        for _ in 0..<count {
+            guard let snapshot = next.redoHistory.popLast() else { return false }
+            next.undoHistory.append(NamedEditSnapshot(name: snapshot.name, state: next.state, title: next.title))
+            next.state = snapshot.state
+            next.title = snapshot.title
+        }
         guard persist(next) else { return false }
         navigateHistory(from: previous, to: next.state)
         return true

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+check_dir=$(mktemp -d -t framethrower-timeline-check)
+trap 'rm -rf "$check_dir"' EXIT
+swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" \
+  "$repo_dir/Tests/RecordingTimelineChecks.swift" \
+  -o "$check_dir/check-recording-timeline"
+"$check_dir/check-recording-timeline"

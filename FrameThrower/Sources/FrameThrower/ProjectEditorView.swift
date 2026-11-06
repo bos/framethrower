@@ -10,7 +10,6 @@ struct ProjectEditorView: View {
     @State private var dragOrigin: PIPPlacement?
     @State private var dragPlacement: PIPPlacement?
     @State private var dragTime = 0.0
-    @State private var seekTime = 0.0
     @State private var exportError: String?
     @State private var isExporting = false
 
@@ -32,15 +31,7 @@ struct ProjectEditorView: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
             player
-            transport
-            TrimTimeline(duration: editor.project.duration, state: state, time: playback.time,
-                         onSeek: { playback.pause(); playback.seek($0) },
-                         onTrim: { start, end in
-                var edited = state
-                edited.trimStart = start
-                edited.trimEnd = end
-                editor.commit(edited, name: "Trim")
-            })
+            timeline
             if editor.project.cameraFilename != nil { cameraControls }
             if let message = editor.errorMessage ?? playback.errorMessage ?? exportError {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -57,7 +48,6 @@ struct ProjectEditorView: View {
                 self.selectedPoint = nil
             }
         }
-        .onChange(of: playback.time) { _, value in seekTime = value }
         .onDisappear { playback.close() }
         .disabled(isExporting)
     }
@@ -116,21 +106,47 @@ struct ProjectEditorView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    private var transport: some View {
-        HStack(spacing: 12) {
-            Button { playback.togglePlayback() } label: {
-                Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
+    private var timeline: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                Button { playback.togglePlayback() } label: {
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
+                }
+                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+                .disabled(playback.isLoading || playback.errorMessage != nil)
+                RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
+                    trimEnd: state.trimEnd, playhead: playback.time,
+                    onInteractionBegan: { playback.pause() },
+                    onSeek: { playback.seek($0) },
+                    onTrim: { start, end in setTrim(start, end) })
+                    .frame(height: 36)
+                    .help("Click or drag to scrub. Drag the blue handles to trim.")
+                Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
+                    .monospacedDigit().font(.caption)
             }
-            .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
-            .disabled(playback.isLoading || playback.errorMessage != nil)
-            Slider(value: $seekTime, in: state.trimStart...max(state.trimStart + 0.001, state.trimEnd)) { editing in
-                playback.pause()
-                if !editing { playback.seek(seekTime) }
-            }
-            .accessibilityLabel("Playhead")
-            Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
-                .monospacedDigit().font(.caption)
+            HStack {
+                Text("Keep \(state.trimStart, specifier: "%.2f")–\(state.trimEnd, specifier: "%.2f") s")
+                    .font(.caption).monospacedDigit()
+                Spacer()
+                Button("Start here") {
+                    setTrim(min(playback.time, state.trimEnd - minimumTrimLength), state.trimEnd)
+                }
+                Button("End here") {
+                    setTrim(state.trimStart, max(playback.time, state.trimStart + minimumTrimLength))
+                }
+                Button("Restore full recording") { setTrim(0, editor.project.duration) }
+            }.controlSize(.small)
         }
+    }
+
+    private var minimumTrimLength: Double { min(0.1, editor.project.duration) }
+
+    private func setTrim(_ start: Double, _ end: Double) {
+        playback.pause()
+        var edited = state
+        edited.trimStart = start
+        edited.trimEnd = end
+        editor.commit(edited, name: "Trim")
     }
 
     private var cameraControls: some View {
@@ -297,57 +313,3 @@ struct CommitSlider: View {
     }
 }
 
-struct TrimTimeline: View {
-    let duration: Double
-    let state: EditState
-    let time: Double
-    var onSeek: (Double) -> Void
-    var onTrim: (Double, Double) -> Void
-    @State private var draftStart: Double?
-    @State private var draftEnd: Double?
-    private var start: Double { draftStart ?? state.trimStart }
-    private var end: Double { draftEnd ?? state.trimEnd }
-    private var minimumLength: Double { min(0.1, duration) }
-
-    var body: some View {
-        VStack(spacing: 8) {
-            GeometryReader { proxy in
-                let width = max(1, proxy.size.width - 20)
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.primary.opacity(0.08)).frame(height: 6)
-                    Rectangle().fill(Color.accentColor.opacity(0.25))
-                        .frame(width: max(1, (end - start) / duration * width), height: 6)
-                        .offset(x: start / duration * width + 10)
-                    Rectangle().fill(.primary).frame(width: 1, height: 20)
-                        .offset(x: min(time, duration) / duration * width + 10)
-                    trimHandle(label: "Trim start", x: start / duration * width + 10)
-                        .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("trim")).onChanged { value in
-                            draftStart = min(max(0, state.trimStart + value.translation.width / width * duration), end - minimumLength)
-                        }.onEnded { _ in onTrim(start, end); draftStart = nil })
-                    trimHandle(label: "Trim end", x: end / duration * width + 10)
-                        .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("trim")).onChanged { value in
-                            draftEnd = max(min(duration, state.trimEnd + value.translation.width / width * duration), start + minimumLength)
-                        }.onEnded { _ in onTrim(start, end); draftEnd = nil })
-                }
-                .frame(height: 28)
-                .coordinateSpace(name: "trim")
-            }.frame(height: 28)
-            HStack {
-                Text("Keep \(start, specifier: "%.2f")–\(end, specifier: "%.2f") s").font(.caption).monospacedDigit()
-                Spacer()
-                Button("Start here") { onTrim(min(time, end - minimumLength), end) }
-                Button("End here") { onTrim(start, max(time, start + minimumLength)) }
-                Button("Restore full recording") { onTrim(0, duration) }
-            }.controlSize(.small)
-        }
-    }
-
-    private func trimHandle(label: String, x: Double) -> some View {
-        RoundedRectangle(cornerRadius: 4).fill(Color.accentColor)
-            .frame(width: 10, height: 20).overlay { Capsule().fill(.white).frame(width: 2, height: 8) }
-            .frame(width: 24, height: 28)
-            .contentShape(Rectangle())
-            .position(x: x, y: 14)
-            .accessibilityLabel(label)
-    }
-}

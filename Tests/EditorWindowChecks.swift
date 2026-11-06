@@ -8,7 +8,7 @@ private enum WindowCheckError: Error { case failed(String) }
 @main
 @MainActor
 struct EditorWindowChecks {
-    static func main() throws {
+    static func main() async throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -89,6 +89,45 @@ struct EditorWindowChecks {
         try require(restoredSecond.undo(), "undo second window after restart")
         try require(restoredFirst.project.state == trimmed,
                     "restored second-window undo must not alter the restored first window")
+
+        try require(model.recordingLibrary.entries.count == 2,
+                    "resolving multiple saved recordings must retain every library row")
+        try require(first.rename(to: "First demonstration"), "rename through shared editor")
+        try require(model.recordingLibrary.entries.first(where: { $0.projectURL == firstURL })?.displayName == first.displayName,
+                    "renaming an open editor must immediately update its library row")
+        try require(first.undo(), "undo shared recording name")
+        try require(model.recordingLibrary.entries.first(where: { $0.projectURL == firstURL })?.displayName == first.displayName,
+                    "undoing rename must update the library without reopening it")
+        let requestBeforeShare = model.editorOpenRequest
+        try require(model.selectRecordingForSharing(at: firstURL) && model.projectEditor === first
+                    && model.lastRecordingURL == first.mediaURL(for: first.project.screenFilename),
+                    "sharing a library row must select that recording rather than the latest clip")
+        try require(model.editorOpenRequest == requestBeforeShare, "sharing must not open an editor window")
+        model.openRecording(at: secondURL)
+        try require(model.projectEditor === second && model.editorOpenRequest?.url == secondURL,
+                    "opening a library row must target its independent editor")
+        try require(!model.selectRecordingForSharing(at: directory.appendingPathComponent("absent.framethrower"))
+                    && model.projectEditor === second,
+                    "a failed row selection must not replace the current sharing target")
+        let restartedLibrary = RecordingLibrary(defaults: defaults, directories: [])
+        await restartedLibrary.refresh()
+        try require(Set(restartedLibrary.entries.map(\.projectURL)) == Set([firstURL, secondURL]),
+                    "the recorder's imported library must survive restart independently of Movies discovery")
+        model.recordingLibrary.remove(at: secondURL)
+        try require(second.rename(to: "Second while hidden"), "edit name in an already-open removed recording")
+        try require(!model.recordingLibrary.entries.contains(where: { $0.projectURL == secondURL }),
+                    "an open editor must not silently restore a removed library row")
+        let afterRemoval = CaptureViewModel(userDefaults: defaults, recordingDirectories: [])
+        afterRemoval.restoreLastProject()
+        await afterRemoval.recordingLibrary.refresh()
+        try require(!afterRemoval.recordingLibrary.entries.contains(where: { $0.projectURL == secondURL }),
+                    "restoring the last editor on launch must respect list removal")
+        try require(afterRemoval.recordingLibrary.restoreLastRemoved()
+                    && afterRemoval.recordingLibrary.entries.contains(where: { $0.projectURL == secondURL && $0.displayName == "Second while hidden" }),
+                    "undo removal after restart must restore the latest saved name")
+        model.openRecording(at: secondURL)
+        try require(model.recordingLibrary.entries.contains(where: { $0.projectURL == secondURL }),
+                    "explicitly reopening a removed project must return it to the list")
 
         let brokenURL = directory.appendingPathComponent("broken.framethrower")
         try Data("broken project".utf8).write(to: brokenURL)

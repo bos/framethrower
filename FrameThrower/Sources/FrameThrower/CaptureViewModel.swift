@@ -113,16 +113,24 @@ final class CaptureViewModel: ObservableObject {
     }
 
     let camera = CameraRecorder()
+    let recordingLibrary: RecordingLibrary
     private var cameraChanges: AnyCancellable?
+    private var libraryChanges: AnyCancellable?
 
-    init(userDefaults: UserDefaults = .standard) {
+    init(userDefaults: UserDefaults = .standard, recordingDirectories: [URL]? = nil) {
         self.userDefaults = userDefaults
+        if let recordingDirectories {
+            recordingLibrary = RecordingLibrary(defaults: userDefaults, directories: recordingDirectories)
+        } else {
+            recordingLibrary = RecordingLibrary(defaults: userDefaults)
+        }
         let preferences = CaptureSelectionPreferences(defaults: userDefaults)
         capturePreferences = preferences
         captureKind = preferences.kind
         selectedWindowID = preferences.windowID
         selectedDisplayID = preferences.displayID
         cameraChanges = camera.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        libraryChanges = recordingLibrary.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
     }
 
     var isCameraReadyForCapture: Bool {
@@ -136,6 +144,7 @@ final class CaptureViewModel: ObservableObject {
     }
     @Published private(set) var editorOpenRequest: EditorOpenRequest?
     private var projectEditors: [URL: ProjectEditor] = [:]
+    private var projectChanges: [URL: AnyCancellable] = [:]
     @Published private(set) var isCaptureBusy = false
     @Published private(set) var isExporting = false
     private var activeCameraURL: URL?
@@ -1061,7 +1070,8 @@ final class CaptureViewModel: ObservableObject {
             let editor = ProjectEditor(project: project, url: url)
             guard editor.save() else { throw ProjectError.invalid(editor.errorMessage ?? "Could not save the project.") }
             projectEditor = editor
-            projectEditors[canonicalProjectURL(url)] = editor
+            registerProjectEditor(editor)
+            recordingLibrary.register(project: editor.project, at: editor.url, restoreRemoved: true)
             userDefaults.set(url.path, forKey: "editor.lastProject")
             requestProjectEditor()
             log("Recording saved. Review, trim, and arrange your camera before sharing.")
@@ -1074,9 +1084,11 @@ final class CaptureViewModel: ObservableObject {
     func restoreLastProject() {
         guard !didRestoreProject else { return }
         didRestoreProject = true
-        guard let path = userDefaults.string(forKey: "editor.lastProject"),
-              FileManager.default.fileExists(atPath: path) else { return }
-        openProject(at: URL(fileURLWithPath: path), present: false)
+        if let path = userDefaults.string(forKey: "editor.lastProject"),
+           FileManager.default.fileExists(atPath: path) {
+            openProject(at: URL(fileURLWithPath: path), present: false, restoreRemoved: false)
+        }
+        Task { [recordingLibrary] in await recordingLibrary.refresh() }
     }
 
     @discardableResult
@@ -1094,18 +1106,38 @@ final class CaptureViewModel: ObservableObject {
         let canonical = canonicalProjectURL(url)
         if let existing = projectEditors[canonical] { return existing }
         if let current = projectEditor, canonicalProjectURL(current.url) == canonical {
-            projectEditors[canonical] = current
+            registerProjectEditor(current)
             return current
         }
         let editor = try ProjectEditor.open(url: canonical)
-        projectEditors[canonical] = editor
+        registerProjectEditor(editor)
         return editor
+    }
+
+    private func registerProjectEditor(_ editor: ProjectEditor) {
+        let url = canonicalProjectURL(editor.url)
+        if projectEditors[url] === editor, projectChanges[url] != nil { return }
+        projectEditors[url] = editor
+        projectChanges[url] = editor.$project.sink { [weak self] project in
+            self?.recordingLibrary.register(project: project, at: url)
+        }
+    }
+
+    func openRecording(at url: URL) {
+        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isAnyUploadActive else { return }
+        openProject(at: url, present: true)
+    }
+
+    @discardableResult
+    func selectRecordingForSharing(at url: URL) -> Bool {
+        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isAnyUploadActive else { return false }
+        return openProject(at: url, present: false) != nil
     }
 
     func requestProjectEditor() {
         guard let projectEditor else { return }
         let url = canonicalProjectURL(projectEditor.url)
-        projectEditors[url] = projectEditor
+        registerProjectEditor(projectEditor)
         editorOpenRequest = EditorOpenRequest(url: url)
     }
 
@@ -1114,7 +1146,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func openProject(at url: URL, present: Bool) -> ProjectEditor? {
+    private func openProject(at url: URL, present: Bool, restoreRemoved: Bool = true) -> ProjectEditor? {
         do {
             let editor = try self.editor(for: url)
             let screenURL = editor.mediaURL(for: editor.project.screenFilename)
@@ -1122,6 +1154,7 @@ final class CaptureViewModel: ObservableObject {
                 throw ProjectError.invalid("Keep the project and its original media files together.")
             }
             projectEditor = editor
+            recordingLibrary.register(project: editor.project, at: editor.url, restoreRemoved: restoreRemoved)
             lastRecordingURL = screenURL
             lastDriveFileURL = nil
             lastSlackFileURL = nil

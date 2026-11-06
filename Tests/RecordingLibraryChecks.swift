@@ -162,8 +162,10 @@ struct RecordingLibraryChecks {
         let pointerBytes = Data("independent pointer original".utf8)
         try cameraBytes.write(to: movies.appendingPathComponent("camera.mov"))
         try pointerBytes.write(to: movies.appendingPathComponent("pointer.json"))
-        let sizedEditor = ProjectEditor(project: sized, url: editor.url)
-        try require(sizedEditor.save(), "save multi-source size fixture")
+        // Changing source references is fixture setup, not an unsaved editor's
+        // permission to replace an already existing project on its first save.
+        try JSONEncoder().encode(sized).write(to: editor.url, options: .atomic)
+        let sizedEditor = try ProjectEditor.open(url: editor.url)
         dismissed.register(project: sizedEditor.project, at: sizedEditor.url, restoreRemoved: true)
         let sizedEntry = dismissed.entries.first { $0.id == sizedEditor.url }
         try require(sizedEntry?.duration == 7 && sizedEntry?.fileSize == Int64(sourceBytes[0].count + cameraBytes.count + pointerBytes.count),

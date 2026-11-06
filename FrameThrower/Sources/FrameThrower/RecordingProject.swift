@@ -891,6 +891,7 @@ final class ProjectEditor: ObservableObject {
     let url: URL
     private let defaultName: String
     private var savedProjectDigest: String?
+    private var savedProjectByteCount: Int?
     private var recoveryTask: Task<Void, Never>?
     private var ownsRecoveryJournal = false
     private var protectedRecoveryNotice: String?
@@ -930,11 +931,13 @@ final class ProjectEditor: ObservableObject {
     deinit { recoveryTask?.cancel() }
 
     static func open(url: URL) throws -> ProjectEditor {
+        let url = url.standardizedFileURL.resolvingSymlinksInPath()
         let data = try Data(contentsOf: url)
         let project = try JSONDecoder().decode(RecordingProject.self, from: data)
         try project.validate()
         let editor = ProjectEditor(project: project, url: url)
         editor.savedProjectDigest = digest(data)
+        editor.savedProjectByteCount = data.count
         editor.restoreRecovery()
         return editor
     }
@@ -1237,7 +1240,7 @@ final class ProjectEditor: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(candidate)
-            try data.write(to: url, options: .atomic)
+            try writeProject(data)
             do {
                 publishingHistoryOperation = operation
                 defer { publishingHistoryOperation = nil }
@@ -1245,6 +1248,7 @@ final class ProjectEditor: ObservableObject {
             }
             references = candidate.references
             savedProjectDigest = Self.digest(data)
+            savedProjectByteCount = data.count
             errorMessage = clearRecovery() ?? protectedRecoveryNotice
             return true
         } catch {
@@ -1252,6 +1256,36 @@ final class ProjectEditor: ObservableObject {
             if draftState != nil { _ = flushRecovery() }
             errorMessage = message
             return false
+        }
+    }
+
+    /// An open editor owns only the exact saved version it read or wrote.
+    /// Missing or externally replaced projects must not become silent resets
+    /// of another editor's changes, even for Rename, Undo, or an ordinary Save.
+    private func writeProject(_ data: Data) throws {
+        if let savedProjectDigest {
+            guard let savedProjectByteCount,
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  (attributes[.size] as? NSNumber)?.int64Value == Int64(savedProjectByteCount),
+                  let existing = try? Data(contentsOf: url), Self.digest(existing) == savedProjectDigest else {
+                throw ProjectError.invalid("The saved project changed or is unavailable at \(url.path). It was not overwritten. Restore the version opened in this editor, then try again.")
+            }
+            try data.write(to: url, options: .atomic)
+        } else {
+            // A new recording has no saved baseline. Publish a staged sibling
+            // exclusively, so even a destination appearing during the write
+            // cannot be replaced by this first save.
+            let staged = url.deletingLastPathComponent().appendingPathComponent(".framethrower-save-\(UUID().uuidString).partial")
+            defer { try? FileManager.default.removeItem(at: staged) }
+            try data.write(to: staged, options: .withoutOverwriting)
+            do { try FileManager.default.linkItem(at: staged, to: url) }
+            catch {
+                if (try? FileManager.default.attributesOfItem(atPath: url.path)) != nil {
+                    throw ProjectError.invalid("A file or folder already exists at \(url.path). Open the existing project or choose a different project location.")
+                }
+                throw error
+            }
         }
     }
 }

@@ -1,0 +1,198 @@
+import Foundation
+
+private enum AssistantCheckError: Error { case failed(String) }
+private enum FixtureTransportError: LocalizedError {
+    case failed
+    var errorDescription: String? { "Fixture transport failed." }
+}
+
+/// Deliberately ignores cancellation until the test releases a reply. This
+/// exercises generation boundaries even with an uncooperative transport.
+private actor AssistantTransport {
+    private(set) var payloads: [Data] = []
+    private var continuations: [Int: CheckedContinuation<Data, any Error>] = [:]
+
+    func send(_ payload: Data) async throws -> Data {
+        let index = payloads.count
+        payloads.append(payload)
+        return try await withCheckedThrowingContinuation { continuations[index] = $0 }
+    }
+    func succeed(_ index: Int, data: Data) { continuations.removeValue(forKey: index)?.resume(returning: data) }
+    func fail(_ index: Int) { continuations.removeValue(forKey: index)?.resume(throwing: FixtureTransportError.failed) }
+}
+
+@main
+@MainActor
+struct EditorAssistantSessionChecks {
+    static func main() async throws {
+        try await checkAtomicSubmissionAndBusy()
+        try await checkFailurePreservesInstruction()
+        try await checkStaleProjectRejection()
+        try await checkCancelledLateReply()
+        try await checkClarificationFollowup()
+        print("Editor assistant session checks passed (atomic Undo, busy gating, failure preservation, stale revisions, cancelled late replies, and clarification context).")
+    }
+
+    private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
+        guard try condition() else { throw AssistantCheckError.failed(message) }
+    }
+    private static func waitUntil(_ condition: @escaping @MainActor () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        throw AssistantCheckError.failed("asynchronous assistant operation timed out")
+    }
+
+    private static func checkAtomicSubmissionAndBusy() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let baseline = fixture.editor.project.state
+        let revision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        session.instruction = "At one second, zoom into this area and hold for a second."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try require(session.isBusy, "submission immediately owns its busy state")
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        try require(fixture.editor.project.state == baseline && !fixture.editor.canUndo,
+                    "waiting for a plan cannot change the project")
+        let response = try sequence(session: session, revision: revision, region: fixture.region.id)
+        await transport.succeed(0, data: response)
+        try await waitUntil { !session.isBusy }
+        let requestCount = await transport.payloads.count
+        try require(requestCount == 1, "repeat submission cannot start a second request")
+        try require(session.errorMessage == nil && session.instruction.isEmpty && session.notice != nil,
+                    "successful submission reports completion and clears the submitted instruction")
+        try require(fixture.editor.project.undoHistory.count == 1 && fixture.editor.project.state.zoomKeyframes.count == 3,
+                    "a multi-anchor sequence has one normal history entry")
+        let finished = fixture.editor.project.state
+        try require(fixture.editor.undo() && fixture.editor.project.state == baseline,
+                    "one Undo restores the complete previous state")
+        try require(fixture.editor.redo() && fixture.editor.project.state == finished,
+                    "one Redo restores the complete planned sequence")
+    }
+
+    private static func checkFailurePreservesInstruction() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let instruction = "Zoom into this area."
+        session.instruction = instruction
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        await transport.fail(0)
+        try await waitUntil { !session.isBusy }
+        try require(session.instruction == instruction && session.errorMessage == "Fixture transport failed." && session.notice == nil,
+                    "transport failure retains the user's request for correction or retry")
+        try require(!fixture.editor.canUndo, "transport failure cannot add history")
+    }
+
+    private static func checkStaleProjectRejection() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let revision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        let instruction = "At one second, zoom into this area."
+        session.instruction = instruction
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        try require(fixture.editor.rename(to: "Changed during planning"), "make a user change while waiting")
+        await transport.succeed(0, data: try sequence(session: session, revision: revision, region: fixture.region.id))
+        try await waitUntil { !session.isBusy }
+        try require(session.errorMessage == EditorCommandError.stale.localizedDescription && session.instruction == instruction,
+                    "stale replies preserve the request and report the actual conflict")
+        try require(fixture.editor.displayName == "Changed during planning" && fixture.editor.project.state.zoomKeyframes.isEmpty &&
+                    fixture.editor.project.undoHistory.count == 1, "stale reply cannot overwrite independent edits or add history")
+    }
+
+    private static func checkCancelledLateReply() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let revision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        session.instruction = "At one second, zoom into this area."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        session.cancel()
+        try require(!session.isBusy && session.notice == nil, "cancellation immediately releases the panel state")
+        session.instruction = "Describe this area as search results."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 2 }
+        await transport.succeed(0, data: try sequence(session: session, revision: revision, region: fixture.region.id))
+        // The cancelled task resumes before this check; it must not steal the
+        // new task's ownership or erase the newer instruction.
+        for _ in 0..<20 { await Task.yield() }
+        try require(session.isBusy && session.instruction == "Describe this area as search results." && !fixture.editor.canUndo,
+                    "late cancelled reply cannot apply edits, clear newer input, or end a newer request")
+        let response = try tool("label_region", ["project_id": session.projectID.uuidString, "expected_revision": revision,
+            "region_id": fixture.region.id.uuidString, "label": "Search results"])
+        await transport.succeed(1, data: response)
+        try await waitUntil { !session.isBusy }
+        try require(fixture.editor.project.state.regions[0].note == "Search results" &&
+                    fixture.editor.project.state.zoomKeyframes.isEmpty && fixture.editor.project.undoHistory.count == 1,
+                    "only the newer request may commit")
+    }
+
+    private static func checkClarificationFollowup() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        let revision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        let original = "Zoom into this area."
+        session.instruction = original
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        let question = "When should the movement start?"
+        await transport.succeed(0, data: try tool("ask_clarification", ["question": question]))
+        try await waitUntil { !session.isBusy }
+        try require(session.notice == question && session.instruction.isEmpty && !fixture.editor.canUndo,
+                    "clarification is a question, not a successful edit")
+        session.instruction = "At one second."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 2 }
+        let payload = await transport.payloads[1]
+        let object = try JSONSerialization.jsonObject(with: payload) as! [String: Any]
+        let messages = object["messages"] as! [[String: Any]]
+        let content = messages.last?["content"] as? String ?? ""
+        try require(content.contains("Earlier instruction: " + original) && content.contains("Question: " + question) &&
+                    content.contains("Answer: At one second."), "followup retains the original request and its question")
+        await transport.succeed(1, data: try sequence(session: session, revision: revision, region: fixture.region.id))
+        try await waitUntil { !session.isBusy }
+        try require(fixture.editor.project.undoHistory.count == 1 && session.errorMessage == nil,
+                    "clarification followed by an answer still creates one edit")
+    }
+
+    private static func sequence(session: EditorAssistantSession, revision: String, region: UUID) throws -> Data {
+        try tool("plan_sequence", ["project_id": session.projectID.uuidString, "expected_revision": revision,
+            "start_seconds": 1, "steps": [["region_id": region.uuidString, "move_seconds": 0.4, "hold_seconds": 1]]])
+    }
+    private static func tool(_ name: String, _ arguments: [String: Any]) throws -> Data {
+        let arguments = String(decoding: try JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
+        return try JSONSerialization.data(withJSONObject: ["choices": [["message": ["tool_calls": [["type": "function",
+            "function": ["name": name, "arguments": arguments]]]]]]])
+    }
+
+    @MainActor
+    private struct Fixture {
+        let directory: URL
+        let editor: ProjectEditor
+        let region = EditorRegion(time: 0, rect: EditorRegionRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4))
+        init() throws {
+            directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var project = RecordingProject(screenFilename: "original.mov", duration: 12)
+            project.state.regions = [region]
+            let url = directory.appendingPathComponent("recording.framethrower")
+            try JSONEncoder().encode(project).write(to: url)
+            editor = try ProjectEditor.open(url: url)
+        }
+        func remove() { try? FileManager.default.removeItem(at: directory) }
+    }
+}

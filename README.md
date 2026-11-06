@@ -208,7 +208,35 @@ Projects stay in the list if their media is missing. Open one and use **Locate�
 to copy the original file back into its project folder. The chosen source is left
 unchanged, and existing files are never overwritten by this recovery action.
 
-## Local command-model experiments
+## Local editing instructions and scribbles
+
+Open the editor's speech-bubble button to type or dictate an editing instruction.
+The pencil button turns on **Scribble** and opens the same sidebar. Drag a box on
+the preview to identify an area; select it and say “this area” in an instruction.
+The box is stored in original source coordinates with the source timestamp.
+Selecting a saved area returns to that frame. Scribble mode owns drawing gestures;
+turn it off to pan, pinch, or move the camera. Escape cancels an unfinished box,
+then exits Scribble. An area's X removes its guide and note; Undo restores both.
+
+An optional area note can be typed or dictated. Return saves a note; Escape or
+moving focus away cancels its draft. Notes describe guides and do not become
+visible graphics. Dictation first produces editable text; submitting an instruction
+is a separate action. Apple SpeechAnalyzer runs on-device on supported macOS26+
+hardware/locales. It may download Apple speech assets on first use; audio is
+never sent to a transcription service. There is no cloud speech fallback.
+
+Supported instructions add smooth region-to-region framing sequences with timed
+holds, return to full frame, revise the selected edit while preserving its timing,
+and label areas. Each complete request is one normal saved Undo/Redo operation.
+Ambiguous requests ask a question. If a sequence overlaps existing framing edits,
+the assistant asks for an explicit revision instead of silently replacing them.
+Edits made while a request is running invalidate its revision and prevent stale
+results from applying. Escape, the request X, or closing the sidebar cancels it.
+
+Video processing remains suspended. Guides and framing metadata work on the
+placeholder preview; decoding footage, screenshots of footage, visual recognition,
+capture, rendering, and export remain unavailable. The text model knows only
+provided area coordinates/notes and the selected edit, and cannot inspect footage.
 
 `llama.cpp` can run the optional Qwen3-4B Q4_K_M GGUF locally. The installer pins
 an official Qwen release and verifies its SHA-256 before using it. The 2.50 GB
@@ -220,6 +248,8 @@ manifest. Install `llama.cpp` first if `llama-server` is unavailable.
 python3 -B Tools/local_model.py install
 Tests/check-local-agent.sh
 python3 -B Tests/LocalModelClientChecks.py
+Tests/check-local-edit-planner.sh --model
+Tests/check-local-model-runtime.sh --model
 ```
 
 Installation downloads weights. Inference uses an offline server bound to numeric
@@ -227,13 +257,16 @@ loopback with a per-run local key, proxies disabled, redirects rejected, and no 
 remote tools or cloud fallback. Metal on Apple Silicon is the default; use
 `Tests/check-local-agent.sh --backend cpu` only for diagnostics. Text inference
 uses a different pipeline from video decoding/scaling and leaves the media
-interlock enabled. The runner stops its model process when the check finishes.
+interlock enabled. The native app also starts and stops its own model process
+per request; cancellation and app termination clean up its authentication key.
 
 The six synthetic tool-call checks cover movement/hold timing, selected scribble
 references, voice labels, revising existing edits, ambiguous targets, and the
-video interlock. This is a proposed command-contract experiment; it does not yet
-connect to the running editor, transcribe speech, inspect images, or apply edits.
-Prompts and model responses stay in private local run directories under
+video interlock. That Python harness remains a prototype check. The native
+planner test additionally exercises the app's actual Swift transport, plan
+parser, command dispatcher, project save, and atomic Undo/Redo. Its timing test
+checks every requested movement, including the final zoom back out.
+Development harness prompts and responses stay in private local directories under
 `~/Library/Caches/FrameThrower/LocalModel/runs`. Console output contains only case
 names, pass/fail results and timings. Network-boundary unit checks use a temporary
 loopback HTTP server and require no model.
@@ -241,7 +274,17 @@ loopback HTTP server and require no model.
 To keep a model server open for development, run
 `python3 -B Tools/local_model.py serve`. It prints its loopback address and the
 local key/log directory; Control-C stops it. Model and runtime choices are
-isolated from the editor's project model and future tool API.
+isolated from the editor's project model and command API.
+
+`EditorCommandBatch` is the provider-independent integration boundary: a version,
+project UUID, expected SHA-256 revision, and ordered typed commands. Supported
+actions are `frameRegion`, `fullFrame`, `holdFraming`, `reviseFraming`, and
+`labelRegion`. Times are original recording seconds; framing timestamps are
+arrival times and movement duration specifies the preceding transition. Region
+rectangles use normalized top-left source coordinates. The dispatcher validates
+the complete batch before committing, accepts no paths or executable operations,
+and rejects stale projects and pending manual drafts. UI, future MCP adapters,
+and App Intents can share it; external MCP/Siri adapters are not implemented yet.
 
 ## Accounts and sharing
 

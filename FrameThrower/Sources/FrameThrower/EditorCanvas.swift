@@ -23,6 +23,11 @@ struct EditorCanvas: NSViewRepresentable {
     var onZoomCommit: (ZoomPlacement, String) -> Void = { _, _ in }
     var presentation = CanvasPresentation()
     var nativeSourceSize: CGSize? = nil
+    var scribbleMode = false
+    var regions: [EditorRegion] = []
+    var selectedRegionID: UUID? = nil
+    var onDrawRegion: (EditorRegionRect) -> Void = { _ in }
+    var onSelectRegion: (UUID?) -> Void = { _ in }
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -34,6 +39,11 @@ struct EditorCanvas: NSViewRepresentable {
         view.onZoomPreview = onZoomPreview
         view.onZoomCommit = onZoomCommit
         view.allowsZoomEditing = allowsZoomEditing
+        view.scribbleMode = scribbleMode
+        view.regions = regions
+        view.selectedRegionID = selectedRegionID
+        view.onDrawRegion = onDrawRegion
+        view.onSelectRegion = onSelectRegion
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
             placement: placement, cameraEnabled: cameraEnabled, zoom: zoom,
@@ -48,6 +58,21 @@ final class EditorCanvasView: NSView {
     private let canvasBorder = CALayer()
     private let outline = CAShapeLayer()
     private let handles = CAShapeLayer()
+    private let guides = CALayer()
+    var scribbleMode = false {
+        didSet {
+            guard oldValue != scribbleMode else { return }
+            if scribbleMode { trackpad = nil; zoomDrag = nil; drag = nil }
+            if !scribbleMode { scribbleStart = nil; scribbleDraft = nil }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    var regions: [EditorRegion] = []
+    var selectedRegionID: UUID?
+    var onDrawRegion: ((EditorRegionRect) -> Void)?
+    var onSelectRegion: ((UUID?) -> Void)?
+    private var scribbleStart: CGPoint?
+    private var scribbleDraft: EditorRegionRect?
     private(set) var canvasRect = CGRect.zero
     private(set) var contentRect = CGRect.zero
     private(set) var placement = PIPPlacement()
@@ -108,7 +133,7 @@ final class EditorCanvasView: NSView {
         handles.fillColor = NSColor.white.cgColor
         handles.strokeColor = NSColor.black.withAlphaComponent(0.55).cgColor
         handles.lineWidth = 1
-        for child in [playerLayer, stillLayer, canvasBorder, outline, handles] { layer?.addSublayer(child) }
+        for child in [playerLayer, stillLayer, canvasBorder, outline, handles, guides] { layer?.addSublayer(child) }
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
@@ -173,6 +198,27 @@ final class EditorCanvasView: NSView {
             circles.addEllipse(in: CGRect(x: point.x - 4.5, y: point.y - 4.5, width: 9, height: 9))
         }
         handles.path = circles
+        updateGuides()
+    }
+
+    private var scribbleGeometry: ScribbleGeometry { ScribbleGeometry(contentRect: contentRect, zoom: zoom) }
+
+    private func updateGuides() {
+        guides.frame = bounds
+        guides.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard scribbleMode else { return }
+        let values = regions.map { ($0.rect, $0.id == selectedRegionID) } + (scribbleDraft.map { [($0, true)] } ?? [])
+        for (region, selected) in values {
+            let rect = scribbleGeometry.viewRect(region).intersection(contentRect)
+            guard !rect.isNull, !rect.isEmpty else { continue }
+            let shape = CAShapeLayer()
+            shape.path = CGPath(rect: rect, transform: nil)
+            shape.strokeColor = (selected ? NSColor.controlAccentColor : NSColor.white).cgColor
+            shape.fillColor = NSColor.controlAccentColor.withAlphaComponent(selected ? 0.15 : 0.04).cgColor
+            shape.lineWidth = selected ? 2 : 1
+            shape.lineDashPattern = selected ? nil : [5, 3]
+            guides.addSublayer(shape)
+        }
     }
 
     private func cornerPoint(_ corner: PIPResizeCorner, in rect: CGRect) -> CGPoint {
@@ -181,11 +227,19 @@ final class EditorCanvasView: NSView {
     }
 
     override func resetCursorRects() {
+        if scribbleMode { addCursorRect(contentRect, cursor: .crosshair); return }
         if allowsZoomEditing, zoom.scale > 1 { addCursorRect(canvasRect, cursor: .openHand) }
     }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if scribbleMode {
+            guard scribbleGeometry.sourcePoint(point) != nil else { return }
+            window?.makeFirstResponder(self)
+            scribbleStart = point
+            scribbleDraft = nil
+            return
+        }
         let rect = placement.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
         let corner = PIPResizeCorner.allCases.first { corner in
@@ -216,6 +270,13 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let scribbleStart {
+            scribbleDraft = scribbleGeometry.region(from: scribbleStart, to: convert(event.locationInWindow, from: nil))
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            updateGuides()
+            CATransaction.commit()
+            return
+        }
         if var pan = zoomDrag {
             let point = convert(event.locationInWindow, from: nil)
             let next = ZoomPlacement(scale: pan.origin.scale,
@@ -250,6 +311,20 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let scribbleStart {
+            let point = convert(event.locationInWindow, from: nil)
+            let region = scribbleGeometry.region(from: scribbleStart, to: point)
+            self.scribbleStart = nil
+            scribbleDraft = nil
+            if let region { onDrawRegion?(region) }
+            else {
+                onSelectRegion?(regions.reversed().first { scribbleGeometry.viewRect($0.rect).contains(point) }?.id)
+            }
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            updateGuides()
+            CATransaction.commit()
+            return
+        }
         if let pan = zoomDrag {
             zoomDrag = nil
             zoom = pan.draft
@@ -320,6 +395,12 @@ final class EditorCanvasView: NSView {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if scribbleStart != nil {
+            scribbleStart = nil; scribbleDraft = nil
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            updateGuides(); CATransaction.commit()
+            return
+        }
         if let trackpad { zoom = trackpad.origin }
         else if let zoomDrag { zoom = zoomDrag.origin }
         trackpad = nil
@@ -333,7 +414,7 @@ final class EditorCanvasView: NSView {
     }
 
     private func acceptsTrackpad(_ event: NSEvent) -> Bool {
-        guard allowsZoomEditing, drag == nil, zoomDrag == nil,
+        guard !scribbleMode, allowsZoomEditing, drag == nil, zoomDrag == nil,
               contentRect.width > 0, contentRect.height > 0 else { return false }
         return trackpad != nil || canvasRect.contains(convert(event.locationInWindow, from: nil))
     }

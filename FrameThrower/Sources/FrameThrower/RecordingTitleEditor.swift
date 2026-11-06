@@ -322,7 +322,10 @@ private final class RecordingTitleCell: NSTextFieldCell {
 
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         var result = super.drawingRect(forBounds: rect)
-        if showsClearButton { result.size.width = max(0, result.width - 22) }
+        if showsClearButton {
+            result.origin.x += 6
+            result.size.width = max(0, result.width - 34)
+        }
         return result
     }
 }

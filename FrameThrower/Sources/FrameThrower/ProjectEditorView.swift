@@ -30,6 +30,10 @@ struct ProjectEditorView: View {
     @State private var cameraFrameError: String?
     @StateObject private var exportSession = VideoExportSession()
     @State private var playAfterRebuild = false
+    @StateObject private var assistant = EditorAssistantSession()
+    @State private var isAssistantPresented = false
+    @State private var scribbleMode = false
+    @State private var selectedRegionID: UUID?
 
     private var state: EditState { editor.editingState }
     private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
@@ -67,7 +71,11 @@ struct ProjectEditorView: View {
                 playback.preview(draft)
             }
         }
-        .onChange(of: editor.project.state) { _, _ in
+        .onChange(of: editor.project.state) { old, next in
+            if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
+            var oldVisual = old; oldVisual.regions = []
+            var nextVisual = next; nextVisual.regions = []
+            guard oldVisual != nextVisual else { return }
             Task {
                 await playback.rebuild(editor: editor)
                 if playAfterRebuild { playAfterRebuild = false; playback.togglePlayback() }
@@ -84,8 +92,10 @@ struct ProjectEditorView: View {
             playback.pause()
             playback.seek(time)
         }
-        .onDisappear { exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
+        .onDisappear { assistant.cancel(); exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            assistant.cancel()
+            LocalModelRuntime.terminateOwnedProcess()
             _ = editor.finishDraft()
         }
         .onExitCommand { if movingEditState != nil { cancelMove() } else { cancelDraft() } }
@@ -93,9 +103,15 @@ struct ProjectEditorView: View {
         .toolbar(removing: .title)
         .toolbar {
             ToolbarItemGroup(placement: .navigation) { ProjectUndoButtons(editor: editor) }
-            ToolbarItem(placement: .principal) {
-                RecordingTitleEditor(editor: editor, renameRequest: editorRenameRequest, font: .systemFont(ofSize: 13, weight: .semibold))
-                    .frame(minWidth: 140, idealWidth: 240, maxWidth: 320, minHeight: 24, maxHeight: 24)
+            recordingTitleToolbar
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { toggleScribble() } label: { Image(systemName: "pencil.tip.crop.circle") }
+                    .tint(scribbleMode ? .accentColor : .primary)
+                    .accessibilityLabel(scribbleMode ? "Stop scribbling" : "Scribble on preview")
+                    .help("Draw a box on the preview to identify an area for an editing instruction.")
+                Button { isAssistantPresented.toggle() } label: { Image(systemName: "text.bubble") }
+                    .accessibilityLabel("Local editing assistant")
+                    .help("Type or dictate editing instructions using an on-device model.")
             }
             ToolbarItem(placement: .primaryAction) {
                 VideoActionsMenu(editor: editor, session: exportSession,
@@ -103,12 +119,42 @@ struct ProjectEditorView: View {
                     .frame(width: 28, height: 24)
             }
         }
+        .inspector(isPresented: $isAssistantPresented) {
+            EditorAssistantPanel(editor: editor, session: assistant, scribbleMode: $scribbleMode,
+                selectedRegionID: selectedRegionID, onSelectRegion: { selectRegion($0) },
+                onRemoveRegion: { removeRegion($0) }, onSubmit: {
+                    playback.pause()
+                    assistant.submit(editor: editor, playhead: playback.time,
+                        regionID: selectedRegionID, editID: selectedEditID)
+                })
+                .inspectorColumnWidth(min: 280, ideal: 300, max: 360)
+        }
+        .onChange(of: isAssistantPresented) { _, visible in if !visible { scribbleMode = false; assistant.cancel() } }
+        .onChange(of: scribbleMode) { _, active in
+            if active { playback.pause(); if !editor.finishDraft() { scribbleMode = false } }
+        }
         .modifier(VideoExportPresentation(session: exportSession))
         .focusedSceneValue(\.editorFileActions, EditorFileActions(
             saveProject: { EditorSaveRouting.save(editor: editor, window: exportSession.window) },
             saveVideo: { beginExport(sharing: false) }, shareVideo: { beginExport(sharing: true) },
             rename: { editorRenameRequest = UUID() }, fitTimeline: { timelineFitRequest = UUID() },
             isBusy: exportSession.isBusy || playback.isLoading))
+    }
+
+    @ToolbarContentBuilder
+    private var recordingTitleToolbar: some ToolbarContent {
+        if #available(macOS 26, *) {
+            ToolbarItem(placement: .principal) { recordingTitle }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .principal) { recordingTitle }
+        }
+    }
+
+    private var recordingTitle: some View {
+        RecordingTitleEditor(editor: editor, renameRequest: editorRenameRequest,
+            font: .systemFont(ofSize: 13, weight: .semibold))
+            .frame(minWidth: 140, idealWidth: 240, maxWidth: 320, minHeight: 28, maxHeight: 28)
     }
 
     private var player: some View {
@@ -119,16 +165,20 @@ struct ProjectEditorView: View {
             onBegin: { playback.pause(); dragTime = editTime; selectedInspector = .camera },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
             onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
-            onCancel: { cancelDraft() },
+            onCancel: { if scribbleMode { scribbleMode = false } else { cancelDraft() } },
             zoom: zoom, allowsZoomEditing: !playback.isLoading && !playback.isScrubbing,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) },
-            presentation: canvasPresentation, nativeSourceSize: playback.sourceSize)
+            presentation: canvasPresentation, nativeSourceSize: playback.sourceSize,
+            scribbleMode: scribbleMode,
+            regions: state.regions.filter { abs($0.time - playback.time) < frameDuration },
+            selectedRegionID: selectedRegionID,
+            onDrawRegion: { addRegion($0) }, onSelectRegion: { selectedRegionID = $0 })
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay {
                 if MediaProcessing.isSuspended {
-                    Text(MediaProcessing.statusMessage).font(.callout).foregroundStyle(.secondary)
+                    Text(MediaProcessing.statusMessage).font(.callout).foregroundStyle(.white.opacity(0.75))
                         .allowsHitTesting(false)
                 }
             }
@@ -142,6 +192,37 @@ struct ProjectEditorView: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func toggleScribble() {
+        if !scribbleMode {
+            playback.pause()
+            guard editor.finishDraft() else { return }
+            isAssistantPresented = true
+        }
+        scribbleMode.toggle()
+    }
+
+    private func addRegion(_ rect: EditorRegionRect) {
+        guard editor.finishDraft() else { return }
+        let region = EditorRegion(time: playback.time, rect: rect)
+        var next = editor.project.state
+        next.regions.append(region)
+        if editor.commit(next, name: "Draw area") { selectedRegionID = region.id }
+    }
+
+    private func selectRegion(_ id: UUID) {
+        guard editor.finishDraft(), let region = state.regions.first(where: { $0.id == id }) else { return }
+        playback.pause(); selectedEditID = nil
+        selectedRegionID = id; scribbleMode = true
+        playback.seek(region.time)
+    }
+
+    private func removeRegion(_ id: UUID) {
+        guard editor.finishDraft() else { return }
+        var next = editor.project.state
+        next.regions.removeAll { $0.id == id }
+        if editor.commit(next, name: "Remove area"), selectedRegionID == id { selectedRegionID = nil }
     }
 
     private var timeline: some View {
@@ -230,14 +311,22 @@ struct ProjectEditorView: View {
                         })
                 }
             }
-            // Each inspector keeps the same allocation. Controls cannot take
-            // space from the preview when playback updates their values.
+            // Allocate by tab, never by playback values or edit selection.
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .frame(height: 176, alignment: .top)
+            .frame(height: inspectorHeight, alignment: .top)
         }
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)
         .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var inspectorHeight: CGFloat {
+        switch selectedInspector {
+        case .zoom: 100
+        case .pointer: 100
+        case .camera: 176
+        case .canvas: 100
+        }
     }
 
     private var zoomControls: some View {

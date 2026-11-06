@@ -7,14 +7,17 @@ struct RenderedProject {
     let asset: AVComposition
     let videoComposition: AVVideoComposition
     let screenSize: CGSize
+    let sourceSize: CGSize
     let cameraAspect: Double
     let previewFrames: PreviewSourceFrames
 
     init(asset: AVComposition, videoComposition: AVVideoComposition, screenSize: CGSize,
-         cameraAspect: Double, previewFrames: PreviewSourceFrames = PreviewSourceFrames()) {
+         cameraAspect: Double, sourceSize: CGSize? = nil,
+         previewFrames: PreviewSourceFrames = PreviewSourceFrames()) {
         self.asset = asset
         self.videoComposition = videoComposition
         self.screenSize = screenSize
+        self.sourceSize = sourceSize ?? screenSize
         self.cameraAspect = cameraAspect
         self.previewFrames = previewFrames
     }
@@ -32,7 +35,7 @@ enum ProjectRenderer {
             switch self {
             case let .invalidVideo(name): return "The recording has no usable video: \(name)."
             case .invalidTrim: return "Choose a trim range inside the recording."
-            case .destinationExists: return "Export needs a new file; existing files and original recordings are never replaced."
+            case .destinationExists: return "Choose a different destination. An original recording or a file changed during export cannot be replaced."
             case .cannotExport: return "This recording could not be prepared for export."
             }
         }
@@ -50,10 +53,8 @@ enum ProjectRenderer {
             throw RenderError.invalidVideo(project.screenFilename)
         }
         let sourceGeometry = try await geometry(of: screenSource)
-        let renderSize = CGSize(
-            width: max(2, (sourceGeometry.size.width / 2).rounded() * 2),
-            height: max(2, (sourceGeometry.size.height / 2).rounded() * 2)
-        )
+        let renderSize = PresentationGeometry(sourceSize: sourceGeometry.size,
+                                               presentation: project.state.presentation).outputSize
         let composition = AVMutableComposition()
         guard let screenTrack = composition.addMutableTrack(
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid
@@ -125,7 +126,8 @@ enum ProjectRenderer {
         videoComposition.instructions = [instruction]
         return RenderedProject(
             asset: composition, videoComposition: videoComposition,
-            screenSize: renderSize, cameraAspect: cameraAspect, previewFrames: previewFrames
+            screenSize: renderSize, cameraAspect: cameraAspect, sourceSize: sourceGeometry.size,
+            previewFrames: previewFrames
         )
     }
 
@@ -136,12 +138,14 @@ enum ProjectRenderer {
         // AVVideoComposition's NSMutableCopying contract returns its mutable
         // counterpart and preserves frame timing, color, and render settings.
         let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
+        let outputSize = PresentationGeometry(sourceSize: rendered.sourceSize, presentation: state.presentation).outputSize
+        videoComposition.renderSize = outputSize
         videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
             if let pip = instruction as? PIPCompositionInstruction { return pip.applying(state) }
             return instruction
         }
         return RenderedProject(asset: rendered.asset, videoComposition: videoComposition,
-                               screenSize: rendered.screenSize, cameraAspect: rendered.cameraAspect,
+                               screenSize: outputSize, cameraAspect: rendered.cameraAspect, sourceSize: rendered.sourceSize,
                                previewFrames: rendered.previewFrames)
     }
 

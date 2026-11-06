@@ -21,6 +21,8 @@ struct EditorCanvas: NSViewRepresentable {
     var onZoomBegin: () -> Void = {}
     var onZoomPreview: (ZoomPlacement) -> Void = { _ in }
     var onZoomCommit: (ZoomPlacement, String) -> Void = { _, _ in }
+    var presentation = CanvasPresentation()
+    var nativeSourceSize: CGSize? = nil
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -34,7 +36,8 @@ struct EditorCanvas: NSViewRepresentable {
         view.allowsZoomEditing = allowsZoomEditing
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
-            placement: placement, cameraEnabled: cameraEnabled, zoom: zoom)
+            placement: placement, cameraEnabled: cameraEnabled, zoom: zoom,
+            presentation: presentation, nativeSourceSize: nativeSourceSize)
     }
 }
 
@@ -42,11 +45,14 @@ struct EditorCanvas: NSViewRepresentable {
 final class EditorCanvasView: NSView {
     let playerLayer = AVPlayerLayer()
     let stillLayer = CALayer()
+    private let canvasBorder = CALayer()
     private let outline = CAShapeLayer()
     private let handles = CAShapeLayer()
     private(set) var canvasRect = CGRect.zero
+    private(set) var contentRect = CGRect.zero
     private(set) var placement = PIPPlacement()
     private var sourceSize = CGSize(width: 1920, height: 1080)
+    private var presentation = CanvasPresentation()
     private var cameraAspect = 16.0 / 9.0
     private var cameraEnabled = false
     var onBegin: (() -> Void)?
@@ -92,13 +98,17 @@ final class EditorCanvasView: NSView {
         layer?.backgroundColor = NSColor.black.cgColor
         playerLayer.videoGravity = .resizeAspect
         stillLayer.contentsGravity = .resizeAspect
+        // Preview-only bounds distinguish a black output canvas from the
+        // surrounding viewer, especially with portrait and square outputs.
+        canvasBorder.borderColor = NSColor.white.withAlphaComponent(0.3).cgColor
+        canvasBorder.borderWidth = 1
         outline.fillColor = nil
         outline.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
         outline.lineWidth = 1
         handles.fillColor = NSColor.white.cgColor
         handles.strokeColor = NSColor.black.withAlphaComponent(0.55).cgColor
         handles.lineWidth = 1
-        for child in [playerLayer, stillLayer, outline, handles] { layer?.addSublayer(child) }
+        for child in [playerLayer, stillLayer, canvasBorder, outline, handles] { layer?.addSublayer(child) }
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
@@ -107,13 +117,15 @@ final class EditorCanvasView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func configure(player: AVPlayer, image: CGImage?, sourceSize: CGSize,
-                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool, zoom: ZoomPlacement = ZoomPlacement()) {
+                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool, zoom: ZoomPlacement = ZoomPlacement(),
+                   presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if playerLayer.player !== player { playerLayer.player = player }
         stillLayer.contents = image
         stillLayer.isHidden = image == nil
-        self.sourceSize = sourceSize
+        self.sourceSize = nativeSourceSize ?? sourceSize
+        self.presentation = presentation
         self.cameraAspect = cameraAspect
         self.cameraEnabled = cameraEnabled
         self.placement = placement
@@ -134,18 +146,16 @@ final class EditorCanvasView: NSView {
     }
 
     private func updateLayers() {
-        let width = max(1, sourceSize.width)
-        let height = max(1, sourceSize.height)
-        let scale = max(0, min(bounds.width / width, bounds.height / height))
-        let size = CGSize(width: width * scale, height: height * scale)
-        canvasRect = CGRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
-                            width: size.width, height: size.height)
+        let geometry = PresentationGeometry(sourceSize: sourceSize, presentation: presentation)
+        canvasRect = geometry.outputRect(in: bounds)
+        contentRect = geometry.contentRect(in: bounds)
         playerLayer.frame = canvasRect
         stillLayer.frame = canvasRect
+        canvasBorder.frame = canvasRect
         let current = drag?.draft ?? placement
         outline.isHidden = !cameraEnabled || !current.visible
         handles.isHidden = outline.isHidden
-        let rect = current.frame(in: size, cameraAspect: cameraAspect)
+        let rect = current.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
         outline.path = current.shape == .circle ? CGPath(ellipseIn: rect, transform: nil)
             : CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
@@ -186,8 +196,8 @@ final class EditorCanvasView: NSView {
             onZoomBegin?()
             let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
             let next = zoom.scale > 1 ? ZoomPlacement() : ZoomPlacement(scale: 2,
-                x: viewport.minX + (point.x - canvasRect.minX) / canvasRect.width * viewport.width,
-                y: viewport.minY + (point.y - canvasRect.minY) / canvasRect.height * viewport.height).clamped
+                x: viewport.minX + min(1, max(0, (point.x - contentRect.minX) / contentRect.width)) * viewport.width,
+                y: viewport.minY + min(1, max(0, (point.y - contentRect.minY) / contentRect.height)) * viewport.height).clamped
             zoom = next
             onZoomCommit?(next, next.scale > 1 ? "Zoom in" : "Zoom out")
         } else if zoom.scale > 1 {
@@ -201,8 +211,8 @@ final class EditorCanvasView: NSView {
         if var pan = zoomDrag {
             let point = convert(event.locationInWindow, from: nil)
             let next = ZoomPlacement(scale: pan.origin.scale,
-                x: pan.origin.x - (point.x - pan.point.x) / max(1, canvasRect.width * pan.origin.scale),
-                y: pan.origin.y - (point.y - pan.point.y) / max(1, canvasRect.height * pan.origin.scale)).clamped
+                x: pan.origin.x - (point.x - pan.point.x) / max(1, contentRect.width * pan.origin.scale),
+                y: pan.origin.y - (point.y - pan.point.y) / max(1, contentRect.height * pan.origin.scale)).clamped
             guard next != pan.draft else { return }
             pan.draft = next
             zoomDrag = pan
@@ -258,8 +268,8 @@ final class EditorCanvasView: NSView {
         if event.magnification != 0 {
             beginTrackpad(.pinch)
             let point = convert(event.locationInWindow, from: nil)
-            let u = min(1, max(0, (point.x - canvasRect.minX) / canvasRect.width))
-            let v = min(1, max(0, (point.y - canvasRect.minY) / canvasRect.height))
+            let u = min(1, max(0, (point.x - contentRect.minX) / contentRect.width))
+            let v = min(1, max(0, (point.y - contentRect.minY) / contentRect.height))
             let old = zoom.clamped
             let scale = min(3, max(1, old.scale * max(0.01, 1 + event.magnification)))
             // Preserve the source pixel beneath the pinch center. Clamping at
@@ -290,8 +300,8 @@ final class EditorCanvasView: NSView {
             // center translates the visible image in the opposite direction.
             let units = event.hasPreciseScrollingDeltas ? 1.0 : 10.0
             let next = ZoomPlacement(scale: zoom.scale,
-                x: zoom.x + dx * units / (canvasRect.width * zoom.scale),
-                y: zoom.y - dy * units / (canvasRect.height * zoom.scale)).clamped
+                x: zoom.x + dx * units / (contentRect.width * zoom.scale),
+                y: zoom.y - dy * units / (contentRect.height * zoom.scale)).clamped
             previewTrackpad(next)
         }
         if event.momentumPhase.contains(.ended) ||
@@ -316,7 +326,7 @@ final class EditorCanvasView: NSView {
 
     private func acceptsTrackpad(_ event: NSEvent) -> Bool {
         guard allowsZoomEditing, drag == nil, zoomDrag == nil,
-              canvasRect.width > 0, canvasRect.height > 0 else { return false }
+              contentRect.width > 0, contentRect.height > 0 else { return false }
         return trackpad != nil || canvasRect.contains(convert(event.locationInWindow, from: nil))
     }
 

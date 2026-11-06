@@ -14,6 +14,7 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isLoading = false
     @Published private(set) var screenSize = CGSize(width: 16, height: 9)
+    @Published private(set) var sourceSize = CGSize(width: 16, height: 9)
     @Published private(set) var cameraAspect = 16.0 / 9.0
     @Published private(set) var errorMessage: String?
     let frameStore = EditorFrameStore()
@@ -122,6 +123,7 @@ final class EditorPlayback: ObservableObject {
                 bounds: sourceBounds))
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
+            sourceSize = rendered.sourceSize
             cameraAspect = rendered.cameraAspect
             bounds = snapshot.state.trimStart...snapshot.state.trimEnd
             renderedProject = rendered

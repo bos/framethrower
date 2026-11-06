@@ -42,7 +42,9 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
     func applying(_ state: EditState, focusedCapture: FocusedFrameCapture? = nil,
                   preservePreviewFrames: Bool = true) -> PIPCompositionInstruction {
         PIPCompositionInstruction(timeRange: timeRange, screenTrackID: screenTrackID, cameraTrackID: cameraTrackID,
-                                  screenGeometry: screenGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
+                                  screenGeometry: screenGeometry, cameraGeometry: cameraGeometry,
+                                  renderSize: PresentationGeometry(sourceSize: screenGeometry.size,
+                                                                   presentation: state.presentation).outputSize,
                                   cameraStart: cameraStart, cameraEnd: cameraEnd, state: state, focusedCapture: focusedCapture,
                                   cursorRecording: cursorRecording,
                                   previewFrames: preservePreviewFrames && focusedCapture == nil ? previewFrames : nil)
@@ -165,31 +167,57 @@ private final class PIPFrameComposer: @unchecked Sendable {
                instruction: PIPCompositionInstruction, state: EditState, at seconds: Double,
                renderSize: CGSize) -> CIImage {
         let canvas = CGRect(origin: .zero, size: renderSize)
+        let presentation = PresentationGeometry(sourceSize: instruction.screenGeometry.size,
+                                                presentation: state.presentation)
+        let content = presentation.contentRect(in: canvas)
+        let sourceCanvas = CGRect(origin: .zero, size: content.size)
         // A track can legitimately have no sample at the start/end of its
         // declared time range (ScreenCaptureKit often starts a fraction late).
         // Missing source pixels are black, never a fatal compositor error or
         // a held frame from another time; camera timing remains independent.
         var image = screenBuffer.map { instruction.screenGeometry.orientedImage($0)
-            .transformed(by: CGAffineTransform(scaleX: canvas.width / instruction.screenGeometry.size.width,
-                                              y: canvas.height / instruction.screenGeometry.size.height))
-        } ?? CIImage(color: .black).cropped(to: canvas)
+            .transformed(by: CGAffineTransform(scaleX: content.width / instruction.screenGeometry.size.width,
+                                              y: content.height / instruction.screenGeometry.size.height))
+        } ?? CIImage(color: .black).cropped(to: sourceCanvas)
         let zoom = state.zoom(at: seconds).clamped
         let zoomScale = zoom.scale
         if zoomScale > 1 {
             // The same source viewport helper drives native focus/pan controls.
             // Clamp the viewport rather than exposing empty space at an edge.
-            let topLeftViewport = zoom.viewport(in: canvas.size)
-            let viewport = CGRect(x: topLeftViewport.minX, y: canvas.height - topLeftViewport.maxY,
+            let topLeftViewport = zoom.viewport(in: sourceCanvas.size)
+            let viewport = CGRect(x: topLeftViewport.minX, y: sourceCanvas.height - topLeftViewport.maxY,
                                   width: topLeftViewport.width, height: topLeftViewport.height)
             image = image.clampedToExtent()
                 .transformed(by: CGAffineTransform(translationX: -viewport.minX, y: -viewport.minY))
                 .transformed(by: CGAffineTransform(scaleX: zoomScale, y: zoomScale))
-                .cropped(to: canvas)
+                .cropped(to: sourceCanvas)
         }
         if let recording = instruction.cursorRecording, state.cursorStyle.visible {
             image = cursor(over: image, recording: recording, style: state.cursorStyle,
-                           zoom: zoom, at: seconds, canvas: canvas)
+                           zoom: zoom, at: seconds, canvas: sourceCanvas)
         }
+        // Zoom and pointer coordinates remain attached to the full screen
+        // source. Presentation frames that source only after its edits render.
+        image = image.cropped(to: sourceCanvas)
+        if presentation.cornerRadius > 0 {
+            let scale = min(canvas.width / presentation.outputSize.width,
+                            canvas.height / presentation.outputSize.height)
+            if let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: sourceCanvas),
+                "inputRadius": presentation.cornerRadius * scale,
+                "inputColor": CIColor.white
+            ])?.outputImage?.cropped(to: sourceCanvas) {
+                image = image.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                    kCIInputBackgroundImageKey: CIImage(color: .clear).cropped(to: sourceCanvas),
+                    kCIInputMaskImageKey: mask
+                ])
+            }
+        }
+        image = image.transformed(by: CGAffineTransform(translationX: content.minX,
+                                                       y: canvas.height - content.maxY))
+        let background = state.presentation.background
+        image = image.composited(over: CIImage(color: CIColor(red: background.red, green: background.green,
+                                                             blue: background.blue)).cropped(to: canvas))
         // Camera placement is in the final output canvas, so it stays steady
         // while the screen content zooms or pans underneath it.
         let placement = state.placement(at: seconds)
@@ -374,7 +402,8 @@ final class LivePreviewSources: @unchecked Sendable {
         let image: CGImage = try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 autoreleasepool {
-                    let native = instruction.renderSize
+                    let native = PresentationGeometry(sourceSize: instruction.screenGeometry.size,
+                                                      presentation: state.presentation).outputSize
                     let limit = maximumSize.width > 0 && maximumSize.height > 0 &&
                         maximumSize.width.isFinite && maximumSize.height.isFinite ? maximumSize : native
                     let scale = min(1, limit.width / native.width, limit.height / native.height)

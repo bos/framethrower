@@ -311,24 +311,95 @@ struct CursorStyle: Codable, Equatable, Sendable {
     var clickHighlight: Bool = true
 }
 
+enum CanvasAspect: String, Codable, CaseIterable, Sendable {
+    case source, wide, portrait, square
+}
+
+struct CanvasColor: Codable, Equatable, Sendable {
+    var red: Double
+    var green: Double
+    var blue: Double
+    static let black = CanvasColor(red: 0, green: 0, blue: 0)
+}
+
+/// Presentation applies to the whole recording. Source-time edits keep their
+/// existing screen and camera coordinates when the output canvas changes.
+struct CanvasPresentation: Codable, Equatable, Sendable {
+    var aspect: CanvasAspect = .source
+    /// Inset as a fraction of the output canvas's shorter edge.
+    var padding: Double = 0
+    /// Screen corner radius as a fraction of the fitted screen's shorter edge.
+    var cornerRadius: Double = 0
+    var background: CanvasColor = .black
+}
+
+/// The common top-left coordinate mapping for rendering and native gestures.
+/// The recording always fits in full; aspect changes never crop or stretch it.
+struct PresentationGeometry: Equatable, Sendable {
+    let outputSize: CGSize
+    let contentRect: CGRect
+    let cornerRadius: CGFloat
+
+    init(sourceSize: CGSize, presentation: CanvasPresentation) {
+        let source = CGSize(width: sourceSize.width.isFinite && sourceSize.width > 0 ? sourceSize.width : 16,
+                            height: sourceSize.height.isFinite && sourceSize.height > 0 ? sourceSize.height : 9)
+        func even(_ value: CGFloat) -> CGFloat { max(2, (value / 2).rounded() * 2) }
+        let edge = max(source.width, source.height)
+        switch presentation.aspect {
+        case .source: outputSize = CGSize(width: even(source.width), height: even(source.height))
+        case .wide: outputSize = CGSize(width: even(edge), height: even(edge * 9 / 16))
+        case .portrait: outputSize = CGSize(width: even(edge * 9 / 16), height: even(edge))
+        case .square: outputSize = CGSize(width: even(edge), height: even(edge))
+        }
+        let padding = presentation.padding.isFinite ? min(0.2, max(0, presentation.padding)) : 0
+        let inset = min(outputSize.width, outputSize.height) * padding
+        let available = CGRect(origin: .zero, size: outputSize).insetBy(dx: inset, dy: inset)
+        let scale = min(available.width / source.width, available.height / source.height)
+        let size = CGSize(width: source.width * scale, height: source.height * scale)
+        contentRect = CGRect(x: (outputSize.width - size.width) / 2,
+                             y: (outputSize.height - size.height) / 2,
+                             width: size.width, height: size.height)
+        let radius = presentation.cornerRadius.isFinite ? min(0.2, max(0, presentation.cornerRadius)) : 0
+        cornerRadius = min(size.width, size.height) * radius
+    }
+
+    func outputRect(in bounds: CGRect) -> CGRect {
+        let scale = max(0, min(bounds.width / outputSize.width, bounds.height / outputSize.height))
+        let size = CGSize(width: outputSize.width * scale, height: outputSize.height * scale)
+        return CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    func contentRect(in bounds: CGRect) -> CGRect {
+        let output = outputRect(in: bounds)
+        let scale = output.width / outputSize.width
+        return CGRect(x: output.minX + contentRect.minX * scale,
+                      y: output.minY + contentRect.minY * scale,
+                      width: contentRect.width * scale, height: contentRect.height * scale)
+    }
+}
+
 struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
     var pipKeyframes: [PIPKeyframe]
     var zoomKeyframes: [ZoomKeyframe] = []
     var cursorStyle: CursorStyle = CursorStyle()
+    var presentation: CanvasPresentation = CanvasPresentation()
 
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
-         zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle()) {
+         zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
+         presentation: CanvasPresentation = CanvasPresentation()) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
         self.zoomKeyframes = zoomKeyframes
         self.cursorStyle = cursorStyle
+        self.presentation = presentation
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -340,6 +411,7 @@ struct EditState: Codable, Equatable, Sendable {
         pipKeyframes = try values.decode([PIPKeyframe].self, forKey: .pipKeyframes)
         zoomKeyframes = try values.decodeIfPresent([ZoomKeyframe].self, forKey: .zoomKeyframes) ?? []
         cursorStyle = try values.decodeIfPresent(CursorStyle.self, forKey: .cursorStyle) ?? CursorStyle()
+        presentation = try values.decodeIfPresent(CanvasPresentation.self, forKey: .presentation) ?? CanvasPresentation()
     }
 
     func zoom(at time: Double) -> ZoomPlacement {
@@ -555,6 +627,13 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        let presentation = state.presentation
+        guard presentation.padding.isFinite, (0...0.2).contains(presentation.padding),
+              presentation.cornerRadius.isFinite, (0...0.2).contains(presentation.cornerRadius),
+              [presentation.background.red, presentation.background.green, presentation.background.blue]
+                .allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+            throw ProjectError.invalid("Canvas padding, corners, and background color must stay within their supported ranges.")
+        }
         guard state.cursorStyle.size.isFinite, (1...4).contains(state.cursorStyle.size),
               state.cursorStyle.smoothing.isFinite, (0...1).contains(state.cursorStyle.smoothing) else {
             throw ProjectError.invalid("Cursor size and smoothing must stay within their supported ranges.")

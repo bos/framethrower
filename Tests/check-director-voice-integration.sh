@@ -13,4 +13,8 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$sources/DirectorConversation.swift" "$sources/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/DirectorVoiceIntegrationChecks.swift" -o "$check_dir/check-director-voice-integration"
-"$check_dir/check-director-voice-integration"
+if [ "${1:-}" = --whisper ]; then
+  "$repo_dir/Tools/build-local-speech-runtime.sh" "$repo_dir/build/LocalSpeech"
+  set -- --whisper-helper "$repo_dir/build/LocalSpeech/FrameThrowerSpeech"
+fi
+"$check_dir/check-director-voice-integration" "$@"

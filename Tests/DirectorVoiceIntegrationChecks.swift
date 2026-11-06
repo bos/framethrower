@@ -20,8 +20,14 @@ private actor NativeDirectorTransport {
 struct DirectorVoiceIntegrationChecks {
     static let panInstruction = "Pan box one to box three over the next three seconds."
     static let replacementAnswer = "Let's have the new movement replace it."
+    static var whisperHelper: URL? {
+        guard let index = CommandLine.arguments.firstIndex(of: "--whisper-helper"),
+              index + 1 < CommandLine.arguments.count else { return nil }
+        return URL(fileURLWithPath: CommandLine.arguments[index + 1])
+    }
 
     static func main() async {
+        defer { LocalModelRuntime.terminateOwnedProcess() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-director-voice-" + UUID().uuidString)
         do {
             guard MediaProcessing.isSuspended else { throw VoiceIntegrationFailure.failed("Requires suspended video") }
@@ -29,6 +35,7 @@ struct DirectorVoiceIntegrationChecks {
             output("Voice integration artifacts: " + directory.path)
             DispatchQueue.global().asyncAfter(deadline: .now() + 240) {
                 FileHandle.standardError.write(Data("Voice integration exceeded 240 seconds. Artifacts: \(directory.path)\n".utf8))
+                LocalModelRuntime.terminateOwnedProcess()
                 Darwin.exit(1)
             }
             guard #available(macOS 26, *),
@@ -45,6 +52,7 @@ struct DirectorVoiceIntegrationChecks {
             output("Director voice integration passed (native PCM/ASR/model, unmodified recognition including mistakes, exact movement, manual history context, conflict answer, frozen timing and durable Undo/Redo; no microphone/playback/audio files/video).")
         } catch {
             FileHandle.standardError.write(Data("Director voice integration failed: \(error). Artifacts retained: \(directory.path)\n".utf8))
+            LocalModelRuntime.terminateOwnedProcess()
             Darwin.exit(1)
         }
     }
@@ -198,6 +206,24 @@ struct DirectorVoiceIntegrationChecks {
 
     @available(macOS 26, *)
     private static func recognize(_ buffers: [AVAudioPCMBuffer], locale: Locale, fixture: Fixture) async throws -> String {
+        if let whisperHelper {
+            let speech = LocalSpeechInput(makeSession: {
+                WhisperLocalSpeechSession(executable: whisperHelper, syntheticBuffers: buffers)
+            })
+            await speech.start()
+            fixture.session.recordSpeechState(phase: String(describing: speech.phase),
+                recognizer: speech.recognizerIdentifier, status: speech.statusMessage, error: speech.errorMessage)
+            try require(speech.phase == .listening && speech.errorMessage == nil,
+                        "Whisper must prepare through the production controller: " + (speech.errorMessage ?? ""))
+            let text = await speech.finish()
+            fixture.session.recordSpeechState(phase: String(describing: speech.phase),
+                recognizer: speech.recognizerIdentifier, status: speech.statusMessage, error: speech.errorMessage)
+            try require(speech.recognizerIdentifier == "whisper.cpp large-v3-turbo Q5_0 (Metal)" &&
+                        speech.errorMessage == nil && text?.isEmpty == false,
+                        "Verified Metal recognition must finish without fallback or word substitutions: " + (speech.errorMessage ?? ""))
+            fixture.session.recordSpeechHypothesis(text!, phase: "final")
+            return text!
+        }
         let transcriber = AppleSpeechConfiguration.transcriber(locale: locale)
         try await AppleSpeechAssetPreparation.prepare(transcriber, locale: locale)
         guard let first = buffers.first,

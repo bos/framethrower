@@ -46,6 +46,9 @@ in memory and tests the actual Metal helper through `LocalSpeechInput.finish`.
 Neither check opens a microphone, plays audio, writes an audio file, or runs a
 video operation. These synthetic checks measure command fidelity, not human
 microphone accuracy.
+`Tests/check-local-speech-bundle.sh` checks the already-built app's outer and
+nested signatures, bundled license, library symlinks, and portable loader paths
+without launching it.
 
 ## Requirements
 
@@ -276,7 +279,7 @@ available from its context menu; Return saves, Escape or dismissing cancels.
 Naming is never required to use a box. Names describe guides and do not become
 visible graphics. The microphone starts dictation; pressing it again finishes
 recognition and submits the instruction. Escape cancels. Typed instructions use
-Return or the send icon. Apple SpeechAnalyzer runs on-device on supported macOS26+
+Return or the send icon. The Apple SpeechAnalyzer fallback runs on-device on supported macOS26+
 hardware/locales. It may download Apple speech assets on first use; audio is
 never sent to a transcription service. There is no cloud speech fallback.
 An absent asset-installation request is a normal result when Apple already has
@@ -441,7 +444,8 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-director-voice-integration.sh`: generated in-memory speech through
   the native recognizer and text model, actual framing edits, conflict answers,
   exact timing, and atomic Undo/Redo. Requires installed local assets; never
-  opens a microphone, plays sound, or constructs a video asset.
+  opens a microphone, plays sound, or constructs a video asset. Add `--whisper`
+  to test the Metal speech controller instead of Apple's recognizer.
 - `Tests/check-editor-inspector-layout.sh`: all inspector tabs, selected and
   deselected edits, fixed preview/timeline geometry, and canceled slider rollback
   with metadata-only previews. UI fixtures use in-memory Director sessions.
@@ -450,6 +454,13 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-pointer-recovery.sh`: same-size source mutations, atomic path
   replacement, exact stable copies, staging cleanup, and no-overwrite publication
   using temporary pointer JSON while movie recovery remains suspended.
+- `Tests/check-project-save-conflicts.sh`: changed or missing saved projects,
+  first-save collisions, preserved local drafts/history, and safe retry after
+  restoring the exact baseline. Existing-file checks are optimistic; first-save
+  publication requires a hard-link-capable filesystem.
+- `Tests/check-local-model-process.sh`: already-exited, graceful, forced, and
+  canceled shutdown, repeated close, actual child disappearance, and local-key
+  cleanup using tiny subprocesses without inference.
 - `Tests/check-recording-masters.sh`: synthetic ProRes/PCM tracks, first-frame
   timing, separate audio, bounded backpressure, interrupted capture, and final frames.
 - `Tests/check-project-recovery.sh`: journal restoration, coalescing, stale/corrupt

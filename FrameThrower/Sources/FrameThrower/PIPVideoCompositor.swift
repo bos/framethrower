@@ -122,11 +122,11 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
 
     private func render(_ request: AVAsynchronousVideoCompositionRequest) throws -> CVPixelBuffer {
         guard let instruction = request.videoCompositionInstruction as? PIPCompositionInstruction,
-              let screenBuffer = request.sourceFrame(byTrackID: instruction.screenTrackID),
               let output = request.renderContext.newPixelBuffer() else {
             throw NSError(domain: "FrameThrower.Compositor", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "A recording frame could not be rendered."])
         }
+        let screenBuffer = request.sourceFrame(byTrackID: instruction.screenTrackID)
         let cameraBuffer = instruction.cameraTrackID.flatMap { request.sourceFrame(byTrackID: $0) }
         instruction.focusedCapture?.capture(screen: screenBuffer, camera: cameraBuffer,
                                              at: request.compositionTime, instruction: instruction)
@@ -145,13 +145,18 @@ private final class PIPFrameComposer: @unchecked Sendable {
     let context = CIContext(options: [.cacheIntermediates: false])
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    func image(screen screenBuffer: CVPixelBuffer, camera cameraBuffer: CVPixelBuffer?,
+    func image(screen screenBuffer: CVPixelBuffer?, camera cameraBuffer: CVPixelBuffer?,
                instruction: PIPCompositionInstruction, state: EditState, at seconds: Double,
                renderSize: CGSize) -> CIImage {
         let canvas = CGRect(origin: .zero, size: renderSize)
-        var image = instruction.screenGeometry.orientedImage(screenBuffer)
+        // A track can legitimately have no sample at the start/end of its
+        // declared time range (ScreenCaptureKit often starts a fraction late).
+        // Missing source pixels are black, never a fatal compositor error or
+        // a held frame from another time; camera timing remains independent.
+        var image = screenBuffer.map { instruction.screenGeometry.orientedImage($0)
             .transformed(by: CGAffineTransform(scaleX: canvas.width / instruction.screenGeometry.size.width,
                                               y: canvas.height / instruction.screenGeometry.size.height))
+        } ?? CIImage(color: .black).cropped(to: canvas)
         let placement = state.placement(at: seconds)
         if placement.visible, seconds >= instruction.cameraStart, seconds < instruction.cameraEnd,
            let geometry = instruction.cameraGeometry, let cameraBuffer {
@@ -192,14 +197,14 @@ private final class PIPFrameComposer: @unchecked Sendable {
 /// screen frame and one camera frame; it never retains composed draft images.
 final class LivePreviewSources: @unchecked Sendable {
     let time: CMTime
-    private let screen: CVPixelBuffer
+    private let screen: CVPixelBuffer?
     private let camera: CVPixelBuffer?
     private let instruction: PIPCompositionInstruction
     private let sourceTime: CMTime
     private let composer = PIPFrameComposer()
     private let queue = DispatchQueue(label: "framethrower.live-frame-render")
 
-    fileprivate init(time: CMTime, sourceTime: CMTime, screen: CVPixelBuffer, camera: CVPixelBuffer?,
+    fileprivate init(time: CMTime, sourceTime: CMTime, screen: CVPixelBuffer?, camera: CVPixelBuffer?,
                      instruction: PIPCompositionInstruction) {
         self.time = time
         self.sourceTime = sourceTime
@@ -254,7 +259,7 @@ final class FocusedFrameCapture: @unchecked Sendable {
         tolerance = max(0.000_001, frameDuration.seconds)
     }
 
-    func capture(screen: CVPixelBuffer, camera: CVPixelBuffer?, at time: CMTime,
+    func capture(screen: CVPixelBuffer?, camera: CVPixelBuffer?, at time: CMTime,
                  instruction: PIPCompositionInstruction) {
         let distance = abs(time.seconds - target.seconds)
         guard distance.isFinite, distance <= tolerance else { return }

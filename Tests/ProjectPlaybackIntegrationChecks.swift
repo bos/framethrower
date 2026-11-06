@@ -32,7 +32,14 @@ struct ProjectPlaybackIntegrationChecks {
         let early = try await play(project, directory: directory, cameraRange: 0..<1)
         try require(early.circles > 15, "camera that started earlier appears from screen time zero")
         try require(early.after > 35, "early camera end does not freeze or repeat its last frame")
-        print("Project streaming playback checks passed (AVPlayerItemVideoOutput: \(delayed.frames + early.frames) frames, delayed/early camera, source gaps, timed circle/rectangle, smooth motion, and clean item/player status).")
+        try await movie(to: directory.appendingPathComponent("late-screen.mov"), width: 160, height: 120, frames: 90, camera: false, firstFrame: 4)
+        var delayedScreen = project
+        delayedScreen.screenFilename = "late-screen.mov"
+        delayedScreen.cameraOffset = 0.5
+        let screenGap = try await play(delayedScreen, directory: directory, cameraRange: 0.5..<2, screenStart: 4.0 / 30)
+        try require(screenGap.initialScreenGap >= 2, "missing initial video samples render black without failing streaming playback")
+        try require(screenGap.circles > 8 && screenGap.after > 15, "playback recovers after initial source gap and continues through camera end")
+        print("Project streaming playback checks passed (AVPlayerItemVideoOutput: \(delayed.frames + early.frames + screenGap.frames) frames, delayed/early camera, source gaps, timed circle/rectangle, smooth motion, missing initial screen samples, and clean item/player status).")
     }
 
     private struct Counts {
@@ -42,12 +49,14 @@ struct ProjectPlaybackIntegrationChecks {
         var circles = 0
         var rectangles = 0
         var moving = 0
+        var initialScreenGap = 0
     }
 
-    private static func play(_ project: RecordingProject, directory: URL, cameraRange: Range<Double>) async throws -> Counts {
+    private static func play(_ project: RecordingProject, directory: URL, cameraRange: Range<Double>, screenStart: Double = 0) async throws -> Counts {
         let rendered = try await ProjectRenderer.makePreview(project: project, directory: directory)
         let item = AVPlayerItem(asset: rendered.asset)
         item.videoComposition = rendered.videoComposition
+        item.seekingWaitsForVideoCompositionRendering = true
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
@@ -88,11 +97,35 @@ struct ProjectPlaybackIntegrationChecks {
                     if seconds.isFinite, seconds > latestFrame {
                         latestFrame = seconds
                         counts.frames += 1
-                        try validate(buffer, at: seconds, project: project, cameraRange: cameraRange, counts: &counts)
+                        try validate(buffer, at: seconds, project: project, cameraRange: cameraRange, screenStart: screenStart, counts: &counts)
                     }
                 }
             }
             try await Task.sleep(for: .milliseconds(5))
+        }
+        player.pause()
+        if screenStart > 0 {
+            // Chase real paused seeks into/out of the initial sample gap. Seek
+            // completion must await custom composition, not only source decode.
+            for seconds in [0.05, 1.6, 0.6, 2.8, 0.0] {
+                let target = CMTime(seconds: seconds, preferredTimescale: 600)
+                let completed = await player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                try require(completed, "paused custom-composition seek completes")
+                var received = false
+                let deadline = Date().addingTimeInterval(2)
+                while !received, Date() < deadline {
+                    var display = CMTime.invalid
+                    if let frame = output.copyPixelBuffer(forItemTime: target, itemTimeForDisplay: &display),
+                       display.seconds.isFinite, abs(display.seconds - seconds) <= 1.0 / 30 + 0.001 {
+                        var seekCounts = Counts()
+                        try validate(frame, at: display.seconds, project: project, cameraRange: cameraRange,
+                                     screenStart: screenStart, counts: &seekCounts)
+                        received = true
+                    }
+                    if !received { try await Task.sleep(for: .milliseconds(5)) }
+                }
+                try require(received, "paused seek delivers a new composed video frame at requested time")
+            }
         }
         try checkStatus(player, item: item)
         try require(counts.frames >= 65, "actual AVPlayer output supplied most playback frames")
@@ -108,7 +141,7 @@ struct ProjectPlaybackIntegrationChecks {
     }
 
     private static func validate(_ buffer: CVPixelBuffer, at seconds: Double, project: RecordingProject,
-                                 cameraRange: Range<Double>, counts: inout Counts) throws {
+                                 cameraRange: Range<Double>, screenStart: Double, counts: inout Counts) throws {
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
         try require(width == 160 && height == 120, "streaming composition preserves native screen size")
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
@@ -132,6 +165,17 @@ struct ProjectPlaybackIntegrationChecks {
                 minX = min(minX, x); minY = min(minY, y)
                 maxX = max(maxX, x); maxY = max(maxY, y)
             }
+        }
+        if seconds < screenStart - 0.005 {
+            for y in Swift.stride(from: 0, to: height, by: 10) {
+                for x in Swift.stride(from: 0, to: width, by: 10) {
+                    let offset = y * stride + x * 4
+                    try require(base[offset] < 20 && base[offset + 1] < 20 && base[offset + 2] < 20,
+                                "missing initial screen sample is black, not a borrowed future frame")
+                }
+            }
+            counts.initialScreenGap += 1
+            return
         }
         // Avoid a one-frame boundary ambiguity between output timebases; test
         // the complete stable intervals on both sides of each source boundary.
@@ -170,7 +214,7 @@ struct ProjectPlaybackIntegrationChecks {
         guard condition() else { throw CheckError.failed(message) }
     }
 
-    private static func movie(to url: URL, width: Int, height: Int, frames: Int, camera: Bool) async throws {
+    private static func movie(to url: URL, width: Int, height: Int, frames: Int, camera: Bool, firstFrame: Int = 0) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
@@ -187,7 +231,7 @@ struct ProjectPlaybackIntegrationChecks {
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? CheckError.failed("start synthetic movie writer") }
         writer.startSession(atSourceTime: .zero)
-        for index in 0..<frames {
+        for index in firstFrame..<frames {
             let deadline = Date().addingTimeInterval(5)
             while !input.isReadyForMoreMediaData {
                 try require(writer.status == .writing && Date() < deadline, "synthetic movie writer stays responsive")

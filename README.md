@@ -52,8 +52,11 @@ without launching it.
 
 ## Requirements
 
-- macOS 15 or later.
-- Xcode with the macOS 15 SDK or later.
+- macOS 15 or later to run the app.
+- Xcode 26 or later with the macOS 26 SDK or later to build it. Speech APIs
+  require this SDK; the deployment target remains macOS 15.
+- CMake (`brew install cmake`) to build the bundled optional Metal speech
+  runtime. End users receive compiled binaries and need no compiler.
 - XcodeGen (`brew install xcodegen`) to regenerate the checked-in Xcode project.
 
 ## Build and run
@@ -70,7 +73,7 @@ team under Signing & Capabilities if needed, and run. The project currently uses
 the original developer's team. Its configuration is in `FrameThrower/project.yml`;
 update that file when changing project settings so regeneration preserves them.
 
-To build and launch from the command line:
+To build and install from the command line:
 
 ```bash
 xcodebuild \
@@ -80,14 +83,19 @@ xcodebuild \
   -destination 'platform=macOS' \
   -derivedDataPath build \
   build
-mkdir -p ~/Applications
-ditto build/Build/Products/Debug/FrameThrower.app ~/Applications/FrameThrower.app
-open -g ~/Applications/FrameThrower.app
+python3 Tools/install-debug.py
 ```
 
-Quit FrameThrower before replacing an installed build. The installed app lives in
-`~/Applications`; `build/` contains disposable build output. The `-g` launch option
-keeps the app in the background so it does not steal focus.
+Quit FrameThrower yourself before installing. The guarded installer refuses a
+running app, checks the build and installed bundle/signing team, stages a copy,
+verifies its signature, and checks processes again immediately before atomic
+replacement. It retains the prior build at the backup path reported in its JSON
+result and rolls back a failed replacement. It never quits, kills, or launches
+FrameThrower. Open `~/Applications/FrameThrower.app` yourself when ready.
+`build/` contains disposable build output. Pass an alternate signed build path
+as the installer's argument when needed. Run
+`python3 Tests/DebugInstallerChecks.py` for temporary-fixture installer tests;
+these never touch the installed app.
 
 For a compile-only check without a signing identity, append
 `CODE_SIGNING_ALLOWED=NO` to the build command. Use a consistently signed build

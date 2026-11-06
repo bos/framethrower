@@ -7,6 +7,54 @@ enum PIPTransition: String, Codable, CaseIterable, Sendable {
     case smooth
 }
 
+enum PIPShape: String, Codable, CaseIterable, Sendable {
+    case original
+    case rectangle
+    case square
+    case circle
+}
+
+/// The crop is expressed in the oriented camera source's top-left coordinate
+/// space. Its anchor selects a fraction of the available horizontal/vertical
+/// travel, so the same edit works independently of the capture resolution.
+struct PIPCrop: Codable, Equatable, Sendable {
+    var x: Double = 0.5
+    var y: Double = 0.5
+
+    func rect(in source: CGSize, shape: PIPShape, aspectRatio: Double = 1) -> CGRect {
+        guard source.width.isFinite, source.height.isFinite,
+              source.width > 0, source.height > 0 else { return .zero }
+        guard shape != .original else { return CGRect(origin: .zero, size: source) }
+        let ratio = shape == .rectangle && aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 1
+        let width = min(source.width, source.height * ratio)
+        let height = width / ratio
+        let horizontal = x.isFinite ? min(1, max(0, x)) : 0.5
+        let vertical = y.isFinite ? min(1, max(0, y)) : 0.5
+        return CGRect(x: (source.width - width) * horizontal,
+                      y: (source.height - height) * vertical,
+                      width: width, height: height)
+    }
+
+    /// Move the crop window in oriented source coordinates. UI gestures that
+    /// move the image itself should negate their translation before calling.
+    func moved(by translation: CGSize, in source: CGSize, shape: PIPShape,
+               aspectRatio: Double = 1) -> PIPCrop {
+        guard translation.width.isFinite, translation.height.isFinite else { return self }
+        let bounds = rect(in: source, shape: shape, aspectRatio: aspectRatio)
+        guard bounds.width > 0, bounds.height > 0 else { return self }
+        var next = self
+        let horizontalTravel = source.width - bounds.width
+        let verticalTravel = source.height - bounds.height
+        if horizontalTravel > 0 {
+            next.x = min(1, max(0, x + translation.width / horizontalTravel))
+        }
+        if verticalTravel > 0 {
+            next.y = min(1, max(0, y + translation.height / verticalTravel))
+        }
+        return next
+    }
+}
+
 /// Coordinates describe the fraction of the available travel, rather than the
 /// canvas itself, so every placement remains on screen as the PIP is resized.
 struct PIPPlacement: Codable, Equatable, Sendable {
@@ -14,11 +62,48 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     var y: Double = 0.95
     var scale: Double = 0.25
     var visible: Bool = true
+    var shape: PIPShape = .original
+    var aspectRatio: Double = 16.0 / 9.0
+    var crop: PIPCrop = PIPCrop()
+
+    init(x: Double = 0.95, y: Double = 0.95, scale: Double = 0.25, visible: Bool = true,
+         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop()) {
+        self.x = x
+        self.y = y
+        self.scale = scale
+        self.visible = visible
+        self.shape = shape
+        self.aspectRatio = aspectRatio
+        self.crop = crop
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case x, y, scale, visible, shape, aspectRatio, crop
+    }
+
+    /// Decode defaults on each placement so old projects and every old undo/redo
+    /// snapshot retain their native camera framing when reopened.
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        x = try values.decode(Double.self, forKey: .x)
+        y = try values.decode(Double.self, forKey: .y)
+        scale = try values.decode(Double.self, forKey: .scale)
+        visible = try values.decode(Bool.self, forKey: .visible)
+        shape = try values.decodeIfPresent(PIPShape.self, forKey: .shape) ?? .original
+        aspectRatio = try values.decodeIfPresent(Double.self, forKey: .aspectRatio) ?? 16.0 / 9.0
+        crop = try values.decodeIfPresent(PIPCrop.self, forKey: .crop) ?? PIPCrop()
+    }
 
     func frame(in canvas: CGSize, cameraAspect: Double) -> CGRect {
         guard canvas.width.isFinite, canvas.height.isFinite,
               canvas.width > 0, canvas.height > 0 else { return .zero }
-        let aspect = cameraAspect.isFinite && cameraAspect > 0 ? cameraAspect : 16.0 / 9.0
+        let originalAspect = cameraAspect.isFinite && cameraAspect > 0 ? cameraAspect : 16.0 / 9.0
+        let aspect: Double
+        switch shape {
+        case .original: aspect = originalAspect
+        case .square, .circle: aspect = 1
+        case .rectangle: aspect = aspectRatio.isFinite ? min(5, max(0.2, aspectRatio)) : 16.0 / 9.0
+        }
         let fraction = scale.isFinite ? min(0.5, max(0.12, scale)) : 0.25
         let width = min(canvas.width * fraction, canvas.height * 0.8 * aspect)
         let height = width / aspect
@@ -27,6 +112,27 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         return CGRect(x: (canvas.width - width) * horizontal,
                       y: (canvas.height - height) * vertical,
                       width: width, height: height)
+    }
+
+    /// Resize from the bottom-right while retaining the top-left position
+    /// whenever the new bounds fit. Only free rectangles change aspect ratio.
+    func resized(by translation: CGSize, in canvas: CGSize, cameraAspect: Double) -> PIPPlacement {
+        guard canvas.width.isFinite, canvas.height.isFinite,
+              canvas.width > 0, canvas.height > 0,
+              translation.width.isFinite, translation.height.isFinite,
+              translation != .zero else { return self }
+        let original = frame(in: canvas, cameraAspect: cameraAspect)
+        let proposedWidth = min(canvas.width * 0.5,
+                                max(canvas.width * 0.12, original.width + translation.width))
+        var next = self
+        next.scale = proposedWidth / canvas.width
+        if shape == .rectangle {
+            next.aspectRatio = min(5, max(0.2, proposedWidth / max(1, original.height + translation.height)))
+        }
+        let resized = next.frame(in: canvas, cameraAspect: cameraAspect)
+        next.x = min(1, max(0, original.minX / max(1, canvas.width - resized.width)))
+        next.y = min(1, max(0, original.minY / max(1, canvas.height - resized.height)))
+        return next
     }
 }
 
@@ -65,7 +171,11 @@ struct EditState: Codable, Equatable, Sendable {
             return PIPPlacement(x: blend(previous.placement.x, point.placement.x),
                                 y: blend(previous.placement.y, point.placement.y),
                                 scale: blend(previous.placement.scale, point.placement.scale),
-                                visible: previous.placement.visible)
+                                visible: previous.placement.visible,
+                                shape: previous.placement.shape,
+                                aspectRatio: blend(previous.placement.aspectRatio, point.placement.aspectRatio),
+                                crop: PIPCrop(x: blend(previous.placement.crop.x, point.placement.crop.x),
+                                              y: blend(previous.placement.crop.y, point.placement.crop.y)))
         }
         return previous.placement
     }
@@ -154,7 +264,10 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   point.duration.isFinite, point.duration > 0,
                   placement.x.isFinite, (0...1).contains(placement.x),
                   placement.y.isFinite, (0...1).contains(placement.y),
-                  placement.scale.isFinite, (0.12...0.5).contains(placement.scale) else {
+                  placement.scale.isFinite, (0.12...0.5).contains(placement.scale),
+                  placement.aspectRatio.isFinite, (0.2...5).contains(placement.aspectRatio),
+                  placement.crop.x.isFinite, (0...1).contains(placement.crop.x),
+                  placement.crop.y.isFinite, (0...1).contains(placement.crop.y) else {
                 throw ProjectError.invalid("Camera placements must have unique, ordered times and valid positions and sizes.")
             }
             priorTime = point.time

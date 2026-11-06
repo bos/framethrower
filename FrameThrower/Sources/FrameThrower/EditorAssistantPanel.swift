@@ -11,8 +11,9 @@ final class EditorAssistantSession: ObservableObject {
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private var clarification: (request: String, question: String, revision: String)?
+    private var framingConflict: (proposal: EditorFramingConflict, context: LocalEditContext, followup: String?)?
     private let transport: @Sendable (Data) async throws -> Data
-    var awaitsClarification: Bool { clarification != nil }
+    var awaitsClarification: Bool { clarification != nil || framingConflict != nil }
 
     init(transport: @escaping @Sendable (Data) async throws -> Data = {
         try await LocalModelRuntime.shared.chat(payload: $0)
@@ -51,24 +52,38 @@ final class EditorAssistantSession: ObservableObject {
             errorMessage = nil
             return
         }
+        if framingConflict != nil, editor.draftState != nil {
+            cancel()
+            errorMessage = EditorCommandError.stale.localizedDescription
+            return
+        }
         guard editor.finishDraft() else { return }
         do {
             let recording = try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
-            let context = LocalEditContext(recording: recording, playhead: playhead,
+            let pendingConflict = framingConflict
+            if let pendingConflict, pendingConflict.context.recording.revision != recording.revision {
+                cancel()
+                throw EditorCommandError.stale
+            }
+            let context = pendingConflict?.context ?? LocalEditContext(recording: recording, playhead: playhead,
                 selectedRegionID: regionID, selectedEditID: editID, videoProcessingAvailable: !MediaProcessing.isSuspended)
             let request: String
             if let clarification, clarification.revision == recording.revision {
                 request = "Earlier instruction: \(clarification.request)\nQuestion: \(clarification.question)\nAnswer: \(text)"
             } else { request = text }
-            let payload = try LocalEditPlanner.payload(request: request, context: context)
+            let payload = try pendingConflict.map {
+                try LocalEditPlanner.conflictPayload(answer: text, conflict: $0.proposal, context: $0.context, question: $0.followup)
+            } ?? LocalEditPlanner.payload(request: request, context: context)
             let token = UUID(); generation = token
-            isBusy = true; errorMessage = nil; notice = "Preparing a local edit…"
+            isBusy = true; errorMessage = nil; notice = "Interpreting your instruction…"
             task = Task { @MainActor [weak self, transport] in
                 do {
                     let data = try await transport(payload)
                     try Task.checkCancellation()
                     guard let self, self.generation == token else { return }
-                    switch try LocalEditPlanner.result(data, context: context, instruction: text) {
+                    let result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
+                        ?? LocalEditPlanner.result(data, context: context, instruction: text)
+                    switch result {
                     case let .commands(batch, summary):
                         let historyName = "Director: " + String(summary.replacingOccurrences(of: "\n", with: "; ").prefix(140))
                         try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID, name: historyName)
@@ -78,20 +93,34 @@ final class EditorAssistantSession: ObservableObject {
                             .compactMap { editor.references.editLabel(for: $0.id) }
                         self.notice = added.isEmpty ? summary : summary + "\nCreated " + added.joined(separator: ", ") + "."
                         self.clarification = nil
+                        self.framingConflict = nil
                     case let .history(history):
                         try EditorHistoryDispatcher.apply(history, to: editor, projectID: self.projectID)
                         let name = (history.action == .undo ? recording.history.undo : recording.history.redo).first ?? "change"
                         let action = history.action == .undo ? "Undid" : "Redid"
                         self.notice = history.count == 1 ? "\(action) \(name)." : "\(action) \(history.count) changes in order."
                         self.clarification = nil
+                        self.framingConflict = nil
                     case let .clarification(question):
                         self.notice = question
-                        self.clarification = (request, question, recording.revision)
+                        if let pendingConflict {
+                            self.framingConflict = (pendingConflict.proposal, pendingConflict.context, question)
+                        } else { self.clarification = (request, question, recording.revision) }
+                    case let .framingConflict(conflict):
+                        _ = try EditorCommandDispatcher.prepare(conflict.replacement, for: editor.project, projectID: self.projectID)
+                        self.notice = conflict.question
+                        self.clarification = nil
+                        self.framingConflict = (conflict, context, nil)
+                    case let .noChanges(message):
+                        self.notice = message
+                        self.clarification = nil
+                        self.framingConflict = nil
                     }
                     self.instruction = ""
                 } catch {
                     guard let self, self.generation == token else { return }
                     self.notice = nil
+                    if case .stale? = error as? EditorCommandError { self.framingConflict = nil; self.clarification = nil }
                     if !(error is CancellationError) { self.errorMessage = error.localizedDescription }
                 }
                 guard let self, self.generation == token else { return }
@@ -102,7 +131,7 @@ final class EditorAssistantSession: ObservableObject {
 
     func cancel() {
         generation = UUID(); task?.cancel(); task = nil
-        isBusy = false; notice = nil; errorMessage = nil; clarification = nil
+        isBusy = false; notice = nil; errorMessage = nil; clarification = nil; framingConflict = nil
     }
 
     private func performHistoryShortcut(_ text: String, editor: ProjectEditor) -> Bool {

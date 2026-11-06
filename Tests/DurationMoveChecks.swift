@@ -190,10 +190,10 @@ struct DurationMoveChecks {
         var conflict = fixture
         conflict.project.state.zoomKeyframes = [ZoomKeyframe(time: 3, scale: 2)]
         conflict.project.ensureReferences()
-        guard case let .clarification(question) = try LocalEditPlanner.result(reply(conflict), context: conflict.context, instruction: instruction) else {
+        guard case let .framingConflict(pending) = try LocalEditPlanner.result(reply(conflict), context: conflict.context, instruction: instruction) else {
             throw DurationMoveFailure.failed("intervening screen edit must clarify before applying")
         }
-        try require(question.contains("screen framing"), "conflict identifies the affected property")
+        try require(pending.question.contains("screen framing"), "conflict identifies the affected property")
     }
 
     static func checkNativeModel() async throws {

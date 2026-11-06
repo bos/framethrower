@@ -154,7 +154,7 @@ private struct LocalEditPlannerChecks {
         for time in [1.0, 3.0, 6.5] {
             fixture.context.recording.state.zoomKeyframes = [ZoomKeyframe(time: time, scale: 2)]
             let proposed = try LocalEditPlanner.result(reply("plan_sequence", sequence(fixture)), context: fixture.context)
-            guard case .clarification = proposed else {
+            guard case .framingConflict = proposed else {
                 throw CheckError.failed("sequence must preserve existing framing at interior and both boundary timestamps")
             }
         }
@@ -162,7 +162,7 @@ private struct LocalEditPlannerChecks {
         _ = try batch(LocalEditPlanner.result(reply("plan_sequence", sequence(fixture)), context: fixture.context))
         fixture.context.recording.state.zoomKeyframes = [ZoomKeyframe(time: 8, scale: 2, transition: .smooth, duration: 8)]
         let overlap = try LocalEditPlanner.result(reply("plan_sequence", sequence(fixture)), context: fixture.context)
-        guard case .clarification = overlap else {
+        guard case .framingConflict = overlap else {
             throw CheckError.failed("existing motion overlapping the sequence must be preserved even when its arrival is later")
         }
     }

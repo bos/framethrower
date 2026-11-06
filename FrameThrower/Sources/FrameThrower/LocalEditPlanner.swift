@@ -13,6 +13,23 @@ enum LocalEditResult: Sendable {
     case commands(EditorCommandBatch, summary: String)
     case clarification(String)
     case history(EditorHistoryRequest)
+    case framingConflict(EditorFramingConflict)
+    case noChanges(String)
+}
+
+/// An already constructed proposal, bound to the project revision that produced
+/// its question. A reply resolves this proposal instead of regenerating it.
+struct EditorFramingConflict: Sendable {
+    var proposal: EditorCommandBatch
+    var summary: String
+    var framingIDs: [UUID]
+    var question: String
+
+    var replacement: EditorCommandBatch {
+        var batch = proposal
+        batch.commands = framingIDs.map { .removeScreenFraming(editID: $0) } + batch.commands
+        return batch
+    }
 }
 
 /// The model proposes a small typed plan. It never invokes application methods
@@ -166,6 +183,7 @@ enum LocalEditPlanner {
             return .clarification("The plan did not include the requested timed movement. Which edit should it start at, and how long should it take?")
         }
         var commands: [EditorCommand] = []
+        var framingConflicts: [ZoomKeyframe] = []
         let summary: String
         switch name {
         case "move_relative":
@@ -206,15 +224,7 @@ enum LocalEditPlanner {
             guard end < context.recording.duration else {
                 throw EditorCommandError.invalid("The proposed movement starts at \(timeLabel(start)) and ends at \(timeLabel(end)), but this recording ends at \(timeLabel(context.recording.duration)). Choose an earlier start or shorter movement.")
             }
-            var priorTime = 0.0
-            if let conflict = context.recording.state.zoomKeyframes.first(where: { point in
-                defer { priorTime = point.time }
-                let begins = point.transition == .smooth ? max(priorTime, point.time - point.duration) : point.time
-                return point.time >= start - 0.000_001 && begins <= end + 0.000_001
-            }) {
-                let label = context.recording.references.editLabel(for: conflict.id) ?? "Another edit"
-                return .clarification("\(label) already changes framing during that movement. Should it stay, or should the new movement replace it?")
-            }
+            framingConflicts = overlappingFraming(in: context.recording.state, start: start, end: end)
             commands = [.frameRegion(regionID: source.id, time: start, motion: EditorCommandMotion(transition: .jump))]
             if path == "via_full_frame" {
                 let half = duration / 2
@@ -257,16 +267,16 @@ enum LocalEditPlanner {
             guard end.isFinite, end < context.recording.duration else {
                 return .clarification("The recording ends before that movement can finish. Should it take less time or start at an earlier edit?")
             }
-            if let conflict = context.recording.state.zoomKeyframes.first(where: {
+            framingConflicts = context.recording.state.zoomKeyframes.filter {
                 $0.time > start.time + 0.000_001 && $0.time < end - 0.000_001
-            }) {
-                let label = context.recording.references.editLabel(for: conflict.id) ?? "another edit"
-                return .clarification("\(label) already changes screen framing during that movement. Should it stay, or should the new movement replace it?")
             }
             if let arrival = context.recording.state.zoomKeyframes.first(where: { abs($0.time - end) < 0.000_001 }),
                arrival.placement.clamped != target.rect.framing() {
-                let label = context.recording.references.editLabel(for: arrival.id) ?? "Another edit"
-                return .clarification("\(label) already sets a different screen view at the arrival. Which view should remain?")
+                framingConflicts.append(arrival)
+            }
+            if let following = context.recording.state.zoomKeyframes.first(where: { $0.time > end + 0.000_001 }),
+               following.transition == .smooth, following.time - following.duration < end {
+                framingConflicts.append(following)
             }
             commands = [.moveForDuration(startEditID: start.id, fromRegionID: source.id, toRegionID: target.id,
                                          duration: duration, viaFullFrame: path == "via_full_frame")]
@@ -383,15 +393,7 @@ enum LocalEditPlanner {
             // Existing intervening edits would make the spoken sequence false.
             // Ask for an explicit revision rather than silently remove user work.
             let start = try number(args["start_seconds"])
-            var previousTime = 0.0
-            let overlaps = context.recording.state.zoomKeyframes.contains { point in
-                defer { previousTime = point.time }
-                let movementStart = point.transition == .smooth ? max(previousTime, point.time - point.duration) : point.time
-                return point.time >= start - 0.000_001 && movementStart <= cursor + 0.000_001
-            }
-            if overlaps {
-                return .clarification("There are framing edits inside that time range. Select an edit to revise it, or remove those edits before adding this sequence.")
-            }
+            framingConflicts = overlappingFraming(in: context.recording.state, start: start, end: cursor)
             summary = steps.count == 1 ? "Added a framing movement." : "Added \(steps.count) framing movements."
         default: throw invalidResponse
         }
@@ -415,8 +417,91 @@ enum LocalEditPlanner {
            !commands.contains(where: { if case .fullFrame = $0 { return true }; return false }) {
             return .clarification("Should it zoom out to the full frame between the boxes?")
         }
-        return .commands(EditorCommandBatch(projectID: context.recording.projectID,
-            revision: context.recording.revision, commands: commands), summary: summary)
+        let batch = EditorCommandBatch(projectID: context.recording.projectID,
+            revision: context.recording.revision, commands: commands)
+        if !framingConflicts.isEmpty {
+            return .framingConflict(EditorFramingConflict(proposal: batch, summary: summary,
+                framingIDs: framingConflicts.map(\.id), question: conflictQuestion(framingConflicts, context: context)))
+        }
+        return .commands(batch, summary: summary)
+    }
+
+    private static func overlappingFraming(in state: EditState, start: Double, end: Double) -> [ZoomKeyframe] {
+        var previous = 0.0
+        return state.zoomKeyframes.filter { point in
+            defer { previous = point.time }
+            let begins = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
+            return point.time >= start - 0.000_001 && (point.time <= end + 0.000_001 || begins < end - 0.000_001)
+        }
+    }
+
+    private static func conflictQuestion(_ points: [ZoomKeyframe], context: LocalEditContext) -> String {
+        let all = context.recording.state.zoomKeyframes
+        let descriptions = points.map { point in
+            let edit = context.recording.state.timedEdits(includeCamera: true).first { $0.zoomID == point.id }
+            let label = edit.flatMap { context.recording.references.editLabel(for: $0.id) } ?? "Framing change"
+            let previous = all.last(where: { $0.time < point.time })?.time ?? 0
+            let start = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
+            return point.transition == .smooth ? "\(label) (\(timeLabel(start))–\(timeLabel(point.time)))" : "\(label) at \(timeLabel(point.time))"
+        }.joined(separator: ", ")
+        return descriptions + (points.count == 1
+            ? " already changes screen framing. Replace that whole framing movement, or keep it?"
+            : " already change screen framing. Replace all these framing movements, or keep them?")
+    }
+
+    static func conflictPayload(answer: String, conflict: EditorFramingConflict, context: LocalEditContext,
+                                question: String? = nil) throws -> Data {
+        try validateInstruction(answer)
+        guard conflict.proposal.projectID == context.recording.projectID,
+              conflict.proposal.revision == context.recording.revision else { throw EditorCommandError.stale }
+        let scope: [String: Any] = ["project_id": ["type": "string"], "expected_revision": ["type": "string"],
+                                   "choice": ["type": "string", "enum": ["replace", "keep"]]]
+        let details: [String: Any] = ["project_id": conflict.proposal.projectID.uuidString,
+            "expected_revision": conflict.proposal.revision, "question": question ?? conflict.question,
+            "conflicting_framing": conflict.question, "proposed_movement": conflict.summary,
+            "answer": answer]
+        let messages: [[String: String]] = [
+            ["role": "system", "content": """
+            Resolve the user's answer to the displayed framing conflict with exactly one tool call.
+            Use resolve_framing_conflict choice=replace when they want the NEW movement to replace existing framing.
+            'Let's have the new movement replace it' means replace. Use keep to leave existing framing unchanged.
+            The choice applies to ALL framing movements listed in the question. Ask for clarification
+            if the answer selects only a subset or requests different timing or targets.
+            Use the exact project_id and expected_revision in the attached data. Do not replan the movement.
+            Ask a concise clarification only if the answer does not specify replace or keep.
+            """],
+            ["role": "user", "content": String(decoding: try JSONSerialization.data(withJSONObject: details, options: .sortedKeys), as: UTF8.self)]
+        ]
+        return try JSONSerialization.data(withJSONObject: ["model": "framethrower-local", "messages": messages,
+            "tools": [function("resolve_framing_conflict", "Resolve the pending framing conflict without replanning.", scope),
+                      function("ask_clarification", "Ask about an unclear answer.", ["question": ["type": "string"]])],
+            "tool_choice": "auto", "temperature": 0, "max_tokens": 256, "chat_template_kwargs": ["enable_thinking": false]])
+    }
+
+    static func conflictResult(_ data: Data, conflict: EditorFramingConflict) throws -> LocalEditResult {
+        guard data.count <= 262_144,
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = root["choices"] as? [[String: Any]], choices.count == 1,
+              let message = choices[0]["message"] as? [String: Any],
+              let calls = message["tool_calls"] as? [[String: Any]], calls.count == 1,
+              calls[0]["type"] as? String == "function", let function = calls[0]["function"] as? [String: Any],
+              let name = function["name"] as? String, let arguments = function["arguments"] as? String,
+              let args = try JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any] else { throw invalidResponse }
+        if name == "ask_clarification" {
+            try keys(args, ["question"])
+            guard let question = args["question"] as? String, !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  question.count <= 600 else { throw invalidResponse }
+            return .clarification(question)
+        }
+        guard name == "resolve_framing_conflict" else { throw invalidResponse }
+        try keys(args, ["project_id", "expected_revision", "choice"])
+        guard let project = args["project_id"] as? String, UUID(uuidString: project) == conflict.proposal.projectID,
+              args["expected_revision"] as? String == conflict.proposal.revision else { throw EditorCommandError.stale }
+        switch args["choice"] as? String {
+        case "replace": return .commands(conflict.replacement, summary: "Replaced the conflicting framing. " + conflict.summary)
+        case "keep": return .noChanges("Kept the existing framing.")
+        default: throw invalidResponse
+        }
     }
 
     private static var invalidResponse: EditorCommandError { .invalid("The local model returned an invalid editing request. No changes were applied.") }

@@ -56,7 +56,47 @@ struct EditorSimulationClockChecks {
         short.advance(to: 1_000.1)
         try near(short.time, 4.05, "Subframe intervals still honor their exact kept end")
         try require(!short.isPlaying, "Short playback ends normally")
-        print("Simulation clock checks passed (source-time playback, pause/resume, ordered callbacks, authoritative seeks, trim/end/restart and short ranges; Foundation only, no media).")
+        try playbackRates()
+        print("Simulation clock checks passed (source-time playback, exact 0.5×/1×/2×/5× rates, continuous active rate changes, paused/rate retention, ordered callbacks, authoritative seeks and trim/end/restart; Foundation only, no media).")
+    }
+
+    static func playbackRates() throws {
+        for rate in EditorSimulationClock.supportedRates {
+            var clock = EditorSimulationClock(bounds: 0...100, time: 3)
+            clock.play(at: 100, rate: rate)
+            clock.advance(to: 102)
+            try near(clock.time, 3 + 2 * rate, "A two-second wall interval advances at the exact selected rate")
+        }
+        var clock = EditorSimulationClock(bounds: 0...100, time: 10)
+        clock.play(at: 200, rate: 2)
+        clock.advance(to: 201)
+        try require(clock.setRate(5, at: 201.25), "The supported active rate change is accepted")
+        try near(clock.time, 12.5, "Changing speed samples the last old-rate interval before rebasing")
+        clock.advance(to: 201.5)
+        try near(clock.time, 13.75, "Only the elapsed interval after the change uses the new speed")
+        clock.pause(at: 201.75)
+        try near(clock.time, 15, "Pause accounts for elapsed time at the selected speed")
+        clock.setRate(0.5, at: 300)
+        try require(!clock.isPlaying && clock.rate == 0.5, "Changing speed while paused stays paused")
+        try near(clock.time, 15, "A paused rate change leaves the source position unchanged")
+        clock.play(at: 400)
+        clock.advance(to: 401)
+        try near(clock.time, 15.5, "Resume retains the configured speed")
+        clock.advance(to: 600)
+        try require(!clock.isPlaying && clock.rate == 0.5, "Reaching the kept end retains the preview speed")
+        try near(clock.time, 100, "Scaled elapsed time stops exactly at the kept end")
+        clock.play(at: 601)
+        clock.advance(to: 603)
+        try near(clock.time, 1, "Restart retains the selected half-speed rate")
+        clock.seek(40)
+        let paused = clock
+        for invalid in [0.0, -1, 1.5, Double.nan, .infinity, -.infinity] {
+            try require(!clock.setRate(invalid, at: 700) && clock == paused,
+                        "Unsupported and nonfinite rates cannot alter time, state or selected rate")
+        }
+        clock.play(at: 800)
+        clock.advance(to: 802)
+        try near(clock.time, 41, "A source seek also retains the configured rate")
     }
 
     static func near(_ actual: Double, _ expected: Double, _ message: String) throws {

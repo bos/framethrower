@@ -344,6 +344,15 @@ struct ProjectEditorView: View {
                 .help(conflictReview != nil
                     ? (MediaProcessing.isSuspended ? "Play or pause the Existing and Proposed outlines over the test pattern." : "Scrub the highlighted timeline spans to compare the pending framings.")
                     : (MediaProcessing.isSuspended ? "Play or pause edits over a drawn test pattern. Video processing stays disabled." : "Play or pause the recording."))
+                Picker("Playback speed", selection: Binding(get: { playback.playbackRate }, set: { _ = playback.setPlaybackRate($0) })) {
+                    ForEach(EditorPlayback.supportedPlaybackRates, id: \.self) { rate in
+                        Text(rate == 0.5 ? "0.5×" : "\(Int(rate))×").tag(rate)
+                    }
+                }
+                .pickerStyle(.segmented).labelsHidden().controlSize(.small)
+                .frame(width: 170)
+                .accessibilityLabel("Playback speed")
+                .help("Preview playback speed. Exported video keeps its original timing.")
                 RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
                     trimEnd: state.trimEnd, playhead: playback.time,
                     onInteractionBegan: { playback.pause() },

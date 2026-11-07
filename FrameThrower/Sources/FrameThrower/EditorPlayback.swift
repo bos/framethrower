@@ -9,6 +9,7 @@ final class EditorFrameStore: ObservableObject {
 
 @MainActor
 final class EditorPlayback: ObservableObject {
+    static let supportedPlaybackRates = EditorSimulationClock.supportedRates
     private var mediaPlayer: AVPlayer?
     var player: AVPlayer {
         if let mediaPlayer { return mediaPlayer }
@@ -21,6 +22,7 @@ final class EditorPlayback: ObservableObject {
     var frameDuration: Double { editFrameDuration }
     @Published private(set) var time = 0.0
     @Published private(set) var isPlaying = false
+    @Published private(set) var playbackRate = 1.0
     @Published private(set) var isLoading = false
     @Published private(set) var screenSize = CGSize(width: 16, height: 9)
     @Published private(set) var sourceSize = CGSize(width: 16, height: 9)
@@ -123,6 +125,7 @@ final class EditorPlayback: ObservableObject {
             editFrameDuration = snapshot.captureFrameDuration ?? 1.0 / 30
             committedState = snapshot.state
             simulationClock = EditorSimulationClock(bounds: bounds, time: time)
+            simulationClock?.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
             stillFrame = nil
             isLoading = false
             return
@@ -353,7 +356,7 @@ final class EditorPlayback: ObservableObject {
             guard canPlay, var clock = simulationClock else { return }
             if isPlaying { pause(); return }
             clock.seek(time)
-            clock.play(at: ProcessInfo.processInfo.systemUptime)
+            clock.play(at: ProcessInfo.processInfo.systemUptime, rate: playbackRate)
             simulationClock = clock
             time = clock.time
             isPlaying = clock.isPlaying
@@ -373,7 +376,7 @@ final class EditorPlayback: ObservableObject {
             stillRequests.invalidate()
             liveSources = nil
             stillFrame = nil
-            player.play()
+            player.playImmediately(atRate: Float(playbackRate))
             isPlaying = true
         }
     }
@@ -406,6 +409,26 @@ final class EditorPlayback: ObservableObject {
             // opening an independent image-generator decoder behind the player.
             requestSeek(position)
         }
+    }
+
+    /// Preview transport preference only; never persisted in project/history
+    /// or applied to exported media. A paused player stays paused.
+    @discardableResult
+    func setPlaybackRate(_ rate: Double) -> Bool {
+        guard !isClosed, Self.supportedPlaybackRates.contains(rate) else { return false }
+        if MediaProcessing.isSuspended {
+            if var clock = simulationClock {
+                clock.setRate(rate, at: ProcessInfo.processInfo.systemUptime)
+                simulationClock = clock
+                time = clock.time
+                isPlaying = clock.isPlaying
+                if !isPlaying { stopSimulation() }
+            }
+        } else if isPlaying {
+            player.playImmediately(atRate: Float(rate))
+        }
+        playbackRate = rate
+        return true
     }
 
     /// Transient paused composition used while a gesture is in progress. The

@@ -233,6 +233,10 @@ removing an edit is one undo step; framing adjustments at one time share a step.
 after an unexpected exit. Undo/Redo reveals the affected edit. Editing never
 overwrites source media.
 
+The speed selector beside Play reviews at 0.5×, 1×, 2×, or 5×. Speed can change
+while playing or paused, and remains selected while editing and replaying.
+This is a preview preference; project timing, Undo history, and exports are unchanged.
+
 **Canvas** sets the output shape (Source, 16:9, 9:16, or Square), padding, screen
 corner radius, and background color for the whole recording. The full screen image
 fits inside the canvas; camera placement uses the entire output, including margins.

@@ -9,10 +9,11 @@ struct EditorSimulationChecks {
     static func main() async throws {
         try require(MediaProcessing.isSuspended, "Requires the media-driver interlock")
         try await transport()
+        try await playbackRates()
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
         try vectorCanvas()
-        print("Editor simulation checks passed (actual suspended clock lifecycle, trim/seek/end/restart, preview preservation, vector screen/PIP interpolation and stable canvas geometry; no AV objects or media).")
+        print("Editor simulation checks passed (actual suspended clock lifecycle, preview rates and continuous changes, trim/seek/end/restart, preview preservation, vector screen/PIP interpolation and stable canvas geometry; no AV objects or media).")
     }
     static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         guard condition() else { throw SimulationFailure.failed(message) }
@@ -122,6 +123,54 @@ struct EditorSimulationChecks {
         canvas.layoutSubtreeIfNeeded()
         try require(canvas.frame == fixedFrame && canvas.testPattern?.screenFrame == canvas.contentRect && !canvas.hasMediaPlayerLayer,
                     "Changing the output aspect updates internal presentation geometry without reallocating the view")
+    }
+    static func playbackRates() async throws {
+        let project = RecordingProject(screenFilename: "no-rate-source.mov", duration: 20,
+            state: EditState(trimStart: 2, trimEnd: 15, pipKeyframes: []))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("no-rate-file-\(UUID()).framethrower")
+        let editor = ProjectEditor(project: project, url: url)
+        let playback = EditorPlayback()
+        try require(playback.playbackRate == 1 && playback.setPlaybackRate(2), "Preview defaults to 1× and accepts a rate before metadata loads")
+        await playback.rebuild(editor: editor)
+        try require(playback.playbackRate == 2 && !playback.isPlaying && !playback.hasMediaPlayer,
+                    "Rebuild retains the speed without starting or creating a media player")
+        playback.seek(3)
+        playback.togglePlayback()
+        try await wait { playback.time > 3.04 }
+        let beforeChange = playback.time
+        try require(playback.setPlaybackRate(5) && playback.isPlaying, "An active supported rate change keeps transport playing")
+        try require(playback.time >= beforeChange && playback.time - beforeChange < 0.08,
+                    "Changing rate rebases the current clock rather than scaling all elapsed playback")
+        try await wait { playback.time > beforeChange + 0.3 }
+        playback.pause()
+        let pausedTime = playback.time
+        var preview = project.state
+        preview.zoomKeyframes = [ZoomKeyframe(time: 4, scale: 2)]
+        playback.preview(preview)
+        for rate in EditorPlayback.supportedPlaybackRates {
+            try require(playback.setPlaybackRate(rate) && playback.playbackRate == rate && !playback.isPlaying,
+                        "Each supported paused rate change leaves transport paused")
+            try near(playback.time, pausedTime, "Paused speed changes preserve the source playhead")
+            try require(playback.isPreviewing, "Speed changes preserve transient editing state")
+        }
+        for rate in [0.0, -1, 1.5, Double.nan, .infinity, -.infinity] {
+            try require(!playback.setPlaybackRate(rate) && playback.playbackRate == 5 && !playback.isPlaying,
+                        "Invalid preview speed cannot change the last supported setting")
+        }
+        await playback.rebuild(editor: editor)
+        try require(playback.playbackRate == 5, "Metadata rebuild retains preview speed independently of project data")
+        playback.seek(14.99)
+        playback.togglePlayback()
+        try await wait { !playback.isPlaying }
+        try near(playback.time, 15, "Fast playback still stops at the exact trim end")
+        playback.togglePlayback()
+        try require(playback.playbackRate == 5 && playback.isPlaying && playback.time >= 2 && playback.time < 2.1,
+                    "Replaying an ended preview retains speed and restarts at the kept beginning")
+        playback.close()
+        try require(!playback.setPlaybackRate(0.5) && !playback.hasMediaPlayer && playback.canvasPlayer == nil,
+                    "Closed or suspended rate actions never allocate AV objects")
+        try require(editor.project == project && !editor.canUndo && !FileManager.default.fileExists(atPath: url.path),
+                    "Preview rates never write project bytes, edit history, or exported media")
     }
     static func allLayers(_ layer: CALayer) -> [CALayer] { [layer] + (layer.sublayers ?? []).flatMap(allLayers) }
 }

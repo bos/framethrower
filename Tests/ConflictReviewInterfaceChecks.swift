@@ -56,6 +56,18 @@ struct ConflictReviewInterfaceChecks {
         let initialViewport = canvas.testPattern?.screenViewport, initialCameraFrame = canvas.testPattern?.cameraFrame
         try require(playback.canPlay && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
                     "The actual editor is playable through its vector clock without creating any AV player/layer")
+        guard let speed = all(NSSegmentedControl.self, in: host).first(where: {
+            $0.segmentCount == 4 && $0.label(forSegment: 0) == "0.5×"
+        }) else { throw Failure.failed("Playback speed selector missing from the editor") }
+        try require((0..<4).map { speed.label(forSegment: $0) ?? "" } == ["0.5×", "1×", "2×", "5×"],
+                    "Review speeds are directly visible together beside Play")
+        speed.selectedSegment = 2
+        try require(speed.sendAction(speed.action, to: speed.target), "Native speed selection sends its action")
+        try await settle(host)
+        try require(playback.playbackRate == 2 && !playback.isPlaying && playback.time == 0 && editor.project == original,
+                    "The actual speed selector changes paused transport without starting playback or editing metadata")
+        _ = playback.setPlaybackRate(1)
+        try await settle(host)
         playback.togglePlayback()
         for _ in 0..<100 where playback.time <= 0.12 { try await Task.sleep(for: .milliseconds(10)) }
         try await settle(host)
@@ -143,8 +155,8 @@ struct ConflictReviewInterfaceChecks {
                     "Crossing trim start updates the real preview immediately without committing during the drag")
         timeline.mouseUp(with: trimEvent(.leftMouseUp, time: 5))
         try await settle(host)
-        try require(abs(playback.time - 5) < 0.000001 && editor.project.state.trimStart == 5 && editor.project.undoHistory.count == 1,
-                    "Releasing trim keeps the carried playhead and creates one Undo entry")
+        try require(abs(playback.time - 5) < 0.000001 && abs(editor.project.state.trimStart - 5) < 0.000001 && editor.project.undoHistory.count == 1,
+                    "Releasing trim keeps the carried playhead and creates one Undo entry: \(playback.time), \(editor.project.state.trimStart), \(editor.project.undoHistory.count)")
         playback.seek(9)
         try await settle(host)
         timeline.mouseDown(with: trimEvent(.leftMouseDown, time: 12))
@@ -154,7 +166,7 @@ struct ConflictReviewInterfaceChecks {
                     "Crossing trim end carries the real playhead before release")
         timeline.mouseUp(with: trimEvent(.leftMouseUp, time: 7))
         try await settle(host)
-        try require(abs(playback.time - 7) < 0.000001 && editor.project.state.trimEnd == 7 && editor.project.undoHistory.count == 2,
+        try require(abs(playback.time - 7) < 0.000001 && abs(editor.project.state.trimEnd - 7) < 0.000001 && editor.project.undoHistory.count == 2,
                     "Trim-end release preserves the playhead after the asynchronous preview rebuild")
         playback.seek(6)
         try await settle(host)
@@ -162,7 +174,7 @@ struct ConflictReviewInterfaceChecks {
         timeline.mouseDragged(with: trimEvent(.leftMouseDragged, time: 6.5))
         timeline.cancelOperation(nil)
         try await settle(host)
-        try require(abs(playback.time - 6) < 0.000001 && editor.project.state.trimStart == 5 && editor.project.undoHistory.count == 2,
+        try require(abs(playback.time - 6) < 0.000001 && abs(editor.project.state.trimStart - 5) < 0.000001 && editor.project.undoHistory.count == 2,
                     "Canceling a crossed trim restores the original playhead without changing saved trim/history")
         print("Conflict review interface checks passed (actual vector playthrough, source/PIP interpolation, full-source moving comparison outlines, linked clock/timeline, read-only scrub, dismissal and fixed geometry; no AV objects/media).")
     }

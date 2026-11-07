@@ -269,7 +269,7 @@ final class EditorAssistantSession: ObservableObject {
                         continue
                     case let .rejectedPlan(reason):
                         guard attempt == 0 else {
-                            throw EditorCommandError.invalid("Director couldn’t produce a movement matching your instruction. No changes were applied. " + reason)
+                            throw EditorCommandError.invalid("Director’s proposed changes didn’t match your instruction. No changes were applied. " + reason)
                         }
                         guard try EditorCommandDispatcher.revision(for: editor.project) == context.recording.revision else {
                             throw EditorCommandError.stale

@@ -224,13 +224,15 @@ enum LocalEditPlanner {
             """
         let messages = try conversationMessages(system: system, context: contextText,
             request: request, conversation: conversation, continuation: continuation)
+        let focusedTools = tools(for: route, context: context, historyInspected: historyInspected).map {
+            EditorAgentControls.focusedManagementTool($0, instruction: request, context: context)
+        }
         return try JSONSerialization.data(withJSONObject: [
             "model": "framethrower-local", "messages": messages,
-            "tools": scopedTools(tools(for: route, context: context, historyInspected: historyInspected), context: context),
-            // After a read, an answer must still be an explicit report or
-            // another typed action. Required allows report/clarification; it
-            // does not force a project mutation.
-            "tool_choice": historyInspected ? "required" : "auto", "temperature": 0,
+            "tools": scopedTools(focusedTools, context: context),
+            // A tool result needs a typed follow-up: a corrected action,
+            // report, or clarification. Required never forces a mutation.
+            "tool_choice": continuation || historyInspected ? "required" : "auto", "temperature": 0,
             "max_tokens": 1_024, "chat_template_kwargs": ["enable_thinking": false]
         ])
     }

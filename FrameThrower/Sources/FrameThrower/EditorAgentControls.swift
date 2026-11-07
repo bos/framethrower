@@ -267,6 +267,9 @@ enum EditorAgentControls {
             try keys(args, ["version", "project_id", "expected_revision", "changes"])
             try scope(args, context: context)
             guard let changes = args["changes"] as? [[String: Any]], (1...16).contains(changes.count) else { throw invalidResponse }
+            if let instruction, let rejection = managementIntentMismatch(instruction, changes: changes, context: context) {
+                return .rejectedPlan(rejection)
+            }
             let active = context.recording.state.timedEdits(includeCamera: true)
             var times: [UUID: Double] = [:]
             for edit in active {
@@ -339,6 +342,103 @@ enum EditorAgentControls {
                 summary: LocalEditPlanner.descriptiveSummary(summaries.joined(separator: "\n"), commands: commands, context: context))
         default: return nil
         }
+    }
+
+    private struct ManagementIntent {
+        let action: String
+        let targetLabel: String?
+    }
+
+    /// Only literal single-operation requests are narrowed. Compound requests
+    /// and contextual answers keep the full management schema and validation.
+    private static func literalManagementIntent(in instruction: String) -> ManagementIntent? {
+        let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?")))
+            .replacingOccurrences(of: "^(?:(?:please|can you|could you|would you|will you)\\s+)+", with: "",
+                                  options: [.regularExpression, .caseInsensitive])
+        guard text.range(of: "[;\\n]|\\b(?:and|then|but|or|also|not|don't|except|unless|if|edits|marks|steps)\\b",
+                         options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        let label = "((?:(?:edit|ref(?:erence)?|zoom|pan|full[ -]?frame|hold|camera)\\s+[A-Za-z]{1,6}|(?-i:[A-Z]{1,6})))"
+        func target(_ pattern: String) -> String? {
+            guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                  let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let range = Range(match.range(at: 1), in: text) else { return nil }
+            return String(text[range])
+        }
+        let expectedAction: String
+        let targetLabel: String?
+        if let label = target("^(?:delete|remove)\\s+(?:the\\s+)?" + label + "$") {
+            expectedAction = "delete"; targetLabel = label
+        } else if let label = target("^(?:move|retime)\\s+(?:the\\s+)?" + label + "\\s+.+$") {
+            expectedAction = "move"; targetLabel = label
+        } else if text.range(of: "^(?:create|add|insert)\\s+(?:(?:a|an|one)\\s+)?(?:new\\s+)?(?:edit(?:\\s+mark)?|reference\\s+mark|mark|step)(?:\\s+.+)?$",
+                             options: [.regularExpression, .caseInsensitive]) != nil {
+            expectedAction = "create"; targetLabel = nil
+        } else { return nil }
+        return ManagementIntent(action: expectedAction, targetLabel: targetLabel)
+    }
+
+    /// Focus the current request, not the earlier routing instruction. A reply
+    /// such as "B instead" must remain free to change the prior target.
+    static func focusedManagementTool(_ tool: [String: Any], instruction: String,
+                                      context: LocalEditContext) -> [String: Any] {
+        guard let intent = literalManagementIntent(in: instruction),
+              var function = tool["function"] as? [String: Any], function["name"] as? String == "manage_edits",
+              var parameters = function["parameters"] as? [String: Any],
+              var properties = parameters["properties"] as? [String: Any],
+              var changes = properties["changes"] as? [String: Any],
+              var items = changes["items"] as? [String: Any],
+              let alternatives = items["oneOf"] as? [[String: Any]] else { return tool }
+        var focused = alternatives.filter {
+            let fields = $0["properties"] as? [String: Any]
+            return (fields?["action"] as? [String: Any])?["const"] as? String == intent.action
+        }
+        guard focused.count == 1 else { return tool }
+        if let label = intent.targetLabel,
+           let edit = EditorActionDescription.resolve(label, in: context.recording.state, references: context.recording.references),
+           let canonical = context.recording.references.editLabel(for: edit.id),
+           var fields = focused[0]["properties"] as? [String: Any],
+           var target = fields["edit_label"] as? [String: Any] {
+            target["enum"] = [canonical]
+            fields["edit_label"] = target
+            focused[0]["properties"] = fields
+        }
+        items["oneOf"] = focused
+        changes["items"] = items
+        changes["maxItems"] = 1
+        properties["changes"] = changes
+        parameters["properties"] = properties
+        function["parameters"] = parameters
+        var result = tool
+        result["function"] = function
+        return result
+    }
+
+    /// Labels are checked by identity as a second defense against responses
+    /// that do not follow the focused schema; aliases still identify one edit.
+    private static func managementIntentMismatch(_ instruction: String, changes: [[String: Any]],
+                                                 context: LocalEditContext) -> String? {
+        guard let intent = literalManagementIntent(in: instruction) else { return nil }
+        let expectedAction = intent.action, targetLabel = intent.targetLabel
+        let expectedTarget: TimedEdit?
+        if let targetLabel {
+            guard let edit = EditorActionDescription.resolve(targetLabel, in: context.recording.state,
+                references: context.recording.references) else {
+                return "The instruction names \(targetLabel), which is not an existing edit. Ask which visible edit is intended; do not substitute another target."
+            }
+            expectedTarget = edit
+        } else { expectedTarget = nil }
+        guard changes.count == 1, changes[0]["action"] as? String == expectedAction else {
+            return "The instruction requests one \(expectedAction) operation. Return only that operation; do not substitute another edit-management action."
+        }
+        if let expectedTarget, let actualLabel = changes[0]["edit_label"] as? String {
+            let actual = EditorActionDescription.resolve(actualLabel, in: context.recording.state,
+                references: context.recording.references)
+            guard actual?.id == expectedTarget.id else {
+                let expectedLabel = context.recording.references.editLabel(for: expectedTarget.id) ?? targetLabel ?? "the named edit"
+                return "The instruction targets \(expectedLabel). Return the requested operation for that same edit identity, not another edit."
+            }
+        }
+        return nil
     }
 
     private static func scope(_ args: [String: Any], context: LocalEditContext) throws {

@@ -336,6 +336,11 @@ actions. Fresh edits clear Redo. The agent can create, move, and remove marks,
 and invoke the same Undo/Redo stack. It cannot selectively skip manual edits to
 undo an older request.
 
+Literal single-mark create, move, and delete requests also validate the proposed
+operation and target identity against the instruction. A mismatched model action
+is rejected before changing the project; the model receives that actual rejection
+for one corrective turn. Repeated mismatches leave the project unchanged.
+
 The initial model context includes the next eight Undo and Redo names and the
 total stack sizes. Director can request older entries through the read-only
 `inspect_history` tool, receiving bounded pages with the actual changes described
@@ -469,6 +474,9 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-history-lookup.sh`: bounded read-only history inspection, saved
   snapshot summaries, and model continuations using actual lookup results. Add
   `--native-model` to check the installed Metal text model's lookup and answer.
+- `Tests/check-management-intent.sh`: captured wrong-action responses, target
+  substitutions, unknown labels, and bounded correction through the real session.
+  Add `--model` to run the corrective turn through the local Metal model.
 - `Tests/check-director-diagnostics.sh`: correlated private traces, bounded
   rotation, valid JSON truncation, permissions, and nonfatal write failures.
 - `Tests/check-director-voice-integration.sh`: generated in-memory speech through

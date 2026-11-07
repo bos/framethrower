@@ -350,6 +350,55 @@ final class EditorAssistantSession: ObservableObject {
         }
     }
 
+    /// Resolve the displayed proposal directly; the captured identity prevents
+    /// a delayed button action from choosing a newer proposal.
+    @discardableResult
+    func resolveConflict(_ side: EditorConflictSide, editor: ProjectEditor, reviewID: UUID) -> Bool {
+        guard !isBusy, observedEditor === editor, conflictReviewID == reviewID,
+              let pending = framingConflict else { return false }
+        let requestID = UUID()
+        let choice = side == .existing ? "keep" : "replace"
+        conversation.begin(side == .existing ? "Keep the existing framing." : "Use the proposed framing.", requestID: requestID)
+        record("conflict_choice", requestID: requestID, details: ["choice": choice, "source": "button"])
+        do {
+            guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
+            guard pending.context.recording.projectID == projectID,
+                  pending.context.recording.revision == (try EditorCommandDispatcher.revision(for: editor.project)),
+                  pending.proposal.proposal.projectID == projectID else { throw EditorCommandError.stale }
+            let before = editor.project.state
+            var outcome: [String: Any]
+            switch try LocalEditPlanner.conflictResult(choice: choice, conflict: pending.proposal) {
+            case let .commands(batch, summary):
+                currentRequestID = requestID
+                defer { currentRequestID = nil }
+                let name = "Director: " + String(summary.replacingOccurrences(of: "\n", with: "; ").prefix(140))
+                try withDirectorChange { try EditorCommandDispatcher.apply(batch, to: editor, projectID: projectID, name: name) }
+                notice = summary
+                outcome = ["status": "applied", "summary": summary, "commands": DirectorConversation.object(batch.commands)]
+            case let .noChanges(summary):
+                notice = summary
+                outcome = ["status": "unchanged", "summary": summary]
+            default: return false
+            }
+            errorMessage = nil; clarification = nil; framingConflict = nil
+            instruction = ""; pendingSpeechID = nil
+            outcome["interaction"] = "conflict_button"; outcome["choice"] = choice
+            outcome["revision"] = try EditorCommandDispatcher.revision(for: editor.project)
+            outcome["history"] = DirectorConversation.object(editor.historyState)
+            outcome["edit_steps"] = DirectorConversation.object(DirectorTranscriptStep.changes(
+                from: before, to: editor.project.state, references: editor.references))
+            finish(requestID, response: nil, outcome: outcome)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            if case .stale? = error as? EditorCommandError { framingConflict = nil; clarification = nil; notice = nil }
+            if case .pendingDraft? = error as? EditorCommandError { framingConflict = nil; clarification = nil; notice = nil }
+            finish(requestID, response: nil, outcome: ["status": "rejected", "error": error.localizedDescription,
+                "interaction": "conflict_button", "choice": choice, "applied": false])
+            return false
+        }
+    }
+
     func cancel() {
         if let id = currentRequestID {
             finish(id, response: nil, outcome: ["status": "cancelled", "summary": "Request cancelled; no pending proposal applied."])
@@ -466,8 +515,13 @@ struct EditorAssistantPanel: View {
             DirectorConversationView(conversation: session.conversation, references: editor.references,
                 state: editor.editingState, selectedEditID: selectedEditID,
                 pendingQuestion: session.awaitsClarification ? session.notice : nil,
-                isBusy: session.isBusy, conflictReview: session.conflictReview,
-                onReviewConflict: onReviewConflict, onSelectEdit: onSelectEdit, onDismissQuestion: {
+                isBusy: session.isBusy, conflictReview: session.conflictReview, conflictReviewID: session.conflictReviewID,
+                onReviewConflict: onReviewConflict, onChooseConflict: { side, reviewID in
+                    Task {
+                        await instructionSpeech.cancel()
+                        session.resolveConflict(side, editor: editor, reviewID: reviewID)
+                    }
+                }, onSelectEdit: onSelectEdit, onDismissQuestion: {
                     Task { await instructionSpeech.cancel(); session.cancel() }
                 })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -653,7 +707,9 @@ private struct DirectorConversationView: View {
     let pendingQuestion: String?
     let isBusy: Bool
     let conflictReview: EditorConflictReview?
+    let conflictReviewID: UUID?
     let onReviewConflict: () -> Void
+    let onChooseConflict: (EditorConflictSide, UUID) -> Void
     let onSelectEdit: (UUID) -> Void
     let onDismissQuestion: () -> Void
     @State private var followingLatest = true
@@ -722,16 +778,24 @@ private struct DirectorConversationView: View {
                         .help("Dismiss this question and start a new instruction. Escape also dismisses it.")
                 }
             }
-            if activeQuestion, conflictReview != nil {
-                HStack(spacing: 12) {
-                    conflictKey("Existing", color: .orange, dashed: false)
-                    conflictKey("Proposed", color: .cyan, dashed: true)
+            if activeQuestion, conflictReview != nil, let conflictReviewID {
+                HStack(spacing: 8) {
+                    Button { onChooseConflict(.existing, conflictReviewID) } label: {
+                        conflictKey("Existing", color: .orange, dashed: false)
+                    }
+                    .help("Keep the existing movement and dismiss this proposal.")
+                    .accessibilityLabel("Existing")
+                    Button { onChooseConflict(.proposed, conflictReviewID) } label: {
+                        conflictKey("Proposed", color: .cyan, dashed: true)
+                    }
+                    .help("Replace the conflicting movement with the displayed proposal. Undo restores the previous movement.")
+                    .accessibilityLabel("Proposed")
                     Spacer(minLength: 0)
                     Button(action: onReviewConflict) { Image(systemName: "scope") }
                         .buttonStyle(.borderless).accessibilityLabel("Review overlap")
                         .help("Move the playhead to the conflicting movement. Scrub the highlighted timeline spans to compare the solid Existing and dashed Proposed frames.")
                 }
-                .font(.caption)
+                .font(.caption).buttonStyle(.bordered).controlSize(.small).disabled(isBusy)
             }
             ForEach(entry.steps) { step in
                 let live = references.edit(in: state, id: step.id)

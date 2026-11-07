@@ -718,7 +718,13 @@ enum LocalEditPlanner {
         try keys(args, ["project_id", "expected_revision", "choice"])
         guard let project = args["project_id"] as? String, UUID(uuidString: project) == conflict.proposal.projectID,
               args["expected_revision"] as? String == conflict.proposal.revision else { throw EditorCommandError.stale }
-        switch args["choice"] as? String {
+        return try conflictResult(choice: args["choice"] as? String ?? "", conflict: conflict)
+    }
+
+    /// Buttons and model replies resolve the same frozen proposal. Only model
+    /// replies require decoding; the dispatcher still validates before writing.
+    static func conflictResult(choice: String, conflict: EditorFramingConflict) throws -> LocalEditResult {
+        switch choice {
         case "replace": return .commands(conflict.replacement, summary: "Replaced the conflicting framing. " + conflict.summary)
         case "keep": return .noChanges("Kept the existing framing.")
         default: throw invalidResponse

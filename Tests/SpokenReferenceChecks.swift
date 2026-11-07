@@ -58,7 +58,7 @@ private struct SpokenReferenceChecks {
             .moveBetweenEdits(fromEditID: fixture.a.id, toEditID: fixture.b.id, regionID: fixture.box2.id)],
             "spoken labels resolve to exact existing edit and box identities")
         if case let .commands(_, summary) = result {
-            try require(summary.contains("Edit A") && summary.contains("Edit B") && summary.contains("Box 2"),
+            try require(summary.contains("Zoom A") && summary.contains("Zoom B") && summary.contains("Box 2") && !summary.contains("Edit A"),
                         "result uses visible names instead of fractional seconds")
         }
         let next = try EditorCommandDispatcher.prepare(plan, for: fixture.project, projectID: fixture.id)
@@ -130,7 +130,11 @@ private struct SpokenReferenceChecks {
         let messages = decoded["messages"] as! [[String: String]]
         let user = messages[1]["content"]!
         try require(user.contains("Edit A") && user.contains("Edit B") && user.contains("Box 2"), "explicitly referenced old labels remain in bounded context")
-        try require(!user.contains(String(repeating: "x", count: 121)), "notes are bounded separately from project metadata")
+        let contextJSON = try JSONSerialization.jsonObject(with: Data(user.split(separator: "\n", maxSplits: 1)[1].utf8)) as! [String: Any]
+        let compactRegions = (contextJSON["recording"] as! [String: Any])["regions"] as! [[String: Any]]
+        try require(compactRegions.allSatisfy { (($0["note"] as? String)?.count ?? 0) <= 120 }, "compact notes are bounded separately from complete current-state metadata")
+        let allRegions = (contextJSON["current_state"] as! [String: Any])["regions"] as! [[String: Any]]
+        try require(allRegions.contains { ($0["note"] as? String)?.count == 4_000 }, "the complete authoritative state retains original notes")
         try require(user.contains("edit_label") && user.contains("source_rect"), "model sees box-to-edit association and exact original geometry")
         let tools = decoded["tools"] as! [[String: Any]]
         try require(tools.count == 2 && tools.allSatisfy { ($0["function"] as? [String: Any])?["name"] as? String != "plan_sequence" },

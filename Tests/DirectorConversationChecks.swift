@@ -22,6 +22,7 @@ struct DirectorConversationChecks {
         try checkConversationProtocolAndChronology()
         try await checkManualEventsAndCurrentState()
         try await checkManualChangeDuringInference()
+        try await checkNonapplyingResultDoesNotClaimManualChange()
         try await checkQuestionPersistence()
         try await checkTypedAnswerDurability()
         try await checkConflictPersistenceAndStaleInvalidation()
@@ -257,6 +258,35 @@ struct DirectorConversationChecks {
         try require(reopened.draftInstruction.isEmpty && reopened.question == nil && reopened.conflict == nil,
                     "A completed request cannot reopen as an unfinished instruction or question")
         second.suspend()
+    }
+
+    static func checkNonapplyingResultDoesNotClaimManualChange() async throws {
+        let fixture = try Fixture(conflict: true)
+        defer { fixture.close() }
+        let transport = ConversationTransport(), session = fixture.session(transport)
+        session.instruction = "Pan from Box 1 to Box 2 over the next three seconds."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try await wait { await transport.payloads.count == 1 }
+        await transport.reply(0, try fixture.movement(session))
+        try await wait { !session.isBusy }
+        try require(session.awaitsClarification, "Create the actual framing conflict before choosing to keep it")
+        session.instruction = "Keep the existing framing."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try await wait { await transport.payloads.count == 2 }
+        let offeredScope = try fixture.scope(session)
+        var manual = fixture.editor.project.state
+        let manualMark = ZoomKeyframe(time: 6, scale: 2.5)
+        manual.zoomKeyframes.append(manualMark)
+        try require(fixture.editor.commit(manual, name: "Manual zoom during reply"), "Make a real manual framing change while the fake reply is pending")
+        await transport.reply(1, try tool("resolve_framing_conflict", offeredScope.merging(["choice": "keep"]) { _, b in b }))
+        try await wait { !session.isBusy }
+        try require(session.errorMessage == nil && fixture.editor.project.state == manual && !session.awaitsClarification,
+                    "Keeping the existing framing must preserve the concurrent manual edit without applying a new change")
+        let entries = DirectorTranscript.entries(in: session.conversation, references: fixture.editor.references)
+        let manualEntry = entries.first { $0.text == "Manual change: Manual zoom during reply" }
+        try require(manualEntry?.steps.map(\.id) == [manualMark.id] && entries.last?.text == "Kept the existing framing." && entries.last?.steps.isEmpty == true,
+                    "A nonapplying assistant result cannot claim the manual mark; its actual change remains in the separate manual event")
+        session.suspend()
     }
 
     static func checkConflictPersistenceAndStaleInvalidation() async throws {

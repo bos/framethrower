@@ -22,7 +22,7 @@ final class EditorAssistantSession: ObservableObject {
     private let diagnostics: DirectorDiagnostics?
     private let persistsConversation: Bool
     private let conversationStorageURL: URL?
-    private(set) var conversation = DirectorConversation()
+    @Published private(set) var conversation = DirectorConversation()
     private weak var observedEditor: ProjectEditor?
     private var projectObservation: AnyCancellable?
     private var observedProject: RecordingProject?
@@ -139,9 +139,12 @@ final class EditorAssistantSession: ObservableObject {
         // the conversation even though no model round trip is necessary.
         if isHistoryShortcut(text) {
             conversation.begin(text, requestID: token)
-            _ = performHistoryShortcut(text, editor: editor)
+            let before = editor.project.state
+            withDirectorChange { _ = performHistoryShortcut(text, editor: editor) }
             finish(token, response: nil, outcome: ["status": errorMessage == nil ? "completed" : "rejected",
-                "summary": notice ?? errorMessage ?? "", "history": DirectorConversation.object(editor.historyState)])
+                "summary": notice ?? errorMessage ?? "", "history": DirectorConversation.object(editor.historyState),
+                "edit_steps": DirectorConversation.object(DirectorTranscriptStep.changes(
+                    from: before, to: editor.project.state, references: editor.references))])
             return
         }
         if editor.draftState != nil, EditorAgentControls.historyAction(in: text) == .redo {
@@ -210,6 +213,7 @@ final class EditorAssistantSession: ObservableObject {
                     let result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
                         ?? LocalEditPlanner.result(data, context: context, instruction: validationInstruction, routingRequest: routingRequest)
                     var outcome: [String: Any]
+                    var appliedFrom: EditState?
                     switch result {
                     case let .rejectedPlan(reason):
                         guard attempt == 0 else {
@@ -228,17 +232,18 @@ final class EditorAssistantSession: ObservableObject {
                         continue
                     case let .commands(batch, summary):
                         let name = "Director: " + String(summary.replacingOccurrences(of: "\n", with: "; ").prefix(140))
+                        appliedFrom = editor.project.state
                         try self.withDirectorChange { try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID, name: name) }
                         let oldIDs = Set(recording.state.timedEdits(includeCamera: true).map(\.id))
                         let created = editor.project.state.timedEdits(includeCamera: true).filter { !oldIDs.contains($0.id) }
-                        let labels = created.compactMap { editor.references.editLabel(for: $0.id) }
-                        self.notice = labels.isEmpty ? summary : summary + "\nCreated " + labels.joined(separator: ", ") + "."
+                        self.notice = summary
                         self.clarification = nil; self.framingConflict = nil
                         outcome = ["status": "applied", "summary": self.notice ?? summary,
                             "commands": DirectorConversation.object(batch.commands),
                             "created_edits": created.map { ["id": $0.id.uuidString, "time": $0.time,
                                 "label": editor.references.editLabel(for: $0.id) ?? ""] as [String: Any] }]
                     case let .history(history):
+                        appliedFrom = editor.project.state
                         try self.withDirectorChange { try EditorHistoryDispatcher.apply(history, to: editor, projectID: self.projectID) }
                         let name = (history.action == .undo ? recording.history.undo : recording.history.redo).first ?? "change"
                         let action = history.action == .undo ? "Undid" : "Redid"
@@ -268,6 +273,10 @@ final class EditorAssistantSession: ObservableObject {
                     }
                     outcome["revision"] = try EditorCommandDispatcher.revision(for: editor.project)
                     outcome["history"] = DirectorConversation.object(editor.historyState)
+                    if let appliedFrom {
+                        outcome["edit_steps"] = DirectorConversation.object(DirectorTranscriptStep.changes(
+                            from: appliedFrom, to: editor.project.state, references: editor.references))
+                    }
                     self.instruction = ""
                     self.finish(token, response: data, outcome: outcome)
                     break
@@ -397,6 +406,8 @@ struct EditorAssistantPanel: View {
     @ObservedObject var editor: ProjectEditor
     @ObservedObject var session: EditorAssistantSession
     let selectedRegionID: UUID?
+    var selectedEditID: UUID? = nil
+    var onSelectEdit: (UUID) -> Void = { _ in }
     let onSelectRegion: (UUID) -> Void
     let onRemoveRegion: (UUID) -> Void
     var onShowOriginalFrame: (UUID) -> Void = { _ in }
@@ -423,11 +434,18 @@ struct EditorAssistantPanel: View {
                         if let selected { reader.scrollTo(selected, anchor: .center) }
                     }
                 }
-                .frame(height: min(180, CGFloat(regions.count) * 44 + CGFloat(max(0, regions.count - 1)) * 4))
+                .frame(height: min(140, CGFloat(regions.count) * 44 + CGFloat(max(0, regions.count - 1)) * 4))
                 Divider()
             }
+            DirectorConversationView(conversation: session.conversation, references: editor.references,
+                state: editor.editingState, selectedEditID: selectedEditID,
+                pendingQuestion: session.awaitsClarification ? session.notice : nil,
+                isBusy: session.isBusy, onSelectEdit: onSelectEdit, onDismissQuestion: {
+                    Task { await instructionSpeech.cancel(); session.cancel() }
+                })
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             TextField(session.awaitsClarification ? "Your answer…" : "What would you like to change?", text: $session.instruction, axis: .vertical)
-                .textFieldStyle(.roundedBorder).lineLimit(3...6)
+                .textFieldStyle(.roundedBorder).lineLimit(2...4)
                 .onSubmit { if instructionSpeech.phase == .idle { onSubmit() } }
                 .disabled(session.isBusy)
                 .accessibilityLabel("Editing instruction")
@@ -437,15 +455,27 @@ struct EditorAssistantPanel: View {
                     session.beginVoiceInstruction()
                     instructionSpeech.contextualStrings = editor.editingState.regions.compactMap {
                         editor.references.boxLabel(for: $0.id)
-                    } + editor.editingState.timedEdits(includeCamera: true).compactMap {
-                        editor.references.editLabel(for: $0.id)
+                    } + editor.editingState.timedEdits(includeCamera: true).flatMap {
+                        EditorActionDescription.describe($0, in: editor.editingState, references: editor.references).aliases
                     }
                     onVoiceBegin()
                 }) { text in
                     if session.appendDictation(text) { onSubmit() }
                 }
                     .disabled(session.isBusy)
-                Text("On-device").font(.caption).foregroundStyle(.secondary)
+                if instructionSpeech.phase == .listening {
+                    HStack(spacing: 5) {
+                        Circle().fill(.red).frame(width: 6, height: 6)
+                        Text("Listening…")
+                    }
+                    .font(.callout).accessibilityElement(children: .combine)
+                } else if instructionSpeech.phase == .preparing || instructionSpeech.phase == .finishing {
+                    ProgressView().controlSize(.small)
+                    Text(instructionSpeech.phase == .preparing ? "Starting microphone…" : "Recognizing…")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("On-device").font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
                 if session.isBusy {
                     ProgressView().controlSize(.small)
@@ -461,20 +491,9 @@ struct EditorAssistantPanel: View {
             }
             .frame(minHeight: 28)
             speechStatus(instructionSpeech)
-            if let message = session.errorMessage {
+            if let message = session.errorMessage, !transcriptContains(message) {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-            } else if let message = session.notice {
-                HStack(alignment: .top) {
-                    Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                    if session.awaitsClarification {
-                        Button { session.cancel() } label: { Image(systemName: "xmark") }
-                            .buttonStyle(.borderless)
-                            .accessibilityLabel("Dismiss question")
-                            .help("Dismiss this question and start a new instruction. Escape also dismisses it.")
-                    }
-                }
             }
-            Spacer(minLength: 0)
         }
         .padding(16)
         .onChange(of: instructionSpeech.transcript) { _, text in
@@ -502,10 +521,17 @@ struct EditorAssistantPanel: View {
             status: instructionSpeech.statusMessage, error: instructionSpeech.errorMessage)
     }
 
+    private func transcriptContains(_ message: String) -> Bool {
+        DirectorTranscript.entries(in: session.conversation, references: editor.references).last?.text == message
+    }
+
     private func regionRow(_ region: EditorRegion) -> some View {
         let label = editor.references.boxLabel(for: region.id) ?? "Box"
-        let editLabel = region.editID.flatMap { editor.references.editLabel(for: $0) }
-        let editExists = region.editID.flatMap { editor.references.edit(in: editor.editingState, id: $0) } != nil
+        let linkedEdit = region.editID.flatMap { editor.references.edit(in: editor.editingState, id: $0) }
+        let editLabel = linkedEdit.map {
+            EditorActionDescription.describe($0, in: editor.editingState, references: editor.references).shortLabel
+        } ?? region.editID.flatMap { editor.references.editLabel(for: $0) }
+        let editExists = linkedEdit != nil
         let association = editLabel.map { "from " + $0 + (editExists ? "" : " · removed") }
         let selected = region.id == selectedRegionID
         return HStack(spacing: 4) {
@@ -579,8 +605,126 @@ struct EditorAssistantPanel: View {
         if speech.phase != .idle, !speech.transcript.isEmpty {
             Text(speech.transcript).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
         }
-        if let message = speech.errorMessage ?? speech.statusMessage {
-            Text(message).font(.caption).foregroundStyle(speech.errorMessage == nil ? Color.secondary : .red)
+        if let message = speech.errorMessage {
+            Text(message).font(.caption).foregroundStyle(.red)
         }
     }
+}
+
+private struct ConversationScrollPosition: Equatable {
+    var offset: CGFloat
+    var contentHeight: CGFloat
+    var viewportHeight: CGFloat
+    var isAtBottom: Bool { offset + viewportHeight >= contentHeight - 36 }
+}
+
+private struct DirectorConversationView: View {
+    @ObservedObject var conversation: DirectorConversation
+    let references: EditorReferences
+    let state: EditState
+    let selectedEditID: UUID?
+    let pendingQuestion: String?
+    let isBusy: Bool
+    let onSelectEdit: (UUID) -> Void
+    let onDismissQuestion: () -> Void
+    @State private var followingLatest = true
+    @State private var readerIsScrolling = false
+
+    private var entries: [DirectorTranscriptEntry] { DirectorTranscript.entries(in: conversation, references: references) }
+
+    var body: some View {
+        ScrollViewReader { reader in
+            ScrollView {
+                // The archive is bounded to 200 exchanges. Measure these
+                // rows eagerly so the end anchor always follows the real last
+                // result, including a reply appended below the visible area.
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(entries) { entry in row(entry) }
+                    if isBusy { Text("Interpreting your instruction…").font(.callout).foregroundStyle(.secondary) }
+                    Color.clear.frame(height: 1).id("conversation-end")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityLabel("Director conversation")
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.top, for: .sizeChanges)
+            .onScrollPhaseChange { _, phase, context in
+                readerIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+                if readerIsScrolling {
+                    let geometry = context.geometry
+                    followingLatest = geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 36
+                }
+            }
+            .onScrollGeometryChange(for: ConversationScrollPosition.self) { geometry in
+                ConversationScrollPosition(offset: geometry.contentOffset.y,
+                    contentHeight: geometry.contentSize.height, viewportHeight: geometry.containerSize.height)
+            } action: { previous, current in
+                // A new result changes the document height. That layout change
+                // is not the reader deliberately scrolling away from the end.
+                if readerIsScrolling {
+                    followingLatest = current.isAtBottom
+                } else if followingLatest && (previous.contentHeight != current.contentHeight || previous.viewportHeight != current.viewportHeight) {
+                    // The new row has now been measured; following before
+                    // this layout pass would stop at the old document end.
+                    reader.scrollTo("conversation-end", anchor: .bottom)
+                }
+            }
+            .onChange(of: entries.last?.id) { _, _ in
+                if followingLatest { reader.scrollTo("conversation-end", anchor: .bottom) }
+            }
+            .onChange(of: isBusy) { _, _ in
+                if followingLatest { reader.scrollTo("conversation-end", anchor: .bottom) }
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ entry: DirectorTranscriptEntry) -> some View {
+        let activeQuestion = entry.isQuestion && entry.text == pendingQuestion && entry.id == entries.last(where: \.isQuestion)?.id
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 6) {
+                Text(entry.text)
+                    .font(entry.kind == .event ? .caption : .callout)
+                    .foregroundStyle(entry.isError ? Color.red : entry.kind == .event ? Color.secondary : Color.primary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if activeQuestion {
+                    Button(action: onDismissQuestion) { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless).accessibilityLabel("Dismiss question")
+                        .help("Dismiss this question and start a new instruction. Escape also dismisses it.")
+                }
+            }
+            ForEach(entry.steps) { step in
+                let live = references.edit(in: state, id: step.id)
+                Button { if let live { onSelectEdit(live.id) } } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(step.label).fontWeight(.medium)
+                            Spacer(minLength: 4)
+                            Text(String(format: "%.2f s", step.time)).monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        Text(step.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(7)
+                    .background(live?.id == selectedEditID && live != nil ? Color.purple.opacity(0.12) : Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(live?.id == selectedEditID && live != nil ? Color.purple : .clear, lineWidth: 1))
+                }
+                .buttonStyle(.plain).disabled(live == nil)
+                .help(step.tooltip + navigationHelp(for: step, live: live))
+                .accessibilityLabel("\(step.label) at \(String(format: "%.2f", step.time)) seconds. \(step.detail)" + navigationHelp(for: step, live: live))
+            }
+        }
+        .padding(entry.kind == .event ? 0 : 9)
+        .background(entry.kind == .user ? Color.accentColor.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(activeQuestion ? Color.accentColor.opacity(0.6) : .clear, lineWidth: 1))
+        .padding(.leading, entry.kind == .user ? 16 : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func navigationHelp(for step: DirectorTranscriptStep, live: TimedEdit?) -> String {
+        guard let live else { return " This mark is no longer in the current edit." }
+        if abs(live.time - step.time) > 0.000001 {
+            return String(format: " This mark has moved to %.2f s. Click to inspect its current state.", live.time)
+        }
+        return " Click to inspect this mark’s current state."
+    }
+
 }

@@ -137,7 +137,8 @@ struct ProjectEditorView: View {
         }
         .inspector(isPresented: $directorMode) {
             EditorAssistantPanel(editor: editor, session: assistant,
-                selectedRegionID: selectedRegionID, onSelectRegion: { selectRegion($0) },
+                selectedRegionID: selectedRegionID, selectedEditID: selectedEditID,
+                onSelectEdit: { selectEdit($0) }, onSelectRegion: { selectRegion($0) },
                 onRemoveRegion: { removeRegion($0) }, onShowOriginalFrame: { showOriginalFrame($0) }, onSubmit: {
                     playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
@@ -215,8 +216,8 @@ struct ProjectEditorView: View {
                 }
             }
             .overlay(alignment: .topLeading) {
-                if let selectedEdit, let label = editor.references.editLabel(for: selectedEdit.id) {
-                    Text(label).font(.caption.weight(.semibold)).foregroundStyle(.white)
+                if let selectedEdit {
+                    Text(editLabel(selectedEdit)).font(.caption.weight(.semibold)).foregroundStyle(.white)
                         .padding(.horizontal, 9).padding(.vertical, 5)
                         .background(.black.opacity(0.65), in: Capsule())
                         .padding(10).allowsHitTesting(false)
@@ -503,7 +504,7 @@ struct ProjectEditorView: View {
                                 Label(editTitle(edit), systemImage: "diamond.fill")
                             }
                             .buttonStyle(.plain)
-                            .help("\(editLabel(edit)) at \(String(format: "%.2f", edit.time)) seconds. Click to select; drag its timeline diamond to move it.")
+                            .help(actionDescription(edit).tooltip + " Click to select; drag its timeline diamond to move it.")
                             Button { removeEdit(edit) } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 20) }
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Remove \(editLabel(edit))")
@@ -522,20 +523,13 @@ struct ProjectEditorView: View {
         .frame(height: 34)
     }
 
-    private func editLabel(_ edit: TimedEdit) -> String {
-        editor.references.editLabel(for: edit.id) ?? "Edit"
+    private func actionDescription(_ edit: TimedEdit) -> EditorActionDescription {
+        EditorActionDescription.describe(edit, in: state, references: editor.references)
     }
 
-    private func editSummary(_ edit: TimedEdit) -> String {
-        let view = state.zoomKeyframes.first { $0.id == edit.zoomID }
-        if let view { return String(format: "%.2f×", view.scale) + (edit.cameraID == nil ? "" : " · Camera") }
-        return edit.cameraID == nil ? "Reference mark" : "Camera"
-    }
+    private func editLabel(_ edit: TimedEdit) -> String { actionDescription(edit).shortLabel }
 
-    private func editTitle(_ edit: TimedEdit) -> String {
-        if edit.zoomID == nil && edit.cameraID == nil { return editLabel(edit) }
-        return editLabel(edit) + " · " + editSummary(edit)
-    }
+    private func editTitle(_ edit: TimedEdit) -> String { editLabel(edit) }
 
     private func timelineMarker(_ edit: TimedEdit) -> RecordingTimelineMarker {
         let view = state.zoomKeyframes.first { $0.id == edit.zoomID }
@@ -549,7 +543,7 @@ struct ProjectEditorView: View {
         let ramps = MotionInterpolation.rampDurations(duration: edit.time - start,
             easeIn: useCamera ? camera?.easeIn : view?.easeIn, easeOut: useCamera ? camera?.easeOut : view?.easeOut)
         return RecordingTimelineMarker(id: edit.id, time: edit.time,
-            help: "\(editLabel(edit)) at \(String(format: "%.2f", edit.time)) seconds: \(editSummary(edit)). Click to select; drag to move.",
+            help: actionDescription(edit).tooltip + " Click to select; drag to move.",
             label: editLabel(edit),
             transitionStart: transition == .smooth ? start : nil, easeIn: ramps.easeIn, easeOut: ramps.easeOut,
             minimumTime: edit.cameraID == nil ? 0 : frameDuration,

@@ -154,7 +154,7 @@ struct DurationMoveChecks {
         guard case let .commands(batch, summary) = try LocalEditPlanner.result(data, context: fixture.context, instruction: request) else {
             throw DurationMoveFailure.failed("expected complete duration plan")
         }
-        try require(summary.contains("5-second") && summary.contains("Box 1") && summary.contains("Box 2") && summary.contains("Edit A"),
+        try require(summary.contains("5-second") && summary.contains("Box 1") && summary.contains("Box 2") && summary.contains("Zoom A") && !summary.contains("Edit A"),
                     "summary uses spoken references and requested duration")
         return batch
     }

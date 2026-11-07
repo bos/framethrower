@@ -84,9 +84,9 @@ enum LocalEditPlanner {
         var edits = Array(allEdits.suffix(8))
         for edit in allEdits {
             let isSelected = edit.id == context.selectedEditID || edit.id == context.liveUI?.selectedEditID
-            let isReferenced = context.recording.references.editLabel(for: edit.id).map {
-                mentions($0, in: referenceRequest) || pairedNames.contains($0)
-            } ?? false
+            let isReferenced = EditorActionDescription.mentions(edit, in: referenceRequest,
+                state: context.recording.state, references: context.recording.references) ||
+                (context.recording.references.editLabel(for: edit.id).map { pairedNames.contains($0) } ?? false)
             let hasBox = regions.contains { region in
                 guard let associatedID = region.editID else { return false }
                 return context.recording.references.edit(in: context.recording.state, id: associatedID)?.id == edit.id
@@ -102,13 +102,16 @@ enum LocalEditPlanner {
             if let editID = region.editID {
                 let active = context.recording.references.edit(in: context.recording.state, id: editID)
                 value["edit_id"] = (active?.id ?? editID).uuidString
-                value["edit_label"] = context.recording.references.editLabel(for: editID)
+                value["edit_label"] = active.map { EditorActionDescription.describe($0, in: context.recording.state,
+                    references: context.recording.references).shortLabel } ?? context.recording.references.editLabel(for: editID)
             }
             return value
         }
         let editValues: [[String: Any]] = edits.map { edit in
             let point = context.recording.state.zoomKeyframes.first { $0.id == edit.zoomID }
-            return ["id": edit.id.uuidString, "label": context.recording.references.editLabel(for: edit.id) ?? "Unlabelled edit",
+            let description = EditorActionDescription.describe(edit, in: context.recording.state, references: context.recording.references)
+            return ["id": edit.id.uuidString, "label": description.shortLabel, "description": description.detail,
+                    "aliases": description.aliases, "action": description.kind.rawValue, "is_movement": description.isMovement,
                     "time": edit.time, "move_seconds": point?.duration ?? 0.4,
                     "has_framing": point != nil, "reference_only": edit.zoomID == nil && edit.cameraID == nil]
         }
@@ -117,7 +120,9 @@ enum LocalEditPlanner {
         func uiValues(_ ui: LocalEditUIContext) -> [String: Any] {
             let selected: [String: Any] = allEdits.first { $0.id == ui.selectedEditID }.map { edit in
                 let point = context.recording.state.zoomKeyframes.first { $0.id == edit.zoomID }
+                let description = EditorActionDescription.describe(edit, in: context.recording.state, references: context.recording.references)
                 return ["id": edit.id.uuidString, "time": edit.time, "move_seconds": point?.duration ?? 0.4,
+                        "label": description.shortLabel, "description": description.detail, "aliases": description.aliases,
                         "reference_only": edit.zoomID == nil && edit.cameraID == nil]
             } ?? [:]
             return ["playhead": ui.playhead, "selectedRegionID": ui.selectedRegionID?.uuidString as Any? ?? NSNull(),
@@ -188,6 +193,13 @@ enum LocalEditPlanner {
             this request. Never repeat a rejected tool call without correcting it.
             A rejected plan is not accepted user intent. In particular, do not
             inherit an unrequested full-frame waypoint from a rejected call.
+            Timeline labels describe current actions, such as Zoom D, Pan G,
+            Full frame E, Hold F, or Ref A. Their letter is the stable identity.
+            Accept each edit's descriptive label, legacy Edit label, or bare letter;
+            changing the action word never creates a different edit. Ref marks
+            add no framing change. Hold boundaries explicitly keep an existing
+            view; they are not extra movements. Do not add consecutive movement
+            steps to the same target merely to fill time; use hold_seconds.
             When the latest tool result rejects a known timing or path mismatch,
             repair the tool call using the existing user's instruction. Do not
             ask the user to confirm a timing or target they already specified.
@@ -273,8 +285,8 @@ enum LocalEditPlanner {
                   let origin = args["arrival_origin"] as? String, ["playhead", "movement_start"].contains(origin),
                   let path = args["path"] as? String, ["direct", "via_full_frame"].contains(path),
                   let source = resolveBox(from, context: context), let target = resolveBox(to, context: context) else { throw invalidResponse }
-            if let instruction, path != relativePath(in: instruction) {
-                return .rejectedPlan("The plan changed the requested movement path. Use path=\(relativePath(in: instruction)) from the original instruction; do not inherit a rejected plan's waypoint.")
+            if let instruction, path != relativePath(in: instruction, context: context) {
+                return .rejectedPlan("The plan changed the requested movement path. Use path=\(relativePath(in: instruction, context: context)) from the original instruction; do not inherit a rejected plan's waypoint.")
             }
             if let instruction {
                 for (prefixes, chosen) in [(["from"], source), (["to", "into"], target)] {
@@ -448,19 +460,43 @@ enum LocalEditPlanner {
                 }
             }
             commands.append(.holdFraming(time: cursor))
+            var previousTarget: ZoomPlacement?
+            var firstTarget: ZoomPlacement?
+            var firstTargetName = ""
+            var movementCount = 0
+            var sequenceDetails: [String] = []
             for step in steps {
                 try keys(step, ["region_id", "move_seconds", "hold_seconds"])
                 let move = try number(step["move_seconds"]), hold = try number(step["hold_seconds"])
                 guard move > 0, move <= 60, hold >= 0, let region = step["region_id"] as? String else { throw invalidResponse }
                 cursor += move
-                let motion = EditorCommandMotion(transition: .smooth, duration: move)
+                let target: ZoomPlacement?
+                let targetName: String
+                if region == "full_frame" { target = ZoomPlacement(); targetName = "Full frame" }
+                else {
+                    let id = try uuid(region)
+                    target = context.recording.state.regions.first(where: { $0.id == id })?.rect.framing()
+                    targetName = context.recording.references.boxLabel(for: id) ?? "Box"
+                }
+                // Identical consecutive declared targets produce no movement.
+                // Keep their original arrival timestamp as an explicit hold
+                // boundary instead of erasing requested time or shortening a
+                // later transition. The rendered framing curve is identical.
+                let stationary = target != nil && target == previousTarget
+                if sequenceDetails.isEmpty { firstTarget = target; firstTargetName = targetName }
+                let motion = EditorCommandMotion(transition: stationary ? .jump : .smooth, duration: move)
+                if !stationary { movementCount += 1 }
+                sequenceDetails.append(stationary ? "Hold \(targetName) through \(timeLabel(cursor))"
+                    : "\(targetName) at \(timeLabel(cursor))")
                 if region == "full_frame" { commands.append(.fullFrame(time: cursor, motion: motion)) }
                 else { commands.append(.frameRegion(regionID: try uuid(region), time: cursor, motion: motion)) }
+                previousTarget = target
                 if hold > 0 {
                     cursor += hold
                     let stationary = EditorCommandMotion(transition: .jump)
                     if region == "full_frame" { commands.append(.fullFrame(time: cursor, motion: stationary)) }
                     else { commands.append(.frameRegion(regionID: try uuid(region), time: cursor, motion: stationary)) }
+                    sequenceDetails.append("Hold through \(timeLabel(cursor))")
                 }
             }
             if let instruction, delayFromPlayhead(in: instruction) != nil,
@@ -478,7 +514,26 @@ enum LocalEditPlanner {
             // Ask for an explicit revision rather than silently remove user work.
             let start = try number(args["start_seconds"])
             framingConflicts = overlappingFraming(in: context.recording.state, start: start, end: cursor)
-            summary = steps.count == 1 ? "Added a framing movement." : "Added \(steps.count) framing movements."
+            // The initial view must be evaluated after the same removals used
+            // by an accepted replacement, not against framing it supersedes.
+            var retained = context.recording.state
+            let removed = Set(framingConflicts.map(\.id))
+            retained.zoomKeyframes.removeAll { removed.contains($0.id) }
+            if firstTarget == retained.zoom(at: start), firstTarget != nil {
+                movementCount -= 1
+                let firstTime: Double
+                switch commands[1] {
+                case let .fullFrame(time, motion):
+                    commands[1] = .fullFrame(time: time, motion: EditorCommandMotion(transition: .jump, duration: motion.duration))
+                    firstTime = time
+                case let .frameRegion(id, time, motion):
+                    commands[1] = .frameRegion(regionID: id, time: time, motion: EditorCommandMotion(transition: .jump, duration: motion.duration))
+                    firstTime = time
+                default: throw invalidResponse
+                }
+                sequenceDetails[0] = "Hold \(firstTargetName) through \(timeLabel(firstTime))"
+            }
+            summary = "\(movementCount) framing \(movementCount == 1 ? "movement" : "movements"): " + sequenceDetails.joined(separator: "; ") + "."
         default: throw invalidResponse
         }
         if ["frame_edits", "move_for_duration", "move_relative", "plan_sequence"].contains(name), let instruction,
@@ -486,7 +541,7 @@ enum LocalEditPlanner {
             return .clarification(question)
         }
         if name == "plan_sequence", let instruction,
-           instruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:and\\s+)?(?:back\\s+)?(?:in|into)\\b",
+           EditorActionDescription.neutralizingLabels(in: instruction, state: context.recording.state, references: context.recording.references).range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:and\\s+)?(?:back\\s+)?(?:in|into)\\b",
                              options: [.regularExpression, .caseInsensitive]) != nil {
             let outward = commands.firstIndex { if case .fullFrame = $0 { return true }; return false }
             guard let outward, commands.suffix(from: outward + 1).contains(where: {
@@ -496,18 +551,47 @@ enum LocalEditPlanner {
             }
         }
         if name == "move_relative", let instruction,
-           instruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:in|into)\\b|\\bfull\\s+frame\\b",
+           EditorActionDescription.neutralizingLabels(in: instruction, state: context.recording.state, references: context.recording.references).range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:in|into)\\b|\\bfull\\s+frame\\b",
                              options: [.regularExpression, .caseInsensitive]) != nil,
            !commands.contains(where: { if case .fullFrame = $0 { return true }; return false }) {
             return .rejectedPlan("The plan omitted the requested full-frame waypoint between the boxes.")
         }
         let batch = EditorCommandBatch(projectID: context.recording.projectID,
             revision: context.recording.revision, commands: commands)
+        let displayedSummary = descriptiveSummary(summary,
+            commands: framingConflicts.map { .removeScreenFraming(editID: $0.id) } + commands, context: context)
         if !framingConflicts.isEmpty {
-            return .framingConflict(EditorFramingConflict(proposal: batch, summary: summary,
+            return .framingConflict(EditorFramingConflict(proposal: batch, summary: displayedSummary,
                 framingIDs: framingConflicts.map(\.id), question: conflictQuestion(framingConflicts, context: context)))
         }
-        return .commands(batch, summary: summary)
+        return .commands(batch, summary: displayedSummary)
+    }
+
+    /// Project the ordinary dispatcher on values only, so a summary names the
+    /// resulting action rather than its previous type or its legacy alias.
+    static func descriptiveSummary(_ summary: String, commands: [EditorCommand], context: LocalEditContext) -> String {
+        var projected = context.recording.state
+        let project = RecordingProject(screenFilename: "summary.mov", duration: context.recording.duration,
+            state: projected, references: context.recording.references)
+        if let revision = try? EditorCommandDispatcher.revision(for: project),
+           let state = try? EditorCommandDispatcher.prepare(EditorCommandBatch(projectID: context.recording.projectID,
+                revision: revision, commands: commands), for: project, projectID: context.recording.projectID) {
+            projected = state
+        }
+        var references = context.recording.references
+        references.register(state: projected)
+        guard let regex = try? NSRegularExpression(pattern: "\\bEdit\\s+[A-Z]{1,6}\\b") else { return summary }
+        let source = summary as NSString
+        let result = NSMutableString(string: summary)
+        for match in regex.matches(in: summary, range: NSRange(location: 0, length: source.length)).reversed() {
+            guard let previous = EditorActionDescription.resolve(source.substring(with: match.range),
+                in: context.recording.state, references: context.recording.references) else { continue }
+            let active = references.edit(in: projected, id: previous.id)
+            let description = EditorActionDescription.describe(active ?? previous,
+                in: active == nil ? context.recording.state : projected, references: references)
+            result.replaceCharacters(in: match.range, with: description.shortLabel)
+        }
+        return result as String
     }
 
     private static func overlappingFraming(in state: EditState, start: Double, end: Double) -> [ZoomKeyframe] {
@@ -523,7 +607,8 @@ enum LocalEditPlanner {
         let all = context.recording.state.zoomKeyframes
         let descriptions = points.map { point in
             let edit = context.recording.state.timedEdits(includeCamera: true).first { $0.zoomID == point.id }
-            let label = edit.flatMap { context.recording.references.editLabel(for: $0.id) } ?? "Framing change"
+            let label = edit.map { EditorActionDescription.describe($0, in: context.recording.state,
+                references: context.recording.references).shortLabel } ?? "Framing change"
             let previous = all.last(where: { $0.time < point.time })?.time ?? 0
             let start = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
             return point.transition == .smooth ? "\(label) (\(timeLabel(start))–\(timeLabel(point.time)))" : "\(label) at \(timeLabel(point.time))"
@@ -689,7 +774,8 @@ enum LocalEditPlanner {
     }
 
     private static func pairedEditReferences(in request: String) -> [(String, String)] {
-        let pattern = "\\b(?:between|from)\\s+(?:edit\\s+)?([a-z]{1,3})\\s+(?:and|to)\\s+(?:edit\\s+)?([a-z]{1,3})\\b"
+        let prefix = "(?:(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera)\\s+)?"
+        let pattern = "\\b(?:between|from)\\s+" + prefix + "([a-z]{1,6})\\s+(?:and|to)\\s+" + prefix + "([a-z]{1,6})\\b"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return [] }
         let text = request as NSString
         return regex.matches(in: request, range: NSRange(location: 0, length: text.length)).map { match in
@@ -727,7 +813,8 @@ enum LocalEditPlanner {
         var requestedEdits = Set<UUID>()
         for edit in edits {
             guard let name = context.recording.references.editLabel(for: edit.id),
-                  mentions(name, in: instruction) || paired.contains(name) else { continue }
+                  EditorActionDescription.mentions(edit, in: instruction, state: context.recording.state,
+                    references: context.recording.references) || paired.contains(name) else { continue }
             requestedEdits.insert(edit.id)
             if !includedEdits.contains(edit.id) { return "The plan left out \(name). What should happen at that edit?" }
         }
@@ -763,7 +850,8 @@ enum LocalEditPlanner {
            let name = context.recording.references.boxLabel(for: extra) {
             return "The plan also used \(name), which the instruction didn’t identify. Which numbered boxes should be included?"
         }
-        let hasOutwardMovement = instruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b|\\bfull\\s+frame\\b",
+        let movementInstruction = EditorActionDescription.neutralizingLabels(in: instruction, state: context.recording.state, references: context.recording.references)
+        let hasOutwardMovement = movementInstruction.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b|\\bfull\\s+frame\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         if hasOutwardMovement {
             for (fromName, toName) in pairedEditReferences(in: instruction) {
@@ -774,7 +862,7 @@ enum LocalEditPlanner {
                        start == from.id, abs(from.time + duration - to.time) < 0.000_001 {
                         // A direct zoom-out into a wider target is also valid;
                         // an explicit full-frame waypoint must be honored.
-                        let explicitlyFullFrame = instruction.range(of: "\\bfull\\s+frame\\b|\\bzoom\\s+out\\s+(?:and\\s+)?then\\b",
+                        let explicitlyFullFrame = movementInstruction.range(of: "\\bfull\\s+frame\\b|\\bzoom\\s+out\\s+(?:and\\s+)?then\\b",
                             options: [.regularExpression, .caseInsensitive]) != nil
                         return viaFullFrame || !explicitlyFullFrame
                     }
@@ -791,10 +879,7 @@ enum LocalEditPlanner {
     }
 
     private static func resolveEdit(_ label: String, context: LocalEditContext) -> TimedEdit? {
-        let matching = context.recording.state.timedEdits(includeCamera: true).filter {
-            context.recording.references.editLabel(for: $0.id).map { normalizedLabel($0) == normalizedLabel(label) } ?? false
-        }
-        return matching.count == 1 ? matching[0] : nil
+        EditorActionDescription.resolve(label, in: context.recording.state, references: context.recording.references)
     }
 
     private static func resolveBox(_ label: String, context: LocalEditContext) -> EditorRegion? {
@@ -812,9 +897,9 @@ enum LocalEditPlanner {
     private static func usesNamedReferences(_ request: String, context: LocalEditContext) -> Bool {
         guard delayFromPlayhead(in: request) == nil else { return false }
         let knownReference = context.recording.state.timedEdits(includeCamera: true).contains {
-            context.recording.references.editLabel(for: $0.id).map { mentions($0, in: request) } ?? false
+            EditorActionDescription.mentions($0, in: request, state: context.recording.state, references: context.recording.references)
         }
-        let explicitReference = request.range(of: "\\b(?:at|between|from|to|revise|change)\\s+(?:edit|step)\\s+[a-z]{1,3}\\b",
+        let explicitReference = request.range(of: "\\b(?:at|between|from|to|revise|change)\\s+(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera)\\s+[a-z]{1,6}\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         return knownReference || explicitReference || !pairedEditNames(in: request).isEmpty
     }
@@ -935,7 +1020,7 @@ enum LocalEditPlanner {
                 // The original instruction determines whether a full-frame
                 // waypoint was requested. A rejected earlier plan must not
                 // smuggle a different path into a timing clarification.
-                properties["path"] = ["type": "string", "enum": [relativePath(in: request)]]
+                properties["path"] = ["type": "string", "enum": [relativePath(in: request, context: context)]]
                 parameters["properties"] = properties
                 function["parameters"] = parameters
                 var focused = tool
@@ -999,7 +1084,8 @@ enum LocalEditPlanner {
         }.count >= 2
     }
 
-    private static func relativePath(in request: String) -> String {
+    private static func relativePath(in request: String, context: LocalEditContext) -> String {
+        let request = EditorActionDescription.neutralizingLabels(in: request, state: context.recording.state, references: context.recording.references)
         let fullFrame = request.range(of: "\\b(?:zoom|pull)\\s+(?:back\\s+)?out\\b.*\\b(?:in|into)\\b|\\bfull\\s+frame\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         return fullFrame ? "via_full_frame" : "direct"

@@ -22,7 +22,12 @@ struct AssistantPanelLayoutChecks {
         project.state.zoomKeyframes = [ZoomKeyframe(id: editID, time: 1, scale: 2)]
         project.state.regions = [region]
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("recording.framethrower"))
-        let session = EditorAssistantSession(transport: { _ in throw Failure.failed("No local request expected") })
+        let question = "How long should the movement take?"
+        let session = EditorAssistantSession(transport: { _ in
+            try JSONSerialization.data(withJSONObject: ["choices": [["message": ["role": "assistant", "tool_calls": [[
+                "id": "layout_question", "type": "function", "function": ["name": "ask_clarification", "arguments": "{\"question\":\"How long should the movement take?\"}"]
+            ]]]]]])
+        })
         let panel = EditorAssistantPanel(editor: editor, session: session, selectedRegionID: region.id,
             onSelectRegion: { _ in }, onRemoveRegion: { _ in }, onSubmit: {})
         let host = NSHostingView(rootView: panel)
@@ -50,7 +55,36 @@ struct AssistantPanelLayoutChecks {
         try await settle(host)
         try checkList(host, expectedHeight: 44)
         try require(!session.isBusy, "Showing guides cannot submit an instruction")
-        print("Assistant panel layout checks passed (single instruction field, no automatic note field, content-sized guide rows, preserved instruction text, and durable box references; no microphone/model/media activity).")
+        session.attach(to: editor)
+        for index in 0..<12 {
+            let id = UUID()
+            session.conversation.begin("Instruction \(index): make this movement easy to follow while preserving the selected text area.", requestID: id)
+            session.conversation.finish(requestID: id, response: nil,
+                outcome: ["status": "applied", "summary": "Adjusted movement \(index) with a smooth acceleration and deceleration."])
+        }
+        session.instruction = "Can you improve this movement?"
+        session.submit(editor: editor, playhead: 1, regionID: nil, editID: editID)
+        for _ in 0..<20 where session.isBusy { try await Task.sleep(for: .milliseconds(20)) }
+        try await settle(host)
+        try require(session.awaitsClarification && session.notice == question && session.errorMessage == nil,
+                    "The real session must expose the fake model's pending question")
+        let composer = all(NSTextField.self, in: host)
+        try require(composer.count == 1 && composer[0].placeholderString == "Your answer…" &&
+                    host.bounds.contains(composer[0].convert(composer[0].bounds, to: host)),
+                    "A long transcript must keep the one answer composer fully on screen at 300 by 600")
+        let composerRect = composer[0].convert(composer[0].bounds, to: host)
+        let bottomGap = host.isFlipped ? host.bounds.maxY - composerRect.maxY : composerRect.minY - host.bounds.minY
+        try require((0...100).contains(bottomGap),
+                    "The answer composer must remain anchored at the bottom of the panel, beside its microphone/send controls")
+        try checkList(host, expectedHeight: 44)
+        let transcript = try transcriptScroll(in: host, regionHeight: 44)
+        try require(transcript.frame.height > 100 && (transcript.documentView?.bounds.height ?? 0) > transcript.contentView.bounds.height,
+                    "Nonempty dialogue must scroll in its own bounded transcript rather than expanding the inspector")
+        try atBottom(transcript, "The pending question at the end of a long transcript must be visible")
+        session.conversation.event(["kind": "edit", "names": ["A new manual adjustment while following the latest conversation result"]])
+        try await settle(host)
+        try atBottom(transcript, "New transcript content must keep following the latest entry when already at the bottom")
+        print("Assistant panel layout checks passed (single bottom-pinned composer, bounded reference list and nonempty conversation, visible pending question and follow-latest after append; user scrolling requires live interaction verification; no microphone/model/media activity).")
     }
 
     static func checkSingleComposer(_ host: NSView) throws {
@@ -60,12 +94,27 @@ struct AssistantPanelLayoutChecks {
     }
     static func checkList(_ host: NSView, expectedHeight: CGFloat) throws {
         let areas = all(NSScrollView.self, in: host)
-        try require(areas.count == 1 && abs(areas[0].frame.height - expectedHeight) < 1,
-                    "Guide list must fit its rows without a large empty region")
+        try require(areas.count == 2 && areas.filter { abs($0.frame.height - expectedHeight) < 1 }.count == 1,
+                    "The reference list must fit its rows independently of the conversation scroll area")
+    }
+    static func transcriptScroll(in host: NSView, regionHeight: CGFloat) throws -> NSScrollView {
+        guard let scroll = all(NSScrollView.self, in: host).first(where: { abs($0.frame.height - regionHeight) >= 1 }) else {
+            throw Failure.failed("Conversation scroll area missing")
+        }
+        return scroll
+    }
+    static func atBottom(_ scroll: NSScrollView, _ message: String) throws {
+        guard let document = scroll.documentView else { throw Failure.failed("Conversation document missing") }
+        try require(scroll.documentVisibleRect.maxY >= document.bounds.maxY - 4,
+                    message + " (visible=\(scroll.documentVisibleRect), document=\(document.bounds), flipped=\(document.isFlipped))")
     }
     static func settle(_ host: NSView) async throws {
-        try await Task.sleep(for: .milliseconds(120))
-        host.layoutSubtreeIfNeeded()
+        // A scroll-to-anchor request queued by layout must get its own native
+        // turn, especially when this offscreen window has no display ticks.
+        for _ in 0..<3 {
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(40))
+        }
     }
     static func all<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
         ((view as? T).map { [$0] } ?? []) + view.subviews.flatMap { all(type, in: $0) }

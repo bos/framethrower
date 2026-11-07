@@ -57,9 +57,14 @@ enum EditorAgentControls {
         }
         let hasOperation = request.range(of: "\\b(?:create|add|insert|move|retime|delete|remove)\\b",
                                          options: [.regularExpression, .caseInsensitive]) != nil
-        let hasMark = request.range(of: "\\b(?:edit|edits|mark|marks|step|steps)\\b",
+        let actionLabel = "\\b(?i:zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera)\\s+(?!(?:to|from|out|in|at|for|over|and|the|into|is|left|right|up|down)\\b)[A-Za-z]{1,6}\\b(?!\\s+(?i:bit|little|lot|touch|tiny|small|slight)\\b)"
+        let hasLabel = request.range(of: actionLabel, options: .regularExpression) != nil
+        let bareLabel = request.range(of: "\\b(?i:move|retime|delete|remove)\\s+(?:[A-Za-z]|[A-Z]{2,6})\\b",
+                                      options: .regularExpression) != nil
+        let hasMark = hasLabel || bareLabel || request.range(of: "\\b(?:edit|edits|mark|marks|step|steps)\\b",
                                     options: [.regularExpression, .caseInsensitive]) != nil
-        let hasFramingTarget = request.range(of: "\\b(?:box|boxes|zoom|crop|camera|pointer|pan)\\b",
+        let action = request.replacingOccurrences(of: actionLabel, with: "", options: .regularExpression)
+        let hasFramingTarget = action.range(of: "\\b(?:box|boxes|zoom|crop|camera|pointer|pan)\\b",
                                              options: [.regularExpression, .caseInsensitive]) != nil
         guard hasOperation && hasMark && !hasFramingTarget else { return nil }
         return [managementTool, clarificationTool]
@@ -116,11 +121,9 @@ enum EditorAgentControls {
             var commands: [EditorCommand] = []
             var summaries: [String] = []
             func resolve(_ label: String) -> TimedEdit? {
-                let matches = active.filter { edit in
-                    times[edit.id] != nil && context.recording.references.editLabel(for: edit.id)
-                        .map { normalized($0) == normalized(label) } == true
-                }
-                return matches.count == 1 ? matches[0] : nil
+                guard let edit = EditorActionDescription.resolve(label, in: context.recording.state,
+                    references: context.recording.references), times[edit.id] != nil else { return nil }
+                return edit
             }
             for change in changes {
                 guard let action = change["action"] as? String else { throw invalidResponse }
@@ -159,7 +162,9 @@ enum EditorAgentControls {
                     return .clarification("That position falls outside the recording. Where should the edit go?")
                 }
                 if let collision = times.first(where: { $0.key != moving?.id && abs($0.value - time) < 0.000_001 }) {
-                    let existing = context.recording.references.editLabel(for: collision.key) ?? "An edit"
+                    let existing = active.first(where: { $0.id == collision.key }).map {
+                        EditorActionDescription.describe($0, in: context.recording.state, references: context.recording.references).shortLabel
+                    } ?? "An edit"
                     return .clarification("\(existing) already marks that position. Should I use that edit or choose another position?")
                 }
                 if let moving {
@@ -173,7 +178,8 @@ enum EditorAgentControls {
                 }
             }
             return .commands(EditorCommandBatch(projectID: context.recording.projectID,
-                revision: context.recording.revision, commands: commands), summary: summaries.joined(separator: "\n"))
+                revision: context.recording.revision, commands: commands),
+                summary: LocalEditPlanner.descriptiveSummary(summaries.joined(separator: "\n"), commands: commands, context: context))
         default: return nil
         }
     }

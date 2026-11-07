@@ -5,6 +5,7 @@ check_dir=$(mktemp -d -t framethrower-local-edit-planner-check)
 trap 'rm -rf "$check_dir"' EXIT
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
   "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorActionDescription.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \

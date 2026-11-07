@@ -1,4 +1,5 @@
 import CryptoKit
+import Combine
 import Foundation
 
 struct DirectorPendingQuestion: Codable {
@@ -47,7 +48,7 @@ struct DirectorProjectSnapshot: Codable, Equatable {
 /// Complete exchanges stay together: an assistant tool call is never detached
 /// from its actual result when the model's recent-conversation window is built.
 @MainActor
-final class DirectorConversation {
+final class DirectorConversation: ObservableObject {
     struct Function: Codable { var name: String; var arguments: String }
     struct Call: Codable { var id: String; var type = "function"; var function: Function }
     struct Message: Codable {
@@ -65,6 +66,7 @@ final class DirectorConversation {
         var id: UUID
         var messages: [Message]
         var summary: String
+        var origin: String? = nil
     }
     private struct Archive: Codable {
         var version = 1
@@ -76,7 +78,7 @@ final class DirectorConversation {
         var earlierSummaries: [String]?
     }
 
-    private(set) var exchanges: [Exchange] = []
+    @Published private(set) var exchanges: [Exchange] = []
     var question: DirectorPendingQuestion?
     var conflict: DirectorPendingConflict?
     var lastProject: DirectorProjectSnapshot?
@@ -137,7 +139,7 @@ final class DirectorConversation {
     }
 
     func begin(_ text: String, requestID: UUID) {
-        exchanges.append(Exchange(id: requestID, messages: [Message(role: "user", content: text)], summary: String(text.prefix(200))))
+        exchanges.append(Exchange(id: requestID, messages: [Message(role: "user", content: text)], summary: String(text.prefix(200)), origin: "request"))
         pruneCount()
     }
 
@@ -146,7 +148,7 @@ final class DirectorConversation {
         // A manual change may arrive while inference is running. Keep it before
         // the later model response rather than moving that result back in time.
         if exchanges.last?.id != requestID {
-            exchanges.append(Exchange(id: requestID, messages: [], summary: ""))
+            exchanges.append(Exchange(id: requestID, messages: [], summary: "", origin: "response"))
         }
         let index = exchanges.count - 1
         let result = Self.jsonText(outcome)
@@ -175,7 +177,7 @@ final class DirectorConversation {
         let kind = details["kind"] as? String ?? "editor_changed"
         let names = details["names"] as? [String] ?? []
         exchanges.append(Exchange(id: UUID(), messages: [Message(role: "user", content: Self.eventText(details))],
-            summary: kind + (names.isEmpty ? "" : ": " + names.joined(separator: ", "))))
+            summary: kind + (names.isEmpty ? "" : ": " + names.joined(separator: ", ")), origin: "app"))
         pruneCount()
     }
 
@@ -193,6 +195,7 @@ final class DirectorConversation {
         }
         if before.title != after.title { changes["title"] = after.title.map { $0 as Any } ?? NSNull() }
         return ["kind": kind, "actor": "user", "names": names, "changes": changes,
+                "edit_steps": object(DirectorTranscriptStep.changes(from: before.state, to: after.state, references: after.references)),
                 "revision": (try? EditorCommandDispatcher.revision(for: after)) ?? "",
                 "undo_count": after.undoHistory.count, "redo_count": after.redoHistory.count]
     }

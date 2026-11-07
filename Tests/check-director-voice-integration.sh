@@ -7,6 +7,8 @@ sources="$repo_dir/FrameThrower/Sources/FrameThrower"
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
   -target "$(uname -m)-apple-macos15.0" \
   "$sources/MediaProcessing.swift" "$sources/EditorRegion.swift" "$sources/RecordingProject.swift" \
+  "$sources/EditorActionDescription.swift" \
+  "$sources/DirectorTranscript.swift" \
   "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources/LocalEditPlanner.swift" \
   "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \

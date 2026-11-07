@@ -17,6 +17,8 @@ private struct LocalEditPlannerChecks {
         try checkCurrentStateContext()
         try checkLiveUIContext()
         try checkOfferedToolValidation()
+        try checkDescriptiveAliases()
+        try checkStationarySequenceAudit()
         if CommandLine.arguments.contains("--model") {
             try await checkNativeModel()
             try await checkNativeRelativeMoves()
@@ -63,6 +65,70 @@ private struct LocalEditPlannerChecks {
             ["region_id": fixture.a.id.uuidString, "move_seconds": 0.5, "hold_seconds": 4],
             ["region_id": "full_frame", "move_seconds": 1, "hold_seconds": 0]
         ]]) { _, b in b }
+    }
+
+    private static func checkDescriptiveAliases() throws {
+        var fixture = try Fixture()
+        let point = ZoomKeyframe(time: 1, scale: 2)
+        fixture.project.state.zoomKeyframes = [point]
+        fixture.project.references.register(state: fixture.project.state)
+        fixture.context.recording.state = fixture.project.state
+        fixture.context.recording.references = fixture.project.references
+        fixture.context.recording.revision = try EditorCommandDispatcher.revision(for: fixture.project)
+        for label in ["Zoom A", "Edit A", "A", "Pan A", "a"] {
+            let args = fixture.scope.merging(["changes": [["edit_label": label, "box_label": "Box 1", "from_edit_label": ""]]]) { _, b in b }
+            let plan = try batch(LocalEditPlanner.result(reply("frame_edits", args), context: fixture.context,
+                instruction: "At \(label), frame Box 1."))
+            try require(plan.commands == [.reviseFraming(editID: point.id, regionID: fixture.a.id)],
+                        "new and legacy aliases revise the same stable edit")
+        }
+        let payload = try JSONSerialization.jsonObject(with: LocalEditPlanner.payload(request: "At Zoom A, frame Box 1.", context: fixture.context)) as! [String: Any]
+        let user = (payload["messages"] as! [[String: Any]])[1]["content"] as! String
+        try require(user.contains("Zoom A") && user.contains("Edit A") && user.contains("Zoom in") && user.contains("aliases"),
+                    "planner context supplies actual action descriptions with separate legacy aliases")
+        try require((payload["tools"] as! [[String: Any]]).contains { ($0["function"] as? [String: Any])?["name"] as? String == "frame_edits" },
+                    "descriptive references route to stable identity tools")
+        for request in ["Move Zoom A after Ref B", "Remove Pan B", "Delete Full frame C", "Move Hold D before Zoom A", "Delete A"] {
+            try require(EditorAgentControls.tools(for: request) != nil, "descriptive management label must not be mistaken for a new framing target: \(request)")
+        }
+        for request in ["Move the screen", "Move camera a little left", "Move camera to the left", "Pan from Box 1 to Box 2"] {
+            try require(EditorAgentControls.tools(for: request) == nil, "normal visual instructions must not be routed as mark management: \(request)")
+        }
+        let management: [String: Any] = ["version": 1, "project_id": fixture.projectID.uuidString,
+            "expected_revision": fixture.context.recording.revision,
+            "changes": [["action": "move", "edit_label": "Zoom A", "at_edit_label": "A", "offset_seconds": 2]]]
+        guard case let .commands(managed, _) = try EditorAgentControls.result(name: "manage_edits", args: management, context: fixture.context) else {
+            throw CheckError.failed("descriptive manage_edits did not resolve")
+        }
+        try require(managed.commands == [.moveEdit(editID: point.id, time: 3)], "edit controls use the same descriptive/bare aliases")
+    }
+
+    private static func checkStationarySequenceAudit() throws {
+        let fixture = try Fixture()
+        let arguments = fixture.scope.merging(["start_seconds": 0, "steps": [
+            ["region_id": fixture.a.id.uuidString, "move_seconds": 0.4, "hold_seconds": 0],
+            ["region_id": "full_frame", "move_seconds": 0.4, "hold_seconds": 3],
+            ["region_id": fixture.b.id.uuidString, "move_seconds": 0.4, "hold_seconds": 0],
+            ["region_id": fixture.b.id.uuidString, "move_seconds": 0.4, "hold_seconds": 0]
+        ]]) { _, b in b }
+        let result = try LocalEditPlanner.result(reply("plan_sequence", arguments), context: fixture.context)
+        guard case let .commands(plan, summary) = result else { throw CheckError.failed("audited sequence missing") }
+        try require(summary.contains("3 framing movements") && summary.contains("Box 1") && summary.contains("Full frame") && summary.contains("4.60 s"),
+                    "summary describes actual movements, targets and preserved final timing")
+        guard case let .frameRegion(id, time, motion) = plan.commands.last else { throw CheckError.failed("missing terminal boundary") }
+        try require(id == fixture.b.id && abs(time - 4.6) < 0.000001 && motion.transition == .jump,
+                    "repeated terminal target becomes an explicit hold at the exact requested timestamp")
+        let applied = try EditorCommandDispatcher.prepare(plan, for: fixture.project, projectID: fixture.projectID)
+        var original = plan
+        original.commands[original.commands.count - 1] = .frameRegion(regionID: fixture.b.id, time: time,
+            motion: EditorCommandMotion(transition: .smooth, duration: 0.4))
+        let prior = try EditorCommandDispatcher.prepare(original, for: fixture.project, projectID: fixture.projectID)
+        for sample in 0...500 {
+            let time = Double(sample) / 100
+            try require(applied.zoom(at: time) == prior.zoom(at: time), "stationary canonicalization changed the visible framing curve")
+        }
+        try require(applied.zoomKeyframes.count == prior.zoomKeyframes.count && applied.zoomKeyframes.contains { abs($0.time - 3.8) < 0.000001 },
+                    "explicit hold boundaries and final timestamps must not be silently removed")
     }
 
     private static func checkSequenceTiming() throws {

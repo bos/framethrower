@@ -58,7 +58,9 @@ private struct ProjectEditorWindow: View {
             }
         }
         .onChange(of: model.editorOpenRequest) { _, request in
-            if let request { openWindow(id: "editor", value: request.url) }
+            if let request, let url = model.consumeEditorOpenRequest(request) {
+                openWindow(id: "editor", value: url)
+            }
         }
     }
 }
@@ -85,8 +87,9 @@ private struct OpenProjectMenu: View {
 
     var body: some View {
         Button("Open project…") {
-            if let url = model.chooseProject() {
-                openWindow(id: "editor", value: url.standardizedFileURL.resolvingSymlinksInPath())
+            if model.chooseProject() != nil, let request = model.editorOpenRequest,
+               let url = model.consumeEditorOpenRequest(request) {
+                openWindow(id: "editor", value: url)
             }
         }
         .keyboardShortcut("o", modifiers: .command)

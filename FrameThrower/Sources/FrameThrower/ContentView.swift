@@ -84,7 +84,9 @@ struct ContentView: View {
             if !granted { sourcePreviews.clear() }
         }
         .onChange(of: model.editorOpenRequest) { _, request in
-            if let request { openWindow(id: "editor", value: request.url) }
+            if let request, let url = model.consumeEditorOpenRequest(request) {
+                openWindow(id: "editor", value: url)
+            }
         }
         .onDisappear { model.stopSourceAutoRefresh() }
         .onOpenURL { SlackCallbackRouter.shared.handle(url: $0) }

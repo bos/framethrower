@@ -192,6 +192,7 @@ final class CaptureViewModel: ObservableObject {
         let url: URL
     }
     @Published private(set) var editorOpenRequest: EditorOpenRequest?
+    private var consumedEditorOpenRequestID: UUID?
     private var projectEditors: [URL: ProjectEditor] = [:]
     private var projectChanges: [URL: AnyCancellable] = [:]
     @Published private(set) var isCaptureBusy = false
@@ -1233,6 +1234,17 @@ final class CaptureViewModel: ObservableObject {
         let url = canonicalProjectURL(projectEditor.url)
         registerProjectEditor(projectEditor)
         editorOpenRequest = EditorOpenRequest(url: url)
+    }
+
+    /// The recorder, every editor scene, and the File menu can observe the
+    /// same request. Claim it before invoking SwiftUI's openWindow: several
+    /// presentations in one update can race before a new scene is registered.
+    /// Reopening later still gets a fresh request and focuses its URL scene.
+    func consumeEditorOpenRequest(_ request: EditorOpenRequest) -> URL? {
+        guard editorOpenRequest?.id == request.id,
+              consumedEditorOpenRequestID != request.id else { return nil }
+        consumedEditorOpenRequestID = request.id
+        return request.url
     }
 
     private func canonicalProjectURL(_ url: URL) -> URL {

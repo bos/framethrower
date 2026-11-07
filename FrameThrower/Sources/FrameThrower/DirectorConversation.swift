@@ -115,7 +115,7 @@ final class DirectorConversation: ObservableObject {
 
     /// Older complete exchanges become compact event summaries; current state
     /// is supplied separately on every request and is never inferred from them.
-    func messages(byteBudget: Int = 12_000) -> [[String: Any]] {
+    func messages(byteBudget: Int = 12_000, continuing requestID: UUID? = nil) -> [[String: Any]] {
         var recent: [Exchange] = []
         var bytes = 0
         for exchange in exchanges.reversed() {
@@ -135,6 +135,33 @@ final class DirectorConversation: ObservableObject {
             ])])
         }
         result += recent.flatMap(\.messages).compactMap { Self.object($0) as? [String: Any] }
+        if let requestID {
+            // Multiple lookup pages can outgrow one complete exchange. Keep
+            // the archive intact, but always deliver the literal request and
+            // latest real call/result pair to a continuation. Older pages are
+            // explicitly omitted, never replaced with invented tool results.
+            let active = exchanges.filter { $0.id == requestID }.flatMap(\.messages)
+            if let original = active.first(where: { $0.role == "user" }),
+               active.count >= 2, let last = active.last, last.role == "tool",
+               let callID = last.toolCallID,
+               let preceding = active.dropLast().last,
+               preceding.role == "assistant", preceding.toolCalls?.contains(where: { $0.id == callID }) == true,
+               !result.contains(where: { $0["role"] as? String == "user" && $0["content"] as? String == original.content }) ||
+                result.last?["tool_call_id"] as? String != callID {
+                let pages = active.dropLast().compactMap { message -> [String: Any]? in
+                    guard message.role == "tool", let content = message.content,
+                          let value = try? JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any],
+                          let page = value["history_page"] as? [String: Any] else { return nil }
+                    return ["stack": page["stack"] ?? NSNull(), "offset": page["offset"] ?? NSNull(),
+                            "limit": page["limit"] ?? NSNull()]
+                }
+                let note = Message(role: "user", content: Self.eventText([
+                    "kind": "continuation_compacted", "omitted_lookup_pages": pages,
+                    "note": "Earlier conversation and lookup pages were omitted to fit context. Only the latest actual tool result follows; inspect again if you need omitted details."
+                ]))
+                result = [original, note, preceding, last].compactMap { Self.object($0) as? [String: Any] }
+            }
+        }
         return result
     }
 

@@ -15,6 +15,147 @@ struct EditorHistoryRequest: Codable, Equatable, Sendable {
     var count: Int
 }
 
+/// Read-only, next-action-first pagination of the normal shared history.
+struct EditorHistoryLookupRequest: Codable, Equatable, Sendable {
+    var projectID: UUID
+    var revision: String
+    var stack: EditorHistoryAction
+    var offset: Int
+    var limit: Int
+}
+
+enum EditorHistoryInspector {
+    @MainActor
+    static func page(_ request: EditorHistoryLookupRequest, to editor: ProjectEditor,
+                     projectID: UUID) throws -> [String: Any] {
+        guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
+        let project = editor.project
+        guard request.projectID == projectID,
+              request.revision == (try EditorCommandDispatcher.revision(for: project)) else {
+            throw EditorCommandError.stale
+        }
+        guard request.offset >= 0, (1...8).contains(request.limit) else {
+            throw EditorCommandError.invalid("History pages need a nonnegative offset and a limit of 1–8.")
+        }
+        let snapshots = request.stack == .undo ? project.undoHistory : project.redoHistory
+        let total = snapshots.count
+        let end = request.offset >= total ? total : request.offset + min(request.limit, total - request.offset)
+        var entries: [[String: Any]] = []
+        if request.offset < total {
+            for index in request.offset..<end {
+                let position = total - 1 - index
+                let target = snapshots[position]
+                let origin = position + 1 < total ? snapshots[position + 1]
+                    : NamedEditSnapshot(name: target.name, state: project.state, title: project.title)
+                // Undo snapshots contain the state BEFORE their named action;
+                // redo snapshots contain the state AFTER it. Report both in
+                // original edit direction, independently of traversal direction.
+                let before = request.stack == .undo ? target : origin
+                let after = request.stack == .undo ? origin : target
+                let components = changedComponents(before, after)
+                entries.append(["index": index, "name": String(target.name.prefix(140)),
+                    "changed_components": components,
+                    "before": summary(before, comparedWith: after, components: components, references: project.references),
+                    "after": summary(after, comparedWith: before, components: components, references: project.references)])
+            }
+        }
+        return ["project_id": projectID.uuidString, "revision": request.revision,
+            "stack": request.stack.rawValue, "total": total, "offset": request.offset,
+            "limit": request.limit, "has_more": end < total, "entries": entries]
+    }
+
+    private static func changedComponents(_ before: NamedEditSnapshot, _ after: NamedEditSnapshot) -> [String] {
+        let a = before.state, b = after.state
+        return [("title", before.title != after.title),
+            ("screen_framing", a.zoomKeyframes != b.zoomKeyframes),
+            ("camera", a.pipKeyframes != b.pipKeyframes),
+            ("pointer", a.cursorStyle != b.cursorStyle), ("audio", a.audio != b.audio),
+            ("trim", a.trimStart != b.trimStart || a.trimEnd != b.trimEnd),
+            ("canvas", a.presentation != b.presentation), ("boxes", a.regions != b.regions),
+            ("reference_marks", a.editAnchors != b.editAnchors)].compactMap { $0.1 ? $0.0 : nil }
+    }
+
+    /// Bounded human-readable projection, never raw snapshots or media paths.
+    /// Two short descriptions per entry keep eight-entry tool results compact.
+    private static func summary(_ snapshot: NamedEditSnapshot, comparedWith other: NamedEditSnapshot, components: [String],
+                                references: EditorReferences) -> [String: Any] {
+        let state = snapshot.state
+        var details: [String] = []
+        for component in components {
+            switch component {
+            case "screen_framing":
+                let changed = state.zoomKeyframes.filter { point in
+                    !other.state.zoomKeyframes.contains(point)
+                }
+                let samples = changed.prefix(2).map { point in
+                    let edit = state.timedEdits(includeCamera: true).first { $0.zoomID == point.id }
+                    let label = edit.map { EditorActionDescription.describe($0, in: state, references: references).shortLabel } ?? "Screen"
+                    let prior = other.state.zoomKeyframes.first { $0.id == point.id }
+                    return "\(label) \(seconds(point.time))s: \(changedPointFields(point, comparedWith: prior))"
+                }.joined(separator: ", ")
+                details.append("Screen: \(state.zoomKeyframes.count) points, \(changed.count) differing (\(samples)).")
+            case "camera":
+                let changed = state.pipKeyframes.filter { !other.state.pipKeyframes.contains($0) }
+                let samples = changed.prefix(2).map { point in
+                    let prior = other.state.pipKeyframes.first { $0.id == point.id }
+                    return "\(seconds(point.time))s: \(changedPointFields(point, comparedWith: prior))"
+                }.joined(separator: "; ")
+                details.append("Camera: \(state.pipKeyframes.count) points, \(changed.count) differing (\(samples)).")
+            case "pointer":
+                details.append("Pointer: \(state.cursorStyle.visible ? "visible" : "hidden"), size \(seconds(state.cursorStyle.size)), smoothing \(seconds(state.cursorStyle.smoothing)), clicks \(state.cursorStyle.clickHighlight ? "on" : "off").")
+            case "audio":
+                details.append("Audio: \(state.audio.isMuted ? "muted" : "unmuted"), volume \(seconds(state.audio.volume)), fades \(seconds(state.audio.fadeIn))/\(seconds(state.audio.fadeOut))s.")
+            case "trim": details.append("Trim: \(seconds(state.trimStart))–\(seconds(state.trimEnd))s.")
+            case "canvas":
+                let canvas = state.presentation
+                details.append("Canvas: \(canvas.aspect.rawValue), padding \(seconds(canvas.padding)), corners \(seconds(canvas.cornerRadius)), RGB \(seconds(canvas.background.red))/\(seconds(canvas.background.green))/\(seconds(canvas.background.blue)).")
+            case "boxes":
+                let changed = state.regions.filter { !other.state.regions.contains($0) }
+                let boxes = changed.prefix(2).map {
+                    "\(references.boxLabel(for: $0.id) ?? "Box") \(seconds($0.time))s rect \(seconds($0.rect.x))/\(seconds($0.rect.y))/\(seconds($0.rect.width))/\(seconds($0.rect.height)) note=\(String($0.note.prefix(24)))"
+                }.joined(separator: "; ")
+                details.append("Boxes: \(state.regions.count), \(changed.count) differing (\(boxes)).")
+            case "reference_marks":
+                let changed = state.editAnchors.filter { !other.state.editAnchors.contains($0) }
+                let times = changed.prefix(2).map { seconds($0.time) }.joined(separator: ", ")
+                details.append("Reference marks: \(state.editAnchors.count), \(changed.count) differing (\(times)s).")
+            default: break
+            }
+        }
+        let text = details.joined(separator: " ")
+        return ["title": snapshot.title.map { String($0.prefix(140)) } as Any? ?? NSNull(),
+            "description": String(text.prefix(160)), "description_truncated": text.count > 160]
+    }
+
+    private static func seconds(_ value: Double) -> String { String(format: "%.2f", value) }
+
+    /// Only these framing-point values reach this helper, never a project or
+    /// snapshot. Flattening retains exact changed crop, aspect and ramp fields
+    /// without spending the bounded description on identical placement values.
+    private static func changedPointFields<T: Encodable>(_ point: T, comparedWith previous: T?) -> String {
+        func fields(_ value: T) -> [String: String] {
+            guard let data = try? JSONEncoder().encode(value),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+            var result: [String: String] = [:]
+            func flatten(_ object: [String: Any], prefix: String = "") {
+                for (key, value) in object where key != "id" {
+                    let path = prefix + key
+                    if let nested = value as? [String: Any] { flatten(nested, prefix: path + ".") }
+                    else if let number = value as? NSNumber { result[path] = number.stringValue }
+                    else if let text = value as? String { result[path] = text }
+                }
+            }
+            flatten(object)
+            return result
+        }
+        let current = fields(point), prior = previous.map(fields) ?? [:]
+        return Set(current.keys).union(prior.keys).sorted().filter { current[$0] != prior[$0] }.map {
+            "\($0)=\(current[$0] ?? "default")"
+        }.joined(separator: ", ")
+    }
+
+}
+
 enum EditorHistoryDispatcher {
     @MainActor
     static func apply(_ request: EditorHistoryRequest, to editor: ProjectEditor,
@@ -53,7 +194,7 @@ enum EditorAgentControls {
 
     static func tools(for request: String) -> [[String: Any]]? {
         if historyAction(in: request) != nil {
-            return [historyTool, clarificationTool]
+            return [historyTool, historyLookupTool, clarificationTool]
         }
         let hasOperation = request.range(of: "\\b(?:create|add|insert|move|retime|delete|remove)\\b",
                                          options: [.regularExpression, .caseInsensitive]) != nil
@@ -67,12 +208,28 @@ enum EditorAgentControls {
         let hasFramingTarget = action.range(of: "\\b(?:box|boxes|zoom|crop|camera|pointer|pan)\\b",
                                              options: [.regularExpression, .caseInsensitive]) != nil
         guard hasOperation && hasMark && !hasFramingTarget else { return nil }
-        return [managementTool, clarificationTool]
+        return [managementTool, historyLookupTool, clarificationTool]
     }
 
     static func result(name: String, args: [String: Any], context: LocalEditContext,
-                       instruction: String? = nil) throws -> LocalEditResult? {
+                       instruction: String? = nil, historyInspected: Bool = false) throws -> LocalEditResult? {
         switch name {
+        case "report_history":
+            try keys(args, ["version", "project_id", "expected_revision", "summary"])
+            try scope(args, context: context)
+            guard historyInspected, let summary = args["summary"] as? String,
+                  !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  summary.count <= 600 else { throw invalidResponse }
+            return .noChanges(summary)
+        case "inspect_history":
+            try keys(args, ["version", "project_id", "expected_revision", "stack", "offset", "limit"])
+            try scope(args, context: context)
+            guard let value = args["stack"] as? String,
+                  let stack = EditorHistoryAction(rawValue: value) else { throw invalidResponse }
+            let offset = try integer(args["offset"]), limit = try integer(args["limit"])
+            guard offset >= 0, (1...8).contains(limit) else { throw invalidResponse }
+            return .historyLookup(EditorHistoryLookupRequest(projectID: context.recording.projectID,
+                revision: context.recording.revision, stack: stack, offset: offset, limit: limit))
         case "change_history":
             try keys(args, ["version", "project_id", "expected_revision", "action", "count"])
             try scope(args, context: context)
@@ -228,6 +385,18 @@ enum EditorAgentControls {
         function("change_history", "Undo or redo the normal shared edit stack, latest first. Default count is 1. Never skip newer manual changes to undo only an agent change. If the requested older change is below intervening changes, explain the latest entries and ask before undoing the whole span.", scopeProperties.merging([
             "action": ["type": "string", "enum": ["undo", "redo"]],
             "count": ["type": "integer", "minimum": 1]
+        ]) { _, b in b })
+    }
+    static var historyLookupTool: [String: Any] {
+        function("inspect_history", "Read a page of the shared Undo or Redo history without changing anything. Offset 0 is the next action; limit is 1–8. Inspect older entries on demand before discussing them. Results describe original edits before/after, not selective undo. Never invent omitted entries or skip intervening changes.", scopeProperties.merging([
+            "stack": ["type": "string", "enum": ["undo", "redo"]],
+            "offset": ["type": "integer", "minimum": 0],
+            "limit": ["type": "integer", "minimum": 1, "maximum": 8]
+        ]) { _, b in b })
+    }
+    static var historyReportTool: [String: Any] {
+        function("report_history", "Answer the user's history question using the inspected entries, without changing anything. Do not claim selective Undo, describe unavailable older entries, or imply an abandoned Redo branch is retained.", scopeProperties.merging([
+            "summary": ["type": "string", "minLength": 1, "maxLength": 600]
         ]) { _, b in b })
     }
     private static var managementTool: [String: Any] {

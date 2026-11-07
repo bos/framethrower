@@ -334,6 +334,13 @@ actions. Fresh edits clear Redo. The agent can create, move, and remove marks,
 and invoke the same Undo/Redo stack. It cannot selectively skip manual edits to
 undo an older request.
 
+The initial model context includes the next eight Undo and Redo names and the
+total stack sizes. Director can request older entries through the read-only
+`inspect_history` tool, receiving bounded pages with the actual changes described
+from saved snapshots. Inspection does not edit the project or create Undo entries.
+This is the available Undo/Redo history, not an audit log of discarded Redo branches.
+“Undo the last change” still uses the same next action as the normal Undo control.
+
 Director receives ordered user messages, assistant tool calls, and the actual
 application results, alongside manual changes and Undo/Redo events. Every request
 also includes the complete current edit state. Recent exchanges retain matching
@@ -454,6 +461,9 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-director-conversation.sh`: ordered dialogue and real tool results,
   manual edits, exact Undo/Redo events, persisted questions, fresh selections,
   frozen timing anchors, failed-save preservation, and compact history snapshots.
+- `Tests/check-history-lookup.sh`: bounded read-only history inspection, saved
+  snapshot summaries, and model continuations using actual lookup results. Add
+  `--native-model` to check the installed Metal text model's lookup and answer.
 - `Tests/check-director-diagnostics.sh`: correlated private traces, bounded
   rotation, valid JSON truncation, permissions, and nonfatal write failures.
 - `Tests/check-director-voice-integration.sh`: generated in-memory speech through

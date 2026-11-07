@@ -189,10 +189,10 @@ struct DurationMoveChecks {
         let payload = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         let tools = payload["tools"] as! [[String: Any]]
         let names = tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
-        try require(Set(names) == ["move_for_duration", "ask_clarification"], "duration language receives the focused duration contract")
+        try require(Set(names) == ["move_for_duration", "ask_clarification", "inspect_history"], "duration language receives the focused duration contract and read-only history lookup")
         let selected = try LocalEditPlanner.payload(request: "At this edit, pan from box one to box two over a period of five seconds.", context: fixture.context)
         let selectedPayload = try JSONSerialization.jsonObject(with: selected) as! [String: Any]
-        try require((selectedPayload["tools"] as! [[String: Any]]).count == 2, "natural spoken number words select duration tool")
+        try require((selectedPayload["tools"] as! [[String: Any]]).count == 3, "natural spoken number words select duration tool with read-only history lookup")
         var conflict = fixture
         conflict.project.state.zoomKeyframes = [ZoomKeyframe(time: 3, scale: 2)]
         conflict.project.ensureReferences()

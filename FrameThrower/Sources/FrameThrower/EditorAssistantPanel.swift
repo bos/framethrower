@@ -219,6 +219,7 @@ final class EditorAssistantSession: ObservableObject {
                 var response: Data?
                 var requestPayload = payload
                 var attempt = 0
+                var historyLookups = 0
                 do {
                     while true {
                     let data = try await transport(requestPayload)
@@ -230,16 +231,42 @@ final class EditorAssistantSession: ObservableObject {
                         self.record("ignored_response", requestID: token, details: ["reason": "superseded or cancelled"])
                         return
                     }
+                    if historyLookups > 0 {
+                        guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
+                        guard try EditorCommandDispatcher.revision(for: editor.project) == context.recording.revision else {
+                            throw EditorCommandError.stale
+                        }
+                    }
                     // Initial commands retain literal timing/reference checks.
                     // A genuine followup may change those constraints; its
                     // ordered conversation supplies intent, while typed command
                     // validation still enforces scope, bounds and atomicity.
                     let validationInstruction = pendingQuestion == nil ? text : nil
                     let result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
-                        ?? LocalEditPlanner.result(data, context: context, instruction: validationInstruction, routingRequest: routingRequest)
+                        ?? LocalEditPlanner.result(data, context: context, instruction: validationInstruction,
+                            routingRequest: routingRequest, historyInspected: historyLookups > 0)
                     var outcome: [String: Any]
                     var appliedFrom: EditState?
                     switch result {
+                    case let .historyLookup(request):
+                        guard historyLookups < 4 else {
+                            throw EditorCommandError.invalid("Director reached the history lookup limit. No changes were applied. Try naming a more specific change.")
+                        }
+                        let page = try EditorHistoryInspector.page(request, to: editor, projectID: self.projectID)
+                        historyLookups += 1
+                        // Inspection is a real tool result, not a new user turn
+                        // or an edit. Keep the frozen instruction anchor and
+                        // ordered call/result pairs for the model's next turn.
+                        self.finish(token, response: data, outcome: ["status": "inspected",
+                            "applied": false, "history_page": page,
+                            "revision": context.recording.revision])
+                        response = nil
+                        requestPayload = try self.modelPayload(text: text, context: context, routingRequest: routingRequest,
+                            question: pendingQuestion, conflict: pendingConflict, continuation: true, historyInspected: true,
+                            continuingRequestID: token)
+                        self.record("model_request", requestID: token, details: ["history_lookup": historyLookups,
+                            "payload": self.object(requestPayload)])
+                        continue
                     case let .rejectedPlan(reason):
                         guard attempt == 0 else {
                             throw EditorCommandError.invalid("Director couldn’t produce a movement matching your instruction. No changes were applied. " + reason)
@@ -249,9 +276,11 @@ final class EditorAssistantSession: ObservableObject {
                         }
                         self.finish(token, response: data, outcome: ["status": "rejected", "error": reason,
                             "retryable": true, "applied": false])
+                        response = nil
                         attempt += 1
                         requestPayload = try self.modelPayload(text: text, context: context, routingRequest: routingRequest,
-                            question: pendingQuestion, conflict: pendingConflict, continuation: true)
+                            question: pendingQuestion, conflict: pendingConflict, continuation: true, historyInspected: historyLookups > 0,
+                            continuingRequestID: token)
                         self.record("model_request", requestID: token, details: ["attempt": attempt,
                             "payload": self.object(requestPayload), "repair_reason": reason])
                         continue
@@ -326,10 +355,11 @@ final class EditorAssistantSession: ObservableObject {
 
     private func modelPayload(text: String, context: LocalEditContext, routingRequest: String,
                               question: DirectorPendingQuestion?, conflict: DirectorPendingConflict?,
-                              continuation: Bool = false) throws -> Data {
+                              continuation: Bool = false, historyInspected: Bool = false,
+                              continuingRequestID: UUID? = nil) throws -> Data {
         var budget = 12_000
         while true {
-            var messages = conversation.messages(byteBudget: budget)
+            var messages = conversation.messages(byteBudget: budget, continuing: continuingRequestID)
             if let question, !continuation {
                 let active: [String: Any] = ["app_event": ["kind": "pending_question",
                     "original_instruction": question.request, "question": question.question,
@@ -341,7 +371,8 @@ final class EditorAssistantSession: ObservableObject {
                 try LocalEditPlanner.conflictPayload(answer: text, conflict: $0.proposal, context: context,
                     question: $0.followup, conversation: messages)
             } ?? LocalEditPlanner.payload(request: text, context: context,
-                routingRequest: routingRequest, conversation: messages, continuation: continuation)
+                routingRequest: routingRequest, conversation: messages, continuation: continuation,
+                historyInspected: historyInspected)
             if payload.count <= 20_000 { return payload }
             guard budget > 0 else {
                 throw EditorCommandError.invalid("This recording has more editing state than Director can currently process. No changes were made.")
@@ -455,7 +486,15 @@ final class EditorAssistantSession: ObservableObject {
     }
     private func isHistoryShortcut(_ text: String) -> Bool {
         let value = normalized(text)
-        return ["undo", "undo that", "undo last change", "undo the last change", "redo", "redo that", "redo last change", "redo the last change"].contains(value)
+        for action in ["undo", "redo"] {
+            if value == action || value == action + " that" { return true }
+            for noun in ["change", "edit"] {
+                if ["last ", "the last ", "that last "].contains(where: { value == action + " " + $0 + noun }) {
+                    return true
+                }
+            }
+        }
+        return false
     }
     private func normalized(_ text: String) -> String {
         text.lowercased().trimmingCharacters(in: .punctuationCharacters).split(whereSeparator: \.isWhitespace).joined(separator: " ")

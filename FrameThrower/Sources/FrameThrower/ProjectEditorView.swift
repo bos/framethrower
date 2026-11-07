@@ -10,7 +10,7 @@ struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
     var onDuplicate: ((ProjectEditor) -> Void)?
     var isDuplicateUnavailable: Bool
-    @StateObject private var playback = EditorPlayback()
+    @StateObject private var playback: EditorPlayback
     @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
     @State private var selectedEditID: UUID?
@@ -45,17 +45,20 @@ struct ProjectEditorView: View {
     private var selectedEdit: TimedEdit? { edits.first { $0.id == selectedEditID } }
     private var editTime: Double { selectedEdit?.time ?? editor.draftTime ?? playback.editingTime }
     private var point: PIPKeyframe? { state.pipKeyframes.first { abs($0.time - editTime) < 0.000001 } }
-    private var placement: PIPPlacement { state.placement(at: editTime) }
-    private var zoom: ZoomPlacement { state.zoom(at: editTime) }
+    private var previewTime: Double { playback.isPlaying ? playback.time : editTime }
+    private var placement: PIPPlacement { state.placement(at: previewTime) }
+    private var zoom: ZoomPlacement { state.zoom(at: previewTime) }
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
-    private var frameDuration: Double { playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30 }
+    private var frameDuration: Double { playback.frameDuration }
 
     init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false,
+         playback: EditorPlayback? = nil,
          assistant: EditorAssistantSession? = nil,
          onDuplicate: ((ProjectEditor) -> Void)? = nil, isDuplicateUnavailable: Bool = false) {
         self.editor = editor
         self.onDuplicate = onDuplicate
         self.isDuplicateUnavailable = isDuplicateUnavailable
+        _playback = StateObject(wrappedValue: playback ?? EditorPlayback())
         _assistant = StateObject(wrappedValue: assistant ?? EditorAssistantSession())
         _directorMode = State(initialValue: directorModeInitiallyEnabled)
     }
@@ -198,9 +201,10 @@ struct ProjectEditorView: View {
     }
 
     private var player: some View {
-        EditorCanvas(player: playback.player, frames: playback.frameStore,
+        EditorCanvas(player: playback.canvasPlayer, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
-            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && conflictReview == nil,
+            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil,
+            showsCameraPattern: editor.project.cameraFilename != nil && conflictReview == nil,
             showsStill: !playback.isPlaying,
             onBegin: { assistant.cancel(); playback.pause(); dragTime = editTime; selectedInspector = .camera },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
@@ -222,9 +226,11 @@ struct ProjectEditorView: View {
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
             conflictOutlines: conflictReview?.outlines(at: playback.time))
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
-            .overlay {
+            .overlay(alignment: .bottomLeading) {
                 if MediaProcessing.isSuspended {
-                    Text(MediaProcessing.statusMessage).font(.callout).foregroundStyle(.white.opacity(0.75))
+                    Text("Test pattern").font(.caption.weight(.semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(.black.opacity(0.65), in: Capsule()).padding(10)
                         .allowsHitTesting(false)
                 }
             }
@@ -334,8 +340,10 @@ struct ProjectEditorView: View {
                 }
                 .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
                 .keyboardShortcut(.space, modifiers: [])
-                .disabled(!playback.canPlay || conflictReview != nil)
-                .help(conflictReview != nil ? "Scrub the highlighted timeline spans to compare the pending framings." : "Play or pause the recording.")
+                .disabled(!playback.canPlay || (conflictReview != nil && !MediaProcessing.isSuspended))
+                .help(conflictReview != nil
+                    ? (MediaProcessing.isSuspended ? "Play or pause the Existing and Proposed outlines over the test pattern." : "Scrub the highlighted timeline spans to compare the pending framings.")
+                    : (MediaProcessing.isSuspended ? "Play or pause edits over a drawn test pattern. Video processing stays disabled." : "Play or pause the recording."))
                 RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
                     trimEnd: state.trimEnd, playhead: playback.time,
                     onInteractionBegan: { playback.pause() },
@@ -672,7 +680,7 @@ struct ProjectEditorView: View {
     }
 
     private func togglePlayback() {
-        guard conflictReview == nil else { return }
+        guard conflictReview == nil || MediaProcessing.isSuspended else { return }
         if playback.isPlaying { playback.pause(); return }
         let hasDraft = editor.draftState != nil
         playAfterRebuild = hasDraft
@@ -720,7 +728,7 @@ struct ProjectEditorView: View {
         var next = state
         next.zoomKeyframes = CursorZoomSuggestions.points(in: recording,
             range: state.trimStart...state.trimEnd, preset: preset,
-            frameDuration: playback.player.currentItem?.videoComposition?.frameDuration.seconds ?? 1.0 / 30)
+            frameDuration: playback.frameDuration)
         if editor.commit(next, name: "Suggest zooms") { selectedEditID = nil }
     }
 

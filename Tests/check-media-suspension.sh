@@ -9,7 +9,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$sources/EditorRegion.swift" \
   "$sources/MediaProcessing.swift" "$sources/RecordingProject.swift" \
   "$sources/ProjectRenderer.swift" "$sources/PIPVideoCompositor.swift" "$sources/CursorRecording.swift" \
-  "$sources/EditorPlayback.swift" "$sources/ScreenMasterWriter.swift" "$sources/RecordingQuality.swift" \
+  "$sources/EditorPlayback.swift" "$sources/EditorSimulationClock.swift" "$sources/ScreenMasterWriter.swift" "$sources/RecordingQuality.swift" \
   "$sources/RecordingLibrary.swift" "$sources/RecordingLibraryView.swift" \
   "$sources/RecordingTitleEditor.swift" "$sources/VideoExportUI.swift" "$sources/RecorderStyle.swift" \
   "$repo_dir/Tests/MediaSuspensionChecks.swift" -o "$check_dir/check-media-suspension"

@@ -5,12 +5,13 @@ import SwiftUI
 /// Pixels and drag geometry stay inside one native view. Neither decoded image
 /// dimensions nor a camera gesture can become a SwiftUI layout proposal.
 struct EditorCanvas: NSViewRepresentable {
-    let player: AVPlayer
+    let player: AVPlayer?
     @ObservedObject var frames: EditorFrameStore
     let sourceSize: CGSize
     let cameraAspect: Double
     let placement: PIPPlacement
     let cameraEnabled: Bool
+    var showsCameraPattern: Bool? = nil
     let showsStill: Bool
     var onBegin: () -> Void
     var onPreview: (PIPPlacement) -> Void
@@ -52,7 +53,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.conflictOutlines = conflictOutlines
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
-            placement: placement, cameraEnabled: cameraEnabled, zoom: zoom,
+            placement: placement, cameraEnabled: cameraEnabled, showsCameraPattern: showsCameraPattern, zoom: zoom,
             presentation: presentation, nativeSourceSize: nativeSourceSize)
     }
 }
@@ -66,7 +67,17 @@ final class EditorCanvasView: NSView {
         let selected: Bool
         var outsideViewport = false
     }
-    let playerLayer = AVPlayerLayer()
+    private var mediaLayer: AVPlayerLayer?
+    var playerLayer: AVPlayerLayer {
+        if let mediaLayer { return mediaLayer }
+        let playerLayer = AVPlayerLayer()
+        playerLayer.videoGravity = .resizeAspect
+        mediaLayer = playerLayer
+        layer?.insertSublayer(playerLayer, at: 0)
+        return playerLayer
+    }
+    var hasMediaPlayerLayer: Bool { mediaLayer != nil }
+    private(set) var testPattern: EditorTestPattern?
     let stillLayer = CALayer()
     private let canvasBorder = CALayer()
     private let outline = CAShapeLayer()
@@ -110,6 +121,7 @@ final class EditorCanvasView: NSView {
     private var presentation = CanvasPresentation()
     private var cameraAspect = 16.0 / 9.0
     private var cameraEnabled = false
+    private var showsCameraPattern = false
     var onBegin: (() -> Void)?
     var onPreview: ((PIPPlacement) -> Void)?
     var onCommit: ((PIPPlacement, String) -> Void)?
@@ -152,7 +164,6 @@ final class EditorCanvasView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        playerLayer.videoGravity = .resizeAspect
         stillLayer.contentsGravity = .resizeAspect
         // Preview-only bounds distinguish a black output canvas from the
         // surrounding viewer, especially with portrait and square outputs.
@@ -164,7 +175,7 @@ final class EditorCanvasView: NSView {
         handles.fillColor = NSColor.white.cgColor
         handles.strokeColor = NSColor.black.withAlphaComponent(0.55).cgColor
         handles.lineWidth = 1
-        for child in [playerLayer, stillLayer, canvasBorder, outline, handles, guides, conflictGuides] { layer?.addSublayer(child) }
+        for child in [stillLayer, canvasBorder, outline, handles, guides, conflictGuides] { layer?.addSublayer(child) }
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
@@ -172,17 +183,25 @@ final class EditorCanvasView: NSView {
     }
     required init?(coder: NSCoder) { nil }
 
-    func configure(player: AVPlayer, image: CGImage?, sourceSize: CGSize,
-                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool, zoom: ZoomPlacement = ZoomPlacement(),
+    func configure(player: AVPlayer?, image: CGImage?, sourceSize: CGSize,
+                   cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool,
+                   showsCameraPattern: Bool? = nil, zoom: ZoomPlacement = ZoomPlacement(),
                    presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if MediaProcessing.isSuspended {
-            playerLayer.player = nil
-            playerLayer.isHidden = true
+            mediaLayer?.player = nil
+            mediaLayer?.isHidden = true
             stillLayer.contents = nil
             stillLayer.isHidden = true
+            if testPattern == nil {
+                let pattern = EditorTestPattern()
+                testPattern = pattern
+                layer?.insertSublayer(pattern.layer, at: 0)
+            }
+            testPattern?.layer.isHidden = false
         } else {
+            testPattern?.layer.isHidden = true
             if playerLayer.player !== player { playerLayer.player = player }
             playerLayer.isHidden = false
             stillLayer.contents = image
@@ -192,6 +211,7 @@ final class EditorCanvasView: NSView {
         self.presentation = presentation
         self.cameraAspect = cameraAspect
         self.cameraEnabled = cameraEnabled
+        self.showsCameraPattern = showsCameraPattern ?? cameraEnabled
         self.placement = placement
         // Frame delivery and SwiftUI updates may arrive between native gesture
         // samples. Continue from the gesture's viewport, never from an older
@@ -213,10 +233,14 @@ final class EditorCanvasView: NSView {
         let geometry = PresentationGeometry(sourceSize: sourceSize, presentation: presentation)
         canvasRect = geometry.outputRect(in: bounds)
         contentRect = geometry.contentRect(in: bounds)
-        playerLayer.frame = canvasRect
+        mediaLayer?.frame = canvasRect
         stillLayer.frame = canvasRect
         canvasBorder.frame = canvasRect
         let current = drag?.draft ?? placement
+        if MediaProcessing.isSuspended {
+            testPattern?.update(in: bounds, sourceSize: sourceSize, presentation: presentation, zoom: zoom,
+                placement: current, cameraEnabled: showsCameraPattern, cameraAspect: cameraAspect)
+        }
         outline.isHidden = !cameraEnabled || !current.visible
         handles.isHidden = outline.isHidden
         let rect = current.frame(in: canvasRect.size, cameraAspect: cameraAspect)

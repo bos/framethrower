@@ -9,7 +9,16 @@ final class EditorFrameStore: ObservableObject {
 
 @MainActor
 final class EditorPlayback: ObservableObject {
-    let player = AVPlayer()
+    private var mediaPlayer: AVPlayer?
+    var player: AVPlayer {
+        if let mediaPlayer { return mediaPlayer }
+        let player = AVPlayer()
+        mediaPlayer = player
+        return player
+    }
+    var canvasPlayer: AVPlayer? { MediaProcessing.isSuspended ? nil : player }
+    var hasMediaPlayer: Bool { mediaPlayer != nil }
+    var frameDuration: Double { editFrameDuration }
     @Published private(set) var time = 0.0
     @Published private(set) var isPlaying = false
     @Published private(set) var isLoading = false
@@ -45,6 +54,9 @@ final class EditorPlayback: ObservableObject {
     private var pendingSeek: CMTime?
     private var scrubGestureActive = false
     private var nativeFrameTask: Task<Void, Never>?
+    private var simulationClock: EditorSimulationClock?
+    private var simulationTask: Task<Void, Never>?
+    private var simulationGeneration: UInt64 = 0
 
     private enum NativeFrameError: LocalizedError {
         case unavailable
@@ -52,7 +64,7 @@ final class EditorPlayback: ObservableObject {
     }
 
     var isPreviewing: Bool { draftState != nil || pendingDraftState != nil }
-    var canPlay: Bool { !isClosed && !isLoading && renderedProject != nil }
+    var canPlay: Bool { !isClosed && !isLoading && (MediaProcessing.isSuspended ? simulationClock != nil : renderedProject != nil) }
 
     var cursorRecording: CursorRecording? {
         renderedProject?.videoComposition.instructions
@@ -87,10 +99,11 @@ final class EditorPlayback: ObservableObject {
         invalidateSeeks()
         let request = generation
         let snapshot = editor.project
+        stopSimulation()
         sourceDuration = snapshot.duration
         bounds = snapshot.state.trimStart...snapshot.state.trimEnd
         time = bounded(time, to: sourceBounds)
-        player.pause()
+        mediaPlayer?.pause()
         isPlaying = false
         // A successful gesture commits this exact draft next. Keep its last
         // displayed pixels across the rebuild so release never flashes back to
@@ -104,11 +117,12 @@ final class EditorPlayback: ObservableObject {
         if MediaProcessing.isSuspended {
             // Keep source-time editing and geometry usable without opening a
             // movie, constructing a composition, or attaching a decoder.
-            player.replaceCurrentItem(with: nil)
+            mediaPlayer?.replaceCurrentItem(with: nil)
             sourceSize = CGSize(width: 1920, height: 1080)
             screenSize = PresentationGeometry(sourceSize: sourceSize, presentation: snapshot.state.presentation).outputSize
             editFrameDuration = snapshot.captureFrameDuration ?? 1.0 / 30
             committedState = snapshot.state
+            simulationClock = EditorSimulationClock(bounds: bounds, time: time)
             stillFrame = nil
             isLoading = false
             return
@@ -177,7 +191,7 @@ final class EditorPlayback: ObservableObject {
     /// the isolated paused frame only after its final native seek completes.
     func seek(_ position: Double) {
         guard !isClosed else { return }
-        if MediaProcessing.isSuspended { time = bounded(position, to: sourceBounds); return }
+        if MediaProcessing.isSuspended { seekSimulation(position, within: sourceBounds); return }
         if isLoading {
             time = bounded(position, to: sourceBounds)
             return
@@ -188,6 +202,13 @@ final class EditorPlayback: ObservableObject {
     }
 
     func beginScrubbing() {
+        if MediaProcessing.isSuspended {
+            guard canPlay else { return }
+            pause()
+            scrubGestureActive = true
+            isScrubbing = true
+            return
+        }
         guard !isClosed, !isLoading, renderedProject != nil else { return }
         player.pause()
         if isPlaying { isPlaying = false }
@@ -199,7 +220,7 @@ final class EditorPlayback: ObservableObject {
 
     func scrub(to position: Double) {
         guard !isClosed else { return }
-        if MediaProcessing.isSuspended { time = bounded(position, to: bounds); return }
+        if MediaProcessing.isSuspended { seekSimulation(position, within: bounds); return }
         let position = bounded(position, to: bounds)
         if isLoading { time = position; return }
         guard renderedProject != nil else { return }
@@ -210,6 +231,7 @@ final class EditorPlayback: ObservableObject {
     func endScrubbing() {
         guard !isClosed, isScrubbing else { return }
         scrubGestureActive = false
+        if MediaProcessing.isSuspended { isScrubbing = false; return }
         finishSeekIfSettled()
     }
 
@@ -323,10 +345,23 @@ final class EditorPlayback: ObservableObject {
         scrubGestureActive = false
         if isScrubbing { isScrubbing = false }
         // Cancellation is a lifecycle operation, never a mouse-drag operation.
-        player.currentItem?.cancelPendingSeeks()
+        mediaPlayer?.currentItem?.cancelPendingSeeks()
     }
 
     func togglePlayback() {
+        if MediaProcessing.isSuspended {
+            guard canPlay, var clock = simulationClock else { return }
+            if isPlaying { pause(); return }
+            clock.seek(time)
+            clock.play(at: ProcessInfo.processInfo.systemUptime)
+            simulationClock = clock
+            time = clock.time
+            isPlaying = clock.isPlaying
+            isScrubbing = false
+            scrubGestureActive = false
+            startSimulation()
+            return
+        }
         guard !isClosed, !isLoading, renderedProject != nil else { return }
         if player.rate > 0 || isPlaying { pause() }
         else {
@@ -344,6 +379,16 @@ final class EditorPlayback: ObservableObject {
     }
 
     func pause() {
+        if MediaProcessing.isSuspended {
+            if var clock = simulationClock {
+                clock.pause(at: ProcessInfo.processInfo.systemUptime)
+                simulationClock = clock
+                time = clock.time
+            }
+            stopSimulation()
+            isPlaying = false
+            return
+        }
         let wasPlaying = isPlaying
         player.pause()
         player.currentItem?.forwardPlaybackEndTime = .invalid
@@ -457,6 +502,38 @@ final class EditorPlayback: ObservableObject {
         position.isFinite ? min(max(position, range.lowerBound), range.upperBound) : range.lowerBound
     }
 
+    private func seekSimulation(_ position: Double, within range: ClosedRange<Double>) {
+        stopSimulation()
+        isPlaying = false
+        time = bounded(position, to: range)
+        simulationClock?.seek(time)
+    }
+
+    private func startSimulation() {
+        stopSimulation()
+        guard isPlaying else { return }
+        let request = simulationGeneration
+        simulationTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(16)) }
+                catch { return }
+                guard let self, !self.isClosed, self.simulationGeneration == request,
+                      var clock = self.simulationClock, self.isPlaying else { return }
+                clock.advance(to: ProcessInfo.processInfo.systemUptime)
+                self.simulationClock = clock
+                self.time = clock.time
+                self.isPlaying = clock.isPlaying
+                if !clock.isPlaying { self.stopSimulation(); return }
+            }
+        }
+    }
+
+    private func stopSimulation() {
+        simulationGeneration &+= 1
+        simulationTask?.cancel()
+        simulationTask = nil
+    }
+
     private func updateStillFrame() {
         guard !isClosed, !isPlaying, !isScrubbing, !seekInFlight, pendingSeek == nil,
               draftState == nil, let renderedProject, let committedState else { return }
@@ -504,17 +581,19 @@ final class EditorPlayback: ObservableObject {
     }
 
     func close() {
+        stopSimulation()
+        simulationClock = nil
         generation += 1
         itemStatusObservation = nil
         invalidateSeeks()
         isClosed = true
-        player.pause()
+        mediaPlayer?.pause()
         isPlaying = false
         isLoading = false
         invalidateStillFrames()
         renderedProject = nil
-        if let observer { player.removeTimeObserver(observer); self.observer = nil }
-        player.replaceCurrentItem(with: nil)
+        if let observer { mediaPlayer?.removeTimeObserver(observer); self.observer = nil }
+        mediaPlayer?.replaceCurrentItem(with: nil)
     }
 }
 

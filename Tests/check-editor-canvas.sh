@@ -12,8 +12,8 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectRenderer.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/CursorRecording.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PIPVideoCompositor.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPlayback.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPlayback.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorSimulationClock.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorTestPattern.swift" \
   "$repo_dir/Tests/EditorCanvasChecks.swift" \
   -o "$check_dir/check-editor-canvas"
 "$check_dir/check-editor-canvas"

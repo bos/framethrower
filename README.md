@@ -9,8 +9,10 @@ recording to Google Drive or a Slack person/channel.
 Video processing is currently disabled in source at the user's request because
 of repeated kernel video-scaler hangs. Capture, camera sessions, live source
 previews, video playback, thumbnails, composition, and export are blocked. The
-editor uses an empty preview while timeline edits, canvas geometry, naming,
-project saving, and Undo/Redo remain usable. Existing recordings are untouched.
+editor plays edits over a drawn vector test pattern using a separate clock.
+This exercises zooms, pans, PIP, scrubbing, and trim timing without opening
+footage or creating a media player. Timeline edits, naming, project saving,
+and Undo/Redo remain usable. Existing recordings are untouched.
 
 `MediaProcessing.isSuspended` is fixed to `true`, with no preference or launch
 argument override. Media test scripts stop before compilation with `SKIP` and
@@ -360,7 +362,7 @@ or footage. Conversation archives live in
 temporary directories and synthetic PCM without opening a microphone or speaker.
 
 Video processing remains suspended. Guides and framing metadata work on the
-placeholder preview; decoding footage, screenshots of footage, visual recognition,
+vector test pattern; decoding footage, screenshots of footage, visual recognition,
 capture, rendering, and export remain unavailable. The text model knows only
 provided area coordinates/notes and the selected edit, and cannot inspect footage.
 
@@ -423,7 +425,7 @@ Safe UI regressions include `Tests/check-editor-inspector-layout.sh` (all four
 tools keep identical preview/timeline geometry), `Tests/check-assistant-panel.sh`
 (one instruction field/microphone and compact linked box rows), and
 `Tests/check-editor-references.sh` (persistent names and recovery). These checks
-use metadata, empty previews, and vector guides while video remains suspended.
+use metadata, vector test patterns, and guides while video remains suspended.
 
 ## Accounts and sharing
 
@@ -458,6 +460,9 @@ their descriptions record what they verify when media processing is enabled.
 
 Automated checks run without camera hardware or connected accounts:
 
+- `Tests/check-editor-simulation-clock.sh` and `Tests/check-editor-simulation.sh`:
+  deterministic transport timing, pause/seek/trim-end/restart/close, interpolated
+  vector screen/PIP geometry, and absence of media players, video layers, and assets.
 - `Tests/check-director-conversation.sh`: ordered dialogue and real tool results,
   manual edits, exact Undo/Redo events, persisted questions, fresh selections,
   frozen timing anchors, failed-save preservation, and compact history snapshots.

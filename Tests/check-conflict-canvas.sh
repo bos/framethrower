@@ -11,6 +11,6 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ScribbleGeometry.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorConflictGeometry.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorTestPattern.swift" \
   "$repo_dir/Tests/ConflictCanvasChecks.swift" -o "$check_dir/check-conflict-canvas"
 "$check_dir/check-conflict-canvas"

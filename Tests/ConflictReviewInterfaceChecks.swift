@@ -18,6 +18,8 @@ struct ConflictReviewInterfaceChecks {
         defer { try? FileManager.default.removeItem(at: directory) }
         var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
         project.state.zoomKeyframes = [ZoomKeyframe(time: 1, scale: 2, transition: .smooth, duration: 1)]
+        project.state.pipKeyframes.append(PIPKeyframe(time: 2,
+            placement: PIPPlacement(x: 0.15, y: 0.2, scale: 0.38), transition: .smooth, duration: 2))
         let box1 = EditorRegion(time: 0, rect: .init(x: 0.1, y: 0.1, width: 0.25, height: 0.3))
         let box2 = EditorRegion(time: 0, rect: .init(x: 0.6, y: 0.5, width: 0.3, height: 0.3))
         project.state.regions = [box1, box2]
@@ -39,7 +41,9 @@ struct ConflictReviewInterfaceChecks {
                     String(decoding: try JSONSerialization.data(withJSONObject: args), as: UTF8.self)]
             ]]]]]])
         })
-        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: false, assistant: session))
+        let playback = EditorPlayback()
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: false,
+            playback: playback, assistant: session))
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 1200, height: 850),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
@@ -48,6 +52,21 @@ struct ConflictReviewInterfaceChecks {
         guard let canvas = all(EditorCanvasView.self, in: host).first,
               let timeline = all(RecordingTimelineView.self, in: host).first else { throw Failure.failed("Production views missing") }
         let originalWindowFrame = window.frame
+        let playingCanvasFrame = canvas.frame, playingTimelineFrame = timeline.frame
+        let initialViewport = canvas.testPattern?.screenViewport, initialCameraFrame = canvas.testPattern?.cameraFrame
+        try require(playback.canPlay && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
+                    "The actual editor is playable through its vector clock without creating any AV player/layer")
+        playback.togglePlayback()
+        for _ in 0..<100 where playback.time <= 0.12 { try await Task.sleep(for: .milliseconds(10)) }
+        try await settle(host)
+        try require(playback.isPlaying && timeline.playhead > 0.12 && canvas.zoom == original.state.zoom(at: timeline.playhead) &&
+                    canvas.testPattern?.screenViewport != initialViewport && canvas.testPattern?.cameraFrame != initialCameraFrame,
+                    "The real editor playhead animates actual screen and PIP interpolation against the static vector chart")
+        try require(canvas.frame == playingCanvasFrame && timeline.frame == playingTimelineFrame &&
+                    !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer && editor.project == original && !editor.canUndo,
+                    "Visual playthrough preserves window layout and edit history while every AV object stays absent")
+        playback.pause(); playback.seek(0)
+        try await settle(host)
         session.instruction = "Pan from Box 1 to Box 2 over the next three seconds."
         session.submit(editor: editor, playhead: 0, regionID: nil, editID: nil)
         for _ in 0..<100 where session.isBusy { try await Task.sleep(for: .milliseconds(10)) }
@@ -69,8 +88,20 @@ struct ConflictReviewInterfaceChecks {
         try await settle(host)
         let comparisonPreviewFrame = canvas.frame
         let comparisonTimelineFrame = timeline.frame
-        try require(canvas.playerLayer.player == nil && canvas.stillLayer.contents == nil,
-                    "Conflict review cannot attach a video source while suspended")
+        try require(!playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer && canvas.stillLayer.contents == nil && canvas.testPattern != nil,
+                    "Conflict review renders a vector chart without creating an AV player/layer or attaching a video source")
+        let comparisonStart = playback.time
+        let comparisonFrames = canvas.conflictFrames
+        playback.togglePlayback()
+        for _ in 0..<100 where playback.time <= comparisonStart + 0.12 { try await Task.sleep(for: .milliseconds(10)) }
+        try await settle(host)
+        try require(playback.isPlaying && playback.isPreviewing && canvas.zoom == ZoomPlacement() &&
+                    canvas.conflictFrames != comparisonFrames && canvas.conflictOutlines?.time == timeline.playhead,
+                    "Comparison Play advances both real curves while preserving the source-frame preview")
+        try require(canvas.frame == comparisonPreviewFrame && timeline.frame == comparisonTimelineFrame &&
+                    editor.project == original && !editor.canUndo && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
+                    "Playing a comparison changes only clock/vector geometry, never layout, history or media state")
+        playback.pause()
         let firstOutlines = canvas.conflictOutlines
         timeline.onScrubBegan?(); timeline.onSeek?(2); timeline.onScrubEnded?()
         try await settle(host)
@@ -96,7 +127,7 @@ struct ConflictReviewInterfaceChecks {
                     editor.draftState == manual && abs(canvas.zoom.scale - 2.2) < 0.000001 && editor.project == original,
                     "A manual edit leaves comparison mode and keeps its own preview/draft without applying the old proposal")
         _ = editor.cancelDraft()
-        print("Conflict review interface checks passed (actual session, full-source outlines, linked source timeline, read-only scrub, dismissal, fixed geometry and media interlock).")
+        print("Conflict review interface checks passed (actual vector playthrough, source/PIP interpolation, full-source moving comparison outlines, linked clock/timeline, read-only scrub, dismissal and fixed geometry; no AV objects/media).")
     }
     static func settle(_ host: NSView) async throws {
         for _ in 0..<3 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(60)) }

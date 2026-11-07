@@ -10,7 +10,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/ScribbleGeometry.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorTestPattern.swift" \
   "$repo_dir/Tests/ScribbleChecks.swift" \
   -o "$check_dir/check-scribble"
 "$check_dir/check-scribble"

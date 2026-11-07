@@ -18,8 +18,8 @@ struct MediaSuspensionChecks {
         try require(editor.save(), "project saves without opening its media")
         let playback = EditorPlayback()
         await playback.rebuild(editor: editor)
-        try require(!playback.isLoading && !playback.canPlay && playback.player.currentItem == nil && playback.errorMessage == nil,
-                    "stub editor cannot attach a video source or report a missing-video decoder error")
+        try require(!playback.isLoading && playback.canPlay && !playback.hasMediaPlayer && playback.canvasPlayer == nil && playback.errorMessage == nil,
+                    "test-pattern transport is available without a video source or decoder")
         playback.seek(3)
         try require(playback.time == 3, "source-time selection still works")
         playback.scrub(to: 4)
@@ -30,14 +30,16 @@ struct MediaSuspensionChecks {
         next.audio = RecordingAudio(isMuted: true, volume: 0.6, fadeIn: 1, fadeOut: 2)
         try require(editor.updateDraft(next, at: 4), "framing remains editable")
         playback.preview(next)
-        try require(playback.screenSize.height > playback.screenSize.width && playback.player.currentItem == nil,
+        try require(playback.screenSize.height > playback.screenSize.width && !playback.hasMediaPlayer,
                     "draft canvas geometry updates without media")
         try require(editor.finishDraft() && editor.undo() && editor.project.state == project.state,
                     "stub framing edits retain normal persistence and Undo")
         try require(editor.redo() && editor.project.state == next, "stub edit Redo restores the change")
         playback.cancelPreview()
         playback.togglePlayback()
-        try require(!playback.isPlaying && playback.player.currentItem == nil, "Play cannot start a decoder")
+        try require(playback.isPlaying && !playback.hasMediaPlayer, "test-pattern Play does not create a media player")
+        playback.pause()
+        try require(!playback.isPlaying && !playback.hasMediaPlayer, "test-pattern Pause does not create a media player")
         playback.close()
 
         await expectSuspended {

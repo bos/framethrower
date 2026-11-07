@@ -208,7 +208,7 @@ enum LocalEditPlanner {
             request: request, conversation: conversation, continuation: continuation)
         return try JSONSerialization.data(withJSONObject: [
             "model": "framethrower-local", "messages": messages,
-            "tools": tools(for: route, context: context), "tool_choice": "auto", "temperature": 0,
+            "tools": scopedTools(tools(for: route, context: context), context: context), "tool_choice": "auto", "temperature": 0,
             "max_tokens": 1_024, "chat_template_kwargs": ["enable_thinking": false]
         ])
     }
@@ -654,9 +654,33 @@ enum LocalEditPlanner {
             context: String(decoding: try JSONSerialization.data(withJSONObject: details, options: .sortedKeys), as: UTF8.self),
             request: answer, conversation: conversation)
         return try JSONSerialization.data(withJSONObject: ["model": "framethrower-local", "messages": messages,
-            "tools": [function("resolve_framing_conflict", "Resolve the pending framing conflict without replanning.", scope),
-                      function("ask_clarification", "Ask about an unclear answer.", ["question": ["type": "string"]])],
+            "tools": scopedTools([function("resolve_framing_conflict", "Resolve the pending framing conflict without replanning.", scope),
+                      function("ask_clarification", "Ask about an unclear answer.", ["question": ["type": "string"]])], context: context),
             "tool_choice": "auto", "temperature": 0, "max_tokens": 256, "chat_template_kwargs": ["enable_thinking": false]])
+    }
+
+    /// Conversation contains historical tool calls with older scope tokens.
+    /// Constrain generation to this request's exact scope; response validation
+    /// still rejects stale or foreign tokens instead of silently rebinding them.
+    private static func scopedTools(_ tools: [[String: Any]], context: LocalEditContext) -> [[String: Any]] {
+        tools.map { tool in
+            guard var function = tool["function"] as? [String: Any],
+                  var parameters = function["parameters"] as? [String: Any],
+                  var properties = parameters["properties"] as? [String: Any] else { return tool }
+            for (key, value) in [("project_id", context.recording.projectID.uuidString),
+                                 ("expected_revision", context.recording.revision)] {
+                guard var schema = properties[key] as? [String: Any] else { continue }
+                schema["type"] = "string"
+                schema["enum"] = [value]
+                schema.removeValue(forKey: "const")
+                properties[key] = schema
+            }
+            parameters["properties"] = properties
+            function["parameters"] = parameters
+            var result = tool
+            result["function"] = function
+            return result
+        }
     }
 
     private static func conversationMessages(system: String, context: String, request: String,

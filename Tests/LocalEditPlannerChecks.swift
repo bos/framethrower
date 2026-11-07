@@ -19,6 +19,7 @@ private struct LocalEditPlannerChecks {
         try checkOfferedToolValidation()
         try checkDescriptiveAliases()
         try checkStationarySequenceAudit()
+        try checkScopedToolSchemas()
         if CommandLine.arguments.contains("--model") {
             try await checkNativeModel()
             try await checkNativeRelativeMoves()
@@ -65,6 +66,68 @@ private struct LocalEditPlannerChecks {
             ["region_id": fixture.a.id.uuidString, "move_seconds": 0.5, "hold_seconds": 4],
             ["region_id": "full_frame", "move_seconds": 1, "hold_seconds": 0]
         ]]) { _, b in b }
+    }
+
+    private static func checkScopedToolSchemas() throws {
+        var fixture = try Fixture()
+        fixture.project.state.zoomKeyframes = [ZoomKeyframe(time: 1, scale: 1.4)]
+        fixture.project.references.register(state: fixture.project.state)
+        fixture.context.recording.state = fixture.project.state
+        fixture.context.recording.references = fixture.project.references
+        fixture.context.recording.revision = try EditorCommandDispatcher.revision(for: fixture.project)
+        fixture.context.recording.history.undo = ["Resize pointer"]
+        let oldScope: [String: Any] = ["project_id": fixture.projectID.uuidString, "expected_revision": "historical-revision"]
+        let arguments = String(decoding: try JSONSerialization.data(withJSONObject: oldScope), as: UTF8.self)
+        let history: [[String: Any]] = [
+            ["role": "assistant", "tool_calls": [["id": "old-history", "type": "function",
+                "function": ["name": "change_history", "arguments": arguments]]]],
+            ["role": "tool", "tool_call_id": "old-history", "name": "change_history", "content": "{\"status\":\"applied\"}"]]
+        func check(_ payload: Data, action: String) throws {
+            let value = try JSONSerialization.jsonObject(with: payload) as! [String: Any]
+            var found = false
+            for tool in value["tools"] as! [[String: Any]] {
+                let function = tool["function"] as! [String: Any]
+                let properties = (function["parameters"] as! [String: Any])["properties"] as! [String: Any]
+                if function["name"] as? String == action { found = true }
+                if function["name"] as? String == "ask_clarification" {
+                    try require(properties["project_id"] == nil && properties["expected_revision"] == nil,
+                                "clarification must keep its original unscoped question schema")
+                } else {
+                    try require((properties["project_id"] as? [String: Any])?["enum"] as? [String] == [fixture.projectID.uuidString] &&
+                                (properties["expected_revision"] as? [String: Any])?["enum"] as? [String] == [fixture.context.recording.revision],
+                                "every exposed mutating tool must constrain scope to this exact context, despite historical calls")
+                }
+            }
+            try require(found, "scope regression did not expose its requested \(action) route")
+        }
+        for (request, action) in [("Frame this area at one second", "plan_sequence"),
+                                  ("Undo the last change", "change_history"), ("Move Zoom A two seconds later", "manage_edits")] {
+            try check(LocalEditPlanner.payload(request: request, context: fixture.context, conversation: history), action: action)
+        }
+        guard case let .framingConflict(conflict) = try LocalEditPlanner.result(reply("plan_sequence", sequence(fixture)), context: fixture.context) else {
+            throw CheckError.failed("scope regression needs an actual overlapping framing proposal")
+        }
+        try check(LocalEditPlanner.conflictPayload(answer: "Replace it", conflict: conflict, context: fixture.context, conversation: history),
+                  action: "resolve_framing_conflict")
+        let historyArgs: [String: Any] = ["version": 1, "project_id": fixture.projectID.uuidString,
+            "expected_revision": fixture.context.recording.revision, "action": "undo", "count": 1]
+        let managementArgs: [String: Any] = ["version": 1, "project_id": fixture.projectID.uuidString,
+            "expected_revision": fixture.context.recording.revision,
+            "changes": [["action": "move", "edit_label": "Zoom A", "at_edit_label": "A", "offset_seconds": 2]]]
+        let conflictArgs: [String: Any] = ["project_id": fixture.projectID.uuidString,
+            "expected_revision": fixture.context.recording.revision, "choice": "replace"]
+        for patch in [["expected_revision": "historical-revision"], ["project_id": UUID().uuidString]] {
+            for (name, original) in [("plan_sequence", sequence(fixture)), ("change_history", historyArgs), ("manage_edits", managementArgs)] {
+                do {
+                    _ = try LocalEditPlanner.result(reply(name, original.merging(patch) { _, b in b }), context: fixture.context)
+                    throw CheckError.failed("\(name) silently rebound a foreign or stale response")
+                } catch EditorCommandError.stale { }
+            }
+            do {
+                _ = try LocalEditPlanner.conflictResult(reply("resolve_framing_conflict", conflictArgs.merging(patch) { _, b in b }), conflict: conflict)
+                throw CheckError.failed("conflict resolution silently rebound a foreign or stale response")
+            } catch EditorCommandError.stale { }
+        }
     }
 
     private static func checkDescriptiveAliases() throws {

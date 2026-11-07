@@ -135,7 +135,15 @@ struct ProjectEditorView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 Toggle(isOn: Binding(get: { directorMode }, set: { value in
                     if value != directorMode { toggleDirectorMode() }
-                })) { Label("Director", systemImage: "clapperboard") }
+                })) {
+                    HStack(alignment: .center, spacing: 6) {
+                        Text("🎬").accessibilityHidden(true)
+                        Text("Director")
+                    }
+                    .fixedSize()
+                    .padding(.horizontal, 4)
+                    .frame(minHeight: 24, alignment: .center)
+                }
                     .toggleStyle(.button)
                     .labelStyle(.titleAndIcon)
                     .accessibilityLabel("Director mode")

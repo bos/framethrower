@@ -199,13 +199,17 @@ final class LocalSpeechInput: ObservableObject {
             let next: any LocalSpeechSession
             if let makeSession { next = try makeSession() }
             else {
-                let words = contextualStrings
-                next = try LocalSpeechBackendFactory.make {
-                    if #available(macOS 26, *) { return AppleLocalSpeechSession(contextualStrings: words) }
-                    throw LocalSpeechError.unavailable
-                }
+                next = try LocalSpeechBackendFactory.make(contextualStrings: contextualStrings)
             }
             session = next
+            if let reporting = next as? any LocalSpeechCaptureReadinessReporting {
+                reporting.onCaptureReady = { [weak self] in
+                    guard let self, self.generation == current, self.phase == .preparing else { return }
+                    self.recognizerIdentifier = (self.session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
+                    self.statusMessage = nil
+                    self.phase = .listening
+                }
+            }
             recognizerIdentifier = (next as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
             do {
                 try await next.start(onResult: { [weak self] result in
@@ -227,9 +231,12 @@ final class LocalSpeechInput: ObservableObject {
                 throw error
             }
             guard generation == current else { await next.cancel(); return }
+            guard phase == .preparing || phase == .listening else { return }
             recognizerIdentifier = (next as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
-            statusMessage = nil
-            phase = .listening
+            if !(next is any LocalSpeechCaptureReadinessReporting) {
+                statusMessage = nil
+                phase = .listening
+            }
         } catch {
             guard generation == current else { return }
             recognizerIdentifier = (session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
@@ -245,7 +252,7 @@ final class LocalSpeechInput: ObservableObject {
     /// Stop listening and return the single finalized utterance. The caller can
     /// put it in an editable command field; it does not apply an editor change.
     func finish() async -> String? {
-        guard phase == .listening, let session else { return nil }
+        guard phase == .listening || phase == .preparing, let session else { return nil }
         let current = generation
         phase = .finishing
         statusMessage = "Finishing dictation…"

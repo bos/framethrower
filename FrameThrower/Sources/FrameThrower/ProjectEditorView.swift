@@ -36,8 +36,10 @@ struct ProjectEditorView: View {
     @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
     @State private var selectedRegionID: UUID?
+    @State private var comparisonDismissedForManualEdit = false
 
     private var state: EditState { editor.editingState }
+    private var conflictReview: EditorConflictReview? { assistant.conflictReview }
     private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
     private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil) }
     private var selectedEdit: TimedEdit? { edits.first { $0.id == selectedEditID } }
@@ -77,12 +79,17 @@ struct ProjectEditorView: View {
         .focusedSceneObject(editor)
         .task {
             await playback.rebuild(editor: editor)
+            if conflictReview != nil { reviewConflict() }
             if let time = editor.draftTime, let draft = editor.draftState {
                 playback.seek(time)
                 selectedEditID = edits.first(where: { abs($0.time - time) < 0.000001 })?.id
                 playback.preview(draft)
             }
         }
+        .onChange(of: assistant.conflictReviewID) { _, _ in reviewConflict() }
+        .onChange(of: playback.time) { _, _ in refreshConflictFrame() }
+        .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame() } }
+        .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: editor.project.state) { old, next in
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
             if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
@@ -96,7 +103,12 @@ struct ProjectEditorView: View {
             }
         }
         .onChange(of: editor.draftState) { old, next in
-            if let next { playback.preview(next) }
+            if let next {
+                // As with a direct preview gesture, starting a manual edit
+                // leaves comparison mode before showing that edit's pixels.
+                leaveConflictForManualEdit()
+                playback.preview(next)
+            }
             else if let old, old != editor.project.state { playback.cancelPreview() }
         }
         .onChange(of: editor.historyNavigationToken) { _, _ in
@@ -138,7 +150,7 @@ struct ProjectEditorView: View {
         .inspector(isPresented: $directorMode) {
             EditorAssistantPanel(editor: editor, session: assistant,
                 selectedRegionID: selectedRegionID, selectedEditID: selectedEditID,
-                onSelectEdit: { selectEdit($0) }, onSelectRegion: { selectRegion($0) },
+                onSelectEdit: { selectEdit($0) }, onReviewConflict: { reviewConflict() }, onSelectRegion: { selectRegion($0) },
                 onRemoveRegion: { removeRegion($0) }, onShowOriginalFrame: { showOriginalFrame($0) }, onSubmit: {
                     playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
@@ -180,25 +192,27 @@ struct ProjectEditorView: View {
     private var player: some View {
         EditorCanvas(player: playback.player, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
-            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing,
+            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && conflictReview == nil,
             showsStill: !playback.isPlaying,
             onBegin: { assistant.cancel(); playback.pause(); dragTime = editTime; selectedInspector = .camera },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
             onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
             onCancel: { cancelEditorInteraction() },
-            zoom: zoom, allowsZoomEditing: !playback.isLoading && !playback.isScrubbing,
+            zoom: conflictReview == nil ? zoom : ZoomPlacement(),
+            allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) },
             presentation: canvasPresentation, nativeSourceSize: playback.sourceSize,
-            scribbleMode: directorMode,
-            regions: state.regions,
+            scribbleMode: directorMode && conflictReview == nil,
+            regions: conflictReview == nil ? state.regions : [],
             regionLabels: Dictionary(uniqueKeysWithValues: state.regions.compactMap { region in
                 editor.references.boxLabel(for: region.id).map { (region.id, $0) }
             }),
             selectedRegionID: selectedRegionID,
             onReferenceBegin: { assistant.cancel() },
-            onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) })
+            onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
+            conflictOutlines: conflictReview?.outlines(at: playback.time))
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay {
                 if MediaProcessing.isSuspended {
@@ -224,6 +238,32 @@ struct ProjectEditorView: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func reviewConflict() {
+        playback.pause()
+        guard let review = conflictReview else {
+            if comparisonDismissedForManualEdit { comparisonDismissedForManualEdit = false; return }
+            if let draft = editor.draftState { playback.preview(draft) }
+            else { playback.cancelPreview() }
+            return
+        }
+        directorMode = true
+        guard !playback.isLoading else { return }
+        selectedEditID = nil; selectedRegionID = nil
+        playback.seek(review.inspectionTime)
+        playback.preview(review.previewState)
+    }
+
+    private func leaveConflictForManualEdit() {
+        guard conflictReview != nil else { return }
+        comparisonDismissedForManualEdit = true
+        assistant.cancel()
+    }
+
+    private func refreshConflictFrame() {
+        guard let review = conflictReview else { return }
+        playback.preview(review.previewState)
     }
 
     private func toggleDirectorMode() {
@@ -252,6 +292,7 @@ struct ProjectEditorView: View {
     }
 
     private func cancelEditorInteraction() {
+        if conflictReview != nil { assistant.cancel(); return }
         if movingEditState != nil { cancelMove() }
         else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
         else if selectedRegionID != nil { selectedRegionID = nil }
@@ -285,7 +326,8 @@ struct ProjectEditorView: View {
                 }
                 .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
                 .keyboardShortcut(.space, modifiers: [])
-                .disabled(!playback.canPlay)
+                .disabled(!playback.canPlay || conflictReview != nil)
+                .help(conflictReview != nil ? "Scrub the highlighted timeline spans to compare the pending framings." : "Play or pause the recording.")
                 RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
                     trimEnd: state.trimEnd, playhead: playback.time,
                     onInteractionBegan: { playback.pause() },
@@ -304,7 +346,9 @@ struct ProjectEditorView: View {
                     onMoveEdit: { id, time, final in moveEdit(id, to: time, final: final) },
                     onCancelMoveEdit: { cancelMove() },
                     onDeselectEdit: { deselectEdit() },
-                    onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest)
+                    onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest,
+                    conflictSpans: (conflictReview?.existingSpans ?? []) + (conflictReview?.proposedSpans ?? []),
+                    conflictOverlaps: conflictReview?.overlapIntervals ?? [])
                     .frame(height: 72)
                     .contextMenu {
                         Button("Hold current framing") { holdCurrentFraming() }
@@ -355,6 +399,7 @@ struct ProjectEditorView: View {
                 case .canvas:
                     PresentationControls(presentation: canvasPresentation,
                         onBegin: {
+                            leaveConflictForManualEdit()
                             playback.pause()
                             if editor.finishDraft() { selectedEditID = nil }
                         }, onPreview: { value in
@@ -424,6 +469,7 @@ struct ProjectEditorView: View {
     }
 
     private func beginAudioGesture() {
+        leaveConflictForManualEdit()
         assistant.cancel()
         playback.pause()
         audioGestureTime = editor.finishDraft() ? playback.editingTime : nil
@@ -618,6 +664,7 @@ struct ProjectEditorView: View {
     }
 
     private func togglePlayback() {
+        guard conflictReview == nil else { return }
         if playback.isPlaying { playback.pause(); return }
         let hasDraft = editor.draftState != nil
         playAfterRebuild = hasDraft
@@ -640,7 +687,7 @@ struct ProjectEditorView: View {
                 Spacer()
             }.toggleStyle(.checkbox).frame(height: 24)
             HStack {
-                CommitSlider(title: "Size", value: state.cursorStyle.size, range: 1...4, valueSuffix: "×", begin: { playback.pause() }, preview: { value in
+                CommitSlider(title: "Size", value: state.cursorStyle.size, range: 1...4, valueSuffix: "×", begin: { leaveConflictForManualEdit(); playback.pause() }, preview: { value in
                     var next = state; next.cursorStyle.size = value; playback.preview(next)
                 }) { value in
                     var next = state.cursorStyle; next.size = value
@@ -648,7 +695,7 @@ struct ProjectEditorView: View {
                 }.frame(width: 300)
                 Spacer()
             }.frame(height: 24)
-            CommitSlider(title: "Smoothing", value: state.cursorStyle.smoothing, range: 0...1, begin: { playback.pause() }, preview: { value in
+            CommitSlider(title: "Smoothing", value: state.cursorStyle.smoothing, range: 0...1, begin: { leaveConflictForManualEdit(); playback.pause() }, preview: { value in
                 var next = state; next.cursorStyle.smoothing = value; playback.preview(next)
             }) { value in
                 var next = state.cursorStyle; next.smoothing = value

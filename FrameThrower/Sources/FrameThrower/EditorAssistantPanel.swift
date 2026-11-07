@@ -14,7 +14,14 @@ final class EditorAssistantSession: ObservableObject {
     private var draftSaveTask: Task<Void, Never>?
     private var generation = UUID()
     private var clarification: DirectorPendingQuestion?
-    private var framingConflict: DirectorPendingConflict?
+    private var framingConflict: DirectorPendingConflict? {
+        didSet { refreshConflictReview() }
+    }
+    @Published private(set) var conflictReview: EditorConflictReview?
+    @Published private(set) var conflictReviewID: UUID?
+    private var reviewProposal: EditorCommandBatch?
+    private var reviewFramingIDs: [UUID] = []
+    private var reviewRevision: String?
     private var currentRequestID: UUID?
     private var speechID: UUID?
     private var pendingSpeechID: UUID?
@@ -77,6 +84,7 @@ final class EditorAssistantSession: ObservableObject {
     private func observeProject(_ next: RecordingProject) {
         guard let previous = observedProject, previous != next else { return }
         observedProject = next
+        refreshConflictReview(project: next)
         var event = DirectorConversation.projectEvent(from: previous, to: next,
             operation: observedEditor?.publishingHistoryOperation)
         event["actor"] = applyingDirectorChange ? "director" : "user"
@@ -84,6 +92,23 @@ final class EditorAssistantSession: ObservableObject {
         if !applyingDirectorChange { conversation.event(event) }
         conversation.lastProject = DirectorProjectSnapshot(next)
         persist()
+    }
+
+    private func refreshConflictReview(project explicitProject: RecordingProject? = nil) {
+        guard let project = explicitProject ?? observedEditor?.project,
+              let pending = framingConflict,
+              pending.context.recording.projectID == projectID,
+              let revision = try? EditorCommandDispatcher.revision(for: project),
+              pending.context.recording.revision == revision else {
+            if conflictReview != nil { conflictReview = nil; conflictReviewID = nil }
+            reviewProposal = nil; reviewFramingIDs = []; reviewRevision = nil
+            return
+        }
+        let proposal = pending.proposal
+        guard reviewProposal != proposal.proposal || reviewFramingIDs != proposal.framingIDs || reviewRevision != revision else { return }
+        reviewProposal = proposal.proposal; reviewFramingIDs = proposal.framingIDs; reviewRevision = revision
+        conflictReview = EditorConflictReview.make(proposal, project: project, projectID: projectID)
+        conflictReviewID = conflictReview == nil ? nil : UUID()
     }
 
     func beginVoiceInstruction() {
@@ -408,6 +433,7 @@ struct EditorAssistantPanel: View {
     let selectedRegionID: UUID?
     var selectedEditID: UUID? = nil
     var onSelectEdit: (UUID) -> Void = { _ in }
+    var onReviewConflict: () -> Void = {}
     let onSelectRegion: (UUID) -> Void
     let onRemoveRegion: (UUID) -> Void
     var onShowOriginalFrame: (UUID) -> Void = { _ in }
@@ -440,7 +466,8 @@ struct EditorAssistantPanel: View {
             DirectorConversationView(conversation: session.conversation, references: editor.references,
                 state: editor.editingState, selectedEditID: selectedEditID,
                 pendingQuestion: session.awaitsClarification ? session.notice : nil,
-                isBusy: session.isBusy, onSelectEdit: onSelectEdit, onDismissQuestion: {
+                isBusy: session.isBusy, conflictReview: session.conflictReview,
+                onReviewConflict: onReviewConflict, onSelectEdit: onSelectEdit, onDismissQuestion: {
                     Task { await instructionSpeech.cancel(); session.cancel() }
                 })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -625,6 +652,8 @@ private struct DirectorConversationView: View {
     let selectedEditID: UUID?
     let pendingQuestion: String?
     let isBusy: Bool
+    let conflictReview: EditorConflictReview?
+    let onReviewConflict: () -> Void
     let onSelectEdit: (UUID) -> Void
     let onDismissQuestion: () -> Void
     @State private var followingLatest = true
@@ -693,6 +722,17 @@ private struct DirectorConversationView: View {
                         .help("Dismiss this question and start a new instruction. Escape also dismisses it.")
                 }
             }
+            if activeQuestion, conflictReview != nil {
+                HStack(spacing: 12) {
+                    conflictKey("Existing", color: .orange, dashed: false)
+                    conflictKey("Proposed", color: .cyan, dashed: true)
+                    Spacer(minLength: 0)
+                    Button(action: onReviewConflict) { Image(systemName: "scope") }
+                        .buttonStyle(.borderless).accessibilityLabel("Review overlap")
+                        .help("Move the playhead to the conflicting movement. Scrub the highlighted timeline spans to compare the solid Existing and dashed Proposed frames.")
+                }
+                .font(.caption)
+            }
             ForEach(entry.steps) { step in
                 let live = references.edit(in: state, id: step.id)
                 Button { if let live { onSelectEdit(live.id) } } label: {
@@ -719,6 +759,15 @@ private struct DirectorConversationView: View {
         .padding(.leading, entry.kind == .user ? 16 : 0)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+    private func conflictKey(_ title: String, color: Color, dashed: Bool) -> some View {
+        HStack(spacing: 4) {
+            Path { path in path.move(to: CGPoint(x: 0, y: 4)); path.addLine(to: CGPoint(x: 20, y: 4)) }
+                .stroke(color, style: StrokeStyle(lineWidth: 2, dash: dashed ? [4, 3] : []))
+                .frame(width: 20, height: 8)
+            Text(title)
+        }
+    }
+
     private func navigationHelp(for step: DirectorTranscriptStep, live: TimedEdit?) -> String {
         guard let live else { return " This mark is no longer in the current edit." }
         if abs(live.time - step.time) > 0.000001 {

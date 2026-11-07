@@ -158,6 +158,13 @@ struct FramingConflictChecks {
         try await wait { !session.isBusy }
         try require(session.awaitsClarification && session.errorMessage == nil && session.instruction.isEmpty && !fixture.editor.canUndo,
                     "First response asks exactly once without applying any work")
+        let reviewID = session.conflictReviewID
+        try require(reviewID != nil && session.conflictReview != nil &&
+                    session.conflictReview?.previewState.zoomKeyframes.isEmpty == true,
+                    "A pending conflict exposes a cached full-source comparison without applying it")
+        _ = session.conflictReview?.outlines(at: 0.5)
+        try require(session.conflictReviewID == reviewID && !fixture.editor.canUndo,
+                    "Reading comparison samples cannot regenerate proposal identities or create Undo")
         return try fixture.conflict(session.projectID)
     }
 
@@ -197,6 +204,8 @@ struct FramingConflictChecks {
         try require(!session.awaitsClarification && session.errorMessage == nil && session.instruction.isEmpty &&
                     session.notice?.contains("Replaced") == true && fixture.editor.project.undoHistory.count == 1,
                     "Exact replace answer completes instead of asking the same question again")
+        try require(session.conflictReview == nil && session.conflictReviewID == nil,
+                    "Accepting a proposal clears its transient comparison")
         try require(fixture.editor.project.state.zoom(at: 0) == fixture.box1.rect.framing() &&
                     fixture.editor.project.state.zoom(at: 3) == fixture.box2.rect.framing() &&
                     !fixture.editor.project.state.zoomKeyframes.contains { abs($0.time - 12.6) < 0.000001 },
@@ -217,7 +226,11 @@ struct FramingConflictChecks {
             session.instruction = stale ? answer : "Keep the existing movement."
             session.submit(editor: fixture.editor, playhead: 9.6, regionID: nil, editID: nil)
             try await wait { await transport.payloads.count == 2 }
-            if stale { try require(fixture.editor.rename(to: "Changed while answering"), "Change project while resolution is in flight") }
+            if stale {
+                try require(fixture.editor.rename(to: "Changed while answering"), "Change project while resolution is in flight")
+                try require(session.conflictReview == nil && session.conflictReviewID == nil,
+                            "A manual revision immediately hides the obsolete comparison")
+            }
             let current = fixture.editor.project
             await transport.reply(1, try choice(conflict, stale ? "replace" : "keep"))
             try await wait { !session.isBusy }
@@ -227,6 +240,8 @@ struct FramingConflictChecks {
             } else {
                 try require(fixture.editor.project == before && !session.awaitsClarification && session.errorMessage == nil && session.notice == "Kept the existing framing.",
                             "Keep ends the question without writing history or changing the recording")
+                try require(session.conflictReview == nil && session.conflictReviewID == nil,
+                            "Keeping existing framing clears the proposal comparison")
             }
         }
         let fixture = try Fixture()

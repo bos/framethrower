@@ -30,6 +30,7 @@ struct EditorCanvas: NSViewRepresentable {
     var onReferenceBegin: () -> Void = {}
     var onDrawRegion: (EditorRegionRect) -> Void = { _ in }
     var onSelectRegion: (UUID?) -> Void = { _ in }
+    var conflictOutlines: EditorConflictOutlines? = nil
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -48,6 +49,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.onReferenceBegin = onReferenceBegin
         view.onDrawRegion = onDrawRegion
         view.onSelectRegion = onSelectRegion
+        view.conflictOutlines = conflictOutlines
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
             placement: placement, cameraEnabled: cameraEnabled, zoom: zoom,
@@ -70,6 +72,17 @@ final class EditorCanvasView: NSView {
     private let outline = CAShapeLayer()
     private let handles = CAShapeLayer()
     private let guides = CALayer()
+    private let conflictGuides = CALayer()
+    var conflictOutlines: EditorConflictOutlines? {
+        didSet {
+            guard oldValue != conflictOutlines else { return }
+            trackpad = nil; zoomDrag = nil; drag = nil
+            scribbleStart = nil; scribbleDraft = nil; guidePressID = nil
+            needsLayout = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    private(set) var conflictFrames: [CGRect] = []
     var scribbleMode = false {
         didSet {
             guard oldValue != scribbleMode else { return }
@@ -151,7 +164,7 @@ final class EditorCanvasView: NSView {
         handles.fillColor = NSColor.white.cgColor
         handles.strokeColor = NSColor.black.withAlphaComponent(0.55).cgColor
         handles.lineWidth = 1
-        for child in [playerLayer, stillLayer, canvasBorder, outline, handles, guides] { layer?.addSublayer(child) }
+        for child in [playerLayer, stillLayer, canvasBorder, outline, handles, guides, conflictGuides] { layer?.addSublayer(child) }
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Recording preview")
@@ -217,6 +230,7 @@ final class EditorCanvasView: NSView {
         }
         handles.path = circles
         updateGuides()
+        updateConflictGuides()
     }
 
     private var scribbleGeometry: ScribbleGeometry { ScribbleGeometry(contentRect: contentRect, zoom: zoom) }
@@ -226,6 +240,7 @@ final class EditorCanvasView: NSView {
         guides.sublayers?.forEach { $0.removeFromSuperlayer() }
         guideBadges = []
         setAccessibilityValue(nil)
+        setAccessibilityHelp(scribbleMode ? "Director mode. Drag to draw a reference box; click a box number to select it. Pinch to zoom and use two fingers to pan. Escape cancels an unfinished action." : Self.navigationHelp)
         guard scribbleMode, contentRect.width > 0, contentRect.height > 0 else { return }
         let values = regions.map { ($0.rect, $0.id == selectedRegionID, Optional($0.id)) }
             + (scribbleDraft.map { [($0, true, nil as UUID?)] } ?? [])
@@ -289,6 +304,55 @@ final class EditorCanvasView: NSView {
         }.joined(separator: "; "))
     }
 
+    private func updateConflictGuides() {
+        conflictGuides.frame = bounds
+        conflictGuides.sublayers?.forEach { $0.removeFromSuperlayer() }
+        conflictFrames = []
+        guard let comparison = conflictOutlines, contentRect.width > 0, contentRect.height > 0 else { return }
+        let unit = CGRect(x: 0, y: 0, width: 1, height: 1)
+        guard [comparison.existing, comparison.proposed].allSatisfy({ rect in
+            [rect.minX, rect.minY, rect.width, rect.height].allSatisfy(\.isFinite) &&
+                rect.width > 0 && rect.height > 0 && !rect.intersection(unit).isEmpty && !rect.intersection(unit).isNull
+        }) else { return }
+        let values: [(CGRect, String, NSColor, Bool)] = [
+            (comparison.existing, "Existing", .systemOrange, false),
+            (comparison.proposed, "Proposed", .systemCyan, true)]
+        for (source, title, color, dashed) in values {
+            let rect = CGRect(x: contentRect.minX + source.minX * contentRect.width,
+                y: contentRect.minY + source.minY * contentRect.height,
+                width: source.width * contentRect.width, height: source.height * contentRect.height)
+                .intersection(contentRect)
+            guard !rect.isNull, !rect.isEmpty else { continue }
+            conflictFrames.append(rect)
+            let shape = CAShapeLayer()
+            shape.path = CGPath(rect: rect.insetBy(dx: 2, dy: 2), transform: nil)
+            shape.fillColor = nil
+            shape.strokeColor = color.cgColor
+            shape.lineWidth = dashed ? 2 : 4
+            shape.lineDashPattern = dashed ? [8, 4] : nil
+            conflictGuides.addSublayer(shape)
+            let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            let width = min(contentRect.width, (title as NSString).size(withAttributes: [.font: font]).width + 14)
+            let badge = CALayer()
+            let y = dashed ? rect.maxY - 24 : rect.minY + 4
+            badge.frame = CGRect(x: min(max(rect.minX + 4, contentRect.minX), contentRect.maxX - width),
+                y: min(max(y, contentRect.minY), contentRect.maxY - 22), width: width, height: 22)
+            badge.cornerRadius = 4
+            badge.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+            badge.borderWidth = 1
+            badge.borderColor = color.cgColor
+            let text = CATextLayer()
+            text.string = title; text.font = font; text.fontSize = 11
+            text.foregroundColor = color.cgColor; text.alignmentMode = .center
+            text.contentsScale = window?.backingScaleFactor ?? 2
+            text.frame = CGRect(x: 4, y: 3, width: max(0, width - 8), height: 16)
+            badge.addSublayer(text); conflictGuides.addSublayer(badge)
+        }
+        guard conflictFrames.count == 2 else { return }
+        setAccessibilityValue(String(format: "Conflict at %.2f seconds. Solid orange Existing frame; dashed cyan Proposed frame.", comparison.time))
+        setAccessibilityHelp("Compare the solid Existing frame and dashed Proposed frame. Scrub the highlighted timeline spans to inspect the movement. Escape dismisses the proposal.")
+    }
+
     private func offscreenDirection(for rect: CGRect) -> String {
         let horizontal = rect.maxX <= contentRect.minX ? -1 : rect.minX >= contentRect.maxX ? 1 : 0
         let vertical = rect.maxY <= contentRect.minY ? -1 : rect.minY >= contentRect.maxY ? 1 : 0
@@ -337,11 +401,13 @@ final class EditorCanvasView: NSView {
     }
 
     override func resetCursorRects() {
+        if conflictOutlines != nil { addCursorRect(contentRect, cursor: .arrow); return }
         if scribbleMode { addCursorRect(contentRect, cursor: .crosshair); return }
         if allowsZoomEditing, zoom.scale > 1 { addCursorRect(canvasRect, cursor: .openHand) }
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard conflictOutlines == nil else { window?.makeFirstResponder(self); return }
         let point = convert(event.locationInWindow, from: nil)
         if scribbleMode {
             window?.makeFirstResponder(self)
@@ -535,7 +601,7 @@ final class EditorCanvasView: NSView {
     }
 
     private func acceptsTrackpad(_ event: NSEvent) -> Bool {
-        guard allowsZoomEditing, drag == nil, zoomDrag == nil, scribbleStart == nil, guidePressID == nil,
+        guard conflictOutlines == nil, allowsZoomEditing, drag == nil, zoomDrag == nil, scribbleStart == nil, guidePressID == nil,
               contentRect.width > 0, contentRect.height > 0 else { return false }
         return trackpad != nil || canvasRect.contains(convert(event.locationInWindow, from: nil))
     }

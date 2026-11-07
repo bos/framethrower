@@ -6,6 +6,7 @@ check_dir=$(mktemp -d -t framethrower-live-layout-check)
 trap 'rm -rf "$check_dir"' EXIT
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorConflictGeometry.swift" \
   -target "$(uname -m)-apple-macos15.0" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \

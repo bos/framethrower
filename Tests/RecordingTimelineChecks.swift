@@ -661,8 +661,79 @@ struct RecordingTimelineChecks {
                      "A crowded edit group cannot steal a trim drag")
         timeline.presentMarkerMenu = nil
 
+        reset(start: 0, end: 10, playhead: 9)
+        timeline.fit(request: UUID())
+        let conflictEdit = RecordingTimelineMarker(id: UUID(), time: 3.5, help: "Zoom C", label: "Zoom C")
+        timeline.edits = [conflictEdit]
+        timeline.selectedEditID = nil
+        selectedEdits = []; seeks = []; trims = []; moves = []
+        let existingSpan = EditorConflictSpan(id: "existing", side: .existing, start: 1, end: 4, label: "Zoom A", help: "Existing Zoom A, 1 to 4 seconds.")
+        let proposedSpan = EditorConflictSpan(id: "proposed", side: .proposed, start: 3, end: 6, label: "Zoom B", help: "Proposed Zoom B, 3 to 6 seconds.")
+        let beforeReviewSize = timeline.intrinsicContentSize
+        timeline.conflictSpans = [existingSpan, proposedSpan]
+        timeline.conflictOverlaps = [3...4]
+        let comparison = timeline.conflictBands()
+        precondition(comparison.count == 2 && comparison[0].frame.maxY < comparison[1].frame.minY &&
+                     comparison[0].frame.minX == timeline.x(for: 1) && comparison[1].frame.maxX == timeline.x(for: 6) &&
+                     timeline.intrinsicContentSize == beforeReviewSize,
+                     "Existing and Proposed get separate source-aligned rows without expanding the 72pt timeline")
+        let paintedReview = rendering()
+        func bandColors(_ bitmap: NSBitmapImageRep, from: Double, to: Double, y: Double) -> [NSColor] {
+            let sx = Double(bitmap.pixelsWide) / timeline.bounds.width
+            let sy = Double(bitmap.pixelsHigh) / timeline.bounds.height
+            return (Int(timeline.x(for: from) * sx)..<Int(timeline.x(for: to) * sx)).compactMap {
+                bitmap.colorAt(x: $0, y: Int(y * sy))?.usingColorSpace(.deviceRGB)
+            }
+        }
+        let existingPixels = bandColors(paintedReview, from: 1.2, to: 2.8, y: 3)
+        let proposedPixels = bandColors(paintedReview, from: 4.2, to: 5.8, y: 9)
+        let orange = existingPixels.filter { $0.redComponent > $0.greenComponent + 0.15 && $0.redComponent > $0.blueComponent + 0.2 }.count
+        let cyan = proposedPixels.filter { $0.blueComponent > $0.redComponent + 0.2 && $0.greenComponent > $0.redComponent + 0.2 }.count
+        precondition(orange > existingPixels.count * 8 / 10 && cyan > proposedPixels.count / 4 && cyan < proposedPixels.count * 8 / 10,
+                     "Existing draws a solid orange span while Proposed draws a visibly dashed cyan span")
+        timeline.conflictOverlaps = []
+        let overlapPixels = changedPixels(paintedReview, rendering())
+        precondition(overlapPixels.count > 30 && overlapPixels.allSatisfy { $0.y <= 12 && $0.x >= timeline.x(for: 3) - 1 && $0.x <= timeline.x(for: 4) + 1 },
+                     "Actual overlap is hatched only in its source interval, above the independent scrub/trim/edit lanes")
+        timeline.conflictOverlaps = [3...4]
+        timeline.trimStart = 3
+        let trimmedReview = rendering()
+        let outside = bandColors(trimmedReview, from: 1.4, to: 1.6, y: 3).map { $0.redComponent * $0.alphaComponent }.max()!
+        let inside = bandColors(trimmedReview, from: 3.4, to: 3.6, y: 3).map { $0.redComponent * $0.alphaComponent }.max()!
+        precondition(inside > outside + 0.2, "Trimmed-out comparison spans remain visible but subdued")
+        timeline.trimStart = 0
+        pinch(1)
+        let zoomedComparison = timeline.conflictBands()
+        precondition(zoomedComparison[0].frame.minX == 12 && zoomedComparison[0].frame.maxX == timeline.x(for: 4),
+                     "Pinching clips a partially visible conflict to the same source axis as the playhead")
+        scroll(-60)
+        precondition(timeline.conflictBands().allSatisfy { $0.frame.minX >= 12 && $0.frame.maxX <= timeline.bounds.width - 12 },
+                     "Panning cannot draw conflict spans outside the time rail")
+        precondition(selectedEdits.isEmpty && seeks.isEmpty && trims.isEmpty && moves.isEmpty,
+                     "Showing, trimming display, or navigating a comparison cannot apply or replace a framing edit")
+        down(CGPoint(x: timeline.x(for: 3.5), y: 3)); up(CGPoint(x: timeline.x(for: 3.5), y: 3))
+        near(seeks.last, 3.5, "Clicking a visible conflict span reviews that source time")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && trims.isEmpty,
+                     "Reviewing a conflict does not select or move the underlying edit at that time")
+        down(CGPoint(x: timeline.x(for: 3.5), y: 47)); up(CGPoint(x: timeline.x(for: 3.5), y: 47))
+        precondition(selectedEdits == [conflictEdit.id], "The existing edit lane stays selectable during comparison review")
+        timeline.playhead = 6
+        timeline.trimStart = 4
+        down(CGPoint(x: timeline.x(for: 3.5), y: 3)); up(CGPoint(x: timeline.x(for: 3.5), y: 3))
+        near(seeks.last, 4, "Review clicks honor the current kept range instead of bypassing trim")
+        precondition(timeline.accessibilityCustomActions()?.contains { $0.name.contains("Existing") && $0.name.contains("1.000") } == true &&
+                     timeline.accessibilityCustomActions()?.contains { $0.name.contains("Proposed") && $0.name.contains("6.000") } == true,
+                     "Comparison actions identify Existing/Proposed and their source times without relying on color")
+        timeline.conflictSpans = [EditorConflictSpan(id: "instant", side: .proposed, start: 5, end: 5, label: "Jump D", help: "Proposed instant change.")]
+        precondition(timeline.conflictBands().first?.frame.width == 4,
+                     "An instantaneous proposed change has a visible source-time tick")
+        timeline.conflictSpans = []
+        timeline.conflictOverlaps = []
+        precondition(timeline.conflictBands().isEmpty && timeline.intrinsicContentSize == beforeReviewSize,
+                     "Dismissing comparison clears its visuals without changing timeline geometry")
+
         window.close()
-        print("Recording timeline checks passed: scrub/trim independence, isolated edit moves, explicit crowded-edit counts and native chooser identity, selected-only group moves, menu/move cancellation, pinch separation, accessible action/time labels, fixed geometry, neighbor limits, trackpad navigation, transition bands, and understated keyboard focus.")
+        print("Recording timeline checks passed: scrub/trim independence, crowded-edit chooser identity/cancellation, selected group moves, pinch separation, accessible labels, fixed geometry, and Existing/Proposed conflict strokes, overlap hatching, source clipping, trim dimming and review-only clicks.")
     }
 
     static func near(_ actual: Double?, _ expected: Double, _ message: String) {

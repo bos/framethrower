@@ -33,6 +33,8 @@ struct RecordingTimeline: NSViewRepresentable {
     var onDeselectEdit: () -> Void = {}
     var onCancelEdit: () -> Void = {}
     var fitRequest: UUID?
+    var conflictSpans: [EditorConflictSpan] = []
+    var conflictOverlaps: [ClosedRange<Double>] = []
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -53,6 +55,8 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onCancelMoveEdit = onCancelMoveEdit
         view.onDeselectEdit = onDeselectEdit
         view.onCancelEdit = onCancelEdit
+        view.conflictSpans = conflictSpans
+        view.conflictOverlaps = conflictOverlaps
         view.fit(request: fitRequest)
     }
 }
@@ -73,6 +77,16 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let text: String
         let selectedID: UUID?
         var isCluster: Bool { ids.count > 1 }
+    }
+    struct ConflictBand: Equatable {
+        let span: EditorConflictSpan
+        let frame: CGRect
+    }
+    var conflictSpans: [EditorConflictSpan] = [] {
+        didSet { if conflictSpans != oldValue { needsDisplay = true; updateTooltips() } }
+    }
+    var conflictOverlaps: [ClosedRange<Double>] = [] {
+        didSet { if conflictOverlaps != oldValue { needsDisplay = true; updateTooltips() } }
     }
     var duration = 1.0 {
         didSet {
@@ -178,6 +192,17 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
         tooltipText[base] = "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        for band in conflictBands() {
+            let side = band.span.side == .existing ? "Existing" : "Proposed"
+            tooltipText[addToolTip(band.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] =
+                "\(side): \(band.span.help) Click to review this source time."
+        }
+        for interval in conflictOverlaps {
+            if let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: 0, height: 12) {
+                tooltipText[addToolTip(frame, owner: self, userData: nil)] = String(format:
+                    "Existing and proposed framing overlap from %.3f to %.3f seconds. Click to review; no changes are applied.", interval.lowerBound, interval.upperBound)
+            }
+        }
         for group in markerGroups() {
             tooltipText[addToolTip(group.frame, owner: self, userData: nil)] = help(for: group)
         }
@@ -197,6 +222,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let start = drag?.start ?? trimStart
         let end = drag?.end ?? trimEnd
         let current = scrubTime ?? playhead
+        drawConflictReview(keptStart: start, keptEnd: end)
         let rail = CGRect(x: 12, y: 21, width: railWidth, height: 6)
         NSColor.quaternaryLabelColor.setFill()
         NSBezierPath(roundedRect: rail, xRadius: 3, yRadius: 3).fill()
@@ -268,6 +294,72 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             NSBezierPath(roundedRect: CGRect(x: cursorX - 7, y: 35, width: 14, height: 2),
                          xRadius: 1, yRadius: 1).fill()
         }
+    }
+
+    /// Conflict comparison uses the space above the scrub rail, preserving the
+    /// edit lane and the timeline's height. The white playhead draws over it.
+    func conflictBands() -> [ConflictBand] {
+        conflictSpans.compactMap { span in
+            guard let frame = conflictFrame(start: span.start, end: span.end,
+                y: span.side == .existing ? 2 : 8, height: 3) else { return nil }
+            return ConflictBand(span: span, frame: frame)
+        }
+    }
+
+    private func conflictFrame(start: Double, end: Double, y: CGFloat, height: CGFloat) -> CGRect? {
+        guard start.isFinite, end.isFinite, start <= end,
+              end >= visibleStart, start <= visibleStart + visibleDuration,
+              end >= 0, start <= duration else { return nil }
+        let lower = max(12, x(for: start)), upper = min(bounds.width - 12, x(for: end))
+        let width = max(start == end ? 4 : 2, upper - lower)
+        let frame = CGRect(x: start == end ? lower - width / 2 : lower, y: y, width: width, height: height)
+            .intersection(CGRect(x: 12, y: y, width: railWidth, height: height))
+        return frame.isNull || frame.isEmpty ? nil : frame
+    }
+
+    private func drawConflictReview(keptStart: Double, keptEnd: Double) {
+        let lane = CGRect(x: 12, y: 0, width: railWidth, height: 12)
+        func draw(alpha: CGFloat) {
+            for interval in conflictOverlaps {
+                guard let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: 0, height: 12) else { continue }
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: frame).addClip()
+                NSColor.labelColor.withAlphaComponent(0.25 * alpha).setStroke()
+                let hatch = NSBezierPath()
+                var position = frame.minX - 12
+                while position <= frame.maxX {
+                    hatch.move(to: CGPoint(x: position, y: 12))
+                    hatch.line(to: CGPoint(x: position + 12, y: 0))
+                    position += 6
+                }
+                hatch.lineWidth = 1; hatch.stroke()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            for band in conflictBands() {
+                let existing = band.span.side == .existing
+                let color = (existing ? NSColor.systemOrange : NSColor.systemCyan).withAlphaComponent(alpha)
+                color.setStroke(); color.setFill()
+                if band.span.isInstant {
+                    let tick = CGRect(x: x(for: band.span.start) - 2, y: band.frame.midY - 2, width: 4, height: 4)
+                    if existing { NSBezierPath(rect: tick).fill() }
+                    else { let ring = NSBezierPath(ovalIn: tick); ring.lineWidth = 1; ring.stroke() }
+                    continue
+                }
+                let line = NSBezierPath()
+                line.lineWidth = 3
+                if !existing { line.setLineDash([4, 3], count: 2, phase: 0) }
+                line.move(to: CGPoint(x: x(for: band.span.start), y: band.frame.midY))
+                line.line(to: CGPoint(x: x(for: band.span.end), y: band.frame.midY))
+                line.stroke()
+            }
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: lane).addClip()
+        draw(alpha: 0.28)
+        NSBezierPath(rect: CGRect(x: x(for: keptStart), y: 0,
+            width: max(0, x(for: keptEnd) - x(for: keptStart)), height: 12)).addClip()
+        draw(alpha: 1)
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     /// A count replaces overlapping hit targets. Recheck the resulting badges,
@@ -534,7 +626,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func accessibilityCustomActions() -> [NSAccessibilityCustomAction]? {
-        markerGroups().map { group in
+        let markerActions = markerGroups().map { group in
             let name: String
             if group.isCluster { name = "Choose among \(group.ids.count) nearby edits" }
             else if let marker = edits.first(where: { $0.id == group.ids[0] }) {
@@ -549,6 +641,20 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 }
             }
         }
+        let conflictActions = conflictBands().map { band in
+            let side = band.span.side == .existing ? "Existing" : "Proposed"
+            let name = String(format: "Review %@: %@, %.3f to %.3f seconds", side, band.span.label, band.span.start, band.span.end)
+            return NSAccessibilityCustomAction(name: name) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.conflictSpans.contains(where: { $0 == band.span }) else { return false }
+                    self.onInteractionBegan?(); self.onScrubBegan?()
+                    self.seek(max(self.visibleStart, band.span.start))
+                    self.onScrubEnded?(); self.scrubTime = nil
+                    return true
+                }
+            }
+        }
+        return markerActions + conflictActions
     }
 
     override func mouseDown(with event: NSEvent) {

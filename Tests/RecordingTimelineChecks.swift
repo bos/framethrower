@@ -543,10 +543,126 @@ struct RecordingTimelineChecks {
         let crowded = RecordingTimelineMarker(id: UUID(), time: 2.01, help: "Close edit", label: "Edit C")
         timeline.edits = [namedA, crowded]
         timeline.selectedEditID = namedA.id
-        precondition(timeline.markerLabels().contains { $0.id == namedA.id }, "Selected edits retain a visible letter at crowded scales")
+        precondition(timeline.markerGroups().contains { $0.selectedID == namedA.id && $0.text == "A · 2" },
+                     "A crowded selected edit retains its letter inside the visible count badge")
+
+        // Close/exact source times must produce one unambiguous target, not a
+        // nearest-hit guess that hides a different edit underneath it.
+        reset(start: 0, end: 10, playhead: 4)
+        timeline.fit(request: UUID())
+        let zoomA = RecordingTimelineMarker(id: UUID(), time: 5, help: "Zoom A: zoom to 2×.", label: "Zoom A")
+        let panB = RecordingTimelineMarker(id: UUID(), time: 5.01, help: "Pan B: move the view right.", label: "Pan B")
+        timeline.edits = [panB, zoomA]
+        timeline.selectedEditID = nil
+        selectedEdits = []; moves = []; seeks = []; trims = []
+        var menus: [NSMenu] = []
+        timeline.presentMarkerMenu = { menu, _ in menus.append(menu) }
+        timeline.onSelectEdit = { id in selectedEdits.append(id); timeline.selectedEditID = id }
+        let clustered = timeline.markerGroups()
+        precondition(clustered.count == 1 && clustered[0].isCluster && clustered[0].text == "2" &&
+                     Set(clustered[0].ids) == [zoomA.id, panB.id], "Nearby hit targets collapse into a visible edit count")
+        let groupPoint = CGPoint(x: clustered[0].frame.midX, y: clustered[0].frame.midY)
+        down(groupPoint); up(groupPoint)
+        precondition(menus.count == 1 && selectedEdits.isEmpty && seeks.isEmpty && trims.isEmpty && moves.isEmpty && timeline.playhead == 4,
+                     "Opening a crowded-edit chooser neither guesses a selection nor warps the playhead")
+        let menu = menus[0]
+        precondition(menu.items.map(\.title) == ["Zoom A · 5.000 s", "Pan B · 5.010 s"] &&
+                     menu.items.map(\.toolTip) == [zoomA.help, panB.help] && menu.items.allSatisfy { $0.state == .off },
+                     "Every chooser item identifies the actual action and precise time in source order")
+        let chosen = menu.items.first { $0.representedObject as? UUID == panB.id }!
+        precondition(NSApp.sendAction(chosen.action!, to: chosen.target, from: chosen) && selectedEdits == [panB.id] && seeks.isEmpty,
+                     "Native menu selection selects exactly the requested edit, independent of hitbox distance")
+        precondition(timeline.markerGroups()[0].selectedID == panB.id && timeline.markerGroups()[0].text == "B · 2",
+                     "The selected member remains clear while its neighbors are still grouped")
+        let selectedPoint = CGPoint(x: timeline.markerGroups()[0].frame.midX, y: 47)
+        down(selectedPoint); up(selectedPoint)
+        precondition(menus.last!.items.first { $0.representedObject as? UUID == panB.id }!.state == .on,
+                     "The chooser checks the actual selected edit")
+        let beforeMenuCancel = cancelledEdits
+        let cancelledMenu = menus.last!
+        key(53)
+        _ = NSApp.sendAction(cancelledMenu.items[0].action!, to: cancelledMenu.items[0].target, from: cancelledMenu.items[0])
+        precondition(selectedEdits == [panB.id] && timeline.selectedEditID == panB.id && cancelledEdits == beforeMenuCancel,
+                     "Escape dismisses the chooser without clearing selection or allowing a stale menu action")
+
+        timeline.selectedEditID = nil
+        selectedEdits = []; moves = []
+        let menuCount = menus.count
+        gesture(from: groupPoint, to: CGPoint(x: groupPoint.x + 30, y: 47))
+        gesture(from: groupPoint, to: CGPoint(x: groupPoint.x, y: 6))
+        precondition(moves.isEmpty && selectedEdits.isEmpty && menus.count == menuCount,
+                     "Dragging an unselected group cannot move a guessed member or open a chooser on release")
+        timeline.selectedEditID = panB.id
+        down(groupPoint)
+        drag(CGPoint(x: groupPoint.x + 30, y: 6))
+        precondition(moves.count == 1 && moves[0].0 == panB.id && !moves[0].2 && selectedEdits.isEmpty,
+                     "Dragging a selected group previews only the explicitly selected edit without reselecting or seeking")
+        let beforeMoveCancel = cancellations
+        key(53); up(CGPoint(x: groupPoint.x + 30, y: 6))
+        precondition(cancellations == beforeMoveCancel + 1 && moves.allSatisfy { !$0.2 } && seeks.isEmpty && trims.isEmpty,
+                     "Escape cancels a grouped edit move and later mouse-up cannot commit it")
+        moves = []
+        gesture(from: groupPoint, to: CGPoint(x: groupPoint.x + 30, y: 24))
+        precondition(moves.count == 2 && moves.allSatisfy { $0.0 == panB.id } && moves.filter(\.2).count == 1 && menus.count == menuCount,
+                     "A selected group drag commits its single known member once and never becomes trim or scrub")
+
+        timeline.selectedEditID = nil
+        selectedEdits = []; moves = []
+        let sameTime = RecordingTimelineMarker(id: UUID(), time: 5, help: "Camera C: resize camera.", label: "Camera C")
+        timeline.edits = [sameTime, zoomA]
+        let exact = timeline.markerGroups()[0]
+        down(CGPoint(x: exact.frame.midX, y: 47)); up(CGPoint(x: exact.frame.midX, y: 47))
+        let cameraItem = menus.last!.items.first { $0.representedObject as? UUID == sameTime.id }!
+        _ = NSApp.sendAction(cameraItem.action!, to: cameraItem.target, from: cameraItem)
+        precondition(selectedEdits == [sameTime.id] && menus.last!.items.allSatisfy { $0.title.hasSuffix("5.000 s") },
+                     "Coincident actions remain individually selectable by identity, with no arbitrary nearest-edit winner")
+        down(CGPoint(x: exact.frame.midX, y: 47)); up(CGPoint(x: exact.frame.midX, y: 47))
+        let removedItem = menus.last!.items.first { $0.representedObject as? UUID == sameTime.id }!
+        timeline.edits = [zoomA]
+        _ = NSApp.sendAction(removedItem.action!, to: removedItem.target, from: removedItem)
+        precondition(selectedEdits == [sameTime.id], "A marker removed while a chooser is open cannot select an unrelated surviving edit")
+        key(53)
+
+        timeline.edits = [panB, zoomA]
+        timeline.selectedEditID = nil
+        selectedEdits = []; seeks = []; trims = []; moves = []
+        let fixedSize = timeline.intrinsicContentSize
+        pinch(100)
+        let separated = timeline.markerGroups()
+        precondition(separated.count == 2 && separated.allSatisfy { !$0.isCluster } &&
+                     !separated[0].frame.intersects(separated[1].frame) && timeline.intrinsicContentSize == fixedSize,
+                     "Pinching close edits apart restores individual nonoverlapping targets at the same fixed timeline height")
+        precondition(timeline.accessibilityCustomActions()?.contains { $0.name.contains("Pan B") && $0.name.contains("5.010") } == true,
+                     "Accessible actions identify the same edit and time as the visual chooser")
+        let separatedPoint = CGPoint(x: timeline.x(for: panB.time), y: 47)
+        let beforeSeparatedClick = menus.count
+        down(separatedPoint); up(separatedPoint)
+        precondition(selectedEdits == [panB.id] && menus.count == beforeSeparatedClick,
+                     "A separated marker selects directly without an unnecessary chooser")
+
+        timeline.fit(request: UUID())
+        timeline.edits = [zoomA, panB, RecordingTimelineMarker(id: UUID(), time: 5.5, help: "Other action", label: "Pan D")]
+        timeline.selectedEditID = zoomA.id
+        let finalGroups = timeline.markerGroups()
+        precondition(finalGroups.count == 2 && finalGroups[0].ids.count == 2 && finalGroups[1].ids.count == 1 &&
+                     !finalGroups[0].frame.intersects(finalGroups[1].frame),
+                     "Clustering does not swallow already-distinct nearby markers and final badge targets never overlap")
+        selectedEdits = []; seeks = []; trims = []; moves = []
+        let beforeLaneDrags = menus.count
+        timeline.playhead = 5
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 6), to: CGPoint(x: timeline.x(for: 6), y: 47))
+        near(seeks.last, 6, "The playhead remains independently draggable over a crowded edit group")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && menus.count == beforeLaneDrags,
+                     "A crowded edit group cannot steal a playhead drag")
+        seeks = []; timeline.trimStart = 5
+        gesture(from: CGPoint(x: timeline.x(for: 5), y: 24), to: CGPoint(x: timeline.x(for: 6), y: 47))
+        near(trims.last?.0, 6, "Trim handles remain independently draggable over crowded edit groups")
+        precondition(selectedEdits.isEmpty && moves.isEmpty && seeks.isEmpty && menus.count == beforeLaneDrags,
+                     "A crowded edit group cannot steal a trim drag")
+        timeline.presentMarkerMenu = nil
 
         window.close()
-        print("Recording timeline checks passed: shared geometry, continuous scrub, trim grouping, keyboard seek, separate edit lane, selection on release, grouped edit moves, neighbor limits, cancellation, locked drag targets, trackpad timeline navigation, zoomed time precision, selected transition bands, deliberate selection reveal, blank-lane deselection, Escape cancellation, and understated keyboard focus.")
+        print("Recording timeline checks passed: scrub/trim independence, isolated edit moves, explicit crowded-edit counts and native chooser identity, selected-only group moves, menu/move cancellation, pinch separation, accessible action/time labels, fixed geometry, neighbor limits, trackpad navigation, transition bands, and understated keyboard focus.")
     }
 
     static func near(_ actual: Double?, _ expected: Double, _ message: String) {

@@ -67,6 +67,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let frame: CGRect
         let overlaysMarker: Bool
     }
+    struct MarkerGroup: Equatable {
+        let ids: [UUID]
+        let frame: CGRect
+        let text: String
+        let selectedID: UUID?
+        var isCluster: Bool { ids.count > 1 }
+    }
     var duration = 1.0 {
         didSet {
             guard duration != oldValue else { return }
@@ -105,8 +112,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var onDeselectEdit: (() -> Void)?
     var onCancelEdit: (() -> Void)?
     private var tooltipText: [Int: String] = [:]
+    // Tests exercise the real menu items and selectors without showing a menu
+    // on the user's desktop. Production always uses the native popup below.
+    var presentMarkerMenu: ((NSMenu, NSPoint) -> Void)?
+    private var activeMarkerMenu: NSMenu?
 
-    private enum Interaction: Equatable { case start, end, scrub, edit(UUID), emptyEditLane }
+    private enum Interaction: Equatable { case start, end, scrub, edit(UUID), cluster, emptyEditLane }
     private struct Drag {
         var interaction: Interaction
         var originX: CGFloat
@@ -118,6 +129,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         var maximumTime = 0.0
         var hasMoved = false
         var movable = true
+        var chooserIDs: [UUID]? = nil
+        var pointerMoved = false
+        var originY: CGFloat = 0
     }
     private var drag: Drag?
     private var scrubTime: Double?
@@ -135,7 +149,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         setAccessibilityElement(true)
         setAccessibilityRole(.slider)
         setAccessibilityLabel("Recording timeline")
-        setAccessibilityHelp("Drag the top playhead to scrub. Drag either lower blue handle to trim. Purple diamonds below the track mark edits. Click to select an edit; drag to change its time. Click empty space below the track to leave the edit. Escape cancels unfinished edits and clears selection. Pinch to zoom the timeline; scroll with two fingers to navigate time.")
+        setAccessibilityHelp("Drag the top playhead to scrub or the blue handles to trim. Click an individual edit to select it, or drag to move its time. Count badges contain nearby edits; click to choose one. Dragging a badge moves only its selected edit. Click empty space below the track to clear selection. Escape cancels an unfinished move. Pinch to separate nearby edits; scroll to navigate time.")
     }
     required init?(coder: NSCoder) { nil }
 
@@ -163,10 +177,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         tooltipText.removeAll()
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
-        tooltipText[base] = "Drag the playhead to scrub. Drag the blue handles to trim. Purple diamonds below the track mark edits. Click to select; drag to change an edit's time. Pinch to zoom the timeline; scroll to navigate time."
-        for marker in edits where markerIsVisible(marker.time) {
-            let rect = CGRect(x: x(for: marker.time) - 8, y: 38, width: 16, height: 18)
-            tooltipText[addToolTip(rect, owner: self, userData: nil)] = marker.label.map { marker.help.hasPrefix($0) ? marker.help : $0 + ": " + marker.help } ?? marker.help
+        tooltipText[base] = "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        for group in markerGroups() {
+            tooltipText[addToolTip(group.frame, owner: self, userData: nil)] = help(for: group)
         }
         for label in markerLabels() {
             if let marker = edits.first(where: { $0.id == label.id }) {
@@ -226,7 +239,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         if let selected = edits.first(where: { $0.id == selectedEditID }) {
             drawTransitionBand(for: selected)
         }
-        for marker in edits where markerIsVisible(drag?.interaction == .edit(marker.id) ? drag?.editTime ?? marker.time : marker.time) {
+        for group in markerGroups() {
+            if group.isCluster { drawCluster(group, start: start, end: end); continue }
+            guard let marker = edits.first(where: { $0.id == group.ids[0] }) else { continue }
             let dragged = drag?.interaction == .edit(marker.id)
             let markerTime = dragged ? drag?.editTime ?? marker.time : marker.time
             let center = CGPoint(x: x(for: markerTime), y: 47)
@@ -255,10 +270,79 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
     }
 
-    /// Labels are part of the edit target. At crowded scales the selected edit
-    /// keeps a compact label over its own diamond; other labels wait for room.
+    /// A count replaces overlapping hit targets. Recheck the resulting badges,
+    /// whose widths depend on their counts/selection, so no two targets overlap.
+    func markerGroups() -> [MarkerGroup] {
+        let visible = edits.filter { markerIsVisible(displayTime(for: $0)) }.sorted {
+            let first = displayTime(for: $0), second = displayTime(for: $1)
+            return first == second ? $0.id.uuidString < $1.id.uuidString : first < second
+        }
+        let selectedIndex = visible.firstIndex { $0.id == selectedEditID }
+        func layout(_ range: Range<Int>) -> (frame: CGRect, text: String, selectedID: UUID?) {
+            let selected = selectedIndex.flatMap { range.contains($0) ? visible[$0] : nil }
+            let token = selected?.label.map { label in
+                let segment = label.components(separatedBy: " · ").first ?? label
+                return String((segment.split(whereSeparator: \.isWhitespace).last.map(String.init) ?? segment).prefix(3))
+            }
+            let text = range.count > 1 ? token.map { $0 + " · " + String(range.count) } ?? String(range.count) : ""
+            let width = range.count > 1 ? max(24, ceil((text as NSString).size(withAttributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .semibold)]).width) + 12) : 16
+            let center = (x(for: displayTime(for: visible[range.lowerBound])) + x(for: displayTime(for: visible[range.upperBound - 1]))) / 2
+            return (CGRect(x: min(max(0, center - width / 2), max(0, bounds.width - width)), y: 38, width: width, height: 18),
+                    text, selected?.id)
+        }
+        // A stack of index ranges keeps a dense timeline linear after sorting,
+        // rather than repeatedly copying or scanning every collapsed member.
+        var ranges: [Range<Int>] = []
+        for index in visible.indices {
+            ranges.append(index..<(index + 1))
+            while ranges.count > 1 {
+                let left = ranges[ranges.count - 2], right = ranges[ranges.count - 1]
+                guard layout(left).frame.insetBy(dx: -1, dy: 0).intersects(layout(right).frame.insetBy(dx: -1, dy: 0)) else { break }
+                ranges.removeLast(2)
+                ranges.append(left.lowerBound..<right.upperBound)
+            }
+        }
+        return ranges.map { range in
+            let value = layout(range)
+            return MarkerGroup(ids: range.map { visible[$0].id }, frame: value.frame, text: value.text, selectedID: value.selectedID)
+        }
+    }
+
+    private func help(for group: MarkerGroup) -> String {
+        guard group.isCluster else {
+            guard let marker = edits.first(where: { $0.id == group.ids.first }) else { return "" }
+            return marker.label.map { marker.help.hasPrefix($0) ? marker.help : $0 + ": " + marker.help } ?? marker.help
+        }
+        let selection = group.selectedID.flatMap { id in edits.first { $0.id == id } }
+        let selected = selection.map {
+            " \($0.label ?? "An edit") is selected." + ($0.movable ? " Drag to move only that edit." : " Its time is fixed.")
+        } ?? " Choose an edit before dragging."
+        return "\(group.ids.count) nearby edits. Click to choose an action and time; pinch to separate them." + selected
+    }
+
+    private func drawCluster(_ group: MarkerGroup, start: Double, end: Double) {
+        let ids = Set(group.ids)
+        let retained = edits.contains { ids.contains($0.id) && displayTime(for: $0) >= start && displayTime(for: $0) <= end }
+        NSColor.systemPurple.withAlphaComponent(retained ? 0.9 : 0.35).setFill()
+        let badge = NSBezierPath(roundedRect: group.frame.insetBy(dx: 0, dy: 1), xRadius: 5, yRadius: 5)
+        badge.fill()
+        if group.selectedID != nil {
+            NSColor.labelColor.setStroke(); badge.lineWidth = 2; badge.stroke()
+        }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: NSColor.white]
+        let text = group.text as NSString
+        let width = text.size(withAttributes: attributes).width
+        text.draw(at: CGPoint(x: group.frame.midX - width / 2, y: group.frame.minY + 3), withAttributes: attributes)
+    }
+
+    /// Labels belong only to individually visible targets. Cluster members are
+    /// identified by action and time in the native chooser instead.
     func markerLabels() -> [MarkerLabel] {
-        let visible = edits.filter { markerIsVisible(displayTime(for: $0)) }
+        let groups = markerGroups()
+        let individuals = Set(groups.filter { !$0.isCluster }.flatMap(\.ids))
+        let visible = edits.filter { individuals.contains($0.id) }
         let font = NSFont.systemFont(ofSize: 9, weight: .semibold)
         var labels: [MarkerLabel] = []
         let ordered = visible.sorted { ($0.id == selectedEditID ? 0 : 1) < ($1.id == selectedEditID ? 0 : 1) }
@@ -271,16 +355,17 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                               CGRect(x: center - 8 - width, y: 39, width: width, height: 16)]
             let available = candidates.first { candidate in
                 candidate.minX >= 0 && candidate.maxX <= bounds.width &&
-                    !visible.contains { other in
-                        other.id != marker.id && candidate.insetBy(dx: -2, dy: 0).intersects(
-                            CGRect(x: x(for: displayTime(for: other)) - 7, y: 38, width: 14, height: 18))
+                    !groups.contains { other in
+                        !other.ids.contains(marker.id) && candidate.insetBy(dx: -2, dy: 0).intersects(other.frame)
                     } && !labels.contains { $0.frame.insetBy(dx: -2, dy: 0).intersects(candidate) }
             }
             if let available { labels.append(MarkerLabel(id: marker.id, text: text, frame: available, overlaysMarker: false)) }
             else if marker.id == selectedEditID {
                 let frame = CGRect(x: min(max(0, center - width / 2), max(0, bounds.width - width)),
                                    y: 39, width: width, height: 16)
-                labels.append(MarkerLabel(id: marker.id, text: text, frame: frame, overlaysMarker: true))
+                if !groups.contains(where: { !$0.ids.contains(marker.id) && $0.frame.insetBy(dx: -2, dy: 0).intersects(frame) }) {
+                    labels.append(MarkerLabel(id: marker.id, text: text, frame: frame, overlaysMarker: true))
+                }
             }
         }
         return labels
@@ -420,6 +505,52 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         return resigned
     }
 
+    private func chooseEdits(_ ids: [UUID], at point: NSPoint) {
+        let markers = ids.compactMap { id in edits.first { $0.id == id } }.sorted {
+            $0.time == $1.time ? $0.id.uuidString < $1.id.uuidString : $0.time < $1.time
+        }
+        guard !markers.isEmpty else { return }
+        let menu = NSMenu(title: "Choose edit")
+        menu.autoenablesItems = false
+        for marker in markers {
+            let item = NSMenuItem(title: "\(marker.label ?? marker.help) · \(String(format: "%.3f s", marker.time))",
+                                 action: #selector(chooseMarker(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = marker.id
+            item.toolTip = marker.help
+            item.state = marker.id == selectedEditID ? .on : .off
+            menu.addItem(item)
+        }
+        activeMarkerMenu = menu
+        if let presentMarkerMenu { presentMarkerMenu(menu, point) }
+        else { menu.popUp(positioning: nil, at: point, in: self); activeMarkerMenu = nil }
+    }
+
+    @objc private func chooseMarker(_ item: NSMenuItem) {
+        guard item.menu === activeMarkerMenu, let id = item.representedObject as? UUID,
+              edits.contains(where: { $0.id == id }) else { return }
+        activeMarkerMenu = nil
+        onSelectEdit?(id)
+    }
+
+    override func accessibilityCustomActions() -> [NSAccessibilityCustomAction]? {
+        markerGroups().map { group in
+            let name: String
+            if group.isCluster { name = "Choose among \(group.ids.count) nearby edits" }
+            else if let marker = edits.first(where: { $0.id == group.ids[0] }) {
+                name = "Select \(marker.label ?? marker.help) at \(String(format: "%.3f", marker.time)) seconds"
+            } else { name = "Select edit" }
+            return NSAccessibilityCustomAction(name: name) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return false }
+                    if group.isCluster { self.chooseEdits(group.ids, at: NSPoint(x: group.frame.midX, y: group.frame.maxY)) }
+                    else if let id = group.ids.first, self.edits.contains(where: { $0.id == id }) { self.onSelectEdit?(id) }
+                    return true
+                }
+            }
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard duration.isFinite, duration > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
@@ -430,8 +561,15 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         onInteractionBegan?()
         if point.y >= 38 && point.y < 56 {
             let labelTarget = markerLabels().first { $0.frame.contains(point) }?.id
-            if let marker = edits.filter({ markerIsVisible($0.time) && (labelTarget == nil ? abs(point.x - x(for: $0.time)) <= 8 : $0.id == labelTarget) })
-                .min(by: { abs(point.x - x(for: $0.time)) < abs(point.x - x(for: $1.time)) }) {
+            let target = markerGroups().first { group in
+                if let labelTarget { return group.ids.contains(labelTarget) }
+                return group.frame.contains(point)
+            }
+            if let target, target.isCluster, target.selectedID == nil {
+                drag = Drag(interaction: .cluster, originX: point.x, originTime: playhead,
+                            start: trimStart, end: trimEnd, chooserIDs: target.ids, originY: point.y)
+            } else if let target, let id = target.selectedID ?? target.ids.first,
+                      let marker = edits.first(where: { $0.id == id }) {
                 let others = edits.filter { $0.id != marker.id && $0.time.isFinite }
                 let gap = frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30
                 let previous = others.filter { $0.time < marker.time }.map(\.time).max()
@@ -444,7 +582,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 let maximum = min(requestedMaximum, min(duration, max(marker.time, following.map { $0 - gap } ?? duration)))
                 drag = Drag(interaction: .edit(marker.id), originX: point.x, originTime: marker.time,
                             start: trimStart, end: trimEnd, editTime: marker.time,
-                            minimumTime: minimum, maximumTime: maximum, movable: marker.movable && minimum <= maximum)
+                            minimumTime: minimum, maximumTime: maximum, movable: marker.movable && minimum <= maximum,
+                            chooserIDs: target.isCluster ? target.ids : nil, originY: point.y)
             } else {
                 drag = Drag(interaction: .emptyEditLane, originX: point.x, originTime: playhead,
                             start: trimStart, end: trimEnd)
@@ -472,9 +611,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     override func mouseDragged(with event: NSEvent) {
         guard var drag else { return }
         let point = convert(event.locationInWindow, from: nil)
+        drag.pointerMoved = drag.pointerMoved || max(abs(point.x - drag.originX), abs(point.y - drag.originY)) >= 3
+        self.drag = drag
         let next = drag.originTime + Double((point.x - drag.originX) / railWidth) * visibleDuration
         switch drag.interaction {
-        case .emptyEditLane: break
+        case .emptyEditLane, .cluster: break
         case .scrub: seek(next)
         case .start: drag.start = min(max(next, 0), drag.end - minimumLength)
         case .end: drag.end = max(min(next, duration), drag.start + minimumLength)
@@ -485,7 +626,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let step = frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30
             drag.editTime = min(max((next / step).rounded() * step, drag.minimumTime), drag.maximumTime)
             self.drag = drag
-            if firstMovement { onSelectEdit?(id) }
+            if firstMovement, drag.chooserIDs == nil { onSelectEdit?(id) }
             onMoveEdit?(id, drag.editTime, false)
         }
         self.drag = drag
@@ -497,18 +638,26 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         self.drag = nil
         scrubTime = nil
         switch drag.interaction {
+        case .cluster:
+            if !drag.pointerMoved, let ids = drag.chooserIDs {
+                chooseEdits(ids, at: convert(event.locationInWindow, from: nil))
+            }
         case .emptyEditLane: onDeselectEdit?()
         case .scrub: onScrubEnded?()
         case .start, .end:
             if drag.start != trimStart || drag.end != trimEnd { onTrim?(drag.start, drag.end) }
         case .edit(let id):
             if drag.hasMoved { onMoveEdit?(id, drag.editTime, true) }
-            else { onSelectEdit?(id) }
+            else if !drag.pointerMoved, let ids = drag.chooserIDs {
+                chooseEdits(ids, at: convert(event.locationInWindow, from: nil))
+            }
+            else if drag.chooserIDs == nil { onSelectEdit?(id) }
         }
         needsDisplay = true
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if let activeMarkerMenu { activeMarkerMenu.cancelTracking(); self.activeMarkerMenu = nil; return }
         let active = drag
         drag = nil
         scrubTime = nil

@@ -11,7 +11,9 @@ struct EditorFileCommands: Commands {
                 .keyboardShortcut("0", modifiers: .command)
                 .disabled(actions?.fitTimeline == nil)
         }
-        CommandGroup(after: .saveItem) {
+        // Window/WindowGroup scenes do not supply the document Save group.
+        // The New/Open anchor exists in both recorder and editor scenes.
+        CommandGroup(after: .newItem) {
             Button("Save Recording") { actions?.saveProject() }
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(actions == nil || actions?.isBusy == true)

@@ -464,6 +464,8 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-editor-inspector-layout.sh`: all inspector tabs, selected and
   deselected edits, fixed preview/timeline geometry, and canceled slider rollback
   with metadata-only previews. UI fixtures use in-memory Director sessions.
+- `Tests/check-editor-file-menu.sh`: actual Window-scene File menu commands,
+  ordering, and the standard Duplicate shortcut without opening projects or media.
 - `Tests/check-recording-audio.sh`: gain/fade curves, trim behavior, legacy
   migration, validation, persistence, Undo/Redo, and unchanged original bytes.
 - `Tests/check-recording-audio-mix.sh`: actual AVAudioMix gain ramps and track

@@ -127,6 +127,43 @@ struct ConflictReviewInterfaceChecks {
                     editor.draftState == manual && abs(canvas.zoom.scale - 2.2) < 0.000001 && editor.project == original,
                     "A manual edit leaves comparison mode and keeps its own preview/draft without applying the old proposal")
         _ = editor.cancelDraft()
+        try await settle(host)
+        func trimEvent(_ type: NSEvent.EventType, time: Double) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: timeline.convert(CGPoint(x: timeline.x(for: time), y: 24), to: nil),
+                modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        playback.seek(3)
+        try await settle(host)
+        timeline.mouseDown(with: trimEvent(.leftMouseDown, time: 0))
+        timeline.mouseDragged(with: trimEvent(.leftMouseDragged, time: 5))
+        try await settle(host)
+        try require(abs(playback.time - 5) < 0.000001 && abs(timeline.playhead - 5) < 0.000001 &&
+                    editor.project.state.trimStart == 0 && !editor.canUndo,
+                    "Crossing trim start updates the real preview immediately without committing during the drag")
+        timeline.mouseUp(with: trimEvent(.leftMouseUp, time: 5))
+        try await settle(host)
+        try require(abs(playback.time - 5) < 0.000001 && editor.project.state.trimStart == 5 && editor.project.undoHistory.count == 1,
+                    "Releasing trim keeps the carried playhead and creates one Undo entry")
+        playback.seek(9)
+        try await settle(host)
+        timeline.mouseDown(with: trimEvent(.leftMouseDown, time: 12))
+        timeline.mouseDragged(with: trimEvent(.leftMouseDragged, time: 7))
+        try await settle(host)
+        try require(abs(playback.time - 7) < 0.000001 && editor.project.state.trimEnd == 12,
+                    "Crossing trim end carries the real playhead before release")
+        timeline.mouseUp(with: trimEvent(.leftMouseUp, time: 7))
+        try await settle(host)
+        try require(abs(playback.time - 7) < 0.000001 && editor.project.state.trimEnd == 7 && editor.project.undoHistory.count == 2,
+                    "Trim-end release preserves the playhead after the asynchronous preview rebuild")
+        playback.seek(6)
+        try await settle(host)
+        timeline.mouseDown(with: trimEvent(.leftMouseDown, time: 5))
+        timeline.mouseDragged(with: trimEvent(.leftMouseDragged, time: 6.5))
+        timeline.cancelOperation(nil)
+        try await settle(host)
+        try require(abs(playback.time - 6) < 0.000001 && editor.project.state.trimStart == 5 && editor.project.undoHistory.count == 2,
+                    "Canceling a crossed trim restores the original playhead without changing saved trim/history")
         print("Conflict review interface checks passed (actual vector playthrough, source/PIP interpolation, full-source moving comparison outlines, linked clock/timeline, read-only scrub, dismissal and fixed geometry; no AV objects/media).")
     }
     static func settle(_ host: NSView) async throws {

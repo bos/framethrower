@@ -355,6 +355,7 @@ struct ProjectEditorView: View {
                     },
                     onScrubEnded: { playback.endScrubbing() },
                     onTrim: { start, end in setTrim(start, end) },
+                    onTrimPlayhead: { position in selectedEditID = nil; playback.seek(position) },
                     edits: edits.map { timelineMarker($0) },
                     selectedEditID: selectedEditID,
                     onSelectEdit: { selectEdit($0) },
@@ -388,7 +389,10 @@ struct ProjectEditorView: View {
         var edited = state
         edited.trimStart = start
         edited.trimEnd = end
-        editor.commit(edited, name: "Trim")
+        if editor.commit(edited, name: "Trim") {
+            let position = min(max(playback.time, start), end)
+            if position != playback.time { playback.seek(position) }
+        }
     }
 
     private var inspector: some View {

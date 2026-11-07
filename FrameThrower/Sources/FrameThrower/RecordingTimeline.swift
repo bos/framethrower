@@ -24,6 +24,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var onScrubBegan: () -> Void = {}
     var onScrubEnded: () -> Void = {}
     var onTrim: (Double, Double) -> Void
+    var onTrimPlayhead: (Double) -> Void = { _ in }
     var edits: [RecordingTimelineMarker] = []
     var selectedEditID: UUID?
     var onSelectEdit: (UUID) -> Void = { _ in }
@@ -47,6 +48,7 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onScrubEnded = onScrubEnded
         view.onSeek = onSeek
         view.onTrim = onTrim
+        view.onTrimPlayhead = onTrimPlayhead
         view.edits = edits
         view.selectedEditID = selectedEditID
         view.onSelectEdit = onSelectEdit
@@ -102,6 +104,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var playhead = 0.0 { didSet { needsDisplay = true } }
     var onSeek: ((Double) -> Void)?
     var onTrim: ((Double, Double) -> Void)?
+    var onTrimPlayhead: ((Double) -> Void)?
     var onInteractionBegan: (() -> Void)?
     var onScrubBegan: (() -> Void)?
     var onScrubEnded: (() -> Void)?
@@ -146,6 +149,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         var chooserIDs: [UUID]? = nil
         var pointerMoved = false
         var originY: CGFloat = 0
+        var originalPlayhead: Double? = nil
     }
     private var drag: Drag?
     private var scrubTime: Double?
@@ -711,6 +715,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             seek(origin)
         } else { origin = interaction == .start ? trimStart : trimEnd }
         drag = Drag(interaction: interaction, originX: point.x, originTime: origin, start: trimStart, end: trimEnd)
+        if interaction == .start || interaction == .end { drag?.originalPlayhead = playhead }
         needsDisplay = true
     }
 
@@ -736,6 +741,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             onMoveEdit?(id, drag.editTime, false)
         }
         self.drag = drag
+        if drag.interaction == .start || drag.interaction == .end {
+            let current = scrubTime ?? playhead
+            let clamped = min(max(current, drag.start), drag.end)
+            if clamped != current {
+                scrubTime = clamped
+                onTrimPlayhead?(clamped)
+            }
+        }
         needsDisplay = true
     }
 
@@ -765,6 +778,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     override func cancelOperation(_ sender: Any?) {
         if let activeMarkerMenu { activeMarkerMenu.cancelTracking(); self.activeMarkerMenu = nil; return }
         let active = drag
+        if let original = active?.originalPlayhead, scrubTime != nil {
+            onTrimPlayhead?(original)
+        }
         drag = nil
         scrubTime = nil
         if let active, case .edit = active.interaction, active.hasMoved {

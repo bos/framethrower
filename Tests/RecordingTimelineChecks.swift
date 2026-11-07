@@ -36,6 +36,7 @@ struct RecordingTimelineChecks {
 
         var seeks: [Double] = []
         var trims: [(Double, Double)] = []
+        var trimPlayheads: [Double] = []
         var interactions = 0
         var scrubPhases: [String] = []
         timeline.onSeek = { time in
@@ -49,6 +50,7 @@ struct RecordingTimelineChecks {
             timeline.trimStart = start
             timeline.trimEnd = end
         }
+        timeline.onTrimPlayhead = { time in trimPlayheads.append(time); timeline.playhead = time }
         timeline.onInteractionBegan = { interactions += 1 }
 
         func reset(duration: Double = 10, start: Double = 2, end: Double = 8, playhead: Double = 4) {
@@ -58,6 +60,7 @@ struct RecordingTimelineChecks {
             timeline.playhead = playhead
             seeks = []
             trims = []
+            trimPlayheads = []
             interactions = 0
             scrubPhases = []
         }
@@ -116,6 +119,30 @@ struct RecordingTimelineChecks {
         precondition(trims.count == 1)
         near(trims.last?.0, 2, "Trimming the end preserves the start")
         near(trims.last?.1, 7, "End handle uses the same source-time scale")
+
+        reset()
+        down(CGPoint(x: timeline.x(for: 2), y: 24))
+        drag(CGPoint(x: timeline.x(for: 5), y: 24))
+        near(timeline.playhead, 5, "Start handle carries a crossed playhead before release")
+        drag(CGPoint(x: timeline.x(for: 6), y: 24))
+        near(timeline.playhead, 6, "Further trimming keeps carrying the playhead")
+        drag(CGPoint(x: timeline.x(for: 3), y: 24))
+        near(timeline.playhead, 6, "Expanding the range does not pull the playhead back")
+        precondition(trims.isEmpty && trimPlayheads == [5, 6], "Live playhead movement creates no trim history")
+        timeline.cancelOperation(nil)
+        near(timeline.playhead, 4, "Cancel restores the pre-drag playhead")
+        precondition(trims.isEmpty)
+
+        reset(playhead: 6)
+        down(CGPoint(x: timeline.x(for: 8), y: 24))
+        drag(CGPoint(x: timeline.x(for: 5), y: 24))
+        near(timeline.playhead, 5, "End handle carries a crossed playhead before release")
+        up(CGPoint(x: timeline.x(for: 5), y: 24))
+        precondition(trims.count == 1 && trimPlayheads == [5], "One completed drag creates one trim operation")
+
+        reset()
+        gesture(from: CGPoint(x: timeline.x(for: 8), y: 24), to: CGPoint(x: timeline.x(for: 7), y: 24))
+        precondition(trimPlayheads.isEmpty && timeline.playhead == 4, "Trimming away from the playhead leaves it alone")
 
         reset()
         let stationaryHandle = CGPoint(x: timeline.x(for: 2) + 6, y: 24)

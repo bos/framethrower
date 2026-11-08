@@ -85,6 +85,16 @@ struct TimelineAnimationInteractionChecks {
             require(all.count == 3 && all.allSatisfy { !$0.labelFrame.isEmpty } && view.animationLanes() == rows && view.intrinsicContentSize.height == 150, "selection hid labels or resized the timeline")
             require(all.filter { $0.startHandle != nil }.allSatisfy { $0.animation.id == selected }, "only the selected editable component gets handles")
         }
+        let envelopeGeometry = geometry(screen.id)
+        let envelope = view.animationEnvelope(for: envelopeGeometry)
+        let rampTime = screen.start + screen.easeIn / 2
+        let rampX = view.x(for: rampTime)
+        require(!envelope.contains(CGPoint(x: rampX, y: envelopeGeometry.body.minY + 4)) &&
+            envelope.contains(CGPoint(x: rampX, y: envelopeGeometry.body.maxY - 2)),
+            "animation fill must leave the area above the ramp as lane background and fill below it")
+        require(!envelope.contains(CGPoint(x: view.x(for: 2), y: envelopeGeometry.body.minY + 1)) &&
+            envelope.contains(CGPoint(x: view.x(for: 2), y: envelopeGeometry.body.maxY - 2)),
+            "animation plateau must preserve the clear area above its curve")
         view.pointerClickTimes = [1, 3, .nan, -1, 13]
         require(view.pointerClickGeometry().map(\.time) == [1, 3] && view.pointerClickGeometry().allSatisfy { $0.frame.minY >= 100 && $0.frame.maxY <= 126 }, "readonly recorded clicks lost their source-time axis or escaped Pointer lane")
         require(view.markerGroups().isEmpty && view.markerLabels().isEmpty, "lane mode duplicated the legacy marker rail")

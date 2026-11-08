@@ -454,9 +454,25 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .pointer: .secondaryLabelColor }
     }
 
+    /// Use source coordinates before viewport clipping so a partially visible
+    /// movement retains its actual ramp shape when the timeline is magnified.
+    func animationEnvelope(for item: AnimationGeometry) -> NSBezierPath {
+        let animation = item.animation
+        guard !animation.isInstant, !animation.isReference, animation.lane != .pointer else {
+            return NSBezierPath(roundedRect: item.body, xRadius: 2, yRadius: 2)
+        }
+        let envelope = NSBezierPath()
+        envelope.move(to: CGPoint(x: x(for: animation.start), y: item.body.maxY))
+        envelope.line(to: CGPoint(x: x(for: animation.start + animation.easeIn), y: item.body.minY + 3))
+        envelope.line(to: CGPoint(x: x(for: animation.end - animation.easeOut), y: item.body.minY + 3))
+        envelope.line(to: CGPoint(x: x(for: animation.end), y: item.body.maxY))
+        envelope.close()
+        return envelope
+    }
+
     private func drawAnimationLanes() {
         for lane in animationLanes() {
-            NSColor.quaternaryLabelColor.withAlphaComponent(0.25).setFill()
+            NSColor.black.withAlphaComponent(0.13).setFill()
             NSBezierPath(roundedRect: lane.frame, xRadius: 3, yRadius: 3).fill()
             (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
                 .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
@@ -472,29 +488,23 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let animation = item.animation
             let selected = animation.id == (animationGesture?.id ?? selectedAnimationID)
             let color = blockedAnimationIDs.contains(animation.id) ? NSColor.systemRed : animationColor(animation.lane)
-            color.withAlphaComponent(selected ? 0.45 : 0.23).setFill()
-            NSBezierPath(roundedRect: item.body, xRadius: 3, yRadius: 3).fill()
-            if !animation.isInstant, !animation.isReference {
-                let ramp = NSBezierPath()
-                ramp.move(to: CGPoint(x: item.body.minX, y: item.body.maxY))
-                ramp.line(to: CGPoint(x: x(for: animation.start + animation.easeIn), y: item.body.minY + 3))
-                ramp.line(to: CGPoint(x: x(for: animation.end - animation.easeOut), y: item.body.minY + 3))
-                ramp.line(to: CGPoint(x: item.body.maxX, y: item.body.maxY))
-                color.withAlphaComponent(0.65).setStroke(); ramp.lineWidth = 1; ramp.stroke()
-            }
-            if selected {
-                NSColor.labelColor.withAlphaComponent(0.8).setStroke()
-                let border = NSBezierPath(roundedRect: item.body, xRadius: 3, yRadius: 3); border.lineWidth = 1; border.stroke()
-            }
+            let envelope = animationEnvelope(for: item)
+            color.withAlphaComponent(selected ? 0.68 : 0.53).setFill()
+            envelope.fill()
+            color.withAlphaComponent(selected ? 1 : 0.85).setStroke()
+            envelope.lineWidth = selected ? 1.5 : 1
+            envelope.stroke()
             (animation.label as NSString).draw(in: item.labelFrame, withAttributes: [
                 .font: NSFont.systemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.labelColor])
             for handle in [item.startHandle, item.endHandle].compactMap({ $0 }) {
-                color.setFill(); NSBezierPath(roundedRect: handle, xRadius: 2, yRadius: 2).fill()
-                NSColor.labelColor.setStroke(); NSBezierPath(roundedRect: handle, xRadius: 2, yRadius: 2).stroke()
+                // Preserve the generous hit regions while painting quiet grips.
+                color.setFill()
+                let grip = CGRect(x: handle.midX - 1.5, y: handle.midY - 4, width: 3, height: 8)
+                NSBezierPath(roundedRect: grip, xRadius: 1.5, yRadius: 1.5).fill()
             }
             for handle in [item.easeInHandle, item.easeOutHandle].compactMap({ $0 }) {
-                NSColor.windowBackgroundColor.setFill(); NSBezierPath(ovalIn: handle).fill()
-                color.setStroke(); NSBezierPath(ovalIn: handle).stroke()
+                let dot = handle.insetBy(dx: 1, dy: 1)
+                color.setFill(); NSBezierPath(ovalIn: dot).fill()
             }
             if let button = item.deleteButton {
                 NSColor.secondaryLabelColor.setStroke()

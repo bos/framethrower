@@ -8,6 +8,9 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorMutation.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPreviewCommand.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAutomationAPI.swift" \
   "$repo_dir/Tests/EditorCommandChecks.swift" \
   -o "$check_dir/check-editor-commands"
 "$check_dir/check-editor-commands"

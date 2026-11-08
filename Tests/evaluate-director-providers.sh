@@ -14,6 +14,9 @@ $sources/EditorConflictReview.swift
 $sources/EditorActionDescription.swift
 $sources/DirectorTranscript.swift
 $sources/EditorCommand.swift
+$sources/EditorMutation.swift
+$sources/EditorPreviewCommand.swift
+$sources/EditorAutomationAPI.swift
 $sources/EditorAgentControls.swift
 $sources/RecordedScene.swift
 $sources/DirectorInspection.swift

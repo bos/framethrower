@@ -776,6 +776,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var cursorFilename: String?
     var sceneFilename: String?
     var title: String?
+    /// Stable entity identity, independent of its title and transport.
+    var automationID: UUID?
     /// Camera start relative to the first screen frame; negative means the
     /// camera started earlier. This is independent of the editable trim.
     var cameraOffset: Double = 0
@@ -792,13 +794,15 @@ struct RecordingProject: Codable, Equatable, Sendable {
          sceneFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
-         captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences()) {
+         captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences(),
+         automationID: UUID? = UUID()) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
         self.cursorFilename = cursorFilename
         self.sceneFilename = sceneFilename
         self.title = title
+        self.automationID = automationID
         self.cameraOffset = cameraOffset
         self.captureFrameDuration = captureFrameDuration
         self.duration = duration
@@ -811,7 +815,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, cameraOffset,
+        case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, automationID, cameraOffset,
              captureFrameDuration, duration, state, undoHistory, redoHistory, references
     }
 
@@ -823,6 +827,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         cursorFilename = try values.decodeIfPresent(String.self, forKey: .cursorFilename)
         sceneFilename = try values.decodeIfPresent(String.self, forKey: .sceneFilename)
         title = try values.decodeIfPresent(String.self, forKey: .title)
+        automationID = try values.decodeIfPresent(UUID.self, forKey: .automationID)
         cameraOffset = try values.decodeIfPresent(Double.self, forKey: .cameraOffset) ?? 0
         captureFrameDuration = try values.decodeIfPresent(Double.self, forKey: .captureFrameDuration)
         duration = try values.decode(Double.self, forKey: .duration)
@@ -1032,6 +1037,15 @@ final class ProjectEditor: ObservableObject {
     @Published private(set) var historyNavigationToken: UUID?
     let url: URL
     private let defaultName: String
+    /// Legacy files acquire this deterministic identity on their next ordinary
+    /// save; opening/querying an editor never rewrites the user's project.
+    var automationID: UUID {
+        if let id = project.automationID { return id }
+        let digest = SHA256.hash(data: Data(url.standardizedFileURL.resolvingSymlinksInPath().path.utf8))
+        let hex = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+        let a = Array(hex)
+        return UUID(uuidString: String(a[0..<8]) + "-" + String(a[8..<12]) + "-" + String(a[12..<16]) + "-" + String(a[16..<20]) + "-" + String(a[20..<32]))!
+    }
     private var savedProjectDigest: String?
     private var savedProjectByteCount: Int?
     private var recoveryTask: Task<Void, Never>?
@@ -1159,12 +1173,26 @@ final class ProjectEditor: ObservableObject {
 
     @discardableResult
     func commit(_ state: EditState, name: String) -> Bool {
+        commitDocument(state: state, title: nil, name: name)
+    }
+
+    /// One document transaction, including an optional title, on the normal
+    /// history stack. Callers validate their entire batch before reaching here.
+    @discardableResult
+    func commitDocument(state: EditState, title: String?, name: String) -> Bool {
+        let normalized = title.map { $0.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        var candidate = project
+        candidate.state = state
+        if let normalized { candidate.title = normalized }
+        do { try candidate.validate() }
+        catch { errorMessage = error.localizedDescription; return false }
         guard finishDraft() else { return false }
-        guard state != project.state else { return true }
+        guard state != project.state || (normalized != nil && normalized != project.title) else { return true }
         var next = project
         next.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
         next.redoHistory.removeAll()
         next.state = state
+        if let normalized { next.title = normalized }
         return persist(next, operation: ProjectHistoryOperation(kind: .edit, names: [name]))
     }
 
@@ -1245,6 +1273,7 @@ final class ProjectEditor: ObservableObject {
         do {
             var snapshot = project
             snapshot.state = editingState
+            snapshot.automationID = UUID()
             snapshot.undoHistory = []
             snapshot.redoHistory = []
             snapshot.references = references
@@ -1446,6 +1475,7 @@ final class ProjectEditor: ObservableObject {
 
     private func persist(_ candidate: RecordingProject, operation: ProjectHistoryOperation? = nil) -> Bool {
         var candidate = candidate
+        if candidate.automationID == nil { candidate.automationID = automationID }
         do {
             try candidate.references.merge(references)
             candidate.ensureReferences(in: draftState)

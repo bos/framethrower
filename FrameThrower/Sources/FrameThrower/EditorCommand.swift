@@ -20,6 +20,7 @@ struct EditorCommandMotion: Codable, Equatable, Sendable {
 /// The external contract is deliberately small and independent of a model or
 /// transport. No command accepts a path, a URL, an executable, or source pixels.
 enum EditorCommand: Codable, Equatable, Sendable {
+    case mutate(EditorMutation)
     case addRegion(region: EditorRegion)
     case frameRegion(regionID: UUID, time: Double, motion: EditorCommandMotion = EditorCommandMotion())
     case fullFrame(time: Double, motion: EditorCommandMotion = EditorCommandMotion())
@@ -36,7 +37,7 @@ enum EditorCommand: Codable, Equatable, Sendable {
 
     private enum Key: String, CodingKey {
         case action, regionID, time, motion, editID, fromEditID, toEditID, note,
-             startEditID, fromRegionID, toRegionID, duration, viaFullFrame, region
+             startEditID, fromRegionID, toRegionID, duration, viaFullFrame, region, mutation
     }
     private struct AnyKey: CodingKey {
         var stringValue: String
@@ -50,6 +51,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
         let action = try values.decode(String.self, forKey: .action)
         let allowed: Set<String>
         switch action {
+        case "mutate":
+            allowed = ["action", "mutation"]
+            self = .mutate(try values.decode(EditorMutation.self, forKey: .mutation))
         case "addRegion":
             allowed = ["action", "region"]
             self = .addRegion(region: try values.decode(EditorRegion.self, forKey: .region))
@@ -112,6 +116,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
     func encode(to encoder: any Encoder) throws {
         var values = encoder.container(keyedBy: Key.self)
         switch self {
+        case let .mutate(mutation):
+            try values.encode("mutate", forKey: .action)
+            try values.encode(mutation, forKey: .mutation)
         case let .addRegion(region):
             try values.encode("addRegion", forKey: .action)
             try values.encode(region, forKey: .region)
@@ -172,6 +179,8 @@ struct EditorCommandBatch: Codable, Equatable, Sendable {
     var projectID: UUID
     var revision: String
     var commands: [EditorCommand]
+    /// Optional title joins state edits in the same document transaction.
+    var title: String? = nil
 }
 
 struct EditorCommandContext: Codable, Equatable, Sendable {
@@ -216,7 +225,7 @@ enum EditorCommandDispatcher {
     }
 
     static func prepare(_ batch: EditorCommandBatch, for project: RecordingProject,
-                        projectID: UUID) throws -> EditState {
+                        projectID: UUID, geometry: EditorMutationGeometry? = nil) throws -> EditState {
         try project.validate()
         guard batch.version == 1 else { throw EditorCommandError.invalid("This editing request uses an unsupported version.") }
         guard batch.projectID == projectID, batch.revision == (try revision(for: project)) else {
@@ -275,6 +284,8 @@ enum EditorCommandDispatcher {
             }
             try flushRegionRemovals()
             switch command {
+            case let .mutate(mutation):
+                try mutation.apply(to: &next, project: project, geometry: geometry)
             case let .addRegion(region):
                 try region.validate(duration: project.duration)
                 guard region.time < project.duration,
@@ -444,6 +455,7 @@ enum EditorCommandDispatcher {
         try flushRegionRemovals()
         var candidate = project
         candidate.state = next
+        if let title = batch.title { candidate.title = title }
         try candidate.validate()
         return next
     }
@@ -451,10 +463,11 @@ enum EditorCommandDispatcher {
     @MainActor
     @discardableResult
     static func apply(_ batch: EditorCommandBatch, to editor: ProjectEditor, projectID: UUID,
-                      name: String = "Edit with assistant") throws -> Bool {
+                      name: String = "Edit with assistant", geometry: EditorMutationGeometry? = nil) throws -> Bool {
         guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
-        let next = try prepare(batch, for: editor.project, projectID: projectID)
-        guard editor.commit(next, name: name) else {
+        let next = try prepare(batch, for: editor.project, projectID: projectID, geometry: geometry)
+        let saved = batch.title.map { editor.commitDocument(state: next, title: $0, name: name) } ?? editor.commit(next, name: name)
+        guard saved else {
             throw EditorCommandError.saveFailed(editor.errorMessage ?? "The recording could not be saved.")
         }
         return true

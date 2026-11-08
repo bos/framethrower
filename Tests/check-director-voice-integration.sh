@@ -11,7 +11,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$sources/EditorConflictReview.swift" \
   "$sources/EditorActionDescription.swift" \
   "$sources/DirectorTranscript.swift" \
-  "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources//RecordedScene.swift" "$sources//DirectorInspection.swift" "$sources//LocalEditPlanner.swift" \
+  "$sources/EditorCommand.swift" "$sources/EditorMutation.swift" "$sources/EditorPreviewCommand.swift" "$sources/EditorAutomationAPI.swift" "$sources/EditorAgentControls.swift" "$sources//RecordedScene.swift" "$sources//DirectorInspection.swift" "$sources//LocalEditPlanner.swift" \
   "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \

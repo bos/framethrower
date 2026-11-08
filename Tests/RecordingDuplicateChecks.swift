@@ -52,6 +52,7 @@ struct RecordingDuplicateChecks {
         defer { observation.cancel() }
         guard let copy = editor.duplicate() else { throw Failure.failed(editor.errorMessage ?? "Duplicate conflict snapshot") }
         try require(copy.url == fixture.directory.appendingPathComponent("recording copy.framethrower") && copy.displayName == "Planning copy", "copy URL and title")
+        try require(copy.automationID != editor.automationID && copy.project.automationID != nil, "a duplicate has a fresh persistent recording identity")
         try require(copy.project.state == draft && copy.references == editor.references && copy.draftState == nil &&
                     copy.project.undoHistory.isEmpty && copy.project.redoHistory.isEmpty && !copy.canUndo && !copy.canRedo,
                     "copy must save the visible draft/reference catalog as a fresh history baseline")

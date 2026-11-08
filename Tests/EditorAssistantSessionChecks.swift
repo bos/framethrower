@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 private enum AssistantCheckError: Error { case failed(String) }
@@ -21,6 +22,61 @@ private actor AssistantTransport {
     func fail(_ index: Int) { continuations.removeValue(forKey: index)?.resume(throwing: FixtureTransportError.failed) }
 }
 
+@MainActor
+private final class AssistantAutomationEndpoint: EditorAutomationEndpoint {
+    let documentID = UUID().uuidString
+    let editor: ProjectEditor
+    var preview = EditorPreviewSnapshot(time: 0, frameTime: 0, isPlaying: false, rate: 1,
+        canPlay: true, kind: .testPattern)
+    var calls: [String] = []
+    var oversizedRead = false
+    var rejectNext = false
+    private let events = PassthroughSubject<EditorAutomationEvent, Never>()
+    init(editor: ProjectEditor) { self.editor = editor }
+    var automationContext: EditorAutomationContext {
+        get throws {
+            .init(documentID: documentID, name: editor.displayName,
+                revision: try EditorCommandDispatcher.revision(for: editor.project),
+                hasDraft: editor.draftState != nil, preview: preview, inspector: "Zoom")
+        }
+    }
+    var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { events.eraseToAnyPublisher() }
+    func performAutomation(_ name: String, arguments: Data) async throws -> Data {
+        let args = try JSONSerialization.jsonObject(with: arguments) as! [String: Any]
+        guard args["document_id"] as? String == documentID else { throw EditorAutomationError.wrongDocument }
+        calls.append(name)
+        if rejectNext {
+            rejectNext = false
+            return try JSONSerialization.data(withJSONObject: ["ok": false, "error": [
+                "code": "animation_conflict", "message": "The screen movement overlaps an existing movement.", "conflicts": []] as [String: Any]])
+        }
+        let value: Any
+        switch name {
+        case "inspect_editor", "describe_editor_actions", "inspect_recording":
+            if oversizedRead { value = ["oversized": String(repeating: "Z", count: 40_000)] }
+            else { value = ["context": try EditorAutomationAPI.object(automationContext), "actions": ["play", "pause", "seek", "set_rate"]] as [String: Any] }
+        case "control_preview":
+            switch args["operation"] as? String {
+            case "play": preview.isPlaying = true
+            case "pause": preview.isPlaying = false
+            case "seek":
+                preview.time = try EditorAutomationAPI.number(args["time"])
+                preview.frameTime = preview.time; preview.isPlaying = false
+            case "set_rate": preview.rate = try EditorAutomationAPI.number(args["rate"])
+            default: throw EditorAutomationError.invalid("Unknown fixture operation")
+            }
+            events.send(.init(actor: "automation", kind: "preview_changed", context: try automationContext))
+            value = try EditorAutomationAPI.object(preview)
+        default: throw EditorAutomationError.invalid("Unexpected fixture action")
+        }
+        return try JSONSerialization.data(withJSONObject: ["ok": true, "result": value])
+    }
+    func manualSeek(_ time: Double, kind: String = "preview_seek") throws {
+        preview.time = time; preview.frameTime = time
+        events.send(.init(actor: "manual", kind: kind, context: try automationContext))
+    }
+}
+
 @main
 @MainActor
 struct EditorAssistantSessionChecks {
@@ -34,19 +90,24 @@ struct EditorAssistantSessionChecks {
         try await checkClarificationFollowup()
         try await checkDismissedClarificationStartsFresh()
         try await checkImmediateHistoryPreservesRedo()
-        print("Editor assistant session checks passed (dictation draft preservation, atomic Undo, busy gating, failure preservation, stale revisions, cancelled late replies, and clarification context).")
+        try await checkEditorAutomationControls()
+        try await checkEditorAutomationReadAndReport()
+        try await checkAutomationDraftReplan()
+        try await checkAutomationManualEventsAndFailure()
+        print("Editor assistant session checks passed (dictation/drafts, atomic Undo, busy/stale/cancel boundaries, clarification, actual editor controls/read/report, bounded draft replan, and manual navigation context).")
     }
 
     private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
         guard try condition() else { throw AssistantCheckError.failed(message) }
     }
-    private static func waitUntil(_ condition: @escaping @MainActor () async -> Bool) async throws {
+    private static func waitUntil(function: String = #function, line: Int = #line,
+                                  _ condition: @escaping @MainActor () async -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
         while ContinuousClock.now < deadline {
             if await condition() { return }
             try await Task.sleep(for: .milliseconds(1))
         }
-        throw AssistantCheckError.failed("asynchronous assistant operation timed out")
+        throw AssistantCheckError.failed("asynchronous assistant operation timed out at \(function):\(line)")
     }
 
     private static func checkDictationPreservesDraft() throws {
@@ -290,6 +351,172 @@ struct EditorAssistantSessionChecks {
         try await waitUntil { !session.isBusy }
         try require(fixture.editor.project.undoHistory.count == 1 && session.errorMessage == nil,
                     "clarification followed by an answer still creates one edit")
+    }
+
+    private static func editorAction(_ endpoint: AssistantAutomationEndpoint, _ name: String,
+                                     _ parameters: [String: Any]) throws -> Data {
+        let context = try endpoint.automationContext
+        return try tool("editor_action", ["document_id": context.documentID, "expected_revision": context.revision,
+            "tool": name, "parameters_json": String(decoding: JSONSerialization.data(withJSONObject: parameters), as: UTF8.self)])
+    }
+
+    private static func editorReport(_ endpoint: AssistantAutomationEndpoint, _ summary: String) throws -> Data {
+        let context = try endpoint.automationContext
+        return try tool("report_editor", ["document_id": context.documentID,
+            "expected_revision": context.revision, "summary": summary])
+    }
+
+    private static func checkEditorAutomationControls() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let endpoint = AssistantAutomationEndpoint(editor: fixture.editor)
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        session.attachAutomation(endpoint)
+        let original = fixture.editor.project
+        for (index, parameters) in [["operation": "play"] as [String: Any],
+            ["operation": "seek", "time": 1.5], ["operation": "set_rate", "rate": 2], ["operation": "pause"]].enumerated() {
+            session.instruction = ["Play the preview", "Seek to 1.5 seconds", "Use 2× preview speed", "Pause the preview"][index]
+            session.submit(editor: fixture.editor, playhead: endpoint.preview.time, regionID: nil, editID: nil)
+            try await waitUntil { await transport.payloads.count == index + 1 }
+            await transport.succeed(index, data: try editorAction(endpoint, "control_preview", parameters))
+            try await waitUntil { !session.isBusy }
+            try require(session.errorMessage == nil && session.instruction.isEmpty,
+                        "Editor control requests must finish from the actual endpoint result")
+        }
+        try require(endpoint.calls == Array(repeating: "control_preview", count: 4) &&
+                    endpoint.preview.time == 1.5 && endpoint.preview.rate == 2 && !endpoint.preview.isPlaying &&
+                    fixture.editor.project == original && !fixture.editor.canUndo,
+                    "Play/seek/rate/pause use the existing host without creating an edit or silently changing timing")
+        let actualResults = session.conversation.messages().compactMap { $0["content"] as? String }.joined()
+        try require(actualResults.contains("editor_result") && actualResults.contains("1.5") && actualResults.contains("rate"),
+                    "The conversation must receive actual transport outcomes, not only the user's instructions")
+
+        var draft = original.state
+        draft.cursorStyle.size = 2
+        try require(fixture.editor.updateDraft(draft, at: 1.5), "Begin a real unfinished manual adjustment")
+        let saved = fixture.editor.project
+        for (offset, parameters) in [["operation": "pause"] as [String: Any], ["operation": "set_rate", "rate": 0.5]].enumerated() {
+            let index = offset + 4
+            session.instruction = offset == 0 ? "Pause the preview" : "Set preview speed to half"
+            session.submit(editor: fixture.editor, playhead: 1.5, regionID: nil, editID: nil)
+            try await waitUntil { await transport.payloads.count == index + 1 }
+            await transport.succeed(index, data: try editorAction(endpoint, "control_preview", parameters))
+            try await waitUntil { !session.isBusy }
+            try require(fixture.editor.project == saved && fixture.editor.draftState == draft,
+                        "Pause and rate instructions cannot save or discard the unfinished manual edit")
+        }
+        _ = fixture.editor.cancelDraft()
+    }
+
+    private static func checkEditorAutomationReadAndReport() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let endpoint = AssistantAutomationEndpoint(editor: fixture.editor)
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        session.attachAutomation(endpoint)
+        session.instruction = "Zoom into this area."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        let question = "When should the movement start?"
+        await transport.succeed(0, data: try tool("ask_clarification", ["question": question]))
+        try await waitUntil { !session.isBusy }
+        session.instruction = "Seek to 1.5 seconds."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try await waitUntil { await transport.payloads.count == 2 }
+        await transport.succeed(1, data: try editorAction(endpoint, "control_preview", ["operation": "seek", "time": 1.5]))
+        try await waitUntil { !session.isBusy }
+        try require(session.awaitsClarification && session.notice == question &&
+                    session.conversation.question?.context.playhead == 0 && endpoint.preview.time == 1.5,
+                    "A navigation interlude must preserve the original pending question and its instruction anchor")
+        session.instruction = "Which preview controls are available?"
+        session.submit(editor: fixture.editor, playhead: 1.5, regionID: nil, editID: nil)
+        try await waitUntil { await transport.payloads.count == 3 }
+        await transport.succeed(2, data: try editorAction(endpoint, "describe_editor_actions", ["category": "preview"]))
+        try await waitUntil { await transport.payloads.count == 4 }
+        let continuation = await transport.payloads[3]
+        try require(String(decoding: continuation, as: UTF8.self).contains("report_editor") && continuation.count <= 20_000,
+                    "A real bounded editor read must enable scoped reporting in the next model turn")
+        await transport.succeed(3, data: try editorReport(endpoint, "The preview can play, pause, seek and change speed."))
+        try await waitUntil { !session.isBusy }
+        try require(session.awaitsClarification && session.notice == question && !fixture.editor.canUndo,
+                    "Read-and-report cannot resolve an unrelated pending question or create history")
+
+        endpoint.oversizedRead = true
+        session.instruction = "Read the editor state."
+        session.submit(editor: fixture.editor, playhead: 1.5, regionID: nil, editID: nil)
+        try await waitUntil { await transport.payloads.count == 5 }
+        await transport.succeed(4, data: try editorAction(endpoint, "inspect_editor", ["section": "state"]))
+        try await waitUntil { await transport.payloads.count == 6 }
+        let bounded = await transport.payloads[5]
+        let text = String(decoding: bounded, as: UTF8.self)
+        try require(bounded.count <= 20_000 && text.contains("too_large") && !text.contains(String(repeating: "Z", count: 1000)),
+                    "Oversized endpoint reads must become an explicit bounded projection failure, never a full context dump")
+        await transport.succeed(5, data: try editorReport(endpoint, "The full state is too large; a smaller page is needed."))
+        try await waitUntil { !session.isBusy }
+    }
+
+    private static func checkAutomationDraftReplan() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let endpoint = AssistantAutomationEndpoint(editor: fixture.editor)
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        session.attachAutomation(endpoint)
+        var draft = fixture.editor.project.state
+        draft.cursorStyle.size = 2
+        try require(fixture.editor.updateDraft(draft, at: 0), "Begin unfinished state before planning a framing edit")
+        let oldRevision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        session.instruction = "At one second, zoom into this area and hold for a second."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: fixture.region.id, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        try require(fixture.editor.draftState == draft, "Merely asking the endpoint-capable model cannot prematurely save the draft")
+        await transport.succeed(0, data: try sequence(session: session, revision: oldRevision, region: fixture.region.id))
+        try await waitUntil { await transport.payloads.count == 2 }
+        let freshRevision = try EditorCommandDispatcher.revision(for: fixture.editor.project)
+        let replanned = String(decoding: await transport.payloads[1], as: UTF8.self)
+        try require(freshRevision != oldRevision && fixture.editor.draftState == nil &&
+                    fixture.editor.project.state == draft && replanned.contains("replan_required") && replanned.contains(freshRevision),
+                    "A persistent plan must save the manual draft once and ask for a new plan against actual current state/revision")
+        await transport.succeed(1, data: try sequence(session: session, revision: freshRevision, region: fixture.region.id))
+        try await waitUntil { !session.isBusy }
+        try require(session.errorMessage == nil && fixture.editor.project.undoHistory.count == 2 &&
+                    fixture.editor.project.state.cursorStyle.size == 2 && fixture.editor.project.state.zoomKeyframes.count == 3,
+                    "The actual agent edit is one Undo after the separately saved manual edit")
+        try require(fixture.editor.undo() && fixture.editor.project.state == draft,
+                    "One Undo of the agent plan preserves the earlier manual adjustment")
+    }
+
+    private static func checkAutomationManualEventsAndFailure() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let endpoint = AssistantAutomationEndpoint(editor: fixture.editor)
+        let transport = AssistantTransport()
+        let session = EditorAssistantSession(transport: { try await transport.send($0) })
+        session.attachAutomation(endpoint)
+        session.instruction = "Seek to 1.5 seconds."
+        session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
+        try await waitUntil { await transport.payloads.count == 1 }
+        try endpoint.manualSeek(4.5, kind: "clock_tick")
+        try require(session.isBusy, "A benign clock callback cannot cancel inference or enter conversation")
+        try endpoint.manualSeek(4.75)
+        try require(!session.isBusy && session.notice == nil, "A later manual navigation must take precedence over old inference")
+        await transport.succeed(0, data: try editorAction(endpoint, "control_preview", ["operation": "seek", "time": 1.5]))
+        for _ in 0..<20 { await Task.yield() }
+        let events = session.conversation.messages().compactMap { $0["content"] as? String }.joined()
+        try require(endpoint.calls.isEmpty && endpoint.preview.time == 4.75 &&
+                    events.contains("editor_navigation") && events.contains("4.75") && !events.contains("clock_tick"),
+                    "Conversation must retain actual manual state while ignoring stale replies and playback ticks")
+        endpoint.rejectNext = true
+        session.instruction = "Play the preview."
+        session.submit(editor: fixture.editor, playhead: 4.75, regionID: nil, editID: nil)
+        try await waitUntil { await transport.payloads.count == 2 }
+        await transport.succeed(1, data: try editorAction(endpoint, "control_preview", ["operation": "play"]))
+        try await waitUntil { !session.isBusy }
+        try require(session.errorMessage?.contains("overlaps") == true && session.instruction == "Play the preview." &&
+                    !endpoint.preview.isPlaying && !fixture.editor.canUndo,
+                    "A structured okfalse editor result is an actual rejection, never a successful notice or applied edit")
     }
 
     private static func sequence(session: EditorAssistantSession, revision: String, region: UUID) throws -> Data {

@@ -39,6 +39,9 @@ final class EditorAssistantSession: ObservableObject {
     @Published private(set) var conversation = DirectorConversation()
     private weak var observedEditor: ProjectEditor?
     private var projectObservation: AnyCancellable?
+    private weak var automation: (any EditorAutomationEndpoint)?
+    private var automationObservation: AnyCancellable?
+    private var performingAutomation = false
     private var observedProject: RecordingProject?
     private var applyingDirectorChange = false
     var awaitsClarification: Bool { clarification != nil || framingConflict != nil }
@@ -62,6 +65,38 @@ final class EditorAssistantSession: ObservableObject {
         modelProvider = provider
         if transport == nil { UserDefaults.standard.set(provider.rawValue, forKey: DirectorProvider.preferenceKey) }
         record("model_provider_changed", details: ["provider": provider.rawValue, "model": provider.modelID])
+    }
+
+    func attachAutomation(_ endpoint: (any EditorAutomationEndpoint)?) {
+        guard automation !== endpoint else { return }
+        automationObservation?.cancel()
+        automation = endpoint
+        automationObservation = endpoint?.automationEvents.sink { [weak self] event in
+            self?.observeAutomation(event)
+        }
+    }
+
+    private func observeAutomation(_ event: EditorAutomationEvent) {
+        // Document changes already carry their real diff/Undo operation from
+        // the project observer. Our own host action has one correlated result.
+        guard event.kind != "document_changed",
+              !["clock_tick", "playback_tick", "playback_ended", "preview_progress"].contains(event.kind),
+              !(performingAutomation && event.actor == "automation") else { return }
+        if isBusy {
+            if let id = currentRequestID {
+                finish(id, response: nil, outcome: ["status": "interrupted",
+                    "summary": "Stopped interpreting after an editor action."])
+            }
+            generation = UUID(); task?.cancel(); task = nil; currentRequestID = nil; isBusy = false
+            performingAutomation = false
+            notice = pendingQuestionText
+        }
+        let details: [String: Any] = ["kind": "editor_navigation", "operation": event.kind,
+            "actor": event.actor == "manual" ? "user" : "automation",
+            "editor": DirectorConversation.object(event.context)]
+        conversation.event(details)
+        record("editor_navigation", details: details)
+        persist()
     }
 
     func attach(to editor: ProjectEditor) {
@@ -205,14 +240,14 @@ final class EditorAssistantSession: ObservableObject {
             finish(token, response: nil, outcome: ["status": "rejected", "error": notice ?? ""])
             return
         }
-        if (framingConflict != nil || clarification != nil), editor.draftState != nil {
+        if automation == nil, (framingConflict != nil || clarification != nil), editor.draftState != nil {
             cancel()
             errorMessage = EditorCommandError.stale.localizedDescription
             conversation.begin(text, requestID: token)
             finish(token, response: nil, outcome: ["status": "rejected", "error": errorMessage ?? ""])
             return
         }
-        guard editor.finishDraft() else {
+        guard automation != nil || editor.finishDraft() else {
             errorMessage = editor.errorMessage ?? "The current edit could not be saved. Your instruction has not been applied."
             notice = nil
             conversation.begin(text, requestID: token)
@@ -220,13 +255,15 @@ final class EditorAssistantSession: ObservableObject {
             return
         }
         do {
-            let recording = try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
-            let pendingConflict = framingConflict
-            let pendingQuestion = clarification
+            let recording = try commandContext(editor: editor)
+            var pendingConflict = framingConflict
+            var pendingQuestion = clarification
             let priorRevision = pendingConflict?.context.recording.revision ?? pendingQuestion?.revision
             if let priorRevision, priorRevision != recording.revision {
-                cancel()
-                throw EditorCommandError.stale
+                if automation == nil { cancel(); throw EditorCommandError.stale }
+                framingConflict = nil; clarification = nil; notice = nil
+                pendingConflict = nil; pendingQuestion = nil
+                conversation.event(["kind": "pending_proposal_invalidated", "actor": "app", "revision": recording.revision])
             }
             var context = pendingConflict?.context ?? pendingQuestion?.context ?? LocalEditContext(
                 recording: recording, playhead: playhead, selectedRegionID: regionID,
@@ -234,6 +271,7 @@ final class EditorAssistantSession: ObservableObject {
             context.liveUI = LocalEditUIContext(playhead: playhead, selectedRegionID: regionID, selectedEditID: editID)
             context.inspectionCapabilities = inspections.capabilities(supportsImages: modelProvider.supportsImages)
             context.inspectionHasObservations = inspections.hasObservations
+            context.automation = try automation?.automationContext
             inspectionImageMessage = nil
             inspectionImageCallID = nil
             let routingRequest = pendingQuestion?.request ?? text
@@ -256,6 +294,8 @@ final class EditorAssistantSession: ObservableObject {
                 var attempt = 0
                 var historyLookups = 0
                 var sceneLookups = 0
+                var automationLookups = 0
+                var draftReplans = 0
                 do {
                     while true {
                     let data = try await transport(requestPayload)
@@ -267,8 +307,8 @@ final class EditorAssistantSession: ObservableObject {
                         self.record("ignored_response", requestID: token, details: ["reason": "superseded or cancelled"])
                         return
                     }
-                    if historyLookups > 0 || sceneLookups > 0 {
-                        guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
+                    if historyLookups > 0 || sceneLookups > 0 || automationLookups > 0 {
+                        guard self.automation != nil || editor.draftState == nil else { throw EditorCommandError.pendingDraft }
                         guard try EditorCommandDispatcher.revision(for: editor.project) == context.recording.revision else {
                             throw EditorCommandError.stale
                         }
@@ -278,7 +318,8 @@ final class EditorAssistantSession: ObservableObject {
                     // ordered conversation supplies intent, while typed command
                     // validation still enforces scope, bounds and atomicity.
                     let validationInstruction = pendingQuestion == nil ? text : nil
-                    var result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
+                    var result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal,
+                        context: context, instruction: text) }
                         ?? LocalEditPlanner.result(data, context: context, instruction: validationInstruction,
                             routingRequest: routingRequest, historyInspected: historyLookups > 0)
                     if case let .inspection(action) = result {
@@ -354,10 +395,123 @@ final class EditorAssistantSession: ObservableObject {
                         _ = try self.inspections.validatedObservation(id: id, project: editor.project, projectID: self.projectID)
                         result = .noChanges(summary)
                     }
+                    if editor.draftState != nil && Self.requiresSavedDraft(result) {
+                        guard draftReplans == 0 else { throw EditorCommandError.pendingDraft }
+                        // A frozen replacement proposal cannot be silently
+                        // rebased onto a different unfinished manual edit.
+                        guard pendingConflict == nil else { throw EditorCommandError.stale }
+                        guard editor.finishDraft() else {
+                            throw EditorCommandError.saveFailed(editor.errorMessage ?? "The unfinished edit could not be saved.")
+                        }
+                        draftReplans += 1
+                        context = try self.updatedContext(context, editor: editor)
+                        if var question = pendingQuestion {
+                            question.context = context; pendingQuestion = question; self.clarification = question
+                        }
+                        self.finish(token, response: data, outcome: ["status": "replan_required", "applied": false,
+                            "summary": "Saved the unfinished manual edit before planning changes.",
+                            "revision": context.recording.revision,
+                            "history": DirectorConversation.object(editor.historyState)])
+                        response = nil
+                        requestPayload = try self.modelPayload(text: text, context: context, routingRequest: routingRequest,
+                            question: pendingQuestion, conflict: pendingConflict, continuation: true,
+                            historyInspected: historyLookups > 0, continuingRequestID: token)
+                        continue
+                    }
+                    if case let .editorAction(call) = result {
+                        guard let endpoint = self.automation else { throw EditorAutomationError.unavailable }
+                        let scoped = try endpoint.automationContext
+                        guard scoped.documentID == context.automation?.documentID,
+                              scoped.revision == context.recording.revision else { throw EditorCommandError.stale }
+                        let readOnly = Self.isAutomationReadOnly(call)
+                        if readOnly {
+                            guard automationLookups < 4 else {
+                                throw EditorAutomationError.invalid("Director reached the editor inspection limit. Try a more specific action.")
+                            }
+                        }
+                        let before = editor.project
+                        let ownsMutation = Self.isAutomationMutation(call)
+                        self.performingAutomation = true
+                        if ownsMutation { self.applyingDirectorChange = true }
+                        let actualData: Data
+                        do { actualData = try await endpoint.performAutomation(call.name, arguments: call.arguments) }
+                        catch {
+                            self.performingAutomation = false; self.applyingDirectorChange = false
+                            throw error
+                        }
+                        self.performingAutomation = false; self.applyingDirectorChange = false
+                        try Task.checkCancellation()
+                        guard self.generation == token, self.automation === endpoint else { throw CancellationError() }
+                        guard let actual = try JSONSerialization.jsonObject(with: actualData) as? [String: Any],
+                              let ok = actual["ok"] as? Bool else {
+                            throw EditorAutomationError.invalid("The editor action returned an invalid result.")
+                        }
+                        let current = try endpoint.automationContext
+                        self.invalidateStalePending(revision: current.revision)
+                        if !ok {
+                            let failure = actual["error"] as? [String: Any]
+                            let message = failure?["message"] as? String ?? "The editor action was not applied."
+                            self.errorMessage = String(message.prefix(800))
+                            self.notice = self.pendingQuestionText
+                            self.finish(token, response: data, outcome: ["status": "rejected", "applied": false,
+                                "error": self.errorMessage ?? "", "editor_result": actual,
+                                "revision": current.revision])
+                            break
+                        }
+                        if readOnly {
+                            guard current.revision == context.recording.revision else { throw EditorCommandError.stale }
+                            automationLookups += 1
+                            context.automation = current
+                            context.automationInspected = true
+                            let base = try LocalEditPlanner.payload(request: text, context: context,
+                                routingRequest: routingRequest, historyInspected: historyLookups > 0)
+                            let resultBudget = min(6_144, max(0, 20_000 - base.count - 1_024))
+                            let projected: [String: Any]
+                            if actualData.count <= resultBudget { projected = actual }
+                            else {
+                                projected = ["ok": false, "editor_ok": true, "source": "director_context_budget",
+                                    "error": ["code": "too_large",
+                                        "message": "The read succeeded, but its result exceeds model context. Request a smaller page of edits, boxes or history, or describe one exact editing operation."],
+                                    "original_result_bytes": actualData.count, "maximum_result_bytes": resultBudget]
+                                self.record("editor_result_omitted", requestID: token,
+                                    details: ["tool": call.name, "original_result_bytes": actualData.count, "maximum_result_bytes": resultBudget])
+                            }
+                            self.finish(token, response: data, outcome: ["status": "inspected", "applied": false,
+                                "summary": "Read the editor’s current state.", "editor_result": projected,
+                                "revision": current.revision])
+                            response = nil
+                            requestPayload = try self.modelPayload(text: text, context: context, routingRequest: routingRequest,
+                                question: pendingQuestion, conflict: pendingConflict, continuation: true,
+                                historyInspected: historyLookups > 0, continuingRequestID: token)
+                            self.record("model_request", requestID: token, details: ["editor_lookup": automationLookups,
+                                "payload": self.object(requestPayload)])
+                            continue
+                        }
+                        let changed = ownsMutation && before != editor.project
+                        let summary = self.automationSummary(call, result: actual["result"], context: current, changed: changed)
+                        self.errorMessage = nil; self.notice = self.pendingQuestionText ?? summary
+                        self.instruction = ""
+                        var outcome: [String: Any] = ["status": changed ? "applied" : "completed", "applied": changed,
+                            "summary": summary, "editor_result": actual, "revision": current.revision,
+                            "history": DirectorConversation.object(editor.historyState)]
+                        if changed {
+                            outcome["edit_steps"] = DirectorConversation.object(DirectorTranscriptStep.changes(
+                                from: before.state, to: editor.project.state, references: editor.references))
+                        }
+                        self.finish(token, response: data, outcome: outcome)
+                        break
+                    }
+                    if case let .editorReport(summary) = result {
+                        self.errorMessage = nil; self.notice = self.pendingQuestionText ?? summary
+                        self.instruction = ""
+                        self.finish(token, response: data, outcome: ["status": "unchanged", "applied": false,
+                            "summary": summary, "revision": context.recording.revision])
+                        break
+                    }
                     var outcome: [String: Any]
                     var appliedFrom: EditState?
                     switch result {
-                    case .inspection, .observationReport:
+                    case .inspection, .observationReport, .editorAction, .editorReport:
                         throw EditorCommandError.invalid("The inspection did not produce a result.")
                     case let .historyLookup(request):
                         guard historyLookups < 4 else {
@@ -399,7 +553,7 @@ final class EditorAssistantSession: ObservableObject {
                         let name = "Director: " + String(summary.replacingOccurrences(of: "\n", with: "; ").prefix(140))
                         appliedFrom = editor.project.state
                         try self.withDirectorChange { try EditorCommandDispatcher.apply(batch, to: editor, projectID: self.projectID, name: name) }
-                        let oldIDs = Set(recording.state.timedEdits(includeCamera: true).map(\.id))
+                        let oldIDs = Set(context.recording.state.timedEdits(includeCamera: true).map(\.id))
                         let created = editor.project.state.timedEdits(includeCamera: true).filter { !oldIDs.contains($0.id) }
                         self.notice = summary
                         self.clarification = nil; self.framingConflict = nil
@@ -410,7 +564,7 @@ final class EditorAssistantSession: ObservableObject {
                     case let .history(history):
                         appliedFrom = editor.project.state
                         try self.withDirectorChange { try EditorHistoryDispatcher.apply(history, to: editor, projectID: self.projectID) }
-                        let name = (history.action == .undo ? recording.history.undo : recording.history.redo).first ?? "change"
+                        let name = (history.action == .undo ? context.recording.history.undo : context.recording.history.redo).first ?? "change"
                         let action = history.action == .undo ? "Undid" : "Redid"
                         self.notice = history.count == 1 ? "\(action) \(name)." : "\(action) \(history.count) changes in order."
                         self.clarification = nil; self.framingConflict = nil
@@ -448,8 +602,8 @@ final class EditorAssistantSession: ObservableObject {
                     }
                 } catch {
                     guard let self, self.generation == token else { return }
-                    self.notice = nil
                     if case .stale? = error as? EditorCommandError { self.framingConflict = nil; self.clarification = nil }
+                    self.notice = self.pendingQuestionText
                     if !(error is CancellationError) { self.errorMessage = error.localizedDescription }
                     self.finish(token, response: response, outcome: ["status": "rejected", "error": error.localizedDescription,
                         "revision": (try? EditorCommandDispatcher.revision(for: editor.project)) ?? ""])
@@ -461,6 +615,92 @@ final class EditorAssistantSession: ObservableObject {
             errorMessage = error.localizedDescription
             conversation.begin(text, requestID: token)
             finish(token, response: nil, outcome: ["status": "rejected", "error": error.localizedDescription])
+        }
+    }
+
+    private var pendingQuestionText: String? {
+        framingConflict.map { $0.followup ?? $0.proposal.question } ?? clarification?.question
+    }
+
+    private func commandContext(editor: ProjectEditor) throws -> EditorCommandContext {
+        if automation != nil, editor.draftState != nil {
+            // The ordinary mutation boundary rightly rejects drafts. A
+            // transport/read request can still inspect committed state while
+            // automation.hasDraft describes the unfinished manual work.
+            // Persistent results must save/replan before they can be applied.
+            return EditorCommandContext(projectID: projectID,
+                revision: try EditorCommandDispatcher.revision(for: editor.project),
+                duration: editor.project.duration, state: editor.project.state,
+                references: editor.project.references, history: editor.historyState)
+        }
+        return try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
+    }
+
+    private static func isAutomationMutation(_ call: EditorAutomationCall) -> Bool {
+        if call.name == "apply_edits" { return true }
+        let args = (try? JSONSerialization.jsonObject(with: call.arguments)) as? [String: Any]
+        return call.name == "control_document" && ["rename", "undo", "redo"].contains(args?["operation"] as? String ?? "")
+    }
+
+    private static func isAutomationReadOnly(_ call: EditorAutomationCall) -> Bool {
+        let tool = EditorAutomationAPI.tools.first { $0["name"] as? String == call.name }
+        return (tool?["annotations"] as? [String: Any])?["readOnlyHint"] as? Bool == true
+    }
+
+    private static func requiresSavedDraft(_ result: LocalEditResult) -> Bool {
+        switch result {
+        case .commands, .framingConflict, .history: return true
+        case let .editorAction(call):
+            if call.name == "apply_edits" { return true }
+            let args = (try? JSONSerialization.jsonObject(with: call.arguments)) as? [String: Any]
+            return call.name == "control_document" && args?["operation"] as? String == "rename"
+        default: return false
+        }
+    }
+
+    private func updatedContext(_ previous: LocalEditContext, editor: ProjectEditor) throws -> LocalEditContext {
+        var context = previous
+        context.recording = try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
+        context.automation = try automation?.automationContext
+        context.automationInspected = false
+        if let current = context.automation, let preview = current.preview {
+            context.liveUI = .init(playhead: preview.time, selectedRegionID: current.selectedBoxID, selectedEditID: current.selectedEditID)
+        }
+        return context
+    }
+
+    private func invalidateStalePending(revision: String) {
+        if let clarification, clarification.revision != revision { self.clarification = nil }
+        if let framingConflict, framingConflict.context.recording.revision != revision { self.framingConflict = nil }
+    }
+
+    private func automationSummary(_ call: EditorAutomationCall, result: Any?,
+                                   context: EditorAutomationContext, changed: Bool) -> String {
+        let args = (try? JSONSerialization.jsonObject(with: call.arguments)) as? [String: Any]
+        let operation = args?["operation"] as? String
+        switch call.name {
+        case "control_preview":
+            guard let preview = context.preview else { return "Preview action completed." }
+            if operation == "set_rate" { return "Preview speed: \(preview.rate.formatted())×." }
+            if preview.isPlaying {
+                if let range = preview.range { return String(format: "Playing %.2f–%.2f s.", range.start, range.end) }
+                return "Playing the preview."
+            }
+            return String(format: "Preview paused at %.2f s.", preview.time)
+        case "navigate_editor":
+            if operation == "show_inspector", let inspector = context.inspector { return "Showing \(inspector) controls." }
+            if operation == "clear_selection" { return "Cleared the selection." }
+            if operation?.hasPrefix("go_to") == true, let preview = context.preview {
+                return String(format: "Moved playhead to %.2f s.", preview.time)
+            }
+            return "Selected the requested editor item."
+        case "control_document":
+            if operation == "rename" { return "Renamed recording to \(context.name)." }
+            if operation == "undo" { return "Undo completed." }
+            if operation == "redo" { return "Redo completed." }
+            return "Recording saved."
+        case "apply_edits": return changed ? "Applied the requested edits." : "No edit changes were needed."
+        default: return "Editor action completed."
         }
     }
 
@@ -576,6 +816,7 @@ final class EditorAssistantSession: ObservableObject {
             record("question_dismissed", details: [:])
         }
         generation = UUID(); task?.cancel(); task = nil; currentRequestID = nil
+        performingAutomation = false
         isBusy = false; notice = nil; errorMessage = nil; clarification = nil; framingConflict = nil
         persist()
     }

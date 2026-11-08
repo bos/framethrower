@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+check_dir=$(mktemp -d -t framethrower-automation-planner-check)
+trap 'rm -rf "$check_dir"' EXIT
+swiftc -whole-module-optimization -Onone -num-threads 1 -parse-as-library -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorActionDescription.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorMutation.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPreviewCommand.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAutomationAPI.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAgentControls.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordedScene.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorInspection.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/LocalModelRuntime.swift" \
+  "$repo_dir/Tests/EditorAutomationPlannerChecks.swift" \
+  -o "$check_dir/check-automation-planner"
+"$check_dir/check-automation-planner" "$@"

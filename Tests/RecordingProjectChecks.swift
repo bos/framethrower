@@ -13,9 +13,33 @@ struct RecordingProjectChecks {
         checkGentleMotionTail()
         checkMotionSpeedProjection()
         checkVisibleMotionSettling()
+        try checkAutomationIdentity()
         try checkPersistence()
         try checkShapeHistoryAndLegacyDecoding()
         print("Recording project checks passed: geometry, crop/shape, jump/smooth timing, validation, durable undo/redo, legacy decoding, and immutable originals.")
+    }
+
+    @MainActor static func checkAutomationIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-identity-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("legacy.framethrower")
+        let legacy = RecordingProject(screenFilename: "absent-source.mov", duration: 5, automationID: nil)
+        let bytes = try JSONEncoder().encode(legacy)
+        try bytes.write(to: url)
+        let editor = try ProjectEditor.open(url: url)
+        let id = editor.automationID
+        precondition(editor.project.automationID == nil)
+        let reopened = try ProjectEditor.open(url: url)
+        precondition(reopened.automationID == id)
+        let unchanged = try Data(contentsOf: url)
+        precondition(unchanged == bytes, "Reading legacy identities must not rewrite a file")
+        precondition(editor.save())
+        precondition(editor.project.automationID == id && editor.project.undoHistory.isEmpty)
+        let saved = try ProjectEditor.open(url: url)
+        precondition(saved.automationID == id)
+        precondition(editor.rename(to: "Renamed") && editor.automationID == id)
+        precondition(editor.undo() && editor.automationID == id)
     }
 
     static func checkShapeAndCropGeometry() {

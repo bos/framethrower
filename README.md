@@ -189,11 +189,13 @@ Click an animation to select it and inspect its destination. Drag its body to
 move the entire movement, or its start/end grips to change its timing. Pull an
 instant change's start grip left to turn it into a smooth movement. The inner
 handles adjust acceleration and deceleration; tooltips report timing. Short,
-coincident marks offer a chooser and remain accessible by pinching into the
-timeline. The selected animation's **×** or Delete removes only that lane's
+crowded marks show a count badge with a chooser listing their names and times;
+pinching into the timeline separates their controls. The selected animation's **×** or Delete removes only that lane's
 change, preserving other components and reference boxes.
 
-Same-lane movements stop at their neighbors with a sticky contact. Hold Option
+Same-lane movements stop at their neighbors with a sticky contact while they
+intersect. Moving a whole span completely past its neighbor reorders it and clears
+the contact warning. Resizing continues to stop at the adjacent movement. Hold Option
 while dragging to push whole neighboring movements, preserving their durations
 and ramps; the chain stops at the recording boundary. Different lanes can overlap.
 Each gesture is one Undo step. Escape restores the whole gesture. Click empty
@@ -219,6 +221,8 @@ unchanged view before a later movement.
 The strip and timeline spans show the effective transition,
 shortened when the previous edit leaves less time available. Screen and camera
 use the same motion curve, with separate settings for each component of an edit.
+Deceleration slows earlier and has a flatter settling tail while retaining the
+chosen ramp duration and arrival time.
 **Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
 with steady holds and returns to the wider context. Suggestions are ordinary
 editable changes and applying them is one undo step.
@@ -287,11 +291,12 @@ unchanged, and existing files are never overwritten by this recovery action.
 ## Director mode
 
 Turn on **Director** in the editor toolbar to draw reference boxes and type or
-dictate editing instructions in one sidebar. Drag a box on
-the preview to identify an area; select it and say “this area” in an instruction.
+dictate editing instructions in one sidebar. Choose **Draw box** on the preview
+and drag to identify an area. The box keeps the video's aspect ratio throughout
+the drag and shrinks both dimensions together at the source edge. Select it and say “this area” in an instruction.
 Boxes show matching **Box 1**, **Box 2** badges in the preview and sidebar.
-Timeline edits have speakable **Edit A**, **Edit B** references in marker labels,
-edit chips, and the selected-edit preview badge. These references survive
+Timeline edits have speakable letter references in descriptive lane labels
+(such as **Zoom A**, **Hold B**, or **Camera C**) and the selected-edit preview badge. These references survive
 retiming, insertion, removal, Undo/Redo, recovery, and reopening; they do not
 silently renumber. New edits can therefore have later letters between older edits.
 The box is stored in original source coordinates with the source timestamp and
@@ -304,8 +309,13 @@ direction badges on the preview boundary.
 If the frame has no edit yet, drawing a box creates its reference mark in the
 same undoable operation. This adds no zoom or camera movement, so the first
 box-first workflow has an Edit A to refer to without changing the footage.
-Director mode owns left-button drawing gestures. Pinch and two-finger pan still
-refine the current framing. Turn Director off to drag the camera or mouse-pan.
+The preview's **Pan view / Draw box** selector chooses the mouse gesture.
+**Pan view** lets you drag a zoomed video while keeping Director and its boxes
+visible. Box badges remain selectable, and the camera remains directly movable
+and resizable. **Draw box** opens Director if necessary and pauses playback when
+you start drawing. Drawing retains a fixed source frame until release. Pinch and
+two-finger pan work with either tool. Switching tools cancels an unfinished mouse
+gesture while retaining earlier completed framing adjustments at that time.
 Escape cancels unfinished drawing or framing first, then exits Director mode.
 A box's X removes its guide and optional name; Undo restores both.
 
@@ -579,6 +589,9 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, separate
   hit targets, draggable edit diamonds, empty-space deselection, Escape routing,
   mouse/keyboard focus cues, pinch navigation, transition bands, and bounds.
+- `Tests/check-preview-tools.sh`: Pan/Box routing with Director visible, live
+  aspect-locked boxes, frozen drawing coordinates, cursor targets, gesture
+  cancellation, trackpad momentum, and independent PIP manipulation without media.
 - `Tests/check-timeline-animation-interactions.sh`: persistent native lanes,
   body/endpoint/ramp gestures, contact and Option pushing, short-mark selection,
   lane-local deletion, pointer ticks, cancellation, and conflict hit targets.

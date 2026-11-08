@@ -86,6 +86,8 @@ struct ConflictReviewInterfaceChecks {
                     "Visual playthrough preserves window layout and edit history while every AV object stays absent (canvas \(playingCanvasFrame)→\(canvas.frame), timeline \(playingTimelineFrame)→\(timeline.frame), AVplayer=\(playback.hasMediaPlayer), AVlayer=\(canvas.hasMediaPlayerLayer), projectEqual=\(editor.project == original), canUndo=\(editor.canUndo), window \(originalWindowFrame)→\(window.frame))")
         playback.pause(); playback.seek(0)
         try await settle(host)
+        try await previewTools(host: host, window: window, canvas: canvas, timeline: timeline,
+            editor: editor, playback: playback)
         session.instruction = "Pan from Box 1 to Box 2 over the next three seconds."
         session.submit(editor: editor, playhead: 0, regionID: nil, editID: nil)
         for _ in 0..<100 where session.isBusy { try await Task.sleep(for: .milliseconds(10)) }
@@ -194,7 +196,91 @@ struct ConflictReviewInterfaceChecks {
         try require(abs(playback.time - 6) < 0.000001 && abs(editor.project.state.trimStart - 5) < 0.000001 && editor.project.undoHistory.count == 2,
                     "Canceling a crossed trim restores the original playhead without changing saved trim/history")
         try await laneGestures(host: host, window: window, timeline: timeline, canvas: canvas, editor: editor, playback: playback)
-        print("Conflict review interface checks passed (vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+        print("Conflict review interface checks passed (native preview Pan/Box tools, vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+    }
+    static func previewTools(host: NSView, window: NSWindow, canvas: EditorCanvasView, timeline: RecordingTimelineView,
+                             editor: ProjectEditor, playback: EditorPlayback) async throws {
+        let original = editor.project, windowFrame = window.frame, playhead = playback.time
+        func picker() throws -> NSSegmentedControl {
+            guard let control = all(NSSegmentedControl.self, in: host).first(where: {
+                $0.segmentCount == 2 && $0.label(forSegment: 0) == "Pan view" && $0.label(forSegment: 1) == "Draw box"
+            }) else { throw Failure.failed("Preview Pan view/Draw box selector is missing") }
+            return control
+        }
+        func choose(_ segment: Int) throws {
+            let control = try picker()
+            control.selectedSegment = segment
+            try require(control.sendAction(control.action, to: control.target), "Preview tool sends its native selection action")
+        }
+        let initialTool = try picker().selectedSegment
+        try require(!canvas.scribbleMode && initialTool == 0,
+                    "The ordinary editor starts with Pan view while Director is closed")
+        try choose(1)
+        try await settle(host)
+        try await Task.sleep(for: .milliseconds(400))
+        try await settle(host)
+        try require(canvas.scribbleMode && canvas.drawsReferenceBoxes && canvas.guideBadges.count == original.state.regions.count,
+                    "Draw box opens Director and retains every visible source reference")
+        let canvasFrame = canvas.frame, timelineFrame = timeline.frame
+        let panelFields = all(NSTextField.self, in: host).filter { $0.placeholderString == "What would you like to change?" }
+        try require(!panelFields.isEmpty, "Choosing Draw box opens the actual Director composer")
+        try choose(0)
+        try await settle(host)
+        try require(canvas.scribbleMode && !canvas.drawsReferenceBoxes && canvas.guideBadges.count == original.state.regions.count &&
+                    !all(NSTextField.self, in: host).filter { $0.placeholderString == "What would you like to change?" }.isEmpty,
+                    "Choosing Pan keeps Director, its composer, and reference boxes visible")
+        guard let badge = canvas.guideBadges.first else { throw Failure.failed("Director box badge missing in Pan") }
+        let point = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+        func event(_ type: NSEvent.EventType) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: canvas.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        canvas.mouseDown(with: event(.leftMouseDown)); canvas.mouseUp(with: event(.leftMouseUp))
+        try await settle(host)
+        try require(canvas.guideBadges.contains { $0.regionID == badge.regionID && $0.selected } && !canvas.drawsReferenceBoxes,
+                    "An actual Pan-mode badge click selects the box without silently returning to Draw box")
+        try choose(1); try await settle(host)
+        try choose(0); try await settle(host)
+        try require(editor.project == original && !editor.canUndo && editor.draftState == nil && playback.time == playhead &&
+                    window.frame == windowFrame && canvas.frame == canvasFrame && timeline.frame == timelineFrame,
+                    "Preview tool and reference selection changes preserve source time, metadata/history and settled geometry (canvas \(canvasFrame)→\(canvas.frame), timeline \(timelineFrame)→\(timeline.frame))")
+        // Two mouse gestures may revise the same instant. Changing tool while
+        // holding the second must restore the first, not cancel the entire
+        // unfinished shared edit or create an Undo entry.
+        playback.seek(1)
+        try await settle(host)
+        let start = CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.minY + canvas.contentRect.height * 0.18)
+        func panEvent(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: canvas.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        let firstEnd = CGPoint(x: start.x + 35, y: start.y + 15)
+        canvas.mouseDown(with: panEvent(.leftMouseDown, start))
+        canvas.mouseDragged(with: panEvent(.leftMouseDragged, firstEnd))
+        canvas.mouseUp(with: panEvent(.leftMouseUp, firstEnd))
+        try await settle(host)
+        guard let firstDraft = editor.draftState, let firstTime = editor.draftTime else {
+            throw Failure.failed("First completed Pan gesture should remain a shared unfinished framing draft")
+        }
+        try require(firstDraft.zoomKeyframes != original.state.zoomKeyframes && firstDraft.pipKeyframes == original.state.pipKeyframes,
+                    "The held background gestures edit Screen framing rather than the animated PIP")
+        let firstZoom = canvas.zoom
+        canvas.mouseDown(with: panEvent(.leftMouseDown, start))
+        canvas.mouseDragged(with: panEvent(.leftMouseDragged, CGPoint(x: start.x - 60, y: start.y - 20)))
+        try await settle(host)
+        try require(editor.draftState != firstDraft, "The second held pan actually changes the draft before tool cancellation")
+        try choose(1)
+        try await settle(host)
+        canvas.mouseUp(with: panEvent(.leftMouseUp, firstEnd))
+        try await settle(host)
+        try require(editor.draftState == firstDraft && editor.draftTime == firstTime && canvas.zoom == firstZoom &&
+                    editor.project == original && editor.canUndo && !editor.canRedo &&
+                    editor.project.undoHistory == original.undoHistory && editor.project.redoHistory == original.redoHistory,
+                    "Switching to Draw box restores only the held Pan, retaining earlier completed shared framing without Undo/Redo or a late-release mutation (draft=\(editor.draftState == firstDraft), time \(String(describing: firstTime))→\(String(describing: editor.draftTime)), zoom \(firstZoom)→\(canvas.zoom), project=\(editor.project == original), undo=\(editor.canUndo), redo=\(editor.canRedo))")
+        _ = editor.cancelDraft()
+        playback.seek(playhead)
+        try choose(0)
+        try await settle(host)
     }
     static func laneGestures(host: NSView, window: NSWindow, timeline: RecordingTimelineView,
                              canvas: EditorCanvasView, editor: ProjectEditor, playback: EditorPlayback) async throws {

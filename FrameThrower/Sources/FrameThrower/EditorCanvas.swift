@@ -17,6 +17,7 @@ struct EditorCanvas: NSViewRepresentable {
     var onPreview: (PIPPlacement) -> Void
     var onCommit: (PIPPlacement, String) -> Void
     var onCancel: () -> Void
+    var onToolCancel: (() -> Void)? = nil
     var zoom = ZoomPlacement()
     var allowsZoomEditing = true
     var onZoomBegin: () -> Void = {}
@@ -25,6 +26,7 @@ struct EditorCanvas: NSViewRepresentable {
     var presentation = CanvasPresentation()
     var nativeSourceSize: CGSize? = nil
     var scribbleMode = false
+    var drawsReferenceBoxes = true
     var regions: [EditorRegion] = []
     var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID? = nil
@@ -39,11 +41,13 @@ struct EditorCanvas: NSViewRepresentable {
         view.onPreview = onPreview
         view.onCommit = onCommit
         view.onCancel = onCancel
+        view.onToolCancel = onToolCancel
         view.onZoomBegin = onZoomBegin
         view.onZoomPreview = onZoomPreview
         view.onZoomCommit = onZoomCommit
         view.allowsZoomEditing = allowsZoomEditing
         view.scribbleMode = scribbleMode
+        view.drawsReferenceBoxes = drawsReferenceBoxes
         view.regions = regions
         view.regionLabels = regionLabels
         view.selectedRegionID = selectedRegionID
@@ -88,7 +92,7 @@ final class EditorCanvasView: NSView {
         didSet {
             guard oldValue != conflictOutlines else { return }
             trackpad = nil; zoomDrag = nil; drag = nil
-            scribbleStart = nil; scribbleDraft = nil; guidePressID = nil
+            scribbleStart = nil; referenceDraft = nil; referenceGeometry = nil; guidePressID = nil
             needsLayout = true
             window?.invalidateCursorRects(for: self)
         }
@@ -97,13 +101,20 @@ final class EditorCanvasView: NSView {
     var scribbleMode = false {
         didSet {
             guard oldValue != scribbleMode else { return }
-            if scribbleMode { trackpad = nil; zoomDrag = nil; drag = nil }
-            if !scribbleMode { scribbleStart = nil; scribbleDraft = nil; guidePressID = nil }
-            setAccessibilityHelp(scribbleMode ?
-                "Director mode. Drag to draw a reference box; click a box number to select it. Pinch to zoom and use two fingers to pan. Escape cancels an unfinished action." : Self.navigationHelp)
+            cancelActiveInteraction(toolChange: true)
+            needsLayout = true
             window?.invalidateCursorRects(for: self)
         }
     }
+    var drawsReferenceBoxes = true {
+        didSet {
+            guard oldValue != drawsReferenceBoxes else { return }
+            cancelActiveInteraction(toolChange: true)
+            needsLayout = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    private var isBoxTool: Bool { scribbleMode && drawsReferenceBoxes && allowsZoomEditing }
     var regions: [EditorRegion] = []
     var regionLabels: [UUID: String] = [:]
     var selectedRegionID: UUID?
@@ -111,8 +122,11 @@ final class EditorCanvasView: NSView {
     var onDrawRegion: ((EditorRegionRect) -> Void)?
     var onSelectRegion: ((UUID?) -> Void)?
     private var scribbleStart: CGPoint?
-    private var scribbleDraft: EditorRegionRect?
+    private(set) var referenceDraft: EditorRegionRect?
+    private var referenceGeometry: ScribbleGeometry?
     private var guidePressID: UUID?
+    private var ignoresTrackpadRemainder = false
+    private var cursorTrackingArea: NSTrackingArea?
     private(set) var guideBadges: [GuideBadge] = []
     private(set) var canvasRect = CGRect.zero
     private(set) var contentRect = CGRect.zero
@@ -126,11 +140,14 @@ final class EditorCanvasView: NSView {
     var onPreview: ((PIPPlacement) -> Void)?
     var onCommit: ((PIPPlacement, String) -> Void)?
     var onCancel: (() -> Void)?
+    var onToolCancel: (() -> Void)?
     var onZoomBegin: (() -> Void)?
     var onZoomPreview: ((ZoomPlacement) -> Void)?
     var onZoomCommit: ((ZoomPlacement, String) -> Void)?
     var allowsZoomEditing = true {
-        didSet { if !allowsZoomEditing { trackpad = nil; zoomDrag = nil } }
+        didSet {
+            if oldValue && !allowsZoomEditing { cancelActiveInteraction() }
+        }
     }
     private(set) var zoom = ZoomPlacement()
     private static let navigationHelp = "Pinch to zoom; use two fingers to pan. Double-click to zoom, or drag a zoomed recording to pan. Drag the camera or its corners to move or resize it. Escape cancels unfinished edits."
@@ -216,7 +233,7 @@ final class EditorCanvasView: NSView {
         // Frame delivery and SwiftUI updates may arrive between native gesture
         // samples. Continue from the gesture's viewport, never from an older
         // frame's configuration.
-        self.zoom = trackpad?.draft ?? zoomDrag?.draft ?? zoom
+        self.zoom = referenceGeometry?.zoom ?? trackpad?.draft ?? zoomDrag?.draft ?? zoom
         updateLayers()
         CATransaction.commit()
     }
@@ -264,10 +281,12 @@ final class EditorCanvasView: NSView {
         guides.sublayers?.forEach { $0.removeFromSuperlayer() }
         guideBadges = []
         setAccessibilityValue(nil)
-        setAccessibilityHelp(scribbleMode ? "Director mode. Drag to draw a reference box; click a box number to select it. Pinch to zoom and use two fingers to pan. Escape cancels an unfinished action." : Self.navigationHelp)
+        setAccessibilityHelp(scribbleMode ? (isBoxTool ?
+            "Box tool. Drag to draw a reference box; click a box number to select it. Pinch to zoom and use two fingers to pan. Escape cancels an unfinished action." :
+            "Pan tool. Drag a zoomed recording to pan; click a box number to select it. Pinch to zoom and use two fingers to pan. Drag the camera or its corners to move or resize it.") : Self.navigationHelp)
         guard scribbleMode, contentRect.width > 0, contentRect.height > 0 else { return }
         let values = regions.map { ($0.rect, $0.id == selectedRegionID, Optional($0.id)) }
-            + (scribbleDraft.map { [($0, true, nil as UUID?)] } ?? [])
+            + (referenceDraft.map { [($0, true, nil as UUID?)] } ?? [])
         var shapeLayers: [(CALayer, Bool)] = []
         var badgeLayers: [(CALayer, Bool)] = []
         for (region, selected, id) in values {
@@ -424,40 +443,101 @@ final class EditorCanvasView: NSView {
                 y: corner == .topLeft || corner == .topRight ? rect.minY : rect.maxY)
     }
 
+    private var cameraRect: CGRect {
+        placement.frame(in: canvasRect.size, cameraAspect: cameraAspect)
+            .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
+    }
+
+    private func cameraCorner(at point: CGPoint) -> PIPResizeCorner? {
+        PIPResizeCorner.allCases.first { corner in
+            let target = cornerPoint(corner, in: cameraRect)
+            return abs(target.x - point.x) <= 12 && abs(target.y - point.y) <= 12
+        }
+    }
+
+    /// Shared by native cursor updates and offscreen interaction checks, so
+    /// the hand never advertises a pan where a camera or box receives a press.
+    func interactionCursor(at point: CGPoint) -> NSCursor {
+        guard conflictOutlines == nil else { return .arrow }
+        if zoomDrag != nil { return .closedHand }
+        if scribbleMode, guideBadges.contains(where: { $0.frame.contains(point) }) { return .pointingHand }
+        if isBoxTool { return contentRect.contains(point) ? .crosshair : .arrow }
+        if cameraEnabled, placement.visible {
+            if let corner = cameraCorner(at: point) {
+                let position: NSCursor.FrameResizePosition
+                switch corner {
+                case .topLeft: position = .topLeft
+                case .topRight: position = .topRight
+                case .bottomLeft: position = .bottomLeft
+                case .bottomRight: position = .bottomRight
+                }
+                return .frameResize(position: position, directions: .all)
+            }
+            if cameraRect.contains(point) { return drag == nil ? .openHand : .closedHand }
+        }
+        return allowsZoomEditing && zoom.scale > 1 && canvasRect.contains(point) ? .openHand : .arrow
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let cursorTrackingArea { removeTrackingArea(cursorTrackingArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.cursorUpdate, .mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        cursorTrackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        interactionCursor(at: convert(event.locationInWindow, from: nil)).set()
+    }
+
+    override func mouseMoved(with event: NSEvent) { cursorUpdate(with: event) }
+    override func mouseEntered(with event: NSEvent) { cursorUpdate(with: event) }
+    override func mouseExited(with event: NSEvent) { NSCursor.arrow.set() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
     override func resetCursorRects() {
-        if conflictOutlines != nil { addCursorRect(contentRect, cursor: .arrow); return }
-        if scribbleMode { addCursorRect(contentRect, cursor: .crosshair); return }
-        if allowsZoomEditing, zoom.scale > 1 { addCursorRect(canvasRect, cursor: .openHand) }
+        // Per-point cursor routing uses the same priority as mouseDown.
+        addCursorRect(bounds, cursor: .arrow)
     }
 
     override func mouseDown(with event: NSEvent) {
         guard conflictOutlines == nil else { window?.makeFirstResponder(self); return }
         let point = convert(event.locationInWindow, from: nil)
-        if scribbleMode {
+        defer { if window?.isKeyWindow == true { interactionCursor(at: point).set() } }
+        if scribbleMode, let badge = guideBadges.reversed().first(where: { $0.frame.contains(point) }) {
             window?.makeFirstResponder(self)
-            guard scribbleGeometry.sourcePoint(point) != nil else { onSelectRegion?(nil); return }
-            if let badge = guideBadges.reversed().first(where: { $0.frame.contains(point) }) {
-                guidePressID = badge.regionID
-                return
-            }
-            onReferenceBegin?()
-            scribbleStart = point
-            scribbleDraft = nil
+            guidePressID = badge.regionID
             return
         }
-        let rect = placement.frame(in: canvasRect.size, cameraAspect: cameraAspect)
-            .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
-        let corner = PIPResizeCorner.allCases.first { corner in
-            let target = cornerPoint(corner, in: rect)
-            return abs(target.x - point.x) <= 12 && abs(target.y - point.y) <= 12
+        if isBoxTool {
+            window?.makeFirstResponder(self)
+            guard scribbleGeometry.sourcePoint(point) != nil else { onSelectRegion?(nil); return }
+            finishTrackpad()
+            ignoresTrackpadRemainder = true
+            let geometry = scribbleGeometry
+            referenceGeometry = geometry
+            scribbleStart = point
+            referenceDraft = nil
+            onReferenceBegin?()
+            return
         }
+        let rect = cameraRect
+        let corner = cameraCorner(at: point)
         if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
             window?.makeFirstResponder(self)
+            finishTrackpad()
+            ignoresTrackpadRemainder = true
             onBegin?()
             drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
             return
         }
         guard allowsZoomEditing, canvasRect.contains(point), canvasRect.width > 0, canvasRect.height > 0 else { return }
+        finishTrackpad()
+        ignoresTrackpadRemainder = true
         if event.clickCount == 2 {
             window?.makeFirstResponder(self)
             onZoomBegin?()
@@ -471,12 +551,13 @@ final class EditorCanvasView: NSView {
             window?.makeFirstResponder(self)
             onZoomBegin?()
             zoomDrag = ZoomDrag(point: point, origin: zoom.clamped, draft: zoom.clamped)
+            window?.invalidateCursorRects(for: self)
         }
     }
 
     override func mouseDragged(with event: NSEvent) {
         if let scribbleStart {
-            scribbleDraft = scribbleGeometry.region(from: scribbleStart, to: convert(event.locationInWindow, from: nil))
+            referenceDraft = referenceGeometry?.region(from: scribbleStart, to: convert(event.locationInWindow, from: nil))
             CATransaction.begin(); CATransaction.setDisableActions(true)
             updateGuides()
             CATransaction.commit()
@@ -516,6 +597,9 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        defer {
+            if window?.isKeyWindow == true { interactionCursor(at: convert(event.locationInWindow, from: nil)).set() }
+        }
         if let guidePressID {
             self.guidePressID = nil
             onSelectRegion?(guidePressID)
@@ -523,9 +607,11 @@ final class EditorCanvasView: NSView {
         }
         if let scribbleStart {
             let point = convert(event.locationInWindow, from: nil)
-            let region = scribbleGeometry.region(from: scribbleStart, to: point)
+            let geometry = referenceGeometry ?? scribbleGeometry
+            let region = geometry.region(from: scribbleStart, to: point)
             self.scribbleStart = nil
-            scribbleDraft = nil
+            referenceDraft = nil
+            referenceGeometry = nil
             if let region { onDrawRegion?(region) }
             else {
                 onSelectRegion?(regions.reversed().first { scribbleGeometry.viewRect($0.rect).contains(point) }?.id)
@@ -538,12 +624,14 @@ final class EditorCanvasView: NSView {
         if let pan = zoomDrag {
             zoomDrag = nil
             zoom = pan.draft
+            window?.invalidateCursorRects(for: self)
             if pan.draft != pan.origin { onZoomCommit?(pan.draft, "Pan recording") }
             return
         }
         guard let drag else { return }
         self.drag = nil
         placement = drag.draft
+        window?.invalidateCursorRects(for: self)
         if drag.draft != drag.origin {
             onCommit?(drag.draft, drag.corner == nil ? "Move camera" : "Resize camera")
         }
@@ -605,28 +693,47 @@ final class EditorCanvasView: NSView {
     }
 
     override func cancelOperation(_ sender: Any?) {
-        if guidePressID != nil { guidePressID = nil; return }
-        if scribbleStart != nil {
-            scribbleStart = nil; scribbleDraft = nil
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            updateGuides(); CATransaction.commit()
-            return
-        }
-        if let trackpad { zoom = trackpad.origin }
-        else if let zoomDrag { zoom = zoomDrag.origin }
+        if !cancelActiveInteraction() { onCancel?() }
+    }
+
+    /// Cancels only a currently held native gesture. Completed framing drafts
+    /// remain the editor's responsibility when the host switches tools.
+    @discardableResult
+    func cancelActiveInteraction(toolChange: Bool = false) -> Bool {
+        let active = guidePressID != nil || scribbleStart != nil || trackpad != nil || zoomDrag != nil || drag != nil
+        guard active else { return false }
+        var changed = false
+        if let trackpad { zoom = trackpad.origin; changed = trackpad.draft != trackpad.origin }
+        else if let zoomDrag { zoom = zoomDrag.origin; changed = zoomDrag.draft != zoomDrag.origin }
+        if let drag { placement = drag.origin; changed = changed || drag.draft != drag.origin }
+        if trackpad != nil { ignoresTrackpadRemainder = true }
         trackpad = nil
         zoomDrag = nil
         drag = nil
+        guidePressID = nil
+        scribbleStart = nil
+        referenceDraft = nil
+        referenceGeometry = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         updateLayers()
         CATransaction.commit()
-        onCancel?()
+        window?.invalidateCursorRects(for: self)
+        if changed {
+            if toolChange, let onToolCancel { onToolCancel() }
+            else { onCancel?() }
+        }
+        return true
     }
 
     private func acceptsTrackpad(_ event: NSEvent) -> Bool {
         guard conflictOutlines == nil, allowsZoomEditing, drag == nil, zoomDrag == nil, scribbleStart == nil, guidePressID == nil,
               contentRect.width > 0, contentRect.height > 0 else { return false }
+        if ignoresTrackpadRemainder {
+            guard event.momentumPhase.isEmpty,
+                  event.phase.contains(.began) || event.phase.isEmpty else { return false }
+            ignoresTrackpadRemainder = false
+        }
         return trackpad != nil || canvasRect.contains(convert(event.locationInWindow, from: nil))
     }
 

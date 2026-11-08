@@ -6,6 +6,10 @@ private enum EditorInspector: String, CaseIterable {
     case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas", audio = "Audio"
 }
 
+private enum PreviewTool: String, CaseIterable {
+    case pan = "Pan view", box = "Draw box"
+}
+
 struct ProjectEditorView: View {
     @ObservedObject var editor: ProjectEditor
     var onDuplicate: ((ProjectEditor) -> Void)?
@@ -37,8 +41,16 @@ struct ProjectEditorView: View {
     @State private var playAfterRebuild = false
     @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
+    @State private var previewTool: PreviewTool = .pan
     @State private var selectedRegionID: UUID?
     @State private var comparisonDismissedForManualEdit = false
+    @State private var canvasGesture: CanvasGestureSnapshot?
+    private struct CanvasGestureSnapshot {
+        let id = UUID()
+        let state: EditState
+        let time: Double
+        let hadDraft: Bool
+    }
 
     private var state: EditState { editor.editingState }
     private var conflictReview: EditorConflictReview? { assistant.conflictReview }
@@ -78,6 +90,7 @@ struct ProjectEditorView: View {
         _playback = StateObject(wrappedValue: playback ?? EditorPlayback())
         _assistant = StateObject(wrappedValue: assistant ?? EditorAssistantSession())
         _directorMode = State(initialValue: directorModeInitiallyEnabled)
+        _previewTool = State(initialValue: directorModeInitiallyEnabled ? .box : .pan)
     }
 
 
@@ -171,7 +184,7 @@ struct ProjectEditorView: View {
                     .toggleStyle(.button)
                     .labelStyle(.titleAndIcon)
                     .accessibilityLabel("Director mode")
-                    .help(directorMode ? "Leave Director mode to drag the camera or pan with the mouse." : "Draw reference boxes and type or dictate editing instructions. Pinch to zoom; use two fingers to pan.")
+                    .help(directorMode ? "Close the Director conversation and reference boxes." : "Show reference boxes and type or dictate editing instructions.")
             }
             ToolbarItem(placement: .primaryAction) {
                 VideoActionsMenu(editor: editor, session: exportSession,
@@ -227,26 +240,48 @@ struct ProjectEditorView: View {
             placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil,
             showsCameraPattern: editor.project.cameraFilename != nil && conflictReview == nil,
             showsStill: !playback.isPlaying,
-            onBegin: { assistant.cancel(); playback.pause(); dragTime = editTime; selectedInspector = .camera },
+            onBegin: {
+                assistant.cancel(); playback.pause(); dragTime = targetTime(editTime)
+                canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil)
+                selectedInspector = .camera
+            },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
-            onCommit: { next, name in setPlacement(next, at: dragTime, name: name) },
-            onCancel: { cancelEditorInteraction() },
+            onCommit: { next, name in setPlacement(next, at: dragTime, name: name); canvasGesture = nil },
+            onCancel: { canvasGesture = nil; cancelEditorInteraction() },
+            onToolCancel: {
+                let snapshot = canvasGesture
+                let expectedProject = editor.project
+                let expectedDraft = editor.draftState
+                // Native tool cancellation runs during a representable update.
+                // Restore next turn only if no newer work has superseded it.
+                Task { @MainActor in
+                    guard canvasGesture?.id == snapshot?.id, editor.project == expectedProject,
+                          editor.draftState == expectedDraft else { return }
+                    restoreCanvasGesture(snapshot)
+                }
+            },
             zoom: conflictReview == nil ? zoom : ZoomPlacement(),
             allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
-            onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name) },
+            onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name); canvasGesture = nil },
             presentation: canvasPresentation, nativeSourceSize: playback.sourceSize,
             scribbleMode: directorMode && conflictReview == nil,
+            drawsReferenceBoxes: previewTool == .box,
             regions: conflictReview == nil ? state.regions : [],
             regionLabels: Dictionary(uniqueKeysWithValues: state.regions.compactMap { region in
                 editor.references.boxLabel(for: region.id).map { (region.id, $0) }
             }),
             selectedRegionID: selectedRegionID,
-            onReferenceBegin: { assistant.cancel() },
+            onReferenceBegin: {
+                assistant.cancel()
+                if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
+                playback.pause()
+            },
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
             conflictOutlines: conflictReview?.outlines(at: playback.time))
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) { previewTools.padding(10) }
             .overlay(alignment: .bottomLeading) {
                 if MediaProcessing.isSuspended {
                     Text("Test pattern").font(.caption.weight(.semibold)).foregroundStyle(.white)
@@ -275,6 +310,35 @@ struct ProjectEditorView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
+    private var previewTools: some View {
+        Picker("Preview tool", selection: Binding(get: { directorMode ? previewTool : .pan }, set: { setPreviewTool($0) })) {
+            Label("Pan view", systemImage: "hand.raised")
+                .help("Drag the zoomed video to pan. Pinch or double-click to zoom in first. Two fingers also pan.")
+                .tag(PreviewTool.pan)
+            Label("Draw box", systemImage: "rectangle.dashed")
+                .help("Drag a reference box with the video's aspect ratio. Opens Director if needed.")
+                .tag(PreviewTool.box)
+        }
+        .pickerStyle(.segmented).labelsHidden().labelStyle(.titleAndIcon).controlSize(.small)
+        .frame(width: 230, height: 24)
+        .padding(5)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .disabled(playback.isLoading || playback.isScrubbing || conflictReview != nil)
+        .accessibilityLabel("Preview tool")
+        .help("Pan view: drag a zoomed video. Draw box: mark a video-shaped reference for Director. Two-finger panning works in either tool.")
+    }
+
+    private func setPreviewTool(_ tool: PreviewTool) {
+        guard !playback.isLoading, !playback.isScrubbing, conflictReview == nil else { return }
+        if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
+        playback.pause()
+        if tool == .box, !directorMode {
+            guard editor.finishDraft() else { return }
+            directorMode = true
+        }
+        previewTool = tool
+    }
+
     private func reviewConflict() {
         playback.pause()
         guard let review = conflictReview else {
@@ -285,7 +349,7 @@ struct ProjectEditorView: View {
         }
         directorMode = true
         guard !playback.isLoading else { return }
-        selectedEditID = nil; selectedRegionID = nil
+        selectedEditID = nil; selectedAnimationID = nil; selectedRegionID = nil
         playback.seek(review.inspectionTime)
         playback.preview(review.previewState)
     }
@@ -307,6 +371,7 @@ struct ProjectEditorView: View {
             guard editor.finishDraft() else { return }
         }
         directorMode.toggle()
+        previewTool = directorMode ? .box : .pan
     }
 
     private func addRegion(_ rect: EditorRegionRect) {
@@ -776,7 +841,7 @@ struct ProjectEditorView: View {
         let hasDraft = editor.draftState != nil
         playAfterRebuild = hasDraft
         guard editor.finishDraft() else { playAfterRebuild = false; return }
-        selectedEditID = nil
+        selectedEditID = nil; selectedAnimationID = nil
         if !hasDraft { playback.togglePlayback() }
     }
 
@@ -825,9 +890,22 @@ struct ProjectEditorView: View {
 
     private func beginZoomGesture() {
         assistant.cancel()
+        if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
         playback.pause()
-        dragTime = editTime
+        dragTime = targetTime(editTime)
+        canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil)
         selectedInspector = .zoom
+    }
+
+    private func restoreCanvasGesture(_ snapshot: CanvasGestureSnapshot?) {
+        guard let snapshot else { return }
+        if snapshot.hadDraft, snapshot.state != editor.project.state {
+            guard editor.updateDraft(snapshot.state, at: snapshot.time) else { return }
+        } else {
+            guard editor.cancelDraft() else { return }
+        }
+        canvasGesture = nil
+        playback.preview(editor.editingState)
     }
 
     private func targetTime(_ position: Double) -> Double {

@@ -10,6 +10,7 @@ struct RecordingProjectChecks {
         checkCornerResizing()
         checkEditingTime()
         checkTransitions()
+        checkGentleMotionTail()
         try checkPersistence()
         try checkShapeHistoryAndLegacyDecoding()
         print("Recording project checks passed: geometry, crop/shape, jump/smooth timing, validation, durable undo/redo, legacy decoding, and immutable originals.")
@@ -264,18 +265,18 @@ struct RecordingProjectChecks {
         precondition(state.placement(at: 2) == second, "Jump happens at its exact timestamp")
         precondition(state.placement(at: 6) == second, "Smooth motion starts at arrival minus duration")
         let midpoint = state.placement(at: 7)
-        near(midpoint.x, 0.6, "Smooth midpoint X")
-        near(midpoint.y, 0.7, "Smooth midpoint Y")
-        near(midpoint.scale, 0.4, "Smooth midpoint size")
+        near(midpoint.x, 0.2 + 0.8 * 12 / 23, "Smooth midpoint X")
+        near(midpoint.y, 0.4 + 0.6 * 12 / 23, "Smooth midpoint Y")
+        near(midpoint.scale, 0.3 + 0.2 * 12 / 23, "Smooth midpoint size")
         precondition(!midpoint.visible, "Visibility remains discrete until arrival")
         let early = state.placement(at: 6.5)
-        near(early.x, 0.2 + 0.8 / 6, "Camera reaches cruise speed after accelerating")
+        near(early.x, 0.2 + 0.8 * 4 / 23, "Camera reaches cruise speed after accelerating")
         precondition(state.placement(at: 8) == third)
         precondition(state.placement(at: 100) == third)
 
         state.pipKeyframes[2].duration = 100
         precondition(state.placement(at: 2) == second, "Long transition cannot begin before previous point")
-        near(state.placement(at: 5).x, 0.6, "Long transition is clamped to previous point")
+        near(state.placement(at: 5).x, 0.2 + 0.8 * 12 / 23, "Long transition is clamped to previous point")
         let identity = state.pipKeyframes[1].id
         state.upsert(PIPKeyframe(time: 2, placement: third))
         precondition(state.pipKeyframes.count == 3 && state.pipKeyframes[1].id == identity)
@@ -293,12 +294,63 @@ struct RecordingProjectChecks {
         ])
         let during = geometry.placement(at: 7)
         precondition(during.shape == .rectangle, "Shape switches discretely at the target timestamp")
-        near(during.aspectRatio, 1.5, "Free rectangle aspect interpolates")
-        near(during.crop.x, 0.5, "Crop X interpolates")
-        near(during.crop.y, 0.5, "Crop Y interpolates")
-        near(geometry.placement(at: 6.5).crop.x, 1.0 / 6, "Crop uses the same acceleration and cruise profile")
+        near(during.aspectRatio, 2 - 12.0 / 23, "Free rectangle aspect interpolates")
+        near(during.crop.x, 12.0 / 23, "Crop X interpolates")
+        near(during.crop.y, 1 - 12.0 / 23, "Crop Y interpolates")
+        near(geometry.placement(at: 6.5).crop.x, 4.0 / 23, "Crop uses the same acceleration and cruise profile")
         precondition(geometry.placement(at: 6) == rectangle)
         precondition(geometry.placement(at: 8) == circle)
+    }
+
+    static func checkGentleMotionTail() {
+        for (previous, end, requested, easeIn, easeOut) in [
+            (0.0, 1.0, 1.0, 0.25, 0.25), (0, 4, 2, 0.4, 0.7),
+            (3, 4, 20, 1.2, 0.8), (0, 1, 1, 0.0, 1.0)
+        ] {
+            let beginning = max(previous, end - requested)
+            let span = end - beginning
+            let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
+            func progress(_ time: Double) -> Double {
+                MotionInterpolation.progress(at: time, from: previous, to: end, duration: requested,
+                    transition: .smooth, easeIn: easeIn, easeOut: easeOut)
+            }
+            let h = span * 0.00001
+            func velocity(_ time: Double) -> Double { (progress(time + h) - progress(time - h)) / (2 * h) }
+            let cruise = 1 / (span - ramps.easeIn / 2 - 5 * ramps.easeOut / 8)
+            for (join, hasRamp) in [(beginning + ramps.easeIn, ramps.easeIn > 0), (end - ramps.easeOut, ramps.easeOut > 0)] where hasRamp && join > beginning && join < end {
+                precondition(abs(velocity(join - h) - velocity(join + h)) < 0.0001 / span,
+                             "Changing velocity profiles cannot introduce a speed discontinuity at the chosen joins")
+                precondition(abs(velocity(join) - cruise) < 0.0001 / span,
+                             "Both ramp joins retain the distance-normalized cruise speed")
+            }
+            near(progress(beginning), 0, "Motion starts at the existing chosen source time")
+            near(progress(end), 1, "The gentler tail reaches the exact existing target timestamp")
+            precondition(abs(velocity(end)) < 0.000001 / span, "The softened tail arrives at rest")
+            let tailQuarter = end - ramps.easeOut / 4
+            let oldCosineRatio = pow(sin(Double.pi / 8), 2)
+            precondition(velocity(tailQuarter) / cruise < oldCosineRatio / 2,
+                         "The final quarter sheds substantially more speed than the previous cosine-squared tail")
+            precondition(velocity(end - ramps.easeOut * 0.02) < velocity(end - ramps.easeOut * 0.04) / 10,
+                         "Approaching the endpoint flattens velocity faster than a quadratic tail")
+            var last = 0.0
+            for step in 0...4000 {
+                let value = progress(beginning + span * Double(step) / 4000)
+                precondition(value.isFinite && value >= last - 0.000000000001 && value >= 0 && value <= 1,
+                             "Asymmetric, clipped, and all-ramp curves remain bounded and monotonic")
+                last = value
+            }
+            // The shared ramp allocator is unchanged, including audio's
+            // linear fade envelope, which must not inherit motion shaping.
+            if easeIn + easeOut <= span {
+                near(ramps.easeIn, easeIn, "Manual acceleration length stays unchanged")
+                near(ramps.easeOut, easeOut, "Manual deceleration length stays unchanged")
+            }
+        }
+        for step in 0...1000 {
+            let time = Double(step) / 1000
+            near(MotionInterpolation.progress(at: time, from: 0, to: 1, duration: 1,
+                transition: .smooth, easeIn: 0, easeOut: 0), time, "Explicit zero ramps remain exactly linear")
+        }
     }
 
     @MainActor static func checkPersistence() throws {

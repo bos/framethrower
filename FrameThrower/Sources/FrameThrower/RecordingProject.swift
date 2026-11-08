@@ -20,19 +20,29 @@ enum MotionInterpolation {
         let beginning = max(previousTime, targetTime - duration)
         guard time > beginning, targetTime > beginning else { return 0 }
         let fraction = min(1, max(0, (time - beginning) / (targetTime - beginning)))
-        // Integrate cosine velocity ramps around a constant-speed middle.
-        // Velocity and acceleration stay continuous wherever a ramp is used.
+        // Integrate a cosine acceleration and a softer cosine-fourth braking
+        // profile around a constant-speed middle. The chosen ramp boundaries
+        // remain exact; braking sheds speed earlier and has a flatter tail.
+        // Normalize distance so velocity/acceleration join continuously and
+        // every movement still reaches its target at the requested timestamp.
         let span = targetTime - beginning
         let ramps = rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
         let startRamp = ramps.easeIn / span
         let endRamp = ramps.easeOut / span
-        let distance = 1 - (startRamp + endRamp) / 2
+        let distance = 1 - startRamp / 2 - 5 * endRamp / 8
         func accelerate(_ fraction: Double, ramp: Double) -> Double {
             (fraction / 2 - ramp / (2 * .pi) * sin(.pi * fraction / ramp)) / distance
         }
-        if fraction < startRamp { return accelerate(fraction, ramp: startRamp) }
-        if fraction > 1 - endRamp { return 1 - accelerate(1 - fraction, ramp: endRamp) }
-        return (fraction - startRamp / 2) / distance
+        let progress: Double
+        if fraction < startRamp { progress = accelerate(fraction, ramp: startRamp) }
+        else if fraction > 1 - endRamp {
+            let remaining = 1 - fraction
+            let phase = .pi * remaining / endRamp
+            let tail = 3 * remaining / 8 - endRamp / (2 * .pi) * sin(phase)
+                + endRamp / (16 * .pi) * sin(2 * phase)
+            progress = 1 - tail / distance
+        } else { progress = (fraction - startRamp / 2) / distance }
+        return min(1, max(0, progress))
     }
 
     /// Ramp values are seconds within the effective movement interval. If an

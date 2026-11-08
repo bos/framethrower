@@ -24,10 +24,10 @@ struct ZoomModelChecks {
         state.zoomKeyframes[0].transition = .smooth
         state.zoomKeyframes[0].duration = 1
         precondition(state.zoom(at: 1) == ZoomPlacement(), "First smooth zoom starts from implicit identity")
-        expect(state.zoom(at: 1.5), ZoomPlacement(scale: 1.5, x: 0.625, y: 0.375), "First smooth zoom midpoint")
-        expect(state.zoom(at: 1.25), ZoomPlacement(scale: 1 + 1.0 / 6, x: 0.5 + 0.25 / 6, y: 0.5 - 0.25 / 6), "Zoom reaches cruise speed after accelerating")
+        expect(state.zoom(at: 1.5), ZoomPlacement(scale: 1 + 12.0 / 23, x: 0.5 + 3.0 / 23, y: 0.5 - 3.0 / 23), "First smooth zoom midpoint")
+        expect(state.zoom(at: 1.25), ZoomPlacement(scale: 1 + 4.0 / 23, x: 0.5 + 1.0 / 23, y: 0.5 - 1.0 / 23), "Zoom reaches cruise speed after accelerating")
         state.zoomKeyframes[0].duration = 10
-        expect(state.zoom(at: 1), ZoomPlacement(scale: 1.5, x: 0.625, y: 0.375), "Long first transition clamps to source start")
+        expect(state.zoom(at: 1), ZoomPlacement(scale: 1 + 12.0 / 23, x: 0.5 + 3.0 / 23, y: 0.5 - 3.0 / 23), "Long first transition clamps to source start")
         state.zoomKeyframes = [ZoomKeyframe(time: 0, scale: 2, x: 0.25, y: 0.25, transition: .smooth)]
         expect(state.zoom(at: 0), ZoomPlacement(scale: 2, x: 0.25, y: 0.25), "Time-zero zoom applies immediately")
 
@@ -36,9 +36,9 @@ struct ZoomModelChecks {
             ZoomKeyframe(time: 5, scale: 1, x: 0, y: 0, transition: .smooth, duration: 10)
         ]
         expect(state.zoom(at: 2), ZoomPlacement(scale: 2, x: 0.25, y: 0.25), "Zoom holds before next transition")
-        expect(state.zoom(at: 3), ZoomPlacement(scale: 2.5, x: 0.525, y: 0.525), "Smooth zoom and pan midpoint")
+        expect(state.zoom(at: 3), ZoomPlacement(scale: 2 + 12.0 / 23, x: 0.25 + 0.55 * 12 / 23, y: 0.25 + 0.55 * 12 / 23), "Smooth zoom and pan midpoint")
         expect(state.zoom(at: 4), ZoomPlacement(scale: 3, x: 0.8, y: 0.8), "Exact zoom arrival")
-        expect(state.zoom(at: 4.5), ZoomPlacement(scale: 2, x: 0.65, y: 0.65), "Long later transition cannot start before previous point")
+        expect(state.zoom(at: 4.5), ZoomPlacement(scale: 3 - 24.0 / 23, x: 0.8 - 0.3 * 12 / 23, y: 0.8 - 0.3 * 12 / 23), "Long later transition cannot start before previous point")
         expect(state.zoom(at: 5), ZoomPlacement(), "Zoom out returns to full source")
         precondition(state.zoom(at: -.infinity) == ZoomPlacement() && state.zoom(at: .nan) == ZoomPlacement())
 
@@ -46,11 +46,11 @@ struct ZoomModelChecks {
             ZoomKeyframe(time: 0, scale: 2, x: 0.25, y: 0.5),
             ZoomKeyframe(time: 2, scale: 2, x: 0.75, y: 0.5, transition: .smooth, duration: 2)
         ]
-        expect(state.zoom(at: 0.5), ZoomPlacement(scale: 2, x: 1.0 / 3, y: 0.5), "Pan uses the same eased timeline")
-        expect(state.zoom(at: 1), ZoomPlacement(scale: 2, x: 0.5, y: 0.5), "Static zoom pans smoothly across source")
+        expect(state.zoom(at: 0.5), ZoomPlacement(scale: 2, x: 0.25 + 2.0 / 23, y: 0.5), "Pan uses the same eased timeline")
+        expect(state.zoom(at: 1), ZoomPlacement(scale: 2, x: 0.25 + 6.0 / 23, y: 0.5), "Static zoom pans smoothly across source")
         state.zoomKeyframes[0] = ZoomKeyframe(time: 0, scale: 1, x: 0, y: 0)
         state.zoomKeyframes[1] = ZoomKeyframe(time: 2, scale: 2, x: 1, y: 1, transition: .smooth, duration: 2)
-        expect(state.zoom(at: 1), ZoomPlacement(scale: 1.5, x: 0.625, y: 0.625),
+        expect(state.zoom(at: 1), ZoomPlacement(scale: 1 + 12.0 / 23, x: 0.5 + 3.0 / 23, y: 0.5 + 3.0 / 23),
                "Interpolation starts from visible clamped viewports, not invisible offscreen focal values")
     }
 
@@ -140,7 +140,7 @@ struct ZoomModelChecks {
             }
         }
         near(MotionInterpolation.progress(at: 2.5, from: 0, to: 4, duration: 2, transition: .smooth),
-             1.0 / 6, "Shared curve reaches cruise speed after its first quarter")
+             4.0 / 23, "Shared curve reaches cruise speed after its first quarter")
         near(MotionInterpolation.progress(at: 3, from: 3, to: 4, duration: 20, transition: .smooth),
              0, "Shared transition starts no earlier than preceding point")
 
@@ -178,7 +178,7 @@ struct ZoomModelChecks {
         near(velocity(0), 0, "Smooth motion starts at rest")
         near(velocity(1), 0, "Smooth motion ends at rest")
         for time in [0.26, 0.35, 0.5, 0.65, 0.74] {
-            near(velocity(time), 4.0 / 3, "Middle half travels at constant speed")
+            near(velocity(time), 32.0 / 23, "Middle half travels at constant speed")
         }
         precondition(velocity(0.01) < velocity(0.1) && velocity(0.1) < velocity(0.2),
                      "Motion gently accelerates before cruising")
@@ -194,9 +194,9 @@ struct ZoomModelChecks {
             let current = progress(time)
             precondition(current >= previous && current >= 0 && current <= 1,
                          "Motion is bounded and monotonic")
-            near(current + progress(1 - time), 1, "Acceleration and deceleration are symmetric")
             previous = current
         }
+        precondition(velocity(0.9) < velocity(0.1), "Braking has a flatter tail than the unchanged acceleration shape")
         for time in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1] {
             near(MotionInterpolation.progress(at: 3 + time, from: 3, to: 4, duration: 20, transition: .smooth),
                  progress(time), "Shortened transitions retain the same acceleration/cruise/deceleration profile")
@@ -213,17 +213,15 @@ struct ZoomModelChecks {
         let ramps = MotionInterpolation.rampDurations(duration: 1, easeIn: 0.1, easeOut: 0.3)
         near(ramps.easeIn, 0.1, "Acceleration duration is measured in seconds")
         near(ramps.easeOut, 0.3, "Deceleration duration is independent")
-        near(custom(0.1, start: 0.1, end: 0.3), 0.0625, "Asymmetric acceleration covers its expected distance")
-        near(custom(0.5, start: 0.1, end: 0.3), 0.5625, "Asymmetric movement retains constant cruise speed")
-        near(custom(0.7, start: 0.1, end: 0.3), 0.8125, "Asymmetric deceleration begins at its chosen time")
+        near(custom(0.1, start: 0.1, end: 0.3), 4.0 / 61, "Asymmetric acceleration covers its expected distance")
+        near(custom(0.5, start: 0.1, end: 0.3), 36.0 / 61, "Asymmetric movement retains constant cruise speed")
+        near(custom(0.7, start: 0.1, end: 0.3), 52.0 / 61, "Asymmetric deceleration begins at its chosen time")
         let shortened = MotionInterpolation.rampDurations(duration: 1, easeIn: 1.2, easeOut: 0.8)
         near(shortened.easeIn, 0.6, "Oversubscribed acceleration shrinks proportionally")
         near(shortened.easeOut, 0.4, "Oversubscribed deceleration shrinks proportionally")
         for step in 0...1000 {
             let time = Double(step) / 1000
             near(custom(time, start: 0, end: 0), time, "Zero ramps explicitly request constant speed")
-            near(custom(time, start: 0.1, end: 0.3) + custom(1 - time, start: 0.3, end: 0.1),
-                 1, "Reversing asymmetric ramp lengths reverses the motion")
             let squeezed = custom(time, start: 1.2, end: 0.8)
             precondition(squeezed.isFinite && squeezed >= 0 && squeezed <= 1,
                          "All-ramp movement remains bounded when there is no cruise interval")

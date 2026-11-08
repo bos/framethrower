@@ -836,7 +836,28 @@ private struct DirectorConversationView: View {
                 }
                 .font(.caption).buttonStyle(.bordered).controlSize(.small).disabled(isBusy)
             }
-            ForEach(entry.steps) { step in
+            stepCards(entry, highlightsSelection: true)
+            if !entry.earlierAdjustments.isEmpty {
+                DisclosureGroup("\(entry.earlierAdjustments.count) earlier \(entry.earlierAdjustments.count == 1 ? "adjustment" : "adjustments")") {
+                    ForEach(entry.earlierAdjustments) { earlier in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(earlier.text).font(.caption).foregroundStyle(.secondary)
+                            stepCards(earlier, highlightsSelection: false)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(entry.kind == .event ? 0 : 9)
+        .background(entry.kind == .user ? Color.accentColor.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(activeQuestion ? Color.accentColor.opacity(0.6) : .clear, lineWidth: 1))
+        .padding(.leading, entry.kind == .user ? 16 : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func stepCards(_ entry: DirectorTranscriptEntry, highlightsSelection: Bool) -> some View {
+        ForEach(entry.steps) { step in
                 let live = references.edit(in: state, id: step.id)
                 Button { if let live { onSelectEdit(live.id) } } label: {
                     VStack(alignment: .leading, spacing: 2) {
@@ -848,19 +869,13 @@ private struct DirectorConversationView: View {
                         Text(step.detail).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                     .font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(7)
-                    .background(live?.id == selectedEditID && live != nil ? Color.purple.opacity(0.12) : Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(live?.id == selectedEditID && live != nil ? Color.purple : .clear, lineWidth: 1))
+                    .background(highlightsSelection && live?.id == selectedEditID && live != nil ? Color.purple.opacity(0.12) : Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(highlightsSelection && live?.id == selectedEditID && live != nil ? Color.purple : .clear, lineWidth: 1))
                 }
                 .buttonStyle(.plain).disabled(live == nil)
                 .help(step.tooltip + navigationHelp(for: step, live: live))
                 .accessibilityLabel("\(step.label) at \(String(format: "%.2f", step.time)) seconds. \(step.detail)" + navigationHelp(for: step, live: live))
             }
-        }
-        .padding(entry.kind == .event ? 0 : 9)
-        .background(entry.kind == .user ? Color.accentColor.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(activeQuestion ? Color.accentColor.opacity(0.6) : .clear, lineWidth: 1))
-        .padding(.leading, entry.kind == .user ? 16 : 0)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
     private func conflictKey(_ title: String, color: Color, dashed: Bool) -> some View {
         HStack(spacing: 4) {

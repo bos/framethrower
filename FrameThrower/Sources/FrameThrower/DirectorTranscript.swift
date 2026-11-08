@@ -41,6 +41,9 @@ struct DirectorTranscriptEntry: Identifiable, Equatable {
     var steps: [DirectorTranscriptStep] = []
     var isQuestion = false
     var isError = false
+    var adjustmentTarget: String? = nil
+    var adjustmentEventID: String? = nil
+    var earlierAdjustments: [DirectorTranscriptEntry] = []
 }
 
 @MainActor
@@ -62,7 +65,9 @@ enum DirectorTranscript {
                     if let status = event["status"] as? String {
                         if let entry = outcome(event, status: status, id: id, conversation: conversation, references: references) { result.append(entry) }
                     } else if let body = eventText(event) {
-                        result.append(.init(id: id, kind: .event, text: body, steps: steps(event)))
+                        let edits = steps(event)
+                        result.append(.init(id: id, kind: .event, text: body, steps: edits,
+                            adjustmentTarget: adjustmentTarget(event, steps: edits), adjustmentEventID: id))
                     }
                 } else if message.role == "tool", let value = object(text), let status = value["status"] as? String {
                     if let entry = outcome(value, status: status, id: id, conversation: conversation, references: references) { result.append(entry) }
@@ -73,7 +78,29 @@ enum DirectorTranscript {
                 }
             }
         }
-        return result
+        var grouped: [DirectorTranscriptEntry] = []
+        for var entry in result {
+            if let target = entry.adjustmentTarget, let previous = grouped.last, previous.adjustmentTarget == target {
+                entry.id = previous.id
+                var earlier = previous
+                earlier.id = previous.adjustmentEventID ?? previous.id
+                earlier.earlierAdjustments = []
+                entry.earlierAdjustments = previous.earlierAdjustments + [earlier]
+                grouped[grouped.count - 1] = entry
+            } else { grouped.append(entry) }
+        }
+        return grouped
+    }
+
+    /// Group only adjacent manual adjustments to the same identities or
+    /// whole-clip component. Captions and rounded descriptions are not identity.
+    /// The saved conversation, model context and Undo stack remain untouched.
+    private static func adjustmentTarget(_ event: [String: Any], steps: [DirectorTranscriptStep]) -> String? {
+        guard event["kind"] as? String == "edit", event["actor"] as? String != "director" else { return nil }
+        if !steps.isEmpty { return "edits:" + Set(steps.map { $0.id.uuidString }).sorted().joined(separator: ",") }
+        guard let changes = event["changes"] as? [String: Any], !changes.isEmpty else { return nil }
+        let components = Set(changes.keys.map { ["trimStart", "trimEnd"].contains($0) ? "trim" : $0 })
+        return "components:" + components.sorted().joined(separator: ",")
     }
 
     private static func outcome(_ value: [String: Any], status: String, id: String,

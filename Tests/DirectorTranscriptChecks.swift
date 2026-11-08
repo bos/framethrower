@@ -12,7 +12,49 @@ struct DirectorTranscriptChecks {
         try persistedChronologyAndFrozenResults()
         try liveNavigationAndRemoval()
         try olderArchives()
+        try groupedManualAdjustments()
         print("Director transcript checks passed (literal requests, chronological persisted dialogue/results/questions/manual Undo, immutable action descriptions, live mark aliases/removal, legacy archive decoding; no app/model/audio/media).")
+    }
+
+    static func groupedManualAdjustments() throws {
+        let conversation = DirectorConversation()
+        let id = UUID(), otherID = UUID()
+        func event(_ id: UUID, time: Double, scale: Double, name: String = "Edit") {
+            let step = DirectorTranscriptStep(id: id, time: time, label: "Zoom B", detail: "Scale \(scale)", tooltip: "A saved adjustment")
+            conversation.event(["kind": "edit", "actor": "user", "names": [name],
+                "edit_steps": DirectorConversation.object([step]), "changes": ["zoomKeyframes": [scale]]])
+        }
+        event(id, time: 8.73, scale: 2, name: "Move edit")
+        let first = DirectorTranscript.entries(in: conversation, references: EditorReferences()).first!.id
+        event(id, time: 8.13, scale: 2, name: "Move edit")
+        event(id, time: 8.13, scale: 1.9)
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        let raw = try encoder.encode(conversation.exchanges)
+        let messages = try JSONSerialization.data(withJSONObject: conversation.messages(), options: .sortedKeys)
+        let grouped = DirectorTranscript.entries(in: conversation, references: EditorReferences())
+        try require(grouped.count == 1 && grouped[0].id == first && grouped[0].steps[0].detail == "Scale 1.9" &&
+                    grouped[0].earlierAdjustments.count == 2 && grouped[0].earlierAdjustments[0].steps[0].time == 8.73 &&
+                    Set(grouped[0].earlierAdjustments.map(\.id)).count == 2,
+                    "Successive adjustments to one identity keep one stable latest card and distinct expandable earlier results")
+        try require(try encoder.encode(conversation.exchanges) == raw &&
+                    JSONSerialization.data(withJSONObject: conversation.messages(), options: .sortedKeys) == messages,
+                    "Display grouping cannot rewrite the saved conversation or model's actual history")
+        event(otherID, time: 8.13, scale: 1.9)
+        try require(DirectorTranscript.entries(in: conversation, references: EditorReferences()).count == 2,
+                    "Identical captions, times and summaries cannot merge different edit identities")
+        conversation.event(["kind": "undo", "names": ["Edit"]])
+        event(otherID, time: 8.13, scale: 1.8)
+        try require(DirectorTranscript.entries(in: conversation, references: EditorReferences()).count == 4,
+                    "Undo separates successive adjustment groups")
+        let trims = DirectorConversation()
+        trims.event(["kind": "edit", "names": ["Trim"], "changes": ["trimStart": 1]])
+        trims.event(["kind": "edit", "names": ["Trim"], "changes": ["trimEnd": 10]])
+        try require(DirectorTranscript.entries(in: trims, references: EditorReferences()).first?.earlierAdjustments.count == 1,
+                    "Adjacent changes to either trim boundary form one display group")
+        trims.begin("Keep this view.", requestID: UUID())
+        trims.event(["kind": "edit", "names": ["Trim"], "changes": ["trimEnd": 9]])
+        try require(DirectorTranscript.entries(in: trims, references: EditorReferences()).count == 3,
+                    "A conversational instruction separates adjustment groups")
     }
 
     static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {

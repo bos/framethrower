@@ -133,7 +133,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             invalidateIntrinsicContentSize()
             needsDisplay = true; updateTooltips()
             setAccessibilityHelp(showsAnimationLanes
-                ? "Screen, Camera and Pointer use one source-time axis. Drag a span to move it; selected edge handles resize it and inner dots change its ramps. Option-drag pushes same-lane neighbors. Delete removes the selected animation. Escape cancels a preview. Pinch to reveal fine controls."
+                ? "Screen, Camera and Pointer use one source-time axis. Drag a span to move it; selected edge handles resize it and tall bars change its ramps. Option-drag pushes same-lane neighbors. Delete removes the selected animation. Escape cancels a preview. Pinch to reveal fine controls."
                 : "Drag the playhead to scrub or the blue handles to trim. Click an edit to select it, or drag to move its time. Pinch to separate nearby edits; scroll to navigate time.")
         }
     }
@@ -284,7 +284,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         tooltipText.removeAll()
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
-        tooltipText[base] = showsAnimationLanes ? "Drag spans to move; selected edges resize and dots adjust ramps. Option-drag pushes neighbors. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        tooltipText[base] = showsAnimationLanes ? "Drag spans to move; selected edges resize and tall bars adjust ramps. Option-drag pushes neighbors. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
         for band in conflictBands() {
             let side = band.span.side == .existing ? "Existing" : "Proposed"
             tooltipText[addToolTip(band.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] =
@@ -348,9 +348,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let cursorX = x(for: current)
         if markerIsVisible(current) {
         NSColor.labelColor.setStroke()
-        let line = NSBezierPath()
-        line.move(to: CGPoint(x: cursorX, y: 8))
-        line.line(to: CGPoint(x: cursorX, y: 34))
+        let line = playheadLine()
         line.lineWidth = 1
         line.stroke()
         let thumb = NSBezierPath()
@@ -366,6 +364,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         if showsAnimationLanes {
             drawAnimationLanes()
             drawTimeTicks()
+            // The time indicator stays visible over every span without adding
+            // a hit target or changing any lane interaction.
+            NSColor.labelColor.setStroke()
+            let line = playheadLine(); line.lineWidth = 1; line.stroke()
             return
         }
         // Edits have their own lane, so the white playhead and trim handles
@@ -445,14 +447,20 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let editable = animation.id == selected && animation.editable
             let labelX = width >= textWidth + 8 ? body.minX + 4 : body.maxX + (editable ? 18 : 4)
             let label = CGRect(x: min(max(railOrigin, labelX), max(railOrigin, bounds.width - 12 - textWidth)),
-                y: body.minY + 2, width: textWidth, height: 13)
+                y: body.minY + 5, width: textWidth, height: 11)
             let timing = editable && !animation.isReference
             let wide = width >= 80 && !animation.isInstant
-            let start = timing ? CGRect(x: left - 4, y: lane.frame.minY + (wide ? 8 : 0), width: 8, height: wide ? 10 : 8) : nil
-            let end = timing && !animation.isInstant ? CGRect(x: right - 4, y: lane.frame.minY + (wide ? 8 : 18), width: 8, height: wide ? 10 : 8) : nil
-            let easeIn = timing && wide ? CGRect(x: x(for: animation.start + animation.easeIn) - 3.5, y: lane.frame.minY, width: 7, height: 7) : nil
-            let easeOut = timing && wide ? CGRect(x: x(for: animation.end - animation.easeOut) - 3.5, y: lane.frame.minY + 19, width: 7, height: 7) : nil
-            let deletion = editable ? CGRect(x: min(body.maxX + 4, bounds.width - 24), y: lane.frame.minY + 9, width: 10, height: 10) : nil
+            let start = timing ? CGRect(x: left - 4, y: lane.frame.minY + (wide ? 15 : 0), width: 8, height: wide ? 10 : 8) : nil
+            let end = timing && !animation.isInstant ? CGRect(x: right - 4, y: lane.frame.minY + (wide ? 15 : 18), width: 8, height: wide ? 10 : 8) : nil
+            var incomingX = x(for: animation.start + animation.easeIn)
+            var outgoingX = x(for: animation.end - animation.easeOut)
+            if outgoingX - incomingX < 14 {
+                let middle = (incomingX + outgoingX) / 2
+                incomingX = middle - 7; outgoingX = middle + 7
+            }
+            let easeIn = timing && wide ? CGRect(x: incomingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
+            let easeOut = timing && wide ? CGRect(x: outgoingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
+            let deletion = editable ? CGRect(x: min(body.maxX + 4, bounds.width - 24), y: lane.frame.minY + 14, width: 10, height: 10) : nil
             return AnimationGeometry(animation: animation, body: body, labelFrame: label, startHandle: start,
                 endHandle: end, easeInHandle: easeIn, easeOutHandle: easeOut, deleteButton: deletion)
         }
@@ -497,6 +505,16 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .pointer: .secondaryLabelColor }
     }
 
+    func playheadLine() -> NSBezierPath {
+        let path = NSBezierPath()
+        let time = scrubTime ?? playhead
+        guard markerIsVisible(time) else { return path }
+        let position = x(for: time)
+        path.move(to: CGPoint(x: position, y: 8))
+        path.line(to: CGPoint(x: position, y: showsAnimationLanes ? animationLanes().last?.frame.maxY ?? 126 : 34))
+        return path
+    }
+
     /// Use source coordinates before viewport clipping so a partially visible
     /// movement retains its actual ramp shape when the timeline is magnified.
     func animationEnvelope(for item: AnimationGeometry) -> NSBezierPath {
@@ -504,10 +522,24 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard !animation.isInstant, !animation.isReference, animation.lane != .pointer else {
             return NSBezierPath(roundedRect: item.body, xRadius: 2, yRadius: 2)
         }
+        let span = animation.duration
+        let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: animation.easeIn, easeOut: animation.easeOut)
+        var samples = [0.0, span, ramps.easeIn, span - ramps.easeOut, span / 2]
+        for (start, length) in [(0.0, ramps.easeIn), (span - ramps.easeOut, ramps.easeOut)] where length > 0 {
+            for index in 0...16 { samples.append(start + length * Double(index) / 16) }
+        }
+        // Explicit zero ramps are vertical velocity changes. Include the
+        // interior limiting values rather than drawing a false gradual ramp.
+        if ramps.easeIn == 0 { samples.append(0.0.nextUp) }
+        if ramps.easeOut == 0 { samples.append(span.nextDown) }
         let envelope = NSBezierPath()
         envelope.move(to: CGPoint(x: x(for: animation.start), y: item.body.maxY))
-        envelope.line(to: CGPoint(x: x(for: animation.start + animation.easeIn), y: item.body.minY + 3))
-        envelope.line(to: CGPoint(x: x(for: animation.end - animation.easeOut), y: item.body.minY + 3))
+        for elapsed in Set(samples).sorted() {
+            let speed = MotionInterpolation.normalizedSpeed(at: elapsed, duration: span,
+                easeIn: animation.easeIn, easeOut: animation.easeOut)
+            envelope.line(to: CGPoint(x: x(for: animation.start + elapsed),
+                y: item.body.maxY - CGFloat(speed) * (item.body.height - 3)))
+        }
         envelope.line(to: CGPoint(x: x(for: animation.end), y: item.body.maxY))
         envelope.close()
         return envelope
@@ -545,10 +577,6 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 let grip = CGRect(x: handle.midX - 1.5, y: handle.midY - 4, width: 3, height: 8)
                 NSBezierPath(roundedRect: grip, xRadius: 1.5, yRadius: 1.5).fill()
             }
-            for handle in [item.easeInHandle, item.easeOutHandle].compactMap({ $0 }) {
-                let dot = handle.insetBy(dx: 1, dy: 1)
-                color.setFill(); NSBezierPath(ovalIn: dot).fill()
-            }
             if let button = item.deleteButton {
                 NSColor.secondaryLabelColor.setStroke()
                 let cross = NSBezierPath(); cross.lineWidth = 1.5
@@ -565,6 +593,25 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             outline.setLineDash([3, 2], count: 2, phase: 0); outline.lineWidth = 2; outline.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
+        // Ramp grips intentionally extend above their lane. Paint them after
+        // clipping the bodies, preserving the full enlarged hit regions.
+        for item in animationGeometry() {
+            let color = animationColor(item.animation.lane)
+            let grips: [(CGRect?, Double)] = [(item.easeInHandle, item.animation.start + item.animation.easeIn),
+                (item.easeOutHandle, item.animation.end - item.animation.easeOut)]
+            for (frame, time) in grips {
+                guard let frame else { continue }
+                let sourceX = x(for: time)
+                if abs(frame.midX - sourceX) > 0.5 {
+                    color.withAlphaComponent(0.7).setStroke()
+                    let leader = NSBezierPath()
+                    leader.move(to: CGPoint(x: frame.midX, y: frame.minY + 8))
+                    leader.line(to: CGPoint(x: sourceX, y: frame.maxY)); leader.lineWidth = 1; leader.stroke()
+                }
+                color.setFill()
+                NSBezierPath(roundedRect: CGRect(x: frame.midX - 1.75, y: frame.minY, width: 3.5, height: frame.height), xRadius: 1.5, yRadius: 1.5).fill()
+            }
+        }
         for crowd in animationCrowds() {
             NSColor.secondaryLabelColor.setStroke()
             let leader = NSBezierPath()
@@ -1162,7 +1209,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         needsDisplay = true
         window?.makeFirstResponder(self)
         onInteractionBegan?()
-        if showsAnimationLanes, point.y >= 38 {
+        let rampHit = showsAnimationLanes && animationGeometry().contains {
+            $0.easeInHandle?.contains(point) == true || $0.easeOutHandle?.contains(point) == true
+        }
+        if showsAnimationLanes, point.y >= 38 || rampHit {
             beginAnimationInteraction(at: point)
             return
         }

@@ -101,6 +101,33 @@ struct TimelineAnimationInteractionChecks {
         require(view.accessibilityCustomActions()?.contains { $0.name.contains("Camera A") } == true, "lane animations lost accessible selection")
         require(geometry(pointer.id).deleteButton == nil && geometry(pointer.id).startHandle == nil, "global pointer settings invented editable keyframes")
 
+        // Actual acceleration is cos²; braking uses (1-u²)². Their midpoint
+        // speeds differ (.5 versus .5625), unlike the old linear trapezoid.
+        var profile = span(.screen, 1, 5, "True speed")
+        profile.easeIn = 1; profile.easeOut = 1
+        reset([profile], selected: profile.id)
+        let shape = geometry(profile.id)
+        let trueEnvelope = view.animationEnvelope(for: shape)
+        func profilePoint(_ time: Double, _ speed: Double, _ item: RecordingTimelineView.AnimationGeometry) -> CGPoint {
+            CGPoint(x: view.x(for: time), y: item.body.maxY - CGFloat(speed) * (item.body.height - 3))
+        }
+        require(!trueEnvelope.contains(profilePoint(1.5, 0.53, shape)) && trueEnvelope.contains(profilePoint(4.5, 0.53, shape)), "timeline speed graph incorrectly uses symmetric acceleration/braking")
+        require(!trueEnvelope.contains(profilePoint(1.25, 0.2, shape)) && trueEnvelope.contains(profilePoint(1.25, 0.1, shape)) &&
+                !trueEnvelope.contains(profilePoint(4.75, 0.2, shape)) && trueEnvelope.contains(profilePoint(4.75, 0.1, shape)), "timeline graph does not sample the true curved acceleration/braking tails")
+        require(trueEnvelope.contains(profilePoint(3, 0.9, shape)) && !trueEnvelope.contains(CGPoint(x: view.x(for: 3), y: shape.body.minY + 1)), "true graph lost its plateau or filled above its speed curve")
+        view.playhead = 3
+        require(view.playheadLine().elementCount == 2 && view.playheadLine().bounds.minY == 8 && view.playheadLine().bounds.maxY == 126 && near(view.playheadLine().bounds.minX, view.x(for: 3)), "playhead indicator did not extend through all three lanes on the common source clock")
+        let graphZoom = AnimationPinchEvent(); graphZoom.amount = 50
+        graphZoom.position = view.convert(CGPoint(x: view.x(for: 4.5), y: 52), to: nil)
+        view.magnify(with: graphZoom); view.playhead = 4.5
+        let clipped = geometry(profile.id), clippedEnvelope = view.animationEnvelope(for: clipped)
+        require(clippedEnvelope.bounds.minX < 64 && clippedEnvelope.bounds.maxX > 888 && !clippedEnvelope.contains(profilePoint(4.5, 0.6, clipped)) && clippedEnvelope.contains(profilePoint(4.5, 0.53, clipped)), "magnified viewport rebuilt a false local ramp instead of clipping the source profile")
+        require(near(view.playheadLine().bounds.minX, view.x(for: 4.5)) && view.playheadLine().bounds.maxY == 126 && seeks.isEmpty, "pinching detached the full-height playhead from its source-time coordinate")
+        var flat = profile; flat.easeIn = 0; flat.easeOut = 0
+        reset([flat], selected: flat.id)
+        let flatGeometry = geometry(flat.id), flatEnvelope = view.animationEnvelope(for: flatGeometry)
+        require(flatEnvelope.contains(profilePoint(1.001, 0.9, flatGeometry)) && flatEnvelope.contains(profilePoint(4.999, 0.9, flatGeometry)), "explicit zero ramps were drawn as a false gradual envelope")
+
         // A click selects; a body drag never seeks or invokes click selection.
         reset([screen, camera, pointer])
         let body = center(geometry(screen.id).body)
@@ -172,6 +199,29 @@ struct TimelineAnimationInteractionChecks {
             down(start); drag(CGPoint(x: start.x + view.x(for: delta + 1) - view.x(for: 1), y: start.y))
             require(requests.last?.0.handle == handle && requests.last?.1 == false, "selected timing/ramp handle did not retain its explicit operation")
             key(53)
+        }
+        var meeting = span(.screen, 2, 6, "Meeting ramps")
+        meeting.easeIn = 2; meeting.easeOut = 2
+        for handle in [TimelineAnimationHandle.easeIn, .easeOut] {
+            reset([meeting], selected: meeting.id)
+            let item = geometry(meeting.id), incoming = item.easeInHandle!, outgoing = item.easeOutHandle!
+            require(!incoming.intersects(outgoing) && incoming.width == 12 && outgoing.width == 12 && incoming.height == 16 && incoming.minY == 36 && !incoming.intersects(item.labelFrame) && !outgoing.intersects(item.labelFrame) && !incoming.intersects(item.startHandle!), "coincident ramp grips stacked, hid labels, or overlapped timing grips")
+            let frame = handle == .easeIn ? incoming : outgoing
+            // Grab the newly visible extension ABOVE the Screen lane.
+            let start = CGPoint(x: frame.midX, y: frame.minY + 1)
+            let delta = handle == .easeIn ? -0.25 : 0.25
+            down(start); drag(CGPoint(x: start.x + view.x(for: 2 + delta) - view.x(for: 2), y: start.y))
+            let projected = geometry(meeting.id).animation
+            require(requests.last?.0.handle == handle && near(requests.last?.0.deltaSeconds ?? .nan, delta) &&
+                    near(handle == .easeIn ? projected.easeIn : projected.easeOut, 1.75) && seeks.isEmpty,
+                    "separated coincident ramp bars were not independently grabbable or introduced a source-time offset")
+            key(53)
+        }
+        for ramps in [(0.0, 4.0), (4.0, 0.0)] {
+            var edgeMeeting = meeting; edgeMeeting.easeIn = ramps.0; edgeMeeting.easeOut = ramps.1
+            reset([edgeMeeting], selected: edgeMeeting.id)
+            let item = geometry(edgeMeeting.id)
+            require(!item.easeInHandle!.intersects(item.easeOutHandle!) && !item.easeInHandle!.intersects(item.deleteButton!) && !item.easeOutHandle!.intersects(item.deleteButton!) && !item.easeInHandle!.intersects(item.labelFrame) && !item.easeOutHandle!.intersects(item.labelFrame), "all-ramp boundary grips overlapped each other, the label, or Delete")
         }
         let jump = span(.screen, 6, 6, "Zoom E")
         reset([jump], selected: jump.id)
@@ -280,7 +330,7 @@ struct TimelineAnimationInteractionChecks {
         gesture(trim, trimmed)
         require(trims.count == 1 && abs(trims[0].0 - 0.5) < 0.000_001, "gutter mode changed trim source-clock geometry")
         view.showsAnimationLanes = false
-        require(view.intrinsicContentSize.height == 72 && view.x(for: 0) == 12 && !view.markerGroups().isEmpty, "legacy marker mode changed when animation lanes were disabled")
+        require(view.intrinsicContentSize.height == 72 && view.x(for: 0) == 12 && !view.markerGroups().isEmpty && view.playheadLine().bounds.maxY == 34, "legacy marker mode changed when animation lanes were disabled")
         print("Timeline animation interaction checks passed (three persistent vector lanes, frozen typed identities, click/drag separation, resize/ramps/jump, Option push/contact, collision feedback, chooser/delete/cancel, Director bands and source-clock viewport; no media or bitmap rendering).")
     }
 }

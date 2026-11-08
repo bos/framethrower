@@ -74,6 +74,7 @@ struct EditorReferences: Codable, Equatable, Sendable {
     func edit(in state: EditState, id: UUID, includeCamera: Bool = true) -> TimedEdit? {
         let active = state.timedEdits(includeCamera: includeCamera)
         if let direct = active.first(where: { $0.id == id }) { return direct }
+        if let component = active.first(where: { $0.zoomID == id || $0.cameraID == id || $0.anchorID == id }) { return component }
         guard let number = edits[id.uuidString] else { return nil }
         let matches = active.filter { edits[$0.id.uuidString] == number }
         return matches.count == 1 ? matches[0] : nil

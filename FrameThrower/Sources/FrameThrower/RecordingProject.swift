@@ -951,15 +951,25 @@ final class ProjectEditor: ObservableObject {
     /// Finger movements and controls at one source time refine a shared draft.
     /// Original media, the saved project, and its history remain untouched.
     @discardableResult
-    func updateDraft(_ state: EditState, at time: Double) -> Bool {
+    func updateDraft(_ state: EditState, at time: Double, editAliases: [UUID: UUID] = [:]) -> Bool {
         guard time.isFinite, (0...project.duration).contains(time) else {
             errorMessage = "The edit time must be inside the recording."
             return false
         }
         if let draftTime, draftTime != time, !finishDraft() { return false }
+        var nextReferences = references
         do {
+            for (replacement, original) in editAliases {
+                guard let number = references.edits[original.uuidString],
+                      nextReferences.edits[replacement.uuidString] == nil || nextReferences.edits[replacement.uuidString] == number else {
+                    throw ProjectError.invalid("The edit reference could not be preserved.")
+                }
+                nextReferences.edits[replacement.uuidString] = number
+            }
+            nextReferences.register(state: state, includeCamera: project.cameraFilename != nil)
             var candidate = project
             candidate.state = state
+            candidate.references = nextReferences
             try candidate.validate()
         } catch {
             errorMessage = error.localizedDescription
@@ -971,7 +981,7 @@ final class ProjectEditor: ObservableObject {
             return true
         }
         draftTime = time
-        references.register(state: state, includeCamera: project.cameraFilename != nil)
+        references = nextReferences
         draftState = state
         errorMessage = protectedRecoveryNotice
         scheduleRecovery()

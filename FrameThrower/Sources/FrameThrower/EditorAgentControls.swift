@@ -395,9 +395,10 @@ enum EditorAgentControls {
         guard focused.count == 1 else { return tool }
         if let label = intent.targetLabel,
            let edit = EditorActionDescription.resolve(label, in: context.recording.state, references: context.recording.references),
-           let canonical = context.recording.references.editLabel(for: edit.id),
            var fields = focused[0]["properties"] as? [String: Any],
            var target = fields["edit_label"] as? [String: Any] {
+            let canonical = EditorActionDescription.unambiguousLabel(for: edit, in: context.recording.state,
+                references: context.recording.references)
             target["enum"] = [canonical]
             fields["edit_label"] = target
             focused[0]["properties"] = fields

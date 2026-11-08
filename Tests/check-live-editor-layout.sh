@@ -16,14 +16,14 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorPlayback.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorSimulationClock.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCanvas.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorTestPattern.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PIPGeometryViews.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/TimelineAnimation.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/CursorZoomSuggestions.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTitleEditor.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorDraftLifecycle.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/PresentationControls.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/VideoExportUI.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/MissingMediaRecovery.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAnimationEditing.swift" \
   "$repo_dir/Tests/EditorMovieFixtures.swift" \
   "$repo_dir/Tests/LiveEditorLayoutChecks.swift" \
   -o "$check_dir/check-live-editor-layout"

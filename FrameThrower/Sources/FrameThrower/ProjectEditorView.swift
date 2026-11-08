@@ -18,6 +18,8 @@ struct ProjectEditorView: View {
     @State private var audioGestureTime: Double?
     @State private var timelineFitRequest: UUID?
     @State private var movingEditState: EditState?
+    @State private var selectedAnimationID: TimelineAnimationID?
+    @State private var animationGesture: AnimationGestureSnapshot?
     @State private var zoomEaseIn: Double?
     @State private var zoomEaseOut: Double?
     @State private var cameraEaseIn: Double?
@@ -50,6 +52,21 @@ struct ProjectEditorView: View {
     private var zoom: ZoomPlacement { state.zoom(at: previewTime) }
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
     private var frameDuration: Double { playback.frameDuration }
+    private struct AnimationGestureSnapshot {
+        let id: TimelineAnimationID
+        let state: EditState
+        let spans: [TimelineAnimation]
+        let replacements: [TimelineAnimationID: UUID]
+        let playhead: Double
+        let selection: UUID?
+        let animationSelection: TimelineAnimationID?
+        let name: String
+    }
+    private var timelineAnimations: [TimelineAnimation] {
+        EditorAnimationEditing.animations(in: state, references: editor.references, duration: editor.project.duration,
+            includeCamera: editor.project.cameraFilename != nil)
+            .filter { $0.lane != .pointer || editor.project.cursorFilename != nil }
+    }
 
     init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false,
          playback: EditorPlayback? = nil,
@@ -94,6 +111,7 @@ struct ProjectEditorView: View {
         .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame() } }
         .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: editor.project.state) { old, next in
+            animationGesture = nil
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
             if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
             var oldVisual = old; oldVisual.regions = []
@@ -111,6 +129,7 @@ struct ProjectEditorView: View {
                 // leaves comparison mode before showing that edit's pixels.
                 leaveConflictForManualEdit()
                 playback.preview(next)
+                if animationGesture == nil { synchronizeAnimationSelection() }
             }
             else if let old, old != editor.project.state { playback.cancelPreview() }
         }
@@ -119,7 +138,9 @@ struct ProjectEditorView: View {
             selectedEditID = edits.first(where: { abs($0.time - time) < 0.000001 })?.id
             playback.pause()
             playback.seek(time)
+            synchronizeAnimationSelection()
         }
+        .onChange(of: selectedInspector) { _, _ in if animationGesture == nil { synchronizeAnimationSelection() } }
         .onAppear { assistant.attach(to: editor) }
         .onDisappear { assistant.suspend(); exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
@@ -307,7 +328,8 @@ struct ProjectEditorView: View {
 
     private func cancelEditorInteraction() {
         if conflictReview != nil { assistant.cancel(); return }
-        if movingEditState != nil { cancelMove() }
+        if animationGesture != nil { cancelAnimationGesture() }
+        else if movingEditState != nil { cancelMove() }
         else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
         else if selectedRegionID != nil { selectedRegionID = nil }
         else if directorMode { directorMode = false }
@@ -336,7 +358,7 @@ struct ProjectEditorView: View {
         VStack(spacing: 8) {
             HStack(spacing: 12) {
                 Button { togglePlayback() } label: {
-                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22)
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22, height: 18)
                 }
                 .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
                 .keyboardShortcut(.space, modifiers: [])
@@ -353,41 +375,49 @@ struct ProjectEditorView: View {
                 .frame(width: 170)
                 .accessibilityLabel("Playback speed")
                 .help("Preview playback speed. Exported video keeps its original timing.")
-                RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
-                    trimEnd: state.trimEnd, playhead: playback.time,
-                    onInteractionBegan: { playback.pause() },
-                    onSeek: { if editor.draftState == nil { playback.scrub(to: $0) } },
-                    onScrubBegan: {
-                        guard editor.finishDraft() else { return }
-                        selectedEditID = nil
-                        playback.beginScrubbing()
-                    },
-                    onScrubEnded: { playback.endScrubbing() },
-                    onTrim: { start, end in setTrim(start, end) },
-                    onTrimPlayhead: { position in selectedEditID = nil; playback.seek(position) },
-                    edits: edits.map { timelineMarker($0) },
-                    selectedEditID: selectedEditID,
-                    onSelectEdit: { selectEdit($0) },
-                    frameDuration: frameDuration,
-                    onMoveEdit: { id, time, final in moveEdit(id, to: time, final: final) },
-                    onCancelMoveEdit: { cancelMove() },
-                    onDeselectEdit: { deselectEdit() },
-                    onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest,
-                    conflictSpans: (conflictReview?.existingSpans ?? []) + (conflictReview?.proposedSpans ?? []),
-                    conflictOverlaps: conflictReview?.overlapIntervals ?? [])
-                    .frame(height: 72)
-                    .contextMenu {
-                        Button("Hold current framing") { holdCurrentFraming() }
-                            .help("Keep this view still until the playhead before a later smooth movement.")
-                        Divider()
-                        Button("Fit Timeline") { timelineFitRequest = UUID() }
-                        Button("Reset trim") { setTrim(0, editor.project.duration) }
-                            .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
-                    }
+                Spacer(minLength: 0)
                 Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
                     .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
-            }
-            editList
+            }.frame(height: 24)
+            RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, playhead: playback.time,
+                onInteractionBegan: { playback.pause() },
+                onSeek: { if editor.draftState == nil { playback.scrub(to: $0) } },
+                onScrubBegan: {
+                    guard editor.finishDraft() else { return }
+                    selectedEditID = nil
+                    selectedAnimationID = nil
+                    playback.beginScrubbing()
+                },
+                onScrubEnded: { playback.endScrubbing() },
+                onTrim: { start, end in setTrim(start, end) },
+                onTrimPlayhead: { position in selectedEditID = nil; selectedAnimationID = nil; playback.seek(position) },
+                edits: edits.map { timelineMarker($0) },
+                selectedEditID: selectedEditID,
+                onSelectEdit: { selectEdit($0) },
+                frameDuration: frameDuration,
+                onMoveEdit: { id, time, final in moveEdit(id, to: time, final: final) },
+                onCancelMoveEdit: { cancelMove() },
+                onDeselectEdit: { deselectEdit() },
+                onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest,
+                conflictSpans: (conflictReview?.existingSpans ?? []) + (conflictReview?.proposedSpans ?? []),
+                conflictOverlaps: conflictReview?.overlapIntervals ?? [],
+                showsAnimationLanes: true,
+                pointerClickTimes: playback.cursorRecording?.clicks.map(\.time) ?? [],
+                animations: timelineAnimations, selectedAnimationID: selectedAnimationID,
+                onSelectAnimation: { selectAnimation($0) },
+                onAnimationEdit: { editAnimation($0, final: $1) },
+                onAnimationCancel: { cancelAnimationGesture() },
+                onDeleteAnimation: { deleteAnimation($0) })
+                .frame(height: RecordingTimeline.animationLaneHeight)
+                .contextMenu {
+                    Button("Hold current framing") { holdCurrentFraming() }
+                        .help("Keep this view still until the playhead before a later smooth movement.")
+                    Divider()
+                    Button("Fit Timeline") { timelineFitRequest = UUID() }
+                    Button("Reset trim") { setTrim(0, editor.project.duration) }
+                        .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
+                }
         }
     }
 
@@ -569,42 +599,11 @@ struct ProjectEditorView: View {
         }
     }
 
-    private var editList: some View {
-        ScrollViewReader { reader in
-            ScrollView(.horizontal) {
-                HStack(spacing: 8) {
-                    ForEach(edits) { edit in
-                        HStack(spacing: 6) {
-                            Button { selectEdit(edit.id) } label: {
-                                Label(editTitle(edit), systemImage: "diamond.fill")
-                            }
-                            .buttonStyle(.plain)
-                            .help(actionDescription(edit).tooltip + " Click to select; drag its timeline diamond to move it.")
-                            Button { removeEdit(edit) } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)).frame(width: 20, height: 20) }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Remove \(editLabel(edit))")
-                                .help("Remove this edit's view and camera changes. Undo restores them.")
-                        }
-                        .font(.caption).padding(.leading, 10).padding(.trailing, 4).frame(height: 28)
-                        .foregroundStyle(selectedEditID == edit.id ? Color.primary : Color.secondary)
-                        .background(selectedEditID == edit.id ? Color.purple.opacity(0.25) : Color.primary.opacity(0.04), in: Capsule())
-                        .overlay(Capsule().strokeBorder(selectedEditID == edit.id ? Color.purple : Color.clear, lineWidth: 2))
-                        .id(edit.id)
-                    }
-                }
-            }
-            .onChange(of: selectedEditID) { _, id in if let id { reader.scrollTo(id, anchor: .center) } }
-        }
-        .frame(height: 34)
-    }
-
     private func actionDescription(_ edit: TimedEdit) -> EditorActionDescription {
         EditorActionDescription.describe(edit, in: state, references: editor.references)
     }
 
     private func editLabel(_ edit: TimedEdit) -> String { actionDescription(edit).shortLabel }
-
-    private func editTitle(_ edit: TimedEdit) -> String { editLabel(edit) }
 
     private func timelineMarker(_ edit: TimedEdit) -> RecordingTimelineMarker {
         let view = state.zoomKeyframes.first { $0.id == edit.zoomID }
@@ -633,12 +632,91 @@ struct ProjectEditorView: View {
         else if edit.cameraID == nil { selectedInspector = .zoom }
         playback.pause()
         playback.seek(edit.time)
+        synchronizeAnimationSelection()
+    }
+
+    private func synchronizeAnimationSelection() {
+        if selectedInspector == .pointer {
+            selectedAnimationID = timelineAnimations.first(where: { $0.lane == .pointer })?.id
+        } else if let edit = selectedEdit {
+            let lane: TimelineAnimationLane = selectedInspector == .camera ? .camera : .screen
+            selectedAnimationID = timelineAnimations.first(where: { $0.editID == edit.id && $0.lane == lane })?.id
+        } else { selectedAnimationID = nil }
     }
 
     private func deselectEdit() {
         playback.pause()
         guard editor.finishDraft() else { return }
         selectedEditID = nil
+        selectedAnimationID = nil
+    }
+
+    private func selectAnimation(_ id: TimelineAnimationID) {
+        playback.pause()
+        if selectedAnimationID == id { return }
+        guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id }) else { return }
+        selectedAnimationID = id
+        if id.lane == .pointer { selectedInspector = .pointer; selectedEditID = nil; return }
+        selectedEditID = edits.first(where: { edit in
+            span.isReference ? edit.anchorID == id.componentID : id.lane == .screen ? edit.zoomID == id.componentID : edit.cameraID == id.componentID
+        })?.id
+        selectedInspector = id.lane == .camera ? .camera : .zoom
+        playback.seek(span.end)
+    }
+
+    private func editAnimation(_ request: AnimationDrag, final: Bool) {
+        if animationGesture == nil {
+            assistant.cancel(); playback.pause()
+            guard editor.finishDraft() else { return }
+            let spans = timelineAnimations
+            guard spans.contains(where: { $0.id == request.id && $0.editable }) else { return }
+            let verb: String = switch request.handle { case .move: "Move"; case .start, .end: "Resize"; case .easeIn, .easeOut: "Adjust ramps for" }
+            animationGesture = AnimationGestureSnapshot(id: request.id, state: editor.project.state, spans: spans,
+                replacements: EditorAnimationEditing.replacementIDs(for: spans), playhead: playback.time,
+                selection: selectedEditID, animationSelection: selectedAnimationID,
+                name: "\(verb) \(request.id.lane.rawValue) animation")
+        }
+        guard let gesture = animationGesture, gesture.id == request.id,
+              let original = gesture.spans.first(where: { $0.id == request.id }),
+              let changes = TimelineAnimationSolver.solve(request, animations: gesture.spans, duration: editor.project.duration),
+              let edit = EditorAnimationEditing.applying(changes, to: gesture.state, duration: editor.project.duration,
+                replacementIDs: gesture.replacements) else { return }
+        let aliases = Dictionary(uniqueKeysWithValues: edit.aliases.map { ($0.replacementID, $0.originalID) })
+        // Every sample uses the same draft time. A moving endpoint must not
+        // turn individual pointer samples into separate Undo entries.
+        guard editor.updateDraft(edit.state, at: original.end, editAliases: aliases) else { return }
+        let component = edit.aliases.first(where: { $0.lane == request.id.lane && $0.originalID == request.id.componentID })?.replacementID ?? request.id.componentID
+        selectedEditID = edits.first(where: { value in
+            original.isReference ? value.anchorID == component : request.id.lane == .screen ? value.zoomID == component : value.cameraID == component
+        })?.id
+        selectedInspector = request.id.lane == .camera ? .camera : .zoom
+        selectedAnimationID = request.id
+        let current = changes.first(where: { $0.id == request.id }) ?? original
+        playback.seek(request.handle == .start ? current.start : current.end)
+        if final {
+            guard editor.finishDraft(name: gesture.name) else { return }
+            selectedAnimationID = TimelineAnimationID(lane: request.id.lane, componentID: component)
+            animationGesture = nil
+        }
+    }
+
+    private func cancelAnimationGesture() {
+        guard let gesture = animationGesture else { return }
+        guard editor.draftState == nil || editor.cancelDraft() else { return }
+        animationGesture = nil
+        selectedEditID = gesture.selection
+        selectedAnimationID = gesture.animationSelection
+        playback.cancelPreview(); playback.seek(gesture.playhead)
+    }
+
+    private func deleteAnimation(_ id: TimelineAnimationID) {
+        playback.pause(); assistant.cancel()
+        guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id && $0.editable }) else { return }
+        var next = state
+        if span.isReference { next.editAnchors.removeAll { $0.id == id.componentID } }
+        else if id.lane == .screen { next.zoomKeyframes.removeAll { $0.id == id.componentID } }
+        else if id.lane == .camera { next.pipKeyframes.removeAll { $0.id == id.componentID && $0.time > 0 } }
+        if editor.commit(next, name: "Remove \(id.lane.rawValue) animation") { selectedAnimationID = nil; selectedEditID = nil }
     }
 
     private func holdCurrentFraming() {

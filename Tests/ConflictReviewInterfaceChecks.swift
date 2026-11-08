@@ -1,6 +1,11 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+private final class OffscreenConflictWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
 /// Production session, views, and metadata. Every media access remains blocked;
 /// nonexistent source filenames and empty native layers are intentional.
 @main @MainActor
@@ -17,7 +22,9 @@ struct ConflictReviewInterfaceChecks {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
-        project.state.zoomKeyframes = [ZoomKeyframe(time: 1, scale: 2, transition: .smooth, duration: 1)]
+        project.state.zoomKeyframes = [ZoomKeyframe(time: 1, scale: 2, transition: .smooth, duration: 1),
+            ZoomKeyframe(time: 6, scale: 2.5, transition: .smooth, duration: 1),
+            ZoomKeyframe(time: 9, scale: 1, transition: .smooth, duration: 1)]
         project.state.pipKeyframes.append(PIPKeyframe(time: 2,
             placement: PIPPlacement(x: 0.15, y: 0.2, scale: 0.38), transition: .smooth, duration: 2))
         let box1 = EditorRegion(time: 0, rect: .init(x: 0.1, y: 0.1, width: 0.25, height: 0.3))
@@ -44,7 +51,7 @@ struct ConflictReviewInterfaceChecks {
         let playback = EditorPlayback()
         let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: false,
             playback: playback, assistant: session))
-        let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 1200, height: 850),
+        let window = OffscreenConflictWindow(contentRect: CGRect(x: -10000, y: -10000, width: 1200, height: 850),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
         defer { session.suspend(); window.close() }
@@ -76,7 +83,7 @@ struct ConflictReviewInterfaceChecks {
                     "The real editor playhead animates actual screen and PIP interpolation against the static vector chart")
         try require(canvas.frame == playingCanvasFrame && timeline.frame == playingTimelineFrame &&
                     !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer && editor.project == original && !editor.canUndo,
-                    "Visual playthrough preserves window layout and edit history while every AV object stays absent")
+                    "Visual playthrough preserves window layout and edit history while every AV object stays absent (canvas \(playingCanvasFrame)→\(canvas.frame), timeline \(playingTimelineFrame)→\(timeline.frame), AVplayer=\(playback.hasMediaPlayer), AVlayer=\(canvas.hasMediaPlayerLayer), projectEqual=\(editor.project == original), canUndo=\(editor.canUndo), window \(originalWindowFrame)→\(window.frame))")
         playback.pause(); playback.seek(0)
         try await settle(host)
         session.instruction = "Pan from Box 1 to Box 2 over the next three seconds."
@@ -91,9 +98,19 @@ struct ConflictReviewInterfaceChecks {
         try require(timeline.conflictSpans == review.existingSpans + review.proposedSpans &&
                     abs(timeline.playhead - review.inspectionTime) < 0.000001,
                     "The same conflict is visible on the timeline at a differing inspection frame")
-        try require(window.frame == originalWindowFrame && timeline.frame.height == 72 &&
+        try require(window.frame == originalWindowFrame && timeline.showsAnimationLanes &&
+                    timeline.frame.height == timeline.intrinsicContentSize.height && timeline.frame.height == RecordingTimeline.animationLaneHeight &&
                     all(NSTextField.self, in: host).contains { $0.placeholderString == "Your answer…" },
                     "A conflict automatically reveals its question without resizing the window or timeline")
+        let lanes = timeline.animationLanes()
+        try require(Set(lanes.map(\.lane)) == [.screen, .camera, .pointer],
+                    "All three persistent animation lanes remain visible during Director review")
+        let screenLane = lanes.first { $0.lane == .screen }!.frame
+        let cameraLane = lanes.first { $0.lane == .camera }!.frame
+        let pointerLane = lanes.first { $0.lane == .pointer }!.frame
+        try require(!timeline.conflictBands().isEmpty && timeline.conflictBands().allSatisfy {
+            screenLane.contains($0.frame) && !cameraLane.intersects($0.frame) && !pointerLane.intersects($0.frame)
+        }, "Director framing conflicts must appear only in the affected Screen lane")
         // Opening the native inspector animates its column. Measure the
         // comparison after that reveal, then verify later scrubs stay fixed.
         try await Task.sleep(for: .milliseconds(400))
@@ -176,7 +193,83 @@ struct ConflictReviewInterfaceChecks {
         try await settle(host)
         try require(abs(playback.time - 6) < 0.000001 && abs(editor.project.state.trimStart - 5) < 0.000001 && editor.project.undoHistory.count == 2,
                     "Canceling a crossed trim restores the original playhead without changing saved trim/history")
-        print("Conflict review interface checks passed (actual vector playthrough, source/PIP interpolation, full-source moving comparison outlines, linked clock/timeline, read-only scrub, dismissal and fixed geometry; no AV objects/media).")
+        try await laneGestures(host: host, window: window, timeline: timeline, canvas: canvas, editor: editor, playback: playback)
+        print("Conflict review interface checks passed (vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+    }
+    static func laneGestures(host: NSView, window: NSWindow, timeline: RecordingTimelineView,
+                             canvas: EditorCanvasView, editor: ProjectEditor, playback: EditorPlayback) async throws {
+        playback.pause()
+        let fixedCanvas = canvas.frame, fixedTimeline = timeline.frame, fixedWindow = window.frame
+        guard let tabs = all(NSSegmentedControl.self, in: host).first(where: { control in
+            (0..<control.segmentCount).contains { control.label(forSegment: $0) == "Camera" } &&
+            (0..<control.segmentCount).contains { control.label(forSegment: $0) == "Pointer" }
+        }) else { throw Failure.failed("Native inspector tabs missing") }
+        for name in ["Camera", "Pointer", "Zoom"] {
+            guard let index = (0..<tabs.segmentCount).first(where: { tabs.label(forSegment: $0) == name }) else {
+                throw Failure.failed("Inspector tab missing: " + name)
+            }
+            tabs.selectedSegment = index
+            try require(tabs.sendAction(tabs.action, to: tabs.target), "The fixture must deliver a real native inspector selection")
+            try await settle(host)
+            let cameraShapeVisible = all(NSSegmentedControl.self, in: host).contains { control in
+                (0..<control.segmentCount).contains { control.label(forSegment: $0) == "Circle" }
+            }
+            try require(cameraShapeVisible == (name == "Camera"),
+                        "The native tab change must actually update the inspector's controls")
+            try require(canvas.frame == fixedCanvas && timeline.frame == fixedTimeline && window.frame == fixedWindow &&
+                        Set(timeline.animationLanes().map(\.lane)) == [.screen, .camera, .pointer],
+                        "Changing inspector tabs cannot hide a timeline lane or resize the preview/timeline")
+        }
+        let componentID = editor.project.state.zoomKeyframes[0].id
+        let animationID = TimelineAnimationID(lane: .screen, componentID: componentID)
+        guard let geometry = timeline.animationGeometry().first(where: { $0.animation.id == animationID }) else {
+            throw Failure.failed("Screen animation geometry missing")
+        }
+        let point = CGPoint(x: geometry.body.midX, y: geometry.body.midY)
+        let playhead = playback.time
+        timeline.mouseDown(with: mouse(.leftMouseDown, point, in: timeline, window: window))
+        try require(playback.time == playhead, "Mouse-down must not seek before click versus drag is known")
+        timeline.mouseUp(with: mouse(.leftMouseUp, point, in: timeline, window: window))
+        try await settle(host)
+        try require(timeline.selectedAnimationID == animationID && abs(playback.time - geometry.animation.end) < 0.000001,
+                    "A completed plain click selects the animation and inspects its destination")
+        let baseline = editor.project
+        let destination = CGPoint(x: point.x + timeline.x(for: 3) - timeline.x(for: 1), y: point.y)
+        timeline.mouseDown(with: mouse(.leftMouseDown, point, in: timeline, window: window))
+        timeline.mouseDragged(with: mouse(.leftMouseDragged, CGPoint(x: point.x + 2, y: point.y), in: timeline, window: window))
+        try require(editor.draftState == nil && editor.project == baseline,
+                    "Click jitter below the drag threshold cannot begin a lane edit")
+        timeline.mouseDragged(with: mouse(.leftMouseDragged, destination, in: timeline, window: window))
+        try require(editor.project == baseline && abs((editor.draftState?.zoomKeyframes.first?.time ?? .nan) - 3) < 0.000001,
+                    "A native span drag previews one draft without saving intermediate finger samples")
+        timeline.mouseUp(with: mouse(.leftMouseUp, destination, in: timeline, window: window))
+        try await settle(host)
+        try require(editor.draftState == nil && editor.project.undoHistory.count == baseline.undoHistory.count + 1 &&
+                    abs((editor.project.state.zoomKeyframes.first?.time ?? .nan) - 3) < 0.000001 && editor.project.state.pipKeyframes == baseline.state.pipKeyframes,
+                    "Mouse-up commits one atomic Screen gesture while preserving independent Camera timing")
+        let committed = editor.project
+        try require(editor.undo() && editor.project.state == baseline.state && editor.redo() && editor.project.state == committed.state,
+                    "One ordinary Undo/Redo restores the entire native lane gesture")
+        try await settle(host)
+        let moved = timeline.animationGeometry().first { $0.animation.id == animationID }!
+        let source = CGPoint(x: moved.body.midX, y: moved.body.midY)
+        let ripplePoint = CGPoint(x: source.x + timeline.x(for: 11) - timeline.x(for: 3), y: source.y)
+        timeline.mouseDown(with: mouse(.leftMouseDown, source, in: timeline, window: window, flags: .option))
+        timeline.mouseDragged(with: mouse(.leftMouseDragged, ripplePoint, in: timeline, window: window, flags: .option))
+        try require(editor.project == committed && abs((editor.draftState?.zoomKeyframes.last?.time ?? .nan) - 12) < 0.000001 &&
+                    editor.draftState?.pipKeyframes == committed.state.pipKeyframes,
+                    "Option ripple previews the whole same-lane cascade clamped to the source edge")
+        timeline.cancelOperation(nil)
+        timeline.mouseUp(with: mouse(.leftMouseUp, ripplePoint, in: timeline, window: window, flags: .option))
+        try await settle(host)
+        try require(editor.project == committed && editor.draftState == nil && editor.project.undoHistory == committed.undoHistory &&
+                    canvas.frame == fixedCanvas && timeline.frame == fixedTimeline && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
+                    "Escape cancels the complete ripple preview, preserves history and cannot resize or activate media")
+    }
+    static func mouse(_ type: NSEvent.EventType, _ point: CGPoint, in view: NSView, window: NSWindow,
+                      flags: NSEvent.ModifierFlags = []) -> NSEvent {
+        NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: flags,
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
     }
     static func settle(_ host: NSView) async throws {
         for _ in 0..<3 { host.layoutSubtreeIfNeeded(); try await Task.sleep(for: .milliseconds(60)) }

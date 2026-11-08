@@ -15,6 +15,7 @@ struct RecordingTimelineMarker: Identifiable, Equatable {
 }
 
 struct RecordingTimeline: NSViewRepresentable {
+    static let animationLaneHeight: CGFloat = 150
     let duration: Double
     let trimStart: Double
     let trimEnd: Double
@@ -36,6 +37,14 @@ struct RecordingTimeline: NSViewRepresentable {
     var fitRequest: UUID?
     var conflictSpans: [EditorConflictSpan] = []
     var conflictOverlaps: [ClosedRange<Double>] = []
+    var showsAnimationLanes = false
+    var pointerClickTimes: [Double] = []
+    var animations: [TimelineAnimation] = []
+    var selectedAnimationID: TimelineAnimationID?
+    var onSelectAnimation: (TimelineAnimationID) -> Void = { _ in }
+    var onAnimationEdit: (AnimationDrag, Bool) -> Void = { _, _ in }
+    var onAnimationCancel: () -> Void = {}
+    var onDeleteAnimation: (TimelineAnimationID) -> Void = { _ in }
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -59,6 +68,14 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onCancelEdit = onCancelEdit
         view.conflictSpans = conflictSpans
         view.conflictOverlaps = conflictOverlaps
+        view.showsAnimationLanes = showsAnimationLanes
+        view.pointerClickTimes = pointerClickTimes
+        view.animationSpans = animations
+        view.selectedAnimationID = selectedAnimationID
+        view.onSelectAnimation = onSelectAnimation
+        view.onAnimationEdit = onAnimationEdit
+        view.onAnimationCancel = onAnimationCancel
+        view.onDeleteAnimation = onDeleteAnimation
         view.fit(request: fitRequest)
     }
 }
@@ -84,6 +101,72 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let span: EditorConflictSpan
         let frame: CGRect
     }
+    struct AnimationLaneGeometry: Equatable {
+        let lane: TimelineAnimationLane
+        let title: String
+        let frame: CGRect
+        let labelFrame: CGRect
+    }
+    struct PointerClickGeometry: Equatable {
+        let time: Double
+        let frame: CGRect
+    }
+    struct AnimationGeometry: Equatable {
+        let animation: TimelineAnimation
+        let body: CGRect
+        let labelFrame: CGRect
+        let startHandle: CGRect?
+        let endHandle: CGRect?
+        let easeInHandle: CGRect?
+        let easeOutHandle: CGRect?
+        let deleteButton: CGRect?
+    }
+    var showsAnimationLanes = false {
+        didSet {
+            guard showsAnimationLanes != oldValue else { return }
+            cancelAnimationGesture()
+            invalidateIntrinsicContentSize()
+            needsDisplay = true; updateTooltips()
+            setAccessibilityHelp(showsAnimationLanes
+                ? "Screen, Camera and Pointer use one source-time axis. Drag a span to move it; selected edge handles resize it and inner dots change its ramps. Option-drag pushes same-lane neighbors. Delete removes the selected animation. Escape cancels a preview. Pinch to reveal fine controls."
+                : "Drag the playhead to scrub or the blue handles to trim. Click an edit to select it, or drag to move its time. Pinch to separate nearby edits; scroll to navigate time.")
+        }
+    }
+    var pointerClickTimes: [Double] = [] {
+        didSet { if pointerClickTimes != oldValue { needsDisplay = true; updateTooltips() } }
+    }
+    var animationSpans: [TimelineAnimation] = [] {
+        didSet {
+            guard animationSpans != oldValue else { return }
+            needsDisplay = true; updateTooltips()
+        }
+    }
+    var selectedAnimationID: TimelineAnimationID? { didSet { if selectedAnimationID != oldValue { needsDisplay = true; updateTooltips() } } }
+    var onSelectAnimation: ((TimelineAnimationID) -> Void)?
+    var onAnimationEdit: ((AnimationDrag, Bool) -> Void)?
+    var onAnimationCancel: (() -> Void)?
+    var onDeleteAnimation: ((TimelineAnimationID) -> Void)?
+    var presentAnimationMenu: ((NSMenu, NSPoint) -> Void)?
+    private(set) var blockedAnimationIDs = Set<TimelineAnimationID>()
+    private struct AnimationGesture {
+        let id: TimelineAnimationID
+        let handle: TimelineAnimationHandle
+        let origin: CGPoint
+        let base: [TimelineAnimation]
+        var hasMoved = false
+        var lastRequest: AnimationDrag?
+        var valid = true
+        var snappedDelta: Double?
+    }
+    private var animationGesture: AnimationGesture?
+    private var animationPreview: [TimelineAnimation]?
+    private var blockedAnimation: TimelineAnimation?
+    private var animationClickID: TimelineAnimationID?
+    private var animationDeleteID: TimelineAnimationID?
+    private var animationChooserIDs: [TimelineAnimationID]?
+    private var animationEmptyClick = false
+    private var animationPointerOrigin: CGPoint?
+    private var activeAnimationMenu: NSMenu?
     var conflictSpans: [EditorConflictSpan] = [] {
         didSet { if conflictSpans != oldValue { needsDisplay = true; updateTooltips() } }
     }
@@ -155,11 +238,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var scrubTime: Double?
     private var keyboardFocus = false
     private var lastFitRequest: UUID?
-    private var railWidth: CGFloat { max(1, bounds.width - 24) }
+    private var railOrigin: CGFloat { showsAnimationLanes ? 64 : 12 }
+    private var railWidth: CGFloat { max(1, bounds.width - railOrigin - 12) }
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 72) }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? RecordingTimeline.animationLaneHeight : 72) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -178,11 +262,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     func x(for time: Double) -> CGFloat {
-        12 + CGFloat((min(max(time, 0), max(0, duration)) - visibleStart) / max(visibleDuration, .leastNonzeroMagnitude)) * railWidth
+        railOrigin + CGFloat((min(max(time, 0), max(0, duration)) - visibleStart) / max(visibleDuration, .leastNonzeroMagnitude)) * railWidth
     }
 
     private func time(for x: CGFloat) -> Double {
-        min(max(visibleStart + Double((x - 12) / railWidth) * visibleDuration, 0), duration)
+        min(max(visibleStart + Double((x - railOrigin) / railWidth) * visibleDuration, 0), duration)
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -195,7 +279,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         tooltipText.removeAll()
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
-        tooltipText[base] = "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        tooltipText[base] = showsAnimationLanes ? "Drag spans to move; selected edges resize and dots adjust ramps. Option-drag pushes neighbors. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
         for band in conflictBands() {
             let side = band.span.side == .existing ? "Existing" : "Proposed"
             tooltipText[addToolTip(band.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] =
@@ -206,6 +290,19 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 tooltipText[addToolTip(frame, owner: self, userData: nil)] = String(format:
                     "Existing and proposed framing overlap from %.3f to %.3f seconds. Click to review; no changes are applied.", interval.lowerBound, interval.upperBound)
             }
+        }
+        if showsAnimationLanes {
+            for click in pointerClickGeometry() {
+                tooltipText[addToolTip(click.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] = String(format: "Recorded click at %.3f seconds.", click.time)
+            }
+            for item in animationGeometry() {
+                tooltipText[addToolTip(item.body.union(item.labelFrame), owner: self, userData: nil)] = item.animation.help
+                let handles: [(CGRect?, String)] = [(item.startHandle, item.animation.isInstant ? "Drag left to animate into this target." : "Drag to change the animation start."),
+                    (item.endHandle, "Drag to change the animation end."), (item.easeInHandle, "Drag to change the acceleration ramp."),
+                    (item.easeOutHandle, "Drag to change the deceleration ramp."), (item.deleteButton, "Delete this animation.")]
+                for (frame, help) in handles { if let frame { tooltipText[addToolTip(frame, owner: self, userData: nil)] = help } }
+            }
+            return
         }
         for group in markerGroups() {
             tooltipText[addToolTip(group.frame, owner: self, userData: nil)] = help(for: group)
@@ -227,7 +324,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let end = drag?.end ?? trimEnd
         let current = scrubTime ?? playhead
         drawConflictReview(keptStart: start, keptEnd: end)
-        let rail = CGRect(x: 12, y: 21, width: railWidth, height: 6)
+        let rail = CGRect(x: railOrigin, y: 21, width: railWidth, height: 6)
         NSColor.quaternaryLabelColor.setFill()
         NSBezierPath(roundedRect: rail, xRadius: 3, yRadius: 3).fill()
         NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
@@ -257,6 +354,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         thumb.close()
         NSColor.labelColor.setFill()
         thumb.fill()
+        }
+        if showsAnimationLanes {
+            drawAnimationLanes()
+            drawTimeTicks()
+            return
         }
         // Edits have their own lane, so the white playhead and trim handles
         // remain independent even when all three share a source time.
@@ -300,12 +402,316 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
     }
 
+    func animationLanes() -> [AnimationLaneGeometry] {
+        TimelineAnimationLane.allCases.enumerated().map { index, lane in
+            let y = CGFloat(40 + index * 30)
+            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .pointer: "Pointer" }
+            return AnimationLaneGeometry(lane: lane, title: title,
+                frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
+                labelFrame: CGRect(x: 8, y: y + 5, width: 52, height: 16))
+        }
+    }
+
+    func pointerClickGeometry() -> [PointerClickGeometry] {
+        pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
+            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 123, width: 2, height: 3))
+        }
+    }
+
+    private var displayedAnimations: [TimelineAnimation] {
+        if let gesture = animationGesture { return animationPreview ?? gesture.base }
+        return animationSpans
+    }
+
+    func animationGeometry() -> [AnimationGeometry] {
+        let selected = animationGesture?.id ?? selectedAnimationID
+        return displayedAnimations.compactMap { animation in
+            guard animation.start.isFinite, animation.end.isFinite, animation.start <= animation.end,
+                  animation.end >= visibleStart, animation.start <= visibleStart + visibleDuration,
+                  let lane = animationLanes().first(where: { $0.lane == animation.lane }) else { return nil }
+            let left = max(railOrigin, x(for: animation.start)), right = min(bounds.width - 12, x(for: animation.end))
+            guard right >= left else { return nil }
+            let width = max(6, right - left)
+            let body = CGRect(x: animation.isInstant ? left - 3 : left, y: lane.frame.minY + 7, width: width, height: 17)
+            let textWidth = min(130, ceil((animation.label as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 9, weight: .medium)]).width))
+            let editable = animation.id == selected && animation.editable
+            let labelX = width >= textWidth + 8 ? body.minX + 4 : body.maxX + (editable ? 18 : 4)
+            let label = CGRect(x: min(max(railOrigin, labelX), max(railOrigin, bounds.width - 12 - textWidth)),
+                y: body.minY + 2, width: textWidth, height: 13)
+            let timing = editable && !animation.isReference
+            let wide = width >= 80 && !animation.isInstant
+            let start = timing ? CGRect(x: left - 4, y: lane.frame.minY + (wide ? 8 : 0), width: 8, height: wide ? 10 : 8) : nil
+            let end = timing && !animation.isInstant ? CGRect(x: right - 4, y: lane.frame.minY + (wide ? 8 : 18), width: 8, height: wide ? 10 : 8) : nil
+            let easeIn = timing && wide ? CGRect(x: x(for: animation.start + animation.easeIn) - 3.5, y: lane.frame.minY, width: 7, height: 7) : nil
+            let easeOut = timing && wide ? CGRect(x: x(for: animation.end - animation.easeOut) - 3.5, y: lane.frame.minY + 19, width: 7, height: 7) : nil
+            let deletion = editable ? CGRect(x: min(body.maxX + 4, bounds.width - 24), y: lane.frame.minY + 9, width: 10, height: 10) : nil
+            return AnimationGeometry(animation: animation, body: body, labelFrame: label, startHandle: start,
+                endHandle: end, easeInHandle: easeIn, easeOutHandle: easeOut, deleteButton: deletion)
+        }
+    }
+
+    private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
+        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .pointer: .secondaryLabelColor }
+    }
+
+    private func drawAnimationLanes() {
+        for lane in animationLanes() {
+            NSColor.quaternaryLabelColor.withAlphaComponent(0.25).setFill()
+            NSBezierPath(roundedRect: lane.frame, xRadius: 3, yRadius: 3).fill()
+            (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+            if lane.lane != .screen, !displayedAnimations.contains(where: { $0.lane == lane.lane }) {
+                ("Not recorded" as NSString).draw(at: CGPoint(x: railOrigin + 5, y: lane.frame.minY + 8), withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.tertiaryLabelColor])
+            }
+        }
+        drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: CGRect(x: railOrigin, y: 38, width: railWidth, height: 90)).addClip()
+        for item in animationGeometry() {
+            let animation = item.animation
+            let selected = animation.id == (animationGesture?.id ?? selectedAnimationID)
+            let color = blockedAnimationIDs.contains(animation.id) ? NSColor.systemRed : animationColor(animation.lane)
+            color.withAlphaComponent(selected ? 0.45 : 0.23).setFill()
+            NSBezierPath(roundedRect: item.body, xRadius: 3, yRadius: 3).fill()
+            if !animation.isInstant, !animation.isReference {
+                let ramp = NSBezierPath()
+                ramp.move(to: CGPoint(x: item.body.minX, y: item.body.maxY))
+                ramp.line(to: CGPoint(x: x(for: animation.start + animation.easeIn), y: item.body.minY + 3))
+                ramp.line(to: CGPoint(x: x(for: animation.end - animation.easeOut), y: item.body.minY + 3))
+                ramp.line(to: CGPoint(x: item.body.maxX, y: item.body.maxY))
+                color.withAlphaComponent(0.65).setStroke(); ramp.lineWidth = 1; ramp.stroke()
+            }
+            if selected {
+                NSColor.labelColor.withAlphaComponent(0.8).setStroke()
+                let border = NSBezierPath(roundedRect: item.body, xRadius: 3, yRadius: 3); border.lineWidth = 1; border.stroke()
+            }
+            (animation.label as NSString).draw(in: item.labelFrame, withAttributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.labelColor])
+            for handle in [item.startHandle, item.endHandle].compactMap({ $0 }) {
+                color.setFill(); NSBezierPath(roundedRect: handle, xRadius: 2, yRadius: 2).fill()
+                NSColor.labelColor.setStroke(); NSBezierPath(roundedRect: handle, xRadius: 2, yRadius: 2).stroke()
+            }
+            for handle in [item.easeInHandle, item.easeOutHandle].compactMap({ $0 }) {
+                NSColor.windowBackgroundColor.setFill(); NSBezierPath(ovalIn: handle).fill()
+                color.setStroke(); NSBezierPath(ovalIn: handle).stroke()
+            }
+            if let button = item.deleteButton {
+                NSColor.secondaryLabelColor.setStroke()
+                let cross = NSBezierPath(); cross.lineWidth = 1.5
+                cross.move(to: CGPoint(x: button.minX + 2, y: button.minY + 2)); cross.line(to: CGPoint(x: button.maxX - 2, y: button.maxY - 2))
+                cross.move(to: CGPoint(x: button.maxX - 2, y: button.minY + 2)); cross.line(to: CGPoint(x: button.minX + 2, y: button.maxY - 2)); cross.stroke()
+            }
+        }
+        NSColor.secondaryLabelColor.setFill()
+        for click in pointerClickGeometry() { NSBezierPath(rect: click.frame).fill() }
+        if let blockedAnimation, let lane = animationLanes().first(where: { $0.lane == blockedAnimation.lane }) {
+            let rect = CGRect(x: x(for: blockedAnimation.start), y: lane.frame.minY + 6,
+                width: max(6, x(for: blockedAnimation.end) - x(for: blockedAnimation.start)), height: 19)
+            NSColor.systemRed.setStroke(); let outline = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+            outline.setLineDash([3, 2], count: 2, phase: 0); outline.lineWidth = 2; outline.stroke()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func animationTargets(at point: CGPoint) -> [AnimationGeometry] {
+        animationGeometry().filter { $0.body.contains(point) || $0.labelFrame.contains(point) }
+    }
+
+    private func beginAnimationInteraction(at point: CGPoint) {
+        guard animationLanes().contains(where: { $0.frame.contains(point) || $0.labelFrame.contains(point) }) else { return }
+        if conflictBands().contains(where: { $0.frame.contains(point) }) {
+            onScrubBegan?()
+            let sourceTime = time(for: point.x)
+            seek(sourceTime)
+            drag = Drag(interaction: .scrub, originX: point.x, originTime: sourceTime,
+                start: trimStart, end: trimEnd, originY: point.y)
+            return
+        }
+        animationPointerOrigin = point
+        let geometry = animationGeometry()
+        if let selected = geometry.first(where: { $0.animation.id == selectedAnimationID }) {
+            if selected.deleteButton?.contains(point) == true { animationDeleteID = selected.animation.id; return }
+            let handles: [(CGRect?, TimelineAnimationHandle)] = [(selected.easeInHandle, .easeIn), (selected.easeOutHandle, .easeOut),
+                (selected.startHandle, .start), (selected.endHandle, .end)]
+            for (frame, handle) in handles where frame?.contains(point) == true {
+                animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans); return
+            }
+        }
+        let targets = animationTargets(at: point)
+        if targets.count > 1 { animationChooserIDs = targets.map { $0.animation.id }; return }
+        if let target = targets.first {
+            animationClickID = target.animation.id
+            if target.animation.editable { animationGesture = AnimationGesture(id: target.animation.id, handle: .move, origin: point, base: animationSpans) }
+        } else if let lane = animationLanes().first(where: { $0.labelFrame.contains(point) }),
+                  let animation = animationSpans.first(where: { $0.lane == lane.lane }) {
+            animationClickID = animation.id
+        } else { animationEmptyClick = true }
+    }
+
+    private func snappedAnimationDelta(_ delta: Double, gesture: inout AnimationGesture) -> Double {
+        guard gesture.handle == .move || gesture.handle == .start || gesture.handle == .end,
+              let target = gesture.base.first(where: { $0.id == gesture.id }) else { return delta }
+        let unit = visibleDuration / Double(railWidth)
+        if let sticky = gesture.snappedDelta, abs(delta - sticky) <= unit * 10 { return sticky }
+        gesture.snappedDelta = nil
+        let others = gesture.base.filter { $0.id != target.id && $0.lane == target.lane && !$0.isReference }
+        let candidates: [Double]
+        switch gesture.handle {
+        case .start: candidates = [-target.start] + others.map { $0.end - target.start }
+        case .end: candidates = [duration - target.end] + others.map { $0.start - target.end }
+        default: candidates = [-target.start, duration - target.end] + others.flatMap { [$0.end - target.start, $0.start - target.end] }
+        }
+        if let closest = candidates.min(by: { abs($0 - delta) < abs($1 - delta) }), abs(closest - delta) <= unit * 6 {
+            gesture.snappedDelta = closest; return closest
+        }
+        return delta
+    }
+
+    private func dragAnimation(with event: NSEvent) {
+        guard var gesture = animationGesture else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard gesture.hasMoved || max(abs(point.x - gesture.origin.x), abs(point.y - gesture.origin.y)) >= 3 else { return }
+        gesture.hasMoved = true
+        animationClickID = nil
+        let raw = Double((point.x - gesture.origin.x) / railWidth) * visibleDuration
+        let delta = snappedAnimationDelta(raw, gesture: &gesture)
+        let request = AnimationDrag(id: gesture.id, handle: gesture.handle, deltaSeconds: delta,
+            push: event.modifierFlags.contains(.option), snapTolerance: 0)
+        guard let changed = TimelineAnimationSolver.solve(request, animations: gesture.base, duration: duration) else {
+            if gesture.lastRequest != nil, gesture.valid { onAnimationCancel?() }
+            gesture.valid = false; gesture.lastRequest = request
+            animationPreview = nil
+            if var target = gesture.base.first(where: { $0.id == gesture.id }) {
+                switch gesture.handle {
+                case .move: target.start += delta; target.end += delta
+                case .start: target.start += delta
+                case .end: target.end += delta
+                case .easeIn, .easeOut: break
+                }
+                blockedAnimation = target
+                blockedAnimationIDs = Set(gesture.base.filter { $0.lane == target.lane && $0.id != target.id && $0.start < target.end && $0.end > target.start }.map(\.id))
+                blockedAnimationIDs.insert(target.id)
+            }
+            animationGesture = gesture; needsDisplay = true; return
+        }
+        blockedAnimation = nil; blockedAnimationIDs.removeAll()
+        gesture.valid = true; gesture.lastRequest = request
+        let changes = Dictionary(uniqueKeysWithValues: changed.map { ($0.id, $0) })
+        animationPreview = gesture.base.map { changes[$0.id] ?? $0 }
+        if var wanted = gesture.base.first(where: { $0.id == gesture.id }),
+           let projected = animationPreview?.first(where: { $0.id == gesture.id }) {
+            switch gesture.handle {
+            case .move: wanted.start += delta; wanted.end += delta
+            case .start: wanted.start += delta
+            case .end: wanted.end += delta
+            case .easeIn, .easeOut: break
+            }
+            if abs(wanted.start - projected.start) > 0.000_001 || abs(wanted.end - projected.end) > 0.000_001 {
+                blockedAnimation = wanted
+                blockedAnimationIDs = Set(gesture.base.filter { $0.lane == wanted.lane && $0.id != wanted.id && !$0.isReference && $0.start < wanted.end && $0.end > wanted.start }.map(\.id))
+                blockedAnimationIDs.insert(wanted.id)
+            }
+        }
+        animationGesture = gesture
+        onAnimationEdit?(request, false)
+        needsDisplay = true; updateTooltips()
+    }
+
+    private func endAnimationInteraction(at point: CGPoint) {
+        let gesture = animationGesture, clicked = animationClickID, deleted = animationDeleteID, chooser = animationChooserIDs, empty = animationEmptyClick
+        let origin = animationPointerOrigin; animationPointerOrigin = nil
+        animationGesture = nil; animationPreview = nil; blockedAnimation = nil; blockedAnimationIDs.removeAll()
+        animationClickID = nil; animationDeleteID = nil; animationChooserIDs = nil; animationEmptyClick = false
+        if gesture?.hasMoved != true, let origin, max(abs(point.x - origin.x), abs(point.y - origin.y)) >= 3 { needsDisplay = true; return }
+        if let gesture, gesture.hasMoved {
+            if gesture.valid, let request = gesture.lastRequest { onAnimationEdit?(request, true) }
+            else { onAnimationCancel?() }
+        } else if let deleted, animationSpans.contains(where: { $0.id == deleted && $0.editable }) { onDeleteAnimation?(deleted) }
+        else if let chooser { chooseAnimations(chooser, at: point) }
+        else if let clicked { onSelectAnimation?(clicked) }
+        else if empty { onDeselectEdit?() }
+        needsDisplay = true; updateTooltips()
+    }
+
+    private func cancelAnimationGesture() {
+        let hadPreview = animationGesture?.hasMoved == true
+        animationPointerOrigin = nil
+        animationGesture = nil; animationPreview = nil; blockedAnimation = nil; blockedAnimationIDs.removeAll()
+        animationClickID = nil; animationDeleteID = nil; animationChooserIDs = nil; animationEmptyClick = false
+        if hadPreview { onAnimationCancel?() }
+        needsDisplay = true
+    }
+
+    private func animationAccessibilityActions() -> [NSAccessibilityCustomAction] {
+        var actions = displayedAnimations.map { animation in
+            NSAccessibilityCustomAction(name: "Select \(animation.label) in \(animation.lane.rawValue), \(String(format: "%.3f to %.3f seconds", animation.start, animation.end))") { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.animationSpans.contains(where: { $0.id == animation.id }) else { return false }
+                    self.onSelectAnimation?(animation.id); return true
+                }
+            }
+        }
+        if let id = selectedAnimationID, let selected = animationSpans.first(where: { $0.id == id && $0.editable }) {
+            actions.append(NSAccessibilityCustomAction(name: "Delete \(selected.label)") { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.animationSpans.contains(where: { $0.id == id && $0.editable }) else { return false }
+                    self.onInteractionBegan?(); self.onDeleteAnimation?(id); return true
+                }
+            })
+        }
+        return actions
+    }
+
+    private func chooseAnimations(_ ids: [TimelineAnimationID], at point: CGPoint) {
+        let menu = NSMenu(title: "Choose animation"); menu.autoenablesItems = false
+        for id in ids {
+            guard let animation = animationSpans.first(where: { $0.id == id }) else { continue }
+            let item = NSMenuItem(title: String(format: "%@ · %.3f–%.3f s", animation.label, animation.start, animation.end),
+                action: #selector(chooseAnimation(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = id; item.toolTip = animation.help
+            menu.addItem(item)
+        }
+        guard !menu.items.isEmpty else { return }
+        activeAnimationMenu = menu
+        if let presentAnimationMenu { presentAnimationMenu(menu, point) }
+        else { menu.popUp(positioning: nil, at: point, in: self); activeAnimationMenu = nil }
+    }
+
+    @objc private func chooseAnimation(_ item: NSMenuItem) {
+        guard item.menu === activeAnimationMenu, let id = item.representedObject as? TimelineAnimationID,
+              animationSpans.contains(where: { $0.id == id }) else { return }
+        activeAnimationMenu = nil; onSelectAnimation?(id)
+    }
+
+    @objc private func deleteAnimation(_ item: NSMenuItem) {
+        guard item.menu === activeAnimationMenu, let id = item.representedObject as? TimelineAnimationID,
+              animationSpans.contains(where: { $0.id == id && $0.editable }) else { return }
+        activeAnimationMenu = nil; onInteractionBegan?(); onDeleteAnimation?(id)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard showsAnimationLanes else { return super.menu(for: event) }
+        let point = convert(event.locationInWindow, from: nil)
+        let targets = animationTargets(at: point)
+        guard let target = targets.first(where: { $0.animation.id == selectedAnimationID }) ?? targets.first else { return nil }
+        let menu = NSMenu(title: target.animation.label); menu.autoenablesItems = false
+        let select = NSMenuItem(title: "Select \(target.animation.label)", action: #selector(chooseAnimation(_:)), keyEquivalent: "")
+        select.target = self; select.representedObject = target.animation.id; menu.addItem(select)
+        if target.animation.editable {
+            let deletion = NSMenuItem(title: "Delete \(target.animation.label)", action: #selector(deleteAnimation(_:)), keyEquivalent: "")
+            deletion.target = self; deletion.representedObject = target.animation.id; menu.addItem(deletion)
+        }
+        activeAnimationMenu = menu
+        return menu
+    }
+
     /// Conflict comparison uses the space above the scrub rail, preserving the
     /// edit lane and the timeline's height. The white playhead draws over it.
     func conflictBands() -> [ConflictBand] {
         conflictSpans.compactMap { span in
             guard let frame = conflictFrame(start: span.start, end: span.end,
-                y: span.side == .existing ? 2 : 8, height: 3) else { return nil }
+                y: showsAnimationLanes ? (span.side == .existing ? 41 : 63) : (span.side == .existing ? 2 : 8), height: 3) else { return nil }
             return ConflictBand(span: span, frame: frame)
         }
     }
@@ -314,26 +720,26 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard start.isFinite, end.isFinite, start <= end,
               end >= visibleStart, start <= visibleStart + visibleDuration,
               end >= 0, start <= duration else { return nil }
-        let lower = max(12, x(for: start)), upper = min(bounds.width - 12, x(for: end))
+        let lower = max(railOrigin, x(for: start)), upper = min(bounds.width - 12, x(for: end))
         let width = max(start == end ? 4 : 2, upper - lower)
         let frame = CGRect(x: start == end ? lower - width / 2 : lower, y: y, width: width, height: height)
-            .intersection(CGRect(x: 12, y: y, width: railWidth, height: height))
+            .intersection(CGRect(x: railOrigin, y: y, width: railWidth, height: height))
         return frame.isNull || frame.isEmpty ? nil : frame
     }
 
     private func drawConflictReview(keptStart: Double, keptEnd: Double) {
-        let lane = CGRect(x: 12, y: 0, width: railWidth, height: 12)
+        let lane = CGRect(x: railOrigin, y: showsAnimationLanes ? 40 : 0, width: railWidth, height: showsAnimationLanes ? 26 : 12)
         func draw(alpha: CGFloat) {
             for interval in conflictOverlaps {
-                guard let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: 0, height: 12) else { continue }
+                guard let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: lane.minY, height: lane.height) else { continue }
                 NSGraphicsContext.saveGraphicsState()
                 NSBezierPath(rect: frame).addClip()
                 NSColor.labelColor.withAlphaComponent(0.25 * alpha).setStroke()
                 let hatch = NSBezierPath()
                 var position = frame.minX - 12
                 while position <= frame.maxX {
-                    hatch.move(to: CGPoint(x: position, y: 12))
-                    hatch.line(to: CGPoint(x: position + 12, y: 0))
+                    hatch.move(to: CGPoint(x: position, y: lane.maxY))
+                    hatch.line(to: CGPoint(x: position + 12, y: lane.minY))
                     position += 6
                 }
                 hatch.lineWidth = 1; hatch.stroke()
@@ -360,8 +766,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: lane).addClip()
         draw(alpha: 0.28)
-        NSBezierPath(rect: CGRect(x: x(for: keptStart), y: 0,
-            width: max(0, x(for: keptEnd) - x(for: keptStart)), height: 12)).addClip()
+        NSBezierPath(rect: CGRect(x: x(for: keptStart), y: lane.minY,
+            width: max(0, x(for: keptEnd) - x(for: keptStart)), height: lane.height)).addClip()
         draw(alpha: 1)
         NSGraphicsContext.restoreGraphicsState()
     }
@@ -369,6 +775,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     /// A count replaces overlapping hit targets. Recheck the resulting badges,
     /// whose widths depend on their counts/selection, so no two targets overlap.
     func markerGroups() -> [MarkerGroup] {
+        if showsAnimationLanes { return [] }
         let visible = edits.filter { markerIsVisible(displayTime(for: $0)) }.sorted {
             let first = displayTime(for: $0), second = displayTime(for: $1)
             return first == second ? $0.id.uuidString < $1.id.uuidString : first < second
@@ -509,17 +916,17 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func magnify(with event: NSEvent) {
-        guard drag == nil, duration.isFinite, duration > 0, event.magnification.isFinite else { return }
+        guard drag == nil, animationGesture == nil, duration.isFinite, duration > 0, event.magnification.isFinite else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point), !event.phase.contains(.cancelled) else { return }
-        let fraction = min(1, max(0, Double((point.x - 12) / railWidth)))
+        let fraction = min(1, max(0, Double((point.x - railOrigin) / railWidth)))
         let anchor = visibleStart + fraction * visibleDuration
         let nextSpan = min(duration, max(minimumVisibleDuration, visibleDuration / max(0.01, 1 + event.magnification)))
         setViewport(start: anchor - fraction * nextSpan, span: nextSpan)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard drag == nil, duration.isFinite, duration > 0,
+        guard drag == nil, animationGesture == nil, duration.isFinite, duration > 0,
               !event.phase.contains(.cancelled), !event.momentumPhase.contains(.cancelled) else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) || !event.momentumPhase.isEmpty else { return }
@@ -573,14 +980,15 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         while tick <= last + step * 0.000_001 {
             let position = x(for: tick)
             let path = NSBezierPath()
-            path.move(to: CGPoint(x: position, y: 57))
-            path.line(to: CGPoint(x: position, y: 60))
+            let tickY: CGFloat = showsAnimationLanes ? 130 : 57
+            path.move(to: CGPoint(x: position, y: tickY))
+            path.line(to: CGPoint(x: position, y: tickY + 3))
             NSColor.tertiaryLabelColor.setStroke()
             path.stroke()
             let text = String(format: "%.*f s", decimals, tick) as NSString
             let width = text.size(withAttributes: attributes).width
             let labelX = min(max(position - width / 2, 0), bounds.width - width)
-            text.draw(at: CGPoint(x: labelX, y: 61), withAttributes: attributes)
+            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? 134 : 61), withAttributes: attributes)
             tick += step
         }
     }
@@ -630,7 +1038,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func accessibilityCustomActions() -> [NSAccessibilityCustomAction]? {
-        let markerActions = markerGroups().map { group in
+        let markerActions = showsAnimationLanes ? animationAccessibilityActions() : markerGroups().map { group in
             let name: String
             if group.isCluster { name = "Choose among \(group.ids.count) nearby edits" }
             else if let marker = edits.first(where: { $0.id == group.ids[0] }) {
@@ -669,7 +1077,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         needsDisplay = true
         window?.makeFirstResponder(self)
         onInteractionBegan?()
-        if point.y >= 38 && point.y < 56 {
+        if showsAnimationLanes, point.y >= 38 {
+            beginAnimationInteraction(at: point)
+            return
+        }
+        guard point.x >= railOrigin else { return }
+        if !showsAnimationLanes, point.y >= 38 && point.y < 56 {
             let labelTarget = markerLabels().first { $0.frame.contains(point) }?.id
             let target = markerGroups().first { group in
                 if let labelTarget { return group.ids.contains(labelTarget) }
@@ -720,6 +1133,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if showsAnimationLanes, animationGesture != nil { dragAnimation(with: event); return }
         guard var drag else { return }
         let point = convert(event.locationInWindow, from: nil)
         drag.pointerMoved = drag.pointerMoved || max(abs(point.x - drag.originX), abs(point.y - drag.originY)) >= 3
@@ -753,6 +1167,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if showsAnimationLanes, animationGesture != nil || animationClickID != nil || animationDeleteID != nil || animationChooserIDs != nil || animationEmptyClick {
+            endAnimationInteraction(at: convert(event.locationInWindow, from: nil)); return
+        }
         guard let drag else { return }
         self.drag = nil
         scrubTime = nil
@@ -776,6 +1193,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if let activeAnimationMenu { activeAnimationMenu.cancelTracking(); self.activeAnimationMenu = nil; return }
+        if showsAnimationLanes, animationGesture != nil || animationClickID != nil || animationDeleteID != nil || animationChooserIDs != nil || animationEmptyClick {
+            cancelAnimationGesture(); return
+        }
         if let activeMarkerMenu { activeMarkerMenu.cancelTracking(); self.activeMarkerMenu = nil; return }
         let active = drag
         if let original = active?.originalPlayhead, scrubTime != nil {
@@ -794,6 +1215,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { cancelOperation(nil); return }
+        if showsAnimationLanes, event.keyCode == 51 || event.keyCode == 117 {
+            guard let id = selectedAnimationID, animationSpans.contains(where: { $0.id == id && $0.editable }) else { return }
+            cancelAnimationGesture(); onInteractionBegan?(); onDeleteAnimation?(id); return
+        }
         guard event.keyCode == 123 || event.keyCode == 124 else { super.keyDown(with: event); return }
         keyboardFocus = true
         onInteractionBegan?()

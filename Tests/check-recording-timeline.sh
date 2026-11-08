@@ -6,7 +6,7 @@ trap 'rm -rf "$check_dir"' EXIT
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/MediaProcessing.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorConflictGeometry.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingTimeline.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/TimelineAnimation.swift" \
   "$repo_dir/Tests/RecordingTimelineChecks.swift" \
   -o "$check_dir/check-recording-timeline"
 "$check_dir/check-recording-timeline"

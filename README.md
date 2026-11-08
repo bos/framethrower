@@ -178,14 +178,28 @@ pauses playback.
 
 Pinch over the timeline to zoom its time scale around your fingers; two-finger
 scrolling navigates time. This changes only the timeline view, not the recording.
-The playhead, trim handles, and edit diamonds have separate hit targets. Click a
-diamond to select its edit and inspect that frame; drag it to change its time.
-The matching item below gets an outline and scrolls into view. Its **×** removes
-the entire edit, including screen and camera changes at that time. Neighboring
-edits cannot be overwritten by dragging. Click empty space in the edit lane to
-save the pending adjustments and deselect without moving the playhead. Escape
-cancels pending adjustments and deselects. Mouse clicks leave no full-timeline
-focus border; keyboard navigation uses a small cue beneath the playhead.
+The playhead and trim handles occupy the top rail. Persistent **Screen**, **Camera**,
+and **Pointer** lanes show the recording's animations below it. Screen combines
+zoom and pan into one viewport movement. Camera has independent PIP movements.
+Pointer currently shows whole-recording style settings and recorded click ticks;
+it does not create timed pointer-style changes. Missing camera or pointer tracks
+show **Not recorded**.
+
+Click an animation to select it and inspect its destination. Drag its body to
+move the entire movement, or its start/end grips to change its timing. Pull an
+instant change's start grip left to turn it into a smooth movement. The inner
+handles adjust acceleration and deceleration; tooltips report timing. Short,
+coincident marks offer a chooser and remain accessible by pinching into the
+timeline. The selected animation's **×** or Delete removes only that lane's
+change, preserving other components and reference boxes.
+
+Same-lane movements stop at their neighbors with a sticky contact. Hold Option
+while dragging to push whole neighboring movements, preserving their durations
+and ramps; the chain stops at the recording boundary. Different lanes can overlap.
+Each gesture is one Undo step. Escape restores the whole gesture. Click empty
+lane space to save pending adjustments and deselect without moving the playhead.
+Mouse clicks leave no full-timeline focus border; keyboard navigation uses a
+small cue beneath the playhead.
 
 The fixed-height inspector has **Zoom**, **Pointer**, and (when present) **Camera**, plus **Canvas**
 and **Audio** controls. Pinch over the preview to zoom the picture; two-finger scrolling pans
@@ -202,7 +216,7 @@ for a selected edit. Drag the visual strip's left and right boundary bars to adj
 acceleration and deceleration; their tooltips report the ramp times. Ramps cannot
 overlap. Right-click the timeline for **Hold current framing** when you need an
 unchanged view before a later movement.
-The strip and the selected edit's timeline band show the effective transition,
+The strip and timeline spans show the effective transition,
 shortened when the previous edit leaves less time available. Screen and camera
 use the same motion curve, with separate settings for each component of an edit.
 **Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
@@ -361,6 +375,11 @@ Reopening preserves a question only if the recording revision still matches.
 The original instruction's playhead remains its timing anchor across answers;
 the current playhead and selected box/edit are supplied separately. An explicit
 “start at the current playhead instead” can change that anchor.
+
+The conversation groups consecutive manual adjustments to the same target into
+one latest-result card. Expand its earlier adjustments to inspect previous
+results. User turns, Undo/Redo, and changes to a different target break the group.
+This display grouping preserves the saved conversation and the ordinary Undo stack.
 
 Local debugging traces include recognition hypotheses and final text, model
 requests/responses, applied or rejected commands, and manual editor events.
@@ -560,6 +579,12 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, separate
   hit targets, draggable edit diamonds, empty-space deselection, Escape routing,
   mouse/keyboard focus cues, pinch navigation, transition bands, and bounds.
+- `Tests/check-timeline-animation-interactions.sh`: persistent native lanes,
+  body/endpoint/ramp gestures, contact and Option pushing, short-mark selection,
+  lane-local deletion, pointer ticks, cancellation, and conflict hit targets.
+- `Tests/check-editor-animation-editing.sh`: timing solver, ripple chains and
+  boundaries, actual screen/camera interpolation, shared-reference splitting,
+  stable labels, atomic drafts, Undo/Redo, failed saves, and metadata preservation.
 - `Tests/check-camera-recording.sh`: synthetic camera writing and frame timing.
 - `Tests/check-capture-lifecycle.sh`: bounded SDK callbacks, event ordering, media
   finalization, and retry isolation.

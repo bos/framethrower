@@ -71,14 +71,36 @@ struct EditorActionDescription: Equatable, Sendable {
     }
 
     /// Descriptive prefixes can change after a revision. Resolve all known
-    /// action prefixes through the stable letter, including old Edit/bare names.
+    /// screen action prefixes through the stable letter, including old Edit/bare
+    /// names. Camera and reference qualifiers identify their own components.
     static func resolve(_ label: String, in state: EditState, references: EditorReferences,
                         includeCamera: Bool = true) -> TimedEdit? {
         guard let letter = letter(in: label) else { return nil }
-        let matches = state.timedEdits(includeCamera: includeCamera).filter {
-            references.editLabel(for: $0.id) == "Edit " + letter
+        let expected = "Edit " + letter
+        let matches = state.timedEdits(includeCamera: includeCamera).filter { edit in
+            [edit.id, edit.zoomID, edit.cameraID, edit.anchorID].compactMap { $0 }
+                .contains { references.editLabel(for: $0) == expected }
         }
-        return matches.count == 1 ? matches[0] : nil
+        // A Screen and Camera animation can retain the same stable letter
+        // after being moved apart. Qualified names identify their own lane;
+        // an unqualified Edit/letter remains ambiguous and needs clarification.
+        let prefix = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let qualified: [TimedEdit]
+        if prefix.hasPrefix("camera ") { qualified = matches.filter { $0.cameraID.map { references.editLabel(for: $0) == expected } == true } }
+        else if ["zoom ", "pan ", "full frame ", "full-frame ", "hold "].contains(where: { prefix.hasPrefix($0) }) {
+            qualified = matches.filter { $0.zoomID.map { references.editLabel(for: $0) == expected } == true }
+        } else if ["ref ", "reference "].contains(where: { prefix.hasPrefix($0) }) {
+            qualified = matches.filter { $0.anchorID.map { references.editLabel(for: $0) == expected } == true }
+        } else { return matches.count == 1 ? matches[0] : nil }
+        return qualified.count == 1 ? qualified[0] : nil
+    }
+
+    static func unambiguousLabel(for edit: TimedEdit, in state: EditState, references: EditorReferences) -> String {
+        if let legacy = references.editLabel(for: edit.id), resolve(legacy, in: state, references: references)?.id == edit.id { return legacy }
+        if edit.zoomID == nil, edit.cameraID != nil, let legacy = references.editLabel(for: edit.id) {
+            return "Camera " + String(legacy.dropFirst(5))
+        }
+        return describe(edit, in: state, references: references).shortLabel
     }
 
     static func mentions(_ edit: TimedEdit, in request: String, state: EditState, references: EditorReferences) -> Bool {

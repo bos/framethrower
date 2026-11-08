@@ -22,12 +22,15 @@ struct EditorActionDescriptionChecks {
                     descriptions[7].tooltip.contains("6.00") && descriptions[7].tooltip.contains("10.00"), "tooltips disclose actual hold and smooth intervals")
         try require(state.zoom(at: 8).scale > 1 && descriptions[6].kind == .reference,
                     "a reference drawn inside ongoing movement must not be described as a hold")
-        for alias in ["Zoom B", "Edit B", "B", "b", "Pan B", "Full-frame B", "Ref B"] {
+        for alias in ["Zoom B", "Edit B", "B", "b", "Pan B", "Full-frame B"] {
             try require(EditorActionDescription.resolve(alias, in: state, references: references)?.id == edits[1].id,
                         "descriptive/legacy/bare/stale-action aliases must preserve letter B: \(alias)")
         }
         try require(EditorActionDescription.resolve("Zoom Z", in: state, references: references) == nil &&
-                    EditorActionDescription.resolve("Box B", in: state, references: references) == nil, "unknown/box labels must not identify an edit")
+                    EditorActionDescription.resolve("Box B", in: state, references: references) == nil &&
+                    EditorActionDescription.resolve("Ref B", in: state, references: references) == nil &&
+                    EditorActionDescription.resolve("Camera B", in: state, references: references) == nil,
+                    "unknown/box or wrong-lane labels must not identify an edit")
         try require(EditorActionDescription.mentions(edits[1], in: "At Zoom B, frame Box 1.", state: state, references: references) &&
                     EditorActionDescription.mentions(edits[1], in: "between B and C", state: state, references: references) &&
                     !EditorActionDescription.mentions(edits[0], in: "move to a box", state: state, references: references),

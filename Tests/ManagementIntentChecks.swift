@@ -93,6 +93,8 @@ struct ManagementIntentChecks {
         try rejectedIntents()
         try validAndUnconstrainedRequests()
         try focusedSchemas()
+        try numericConjunctions()
+        try sentenceReferenceRouting()
         try boxManagement()
         try await boxSessionRepair()
         try await boxSessionRepair(wrongCorrection: true)
@@ -183,6 +185,45 @@ struct ManagementIntentChecks {
         try assertSchema(LocalEditPlanner.payload(request: "B instead.", context: context, routingRequest: "Delete Edit C."), action: nil, target: nil)
         try assertSchema(LocalEditPlanner.payload(request: "Delete Edit C and move Edit B to three seconds.", context: context), action: nil, target: nil)
     }
+    static func numericConjunctions() throws {
+        let fixture = try Fixture(); defer { fixture.close() }
+        let before = fixture.editor.project, bytes = try Data(contentsOf: fixture.editor.url)
+        for request in ["Move Ref B to one and a half seconds after Ref A.",
+                        "Move Ref B to two and three quarters seconds after Ref A.",
+                        "Move Ref B to one hundred and five seconds after Ref A."] {
+            try assertSchema(LocalEditPlanner.payload(request: request, context: fixture.context()), action: "move", target: "Edit B")
+            for changes in [[delete("Ref B")], [create(2.5)], [move("Ref C")]] {
+                guard case .rejectedPlan = try fixture.result(changes, instruction: request) else {
+                    throw IntentFailure.failed("Numeric conjunction exposed a wrong management opcode/identity: " + request)
+                }
+            }
+        }
+        var change = move("Ref B"); change["offset_seconds"] = 1.5
+        let valid = try commands(fixture.result([change], instruction: "Move Ref B to one and a half seconds after Ref A."))
+        try require(valid.commands == [.moveEdit(editID: fixture.b.id, time: 2.5)], "Correct numeric-conjunction move lost stable identity/timing")
+        for request in ["Move Ref B to one and a half seconds after Ref A and delete Ref C.",
+                        "Do not move Ref B; delete Ref C instead."] {
+            try assertSchema(LocalEditPlanner.payload(request: request, context: fixture.context()), action: nil, target: nil)
+        }
+        let compound = try commands(fixture.result([change, delete("Ref C")], instruction: "Move Ref B to one and a half seconds after Ref A and delete Ref C."))
+        try require(compound.commands.count == 2 && fixture.editor.project == before && Data(contentsOf: fixture.editor.url) == bytes,
+                    "True compound intent must remain usable; rejected proposals must not alter bytes/history")
+    }
+    static func sentenceReferenceRouting() throws {
+        let fixture = try Fixture(); defer { fixture.close() }
+        func names(_ request: String) throws -> Set<String> {
+            let root = try JSONSerialization.jsonObject(with: LocalEditPlanner.payload(request: request, context: fixture.context())) as! [String: Any]
+            return Set((root["tools"] as! [[String: Any]]).compactMap { ($0["function"] as? [String: Any])?["name"] as? String })
+        }
+        for request in ["At 1 second, take 0.6 seconds to frame Box 4, hold it for 2 seconds, then return to full frame over 0.8 seconds.",
+                        "At 1 second, zoom in to Box 4 over two seconds."] {
+            try require(names(request).contains("plan_sequence"), "Ordinary framing modifiers were interpreted as reference identifiers: " + request)
+        }
+        for request in ["Revise Zoom A to frame Box 4.", "Revise Zoom ZAA to frame Box 4."] {
+            let tools = try names(request)
+            try require(tools.contains("frame_edits") && !tools.contains("plan_sequence"), "Valid short stable reference label lost named-edit routing")
+        }
+    }
     static func boxDelete(_ label: String) -> [String: Any] { ["action": "delete", "box_label": label] }
     static func boxNote(_ label: String, _ note: String) -> [String: Any] { ["action": "note", "box_label": label, "note": note] }
     private static func capturedBoxRename(_ fixture: Fixture, id: UUID) throws -> Data {
@@ -214,7 +255,9 @@ struct ManagementIntentChecks {
         let before = fixture.editor.project, bytes = try Data(contentsOf: fixture.editor.url)
         let context = try fixture.context(selectedBox: fixture.box5.id)
         let request = "Delete box 4."
-        for noteRequest in ["Set the note for Box 4 to area.", "Please add a note to Box 4: red and blue.", "Change Box 4's note to area."] {
+        for noteRequest in ["Set the note for Box 4 to area.", "Please add a note to Box 4: red and blue.", "Change Box 4's note to area.",
+                            "Give Box 4 the note Search results.", "Add Box 4 a note: Search results.", "Set Box 4 the note Search results.",
+                            "Give Box 4 a note red and blue."] {
             for changes in [[boxDelete("Box 4")], [boxNote("Box 5", "area")]] {
                 guard case .rejectedPlan = try LocalEditPlanner.result(tool(fixture.args(changes), name: "manage_boxes"),
                     context: context, instruction: noteRequest, routingRequest: noteRequest) else {
@@ -265,6 +308,7 @@ struct ManagementIntentChecks {
         try assertBoxSchema(LocalEditPlanner.payload(request: "Box 5 instead.", context: context, routingRequest: request), focused: false)
         try assertBoxSchema(LocalEditPlanner.payload(request: "Delete Box 4 and set the note for Box 5 to area.", context: context), focused: false)
         try assertBoxSchema(LocalEditPlanner.payload(request: "Set the note for Box 4 to area and delete Box 5.", context: context), focused: false)
+        try assertBoxSchema(LocalEditPlanner.payload(request: "Give Box 4 the note area and delete Box 5.", context: context), focused: false)
         try EditorCommandDispatcher.apply(deletion, to: fixture.editor, projectID: fixture.projectID, name: "Director: Removed Box 4.")
         var expected = before.state; expected.regions.removeAll { $0.id == fixture.box4.id }
         try require(fixture.editor.project.state == expected && fixture.editor.project.references == before.references &&

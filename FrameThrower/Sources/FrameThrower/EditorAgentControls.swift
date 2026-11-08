@@ -391,7 +391,15 @@ enum EditorAgentControls {
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?")))
             .replacingOccurrences(of: "^(?:(?:please|can you|could you|would you|will you)\\s+)+", with: "",
                                   options: [.regularExpression, .caseInsensitive])
-        guard text.range(of: "[;\\n]|\\b(?:and|then|but|or|also|not|don't|except|unless|if|edits|marks|steps)\\b",
+        // A numeric conjunction is part of one time expression, not another
+        // command. Keep the original text for target/action parsing.
+        let number = "(?:[0-9]+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+        let conjunctionText = text
+            .replacingOccurrences(of: "\\b(" + number + ")\\s+and\\s+((?:(?:a|one|three)\\s+)?(?:half|halves|quarters?))\\b", with: "$1 $2",
+                                  options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: "\\b(hundred|thousand|million|billion)\\s+and\\s+(" + number + ")\\b", with: "$1 $2",
+                                  options: [.regularExpression, .caseInsensitive])
+        guard conjunctionText.range(of: "[;\\n]|\\b(?:and|then|but|or|also|not|don't|except|unless|if|edits|marks|steps)\\b",
                          options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
         let label = "((?:(?:edit|ref(?:erence)?|zoom|pan|full[ -]?frame|hold|camera)\\s+[A-Za-z]{1,6}|(?-i:[A-Z]{1,6})))"
         func target(_ pattern: String) -> String? {
@@ -478,6 +486,7 @@ enum EditorAgentControls {
         guard text.range(of: "[;\\n]|\\b(?:and|then|also|but|or)\\s+(?:(?:please|then)\\s+)?(?:delete|remove|set|update|edit|change|add|attach|note|label|rename|frame|zoom|pan|move|create|box\\s*[0-9]+)\\b",
                          options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
         let notePatterns = [
+            "^(?:give|add|set)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})\\s+(?:(?:a|an|the)\\s+)?note(?:\\s*[:=].+|\\s+.+)$",
             "^(?:set|update|edit|change|add|attach|clear|remove|delete)\\s+(?:(?:a|an|the)\\s+)?note\\s+(?:for|to|on|of)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:\\s*[:=].*|\\s+.*)?$",
             "^(?:set|update|edit|change|clear|remove|delete)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:[’']s)?\\s+note(?:\\s*[:=].*|\\s+.*)?$",
             "^(?:note|label|name|rename)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:\\s*[:=].+|\\s+.+)$"

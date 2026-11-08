@@ -23,6 +23,7 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var time = 0.0
     @Published private(set) var isPlaying = false
     @Published private(set) var playbackRate = 1.0
+    @Published private(set) var auditionRange: EditorPreviewRange?
     @Published private(set) var isLoading = false
     @Published private(set) var screenSize = CGSize(width: 16, height: 9)
     @Published private(set) var sourceSize = CGSize(width: 16, height: 9)
@@ -42,10 +43,15 @@ final class EditorPlayback: ObservableObject {
     private var isClosed = false
     private var observer: Any?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var endObservation: (any NSObjectProtocol)?
+    private var transportGeneration: UInt64 = 0
     private var generation = 0
     private var bounds = 0.0...1.0
     private var sourceDuration = 0.0
     private var sourceBounds: ClosedRange<Double> { 0...max(0, sourceDuration) }
+    private var playbackBounds: ClosedRange<Double> {
+        auditionRange.map { $0.start...$0.end } ?? bounds
+    }
     private var editFrameDuration = 1.0 / 30.0
     private var draftState: EditState?
     private var pendingDraftState: EditState?
@@ -70,10 +76,59 @@ final class EditorPlayback: ObservableObject {
     var canPlay: Bool { !isClosed && !isLoading && (MediaProcessing.isSuspended ? simulationClock != nil : renderedProject != nil) }
 
     var cursorRecording: CursorRecording? { cachedCursorRecording }
+    var previewSourceBounds: ClosedRange<Double> { sourceBounds }
+    var keptPreviewRange: EditorPreviewRange { .init(start: bounds.lowerBound, end: bounds.upperBound) }
+    var previewSnapshot: EditorPreviewSnapshot {
+        .init(time: time, frameTime: editingTime, isPlaying: isPlaying, rate: playbackRate,
+              range: auditionRange, canPlay: canPlay, kind: MediaProcessing.isSuspended ? .testPattern : .footage)
+    }
+
+    /// The host finishes drafts at its normal navigation boundaries. This
+    /// engine owns only transport state and never reaches into a ProjectEditor.
+    func applyPreviewCommand(_ command: EditorPreviewCommand) async throws -> EditorPreviewSnapshot {
+        try Task.checkCancellation()
+        guard !isClosed else { throw EditorPreviewError.unavailable }
+        switch command {
+        case .play:
+            guard canPlay else { throw EditorPreviewError.unavailable }
+            play()
+        case .pause:
+            pause()
+        case let .setRate(rate):
+            guard setPlaybackRate(rate) else { throw EditorPreviewError.unsupportedRate }
+        case let .seek(position):
+            guard canPlay else { throw EditorPreviewError.unavailable }
+            guard position.isFinite, sourceBounds.contains(position) else { throw EditorPreviewError.invalidTime }
+            seek(position)
+        case let .stepFrames(count):
+            guard canPlay else { throw EditorPreviewError.unavailable }
+            if count != 0 {
+                pause()
+                let frame = (editingTime / editFrameDuration).rounded()
+                let lastFrame = max(0, ceil(sourceDuration / editFrameDuration) - 1)
+                let target = min(lastFrame, max(0, frame + Double(count))) * editFrameDuration
+                seek(target)
+            }
+        case let .playRange(start, end):
+            guard canPlay else { throw EditorPreviewError.unavailable }
+            guard start.isFinite, end.isFinite, sourceBounds.contains(start), sourceBounds.contains(end), start < end else {
+                throw EditorPreviewError.invalidRange
+            }
+            pause()
+            auditionRange = .init(start: start, end: end)
+            time = start
+            play()
+        }
+        return previewSnapshot
+    }
 
 
     var editingTime: Double {
-        RecordingProject.editingTime(at: time, duration: sourceDuration, frameDuration: editFrameDuration)
+        // A mathematically exact frame multiple can divide to N−1ulp. A
+        // sub-picosecond tolerance prevents repeated single-frame steps from
+        // sticking there, without crossing a nanosecond source timestamp.
+        RecordingProject.editingTime(at: time + min(1e-12, editFrameDuration * 1e-10),
+            duration: sourceDuration, frameDuration: editFrameDuration)
     }
 
     init() {
@@ -84,9 +139,9 @@ final class EditorPlayback: ObservableObject {
                 guard let self, !self.isClosed, self.draftState == nil,
                       self.isPlaying, !self.isLoading,
                       !self.isScrubbing, !self.seekInFlight, self.pendingSeek == nil else { return }
-                self.time = time.seconds.isFinite ? time.seconds : 0
-                if self.time >= self.bounds.upperBound {
-                    self.pause()
+                self.time = time.seconds.isFinite ? min(time.seconds, self.playbackBounds.upperBound) : 0
+                if self.time >= self.playbackBounds.upperBound {
+                    self.finishPlaybackAtBoundary()
                 }
             }
         }
@@ -95,6 +150,8 @@ final class EditorPlayback: ObservableObject {
     func rebuild(editor: ProjectEditor) async {
         guard !isClosed else { return }
         generation += 1
+        clearEndObservation()
+        auditionRange = nil
         itemStatusObservation = nil
         invalidateSeeks()
         let request = generation
@@ -196,10 +253,32 @@ final class EditorPlayback: ObservableObject {
         }
     }
 
+    private func observePlaybackEnd(of item: AVPlayerItem) {
+        clearEndObservation()
+        let request = generation, transport = transportGeneration
+        endObservation = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+            object: item, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.isClosed, request == self.generation,
+                          transport == self.transportGeneration,
+                          self.mediaPlayer?.currentItem === item, self.isPlaying else { return }
+                    self.finishPlaybackAtBoundary()
+                }
+            }
+    }
+
     /// A normal seek uses the same chasing pipeline as scrubbing, and restores
     /// the isolated paused frame only after its final native seek completes.
     func seek(_ position: Double) {
         guard !isClosed else { return }
+        pause()
+        clearAudition()
+        scrubGestureActive = false
+        if MediaProcessing.isSuspended { isScrubbing = false }
+        seekSource(position)
+    }
+
+    private func seekSource(_ position: Double) {
         if MediaProcessing.isSuspended { seekSimulation(position, within: sourceBounds); return }
         if isLoading {
             time = bounded(position, to: sourceBounds)
@@ -211,6 +290,7 @@ final class EditorPlayback: ObservableObject {
     }
 
     func beginScrubbing() {
+        clearAudition()
         if MediaProcessing.isSuspended {
             guard canPlay else { return }
             pause()
@@ -229,6 +309,7 @@ final class EditorPlayback: ObservableObject {
 
     func scrub(to position: Double) {
         guard !isClosed else { return }
+        clearAudition()
         if MediaProcessing.isSuspended { seekSimulation(position, within: bounds); return }
         let position = bounded(position, to: bounds)
         if isLoading { time = position; return }
@@ -358,10 +439,16 @@ final class EditorPlayback: ObservableObject {
     }
 
     func togglePlayback() {
+        if isPlaying { pause() }
+        else { play() }
+    }
+
+    /// Idempotent transport action, unlike a UI toggle.
+    func play() {
+        guard canPlay, !isPlaying else { return }
+        let activeBounds = playbackBounds
         if MediaProcessing.isSuspended {
-            guard canPlay, var clock = simulationClock else { return }
-            if isPlaying { pause(); return }
-            clock.seek(time)
+            var clock = EditorSimulationClock(bounds: activeBounds, time: time)
             clock.play(at: ProcessInfo.processInfo.systemUptime, rate: playbackRate)
             simulationClock = clock
             time = clock.time
@@ -371,23 +458,24 @@ final class EditorPlayback: ObservableObject {
             startSimulation()
             return
         }
-        guard !isClosed, !isLoading, renderedProject != nil else { return }
-        if player.rate > 0 || isPlaying { pause() }
-        else {
-            let position = time < bounds.lowerBound || time >= bounds.upperBound - 0.03 ? bounds.lowerBound : time
-            invalidateSeeks()
-            discardPreview(restoringFrame: false)
-            player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: bounds.upperBound, preferredTimescale: 600)
-            requestSeek(position)
-            stillRequests.invalidate()
-            liveSources = nil
-            stillFrame = nil
-            player.playImmediately(atRate: Float(playbackRate))
-            isPlaying = true
-        }
+        guard renderedProject != nil else { return }
+        let position = time < activeBounds.lowerBound || time >= activeBounds.upperBound ? activeBounds.lowerBound : time
+        invalidateSeeks()
+        discardPreview(restoringFrame: false)
+        player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: activeBounds.upperBound, preferredTimescale: 600)
+        requestSeek(position)
+        transportGeneration &+= 1
+        if let item = mediaPlayer?.currentItem { observePlaybackEnd(of: item) }
+        stillRequests.invalidate()
+        liveSources = nil
+        stillFrame = nil
+        player.playImmediately(atRate: Float(playbackRate))
+        isPlaying = true
     }
 
     func pause() {
+        transportGeneration &+= 1
+        clearEndObservation()
         if MediaProcessing.isSuspended {
             if var clock = simulationClock {
                 clock.pause(at: ProcessInfo.processInfo.systemUptime)
@@ -396,6 +484,7 @@ final class EditorPlayback: ObservableObject {
             }
             stopSimulation()
             isPlaying = false
+            finishAuditionIfNeeded()
             return
         }
         let wasPlaying = isPlaying
@@ -405,7 +494,8 @@ final class EditorPlayback: ObservableObject {
         guard wasPlaying, !seekInFlight, pendingSeek == nil, !isScrubbing,
               let renderedProject else { return }
         let current = player.currentTime().seconds
-        let position = current.isFinite ? min(max(current, bounds.lowerBound), bounds.upperBound) : time
+        let activeBounds = playbackBounds
+        let position = current.isFinite ? min(max(current, activeBounds.lowerBound), activeBounds.upperBound) : time
         let target = Self.frameTime(at: position, bounds: sourceBounds)
         if renderedProject.previewFrames.sources(at: target) != nil {
             if time != position { time = position }
@@ -415,6 +505,7 @@ final class EditorPlayback: ObservableObject {
             // opening an independent image-generator decoder behind the player.
             requestSeek(position)
         }
+        finishAuditionIfNeeded()
     }
 
     /// Preview transport preference only; never persisted in project/history
@@ -428,7 +519,7 @@ final class EditorPlayback: ObservableObject {
                 simulationClock = clock
                 time = clock.time
                 isPlaying = clock.isPlaying
-                if !isPlaying { stopSimulation() }
+                if !isPlaying { stopSimulation(); finishAuditionIfNeeded() }
             }
         } else if isPlaying {
             player.playImmediately(atRate: Float(rate))
@@ -535,7 +626,9 @@ final class EditorPlayback: ObservableObject {
         stopSimulation()
         isPlaying = false
         time = bounded(position, to: range)
-        simulationClock?.seek(time)
+        var clock = EditorSimulationClock(bounds: playbackBounds, time: time)
+        _ = clock.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+        simulationClock = clock
     }
 
     private func startSimulation() {
@@ -552,7 +645,7 @@ final class EditorPlayback: ObservableObject {
                 self.simulationClock = clock
                 self.time = clock.time
                 self.isPlaying = clock.isPlaying
-                if !clock.isPlaying { self.stopSimulation(); return }
+                if !clock.isPlaying { self.stopSimulation(); self.finishAuditionIfNeeded(); return }
             }
         }
     }
@@ -561,6 +654,33 @@ final class EditorPlayback: ObservableObject {
         simulationGeneration &+= 1
         simulationTask?.cancel()
         simulationTask = nil
+    }
+
+    private func finishAuditionIfNeeded() {
+        if let auditionRange, time >= auditionRange.end { clearAudition() }
+    }
+
+    private func finishPlaybackAtBoundary() {
+        let end = playbackBounds.upperBound
+        pause()
+        time = end
+        finishAuditionIfNeeded()
+    }
+
+    private func clearAudition() {
+        guard auditionRange != nil else { return }
+        auditionRange = nil
+        mediaPlayer?.currentItem?.forwardPlaybackEndTime = .invalid
+        if MediaProcessing.isSuspended, simulationClock != nil {
+            var clock = EditorSimulationClock(bounds: bounds, time: time)
+            _ = clock.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+            simulationClock = clock
+        }
+    }
+
+    private func clearEndObservation() {
+        if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
+        endObservation = nil
     }
 
     private func updateStillFrame() {
@@ -613,6 +733,8 @@ final class EditorPlayback: ObservableObject {
         cachedCursorRecording = nil
         stopSimulation()
         simulationClock = nil
+        auditionRange = nil
+        clearEndObservation()
         generation += 1
         itemStatusObservation = nil
         invalidateSeeks()

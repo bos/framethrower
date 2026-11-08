@@ -14,7 +14,7 @@ struct EditorActionDescriptionChecks {
         references.register(state: state)
         let edits = state.timedEdits(includeCamera: true)
         let descriptions = edits.map { EditorActionDescription.describe($0, in: state, references: references) }
-        try require(descriptions.map(\.shortLabel) == ["Full frame A", "Zoom B", "Pan C", "Full frame D", "Hold E", "Camera F", "Ref G", "Zoom H"],
+        try require(descriptions.map(\.shortLabel) == ["Full frame A", "Zoom B", "Pan C", "Full frame D", "Hold E", "Camera F", "Reference G", "Zoom H"],
                     "descriptions must reflect actual screen/camera deltas, holds and reference-only anchors")
         try require(!descriptions[0].isMovement && descriptions[1].isMovement && descriptions[2].isMovement &&
                     !descriptions[4].isMovement && !descriptions[6].isMovement, "holds, initial view and references are not movements")
@@ -22,6 +22,11 @@ struct EditorActionDescriptionChecks {
                     descriptions[7].tooltip.contains("6.00") && descriptions[7].tooltip.contains("10.00"), "tooltips disclose actual hold and smooth intervals")
         try require(state.zoom(at: 8).scale > 1 && descriptions[6].kind == .reference,
                     "a reference drawn inside ongoing movement must not be described as a hold")
+        for alias in ["Reference G", "Ref G", "Edit G", "G"] {
+            try require(EditorActionDescription.resolve(alias, in: state, references: references)?.id == edits[6].id,
+                        "Expanded and abbreviated reference names retain the same stable identity")
+        }
+        try require(descriptions[6].aliases.contains("Ref G"), "Older conversation references remain exposed as aliases")
         for alias in ["Zoom B", "Edit B", "B", "b", "Pan B", "Full-frame B"] {
             try require(EditorActionDescription.resolve(alias, in: state, references: references)?.id == edits[1].id,
                         "descriptive/legacy/bare/stale-action aliases must preserve letter B: \(alias)")
@@ -64,7 +69,7 @@ struct EditorActionDescriptionChecks {
         try require(EditorActionDescription.describe(groupedZoom, in: grouped, references: groupedReferences).shortLabel == "Zoom B" &&
                     EditorActionDescription.describe(groupedCamera, in: grouped, references: groupedReferences).shortLabel == "Camera F",
                     "a valid grouped anchor a fraction later than its own component must not treat that component as its predecessor")
-        print("Editor action description checks passed (Zoom/Pan/Full frame/Hold/Ref/Camera, initial view, actual intervals, combined changes, retimed identity, aliases and ambiguity; no media).")
+        print("Editor action description checks passed (Zoom/Pan/Full frame/Hold/Reference/Camera, initial view, actual intervals, combined changes, retimed identity, aliases and ambiguity; no media).")
     }
     private static func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw Failure.failed(message) }

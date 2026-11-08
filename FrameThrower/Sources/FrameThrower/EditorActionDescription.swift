@@ -4,7 +4,7 @@ import Foundation
 /// durable identity when a target changes, moves, or is undone.
 struct EditorActionDescription: Equatable, Sendable {
     enum Kind: String, Sendable {
-        case zoom = "Zoom", pan = "Pan", fullFrame = "Full frame", hold = "Hold", reference = "Ref", camera = "Camera"
+        case zoom = "Zoom", pan = "Pan", fullFrame = "Full frame", hold = "Hold", reference = "Reference", camera = "Camera"
     }
 
     let kind: Kind
@@ -66,8 +66,9 @@ struct EditorActionDescription: Equatable, Sendable {
             let start = zoom != nil ? priorZoom?.time ?? 0 : priorCamera?.time ?? 0
             tooltip += String(format: " Hold from %.2f to %.2f s.", start, edit.time)
         }
+        let abbreviatedReference = kind == .reference ? letter.map { "Ref " + $0 } : nil
         return Self(kind: kind, shortLabel: label, detail: detail, tooltip: tooltip, legacyLabel: legacy,
-                    aliases: [label, legacy, letter].compactMap { $0 }, isMovement: screenChanged || cameraChanged)
+                    aliases: [label, legacy, letter, abbreviatedReference].compactMap { $0 }, isMovement: screenChanged || cameraChanged)
     }
 
     /// Descriptive prefixes can change after a revision. Resolve all known

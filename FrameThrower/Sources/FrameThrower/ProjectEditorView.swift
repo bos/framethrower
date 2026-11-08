@@ -50,6 +50,7 @@ struct ProjectEditorView: View {
         let state: EditState
         let time: Double
         let hadDraft: Bool
+        let playhead: Double
     }
 
     private var state: EditState { editor.editingState }
@@ -57,11 +58,19 @@ struct ProjectEditorView: View {
     private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
     private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil) }
     private var selectedEdit: TimedEdit? { edits.first { $0.id == selectedEditID } }
-    private var editTime: Double { selectedEdit?.time ?? editor.draftTime ?? playback.editingTime }
+    private var editTime: Double { selectedAnimationTime ?? selectedEdit?.time ?? editor.draftTime ?? playback.editingTime }
+    private var selectedAnimationTime: Double? {
+        guard let selectedAnimationID else { return nil }
+        let id = selectedAnimationID.componentID
+        switch selectedAnimationID.lane {
+        case .screen: return state.zoomKeyframes.first { $0.id == id }?.time ?? state.editAnchors.first { $0.id == id }?.time
+        case .camera: return state.pipKeyframes.first { $0.id == id }?.time
+        case .pointer: return nil
+        }
+    }
     private var point: PIPKeyframe? { state.pipKeyframes.first { abs($0.time - editTime) < 0.000001 } }
-    private var previewTime: Double { playback.isPlaying ? playback.time : editTime }
-    private var placement: PIPPlacement { state.placement(at: previewTime) }
-    private var zoom: ZoomPlacement { state.zoom(at: previewTime) }
+    private var placement: PIPPlacement { state.placement(at: editTime) }
+    private var zoom: ZoomPlacement { state.zoom(at: editTime) }
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
     private var frameDuration: Double { playback.frameDuration }
     private struct AnimationGestureSnapshot {
@@ -196,7 +205,7 @@ struct ProjectEditorView: View {
         .inspector(isPresented: $directorMode) {
             EditorAssistantPanel(editor: editor, session: assistant,
                 selectedRegionID: selectedRegionID, selectedEditID: selectedEditID,
-                onSelectEdit: { selectEdit($0) }, onReviewConflict: { reviewConflict() }, onSelectRegion: { selectRegion($0) },
+                onSelectEdit: { inspectEdit($0) }, onReviewConflict: { reviewConflict() }, onSelectRegion: { selectRegion($0) },
                 onRemoveRegion: { removeRegion($0) }, onShowOriginalFrame: { showOriginalFrame($0) }, onSubmit: {
                     playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
@@ -238,17 +247,16 @@ struct ProjectEditorView: View {
     private var player: some View {
         EditorCanvas(player: playback.canvasPlayer, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
-            placement: placement, cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil,
+            placement: state.placement(at: playback.time), cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil,
             showsCameraPattern: editor.project.cameraFilename != nil && conflictReview == nil,
             showsStill: !playback.isPlaying,
-            onBegin: {
-                assistant.cancel(); playback.pause(); dragTime = targetTime(editTime)
-                canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil)
-                selectedInspector = .camera
-            },
+            onBegin: { beginCameraGesture() },
             onPreview: { next in setPlacement(next, at: dragTime, name: "Edit") },
             onCommit: { next, name in setPlacement(next, at: dragTime, name: name); canvasGesture = nil },
-            onCancel: { canvasGesture = nil; cancelEditorInteraction() },
+            onCancel: {
+                if let snapshot = canvasGesture { restoreCanvasGesture(snapshot) }
+                else { cancelEditorInteraction() }
+            },
             onToolCancel: {
                 let snapshot = canvasGesture
                 let expectedProject = editor.project
@@ -261,8 +269,11 @@ struct ProjectEditorView: View {
                     restoreCanvasGesture(snapshot)
                 }
             },
-            zoom: conflictReview == nil ? zoom : ZoomPlacement(),
+            prepareEditingPose: { EditorCanvasEditingPose(zoom: state.zoom(at: dragTime), placement: state.placement(at: dragTime)) },
+            onEditingEnded: { canvasGesture = nil },
+            zoom: conflictReview == nil ? state.zoom(at: playback.time) : ZoomPlacement(),
             allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil,
+            panEditingScale: zoom.scale,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name); canvasGesture = nil },
@@ -395,6 +406,7 @@ struct ProjectEditorView: View {
 
     private func cancelEditorInteraction() {
         if conflictReview != nil { assistant.cancel(); return }
+        if let snapshot = canvasGesture { restoreCanvasGesture(snapshot); return }
         if animationGesture != nil { cancelAnimationGesture() }
         else if movingEditState != nil { cancelMove() }
         else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
@@ -639,6 +651,7 @@ struct ProjectEditorView: View {
                 }) { value in
                     var next = zoom; next.scale = value
                     setZoom(next, at: dragTime, name: "Zoom recording")
+                    canvasGesture = nil
                 }
                 .frame(width: 285)
                 .help("Change the magnification at the current video time. Pinch to zoom; use two fingers to pan. Double-click also zooms where you click.")
@@ -704,8 +717,14 @@ struct ProjectEditorView: View {
         if edit.zoomID == nil && edit.cameraID != nil { selectedInspector = .camera }
         else if edit.cameraID == nil { selectedInspector = .zoom }
         playback.pause()
-        playback.seek(edit.time)
         synchronizeAnimationSelection()
+    }
+
+    /// Conversation cards explicitly inspect an edit; lane clicks only select.
+    private func inspectEdit(_ id: UUID) {
+        selectEdit(id)
+        guard selectedEditID == id, let selectedEdit else { return }
+        playback.seek(selectedEdit.time)
     }
 
     private func synchronizeAnimationSelection() {
@@ -714,6 +733,10 @@ struct ProjectEditorView: View {
         } else if let edit = selectedEdit {
             let lane: TimelineAnimationLane = selectedInspector == .camera ? .camera : .screen
             selectedAnimationID = timelineAnimations.first(where: { $0.editID == edit.id && $0.lane == lane })?.id
+        } else if selectedInspector == .camera, selectedAnimationID?.lane == .camera,
+                  selectedAnimationID?.componentID == state.pipKeyframes.first?.id {
+            // The fixed initial camera target has no grouped TimedEdit.
+            return
         } else { selectedAnimationID = nil }
     }
 
@@ -734,7 +757,6 @@ struct ProjectEditorView: View {
             span.isReference ? edit.anchorID == id.componentID : id.lane == .screen ? edit.zoomID == id.componentID : edit.cameraID == id.componentID
         })?.id
         selectedInspector = id.lane == .camera ? .camera : .zoom
-        playback.seek(span.end)
     }
 
     private func editAnimation(_ request: AnimationDrag, final: Bool) {
@@ -898,11 +920,26 @@ struct ProjectEditorView: View {
 
     private func beginZoomGesture() {
         assistant.cancel()
+        let originalTime = playback.time
         if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
         playback.pause()
         dragTime = targetTime(editTime)
-        canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil)
+        canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil, playhead: originalTime)
+        inspectEditingTarget(at: dragTime)
         selectedInspector = .zoom
+    }
+
+    private func beginCameraGesture() {
+        assistant.cancel()
+        dragTime = targetTime(editTime)
+        canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil, playhead: playback.time)
+        inspectEditingTarget(at: dragTime)
+        selectedInspector = .camera
+    }
+
+    private func inspectEditingTarget(at time: Double) {
+        playback.pause()
+        if playback.time != time { playback.seek(time) }
     }
 
     private func restoreCanvasGesture(_ snapshot: CanvasGestureSnapshot?) {
@@ -914,6 +951,7 @@ struct ProjectEditorView: View {
         }
         canvasGesture = nil
         playback.preview(editor.editingState)
+        playback.seek(snapshot.playhead)
     }
 
     private func targetTime(_ position: Double) -> Double {
@@ -942,6 +980,7 @@ struct ProjectEditorView: View {
         playback.pause()
         let next = applyingZoom(placement, at: time)
         guard next != state else { return }
+        inspectEditingTarget(at: targetTime(time))
         if editor.updateDraft(next, at: targetTime(time)) {
             selectedEditID = next.timedEdits(includeCamera: editor.project.cameraFilename != nil).first { abs($0.time - targetTime(time)) < 0.000001 }?.id
         }
@@ -953,6 +992,7 @@ struct ProjectEditorView: View {
         change(&point)
         var next = state
         if let index = next.zoomKeyframes.firstIndex(where: { $0.id == point.id }) { next.zoomKeyframes[index] = point }
+        if next != state { inspectEditingTarget(at: point.time) }
         _ = editor.updateDraft(next, at: point.time)
     }
 
@@ -1012,12 +1052,13 @@ struct ProjectEditorView: View {
                         }
                         .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
                     }
-                CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { assistant.cancel(); playback.pause() }, preview: { value in
+                CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { beginCameraGesture() }, preview: { value in
                     var next = placement; next.scale = value
                     setPlacement(next, at: editTime, name: "Edit")
                 }) { value in
                     var next = placement; next.scale = value
                     setPlacement(next, at: editTime, name: "Resize camera")
+                    canvasGesture = nil
                 }.frame(width: 180)
                     .help("Resize the camera overlay. Drag any camera corner to resize directly.")
                 Spacer(minLength: 0)
@@ -1085,6 +1126,7 @@ struct ProjectEditorView: View {
         playback.pause()
         let edited = applying(next, at: time)
         guard edited != state else { return }
+        inspectEditingTarget(at: targetTime(time))
         if editor.updateDraft(edited, at: targetTime(time)) {
             selectedEditID = edited.timedEdits(includeCamera: editor.project.cameraFilename != nil).first { abs($0.time - targetTime(time)) < 0.000001 }?.id
         }
@@ -1096,6 +1138,7 @@ struct ProjectEditorView: View {
         update(&selected)
         var edited = state
         if let index = edited.pipKeyframes.firstIndex(where: { $0.id == selected.id }) { edited.pipKeyframes[index] = selected }
+        if edited != state { inspectEditingTarget(at: selected.time) }
         _ = editor.updateDraft(edited, at: selected.time)
     }
 

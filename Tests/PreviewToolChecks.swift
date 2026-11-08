@@ -241,6 +241,46 @@ private final class PreviewGesture: NSEvent {
         canvas.keyDown(with: deleteKey(51)); release(end)
         try require(canvas.referenceDraft == nil && boxes.count == completedBoxCount && deletedRegions.count == 2,
             "Delete during an unfinished draw cancels only that draw, preserving the previously selected box and ignoring late mouseUp")
+        canvas.drawsReferenceBoxes = false
+        canvas.regions = []
+        configure(ZoomPlacement())
+        let targetZoom = ZoomPlacement(scale: 2, x: 0.55, y: 0.55)
+        let targetCamera = PIPPlacement(x: 0.2, y: 0.3, scale: 0.25)
+        var preparations = 0
+        canvas.panEditingScale = targetZoom.scale
+        canvas.prepareEditingPose = {
+            preparations += 1
+            return EditorCanvasEditingPose(zoom: targetZoom, placement: targetCamera)
+        }
+        press(start); release(start)
+        try require(preparations == 0 && canvas.zoom == ZoomPlacement(),
+            "A plain preview click cannot prepare or inspect a selected target")
+        let empty = PreviewGesture()
+        empty.position = canvas.convert(start, to: nil); empty.eventPhase = .began
+        canvas.magnify(with: empty)
+        empty.eventPhase = .cancelled; canvas.magnify(with: empty)
+        try require(preparations == 0, "Empty or canceled trackpad phases cannot prepare a target")
+        press(start); move(end)
+        let preparedPan = ZoomPlacement(scale: 2,
+            x: targetZoom.x - (end.x - start.x) / (canvas.contentRect.width * 2),
+            y: targetZoom.y - (end.y - start.y) / (canvas.contentRect.height * 2)).clamped
+        try require(preparations == 1 && canvas.zoom == preparedPan && canvas.placement == targetCamera,
+            "First Pan delta uses the synchronously prepared target, even when the displayed source was full frame")
+        release(end)
+        try require(canvas.zoom == preparedPan && zoomCommits.last == preparedPan,
+            "Prepared pan release retains the exact target delta without returning to the previously displayed view")
+        configure(initial, camera: true)
+        let currentCamera = pip.frame(in: canvas.canvasRect.size, cameraAspect: 16.0 / 9)
+            .offsetBy(dx: canvas.canvasRect.minX, dy: canvas.canvasRect.minY)
+        let cameraStart = CGPoint(x: currentCamera.midX, y: currentCamera.midY)
+        let cameraEnd = CGPoint(x: cameraStart.x + 40, y: cameraStart.y + 20)
+        let targetRect = targetCamera.frame(in: canvas.canvasRect.size, cameraAspect: 16.0 / 9)
+        var preparedCamera = targetCamera
+        preparedCamera.x += 40 / (canvas.canvasRect.width - targetRect.width)
+        preparedCamera.y += 20 / (canvas.canvasRect.height - targetRect.height)
+        press(cameraStart); move(cameraEnd); release(cameraEnd)
+        try require(preparations == 2 && canvas.placement == preparedCamera && pipCommits.last == preparedCamera && canvas.zoom == targetZoom,
+            "First PIP delta also uses target geometry and prepares screen/camera together")
         try require(canvas.frame == fixedFrame && !canvas.hasMediaPlayerLayer && canvas.stillLayer.contents == nil && canvas.testPattern != nil,
             "All preview-tool interactions preserve layout and use only native vector content")
         print("Preview tool checks passed (Director Pan/Box routing, badges/cursors, live locked boxes/frozen source, trackpad momentum, cancellation/late release, PIP move/resize, fixed vector layout; no AV objects/media).")

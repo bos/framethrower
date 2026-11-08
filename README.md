@@ -186,7 +186,11 @@ Pointer currently shows whole-recording style settings and recorded click ticks;
 it does not create timed pointer-style changes. Missing camera or pointer tracks
 show **Not recorded**.
 
-Click an animation to select it and inspect its destination. Drag its body to
+Click an animation to select it without moving the playhead or preview. The
+inspector shows the selected target; the preview stays at the current source
+time. Starting a framing adjustment inspects that target before applying the
+first gesture delta. Escape cancels an unfinished gesture and restores the
+previous playhead and framing. Drag its body to
 move the entire movement, or its start/end grips to change its timing. Pull an
 instant change's start grip left to turn it into a smooth movement. The tall
 inner grips extend above the lane and adjust acceleration and deceleration; tooltips report their purpose. Coincident ramp boundaries have

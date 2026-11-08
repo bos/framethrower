@@ -2,6 +2,11 @@ import AppKit
 import AVFoundation
 import SwiftUI
 
+struct EditorCanvasEditingPose {
+    var zoom: ZoomPlacement
+    var placement: PIPPlacement
+}
+
 /// Pixels and drag geometry stay inside one native view. Neither decoded image
 /// dimensions nor a camera gesture can become a SwiftUI layout proposal.
 struct EditorCanvas: NSViewRepresentable {
@@ -18,8 +23,11 @@ struct EditorCanvas: NSViewRepresentable {
     var onCommit: (PIPPlacement, String) -> Void
     var onCancel: () -> Void
     var onToolCancel: (() -> Void)? = nil
+    var prepareEditingPose: (() -> EditorCanvasEditingPose)? = nil
+    var onEditingEnded: (() -> Void)? = nil
     var zoom = ZoomPlacement()
     var allowsZoomEditing = true
+    var panEditingScale: Double? = nil
     var onZoomBegin: () -> Void = {}
     var onZoomPreview: (ZoomPlacement) -> Void = { _ in }
     var onZoomCommit: (ZoomPlacement, String) -> Void = { _, _ in }
@@ -43,10 +51,13 @@ struct EditorCanvas: NSViewRepresentable {
         view.onCommit = onCommit
         view.onCancel = onCancel
         view.onToolCancel = onToolCancel
+        view.prepareEditingPose = prepareEditingPose
+        view.onEditingEnded = onEditingEnded
         view.onZoomBegin = onZoomBegin
         view.onZoomPreview = onZoomPreview
         view.onZoomCommit = onZoomCommit
         view.allowsZoomEditing = allowsZoomEditing
+        view.panEditingScale = panEditingScale
         view.scribbleMode = scribbleMode
         view.drawsReferenceBoxes = drawsReferenceBoxes
         view.regions = regions
@@ -144,6 +155,8 @@ final class EditorCanvasView: NSView {
     var onCommit: ((PIPPlacement, String) -> Void)?
     var onCancel: (() -> Void)?
     var onToolCancel: (() -> Void)?
+    var prepareEditingPose: (() -> EditorCanvasEditingPose)?
+    var onEditingEnded: (() -> Void)?
     var onZoomBegin: (() -> Void)?
     var onZoomPreview: ((ZoomPlacement) -> Void)?
     var onZoomCommit: ((ZoomPlacement, String) -> Void)?
@@ -153,11 +166,20 @@ final class EditorCanvasView: NSView {
         }
     }
     private(set) var zoom = ZoomPlacement()
+    var panEditingScale: Double? {
+        didSet {
+            if ((oldValue ?? zoom.scale) > 1) != ((panEditingScale ?? zoom.scale) > 1) {
+                window?.invalidateCursorRects(for: self)
+            }
+        }
+    }
+    private var canPan: Bool { allowsZoomEditing && (panEditingScale ?? zoom.scale).isFinite && (panEditingScale ?? zoom.scale) > 1 }
     private static let navigationHelp = "Pinch to zoom; use two fingers to pan. Double-click to zoom, or drag a zoomed recording to pan. Drag the camera or its corners to move or resize it. Escape cancels unfinished edits."
     private struct ZoomDrag {
         let point: CGPoint
-        let origin: ZoomPlacement
+        var origin: ZoomPlacement
         var draft: ZoomPlacement
+        var hasBegun = false
     }
     private var zoomDrag: ZoomDrag?
     private enum TrackpadKind { case pinch, pan }
@@ -169,9 +191,10 @@ final class EditorCanvasView: NSView {
     private var trackpad: TrackpadGesture?
     private struct Drag {
         let point: CGPoint
-        let origin: PIPPlacement
+        var origin: PIPPlacement
         let corner: PIPResizeCorner?
         var draft: PIPPlacement
+        var hasBegun = false
     }
     private var drag: Drag?
     override var isFlipped: Bool { true }
@@ -478,7 +501,7 @@ final class EditorCanvasView: NSView {
             }
             if cameraRect.contains(point) { return drag == nil ? .openHand : .closedHand }
         }
-        return allowsZoomEditing && zoom.scale > 1 && canvasRect.contains(point) ? .openHand : .arrow
+        return canPan && canvasRect.contains(point) ? .openHand : .arrow
     }
 
     override func updateTrackingAreas() {
@@ -534,7 +557,6 @@ final class EditorCanvasView: NSView {
             window?.makeFirstResponder(self)
             finishTrackpad()
             ignoresTrackpadRemainder = true
-            onBegin?()
             drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
             return
         }
@@ -543,16 +565,15 @@ final class EditorCanvasView: NSView {
         ignoresTrackpadRemainder = true
         if event.clickCount == 2 {
             window?.makeFirstResponder(self)
-            onZoomBegin?()
+            prepareGesture(camera: false)
             let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
             let next = zoom.scale > 1 ? ZoomPlacement() : ZoomPlacement(scale: 2,
                 x: viewport.minX + min(1, max(0, (point.x - contentRect.minX) / contentRect.width)) * viewport.width,
                 y: viewport.minY + min(1, max(0, (point.y - contentRect.minY) / contentRect.height)) * viewport.height).clamped
             zoom = next
             onZoomCommit?(next, next.scale > 1 ? "Zoom in" : "Zoom out")
-        } else if zoom.scale > 1 {
+        } else if canPan {
             window?.makeFirstResponder(self)
-            onZoomBegin?()
             zoomDrag = ZoomDrag(point: point, origin: zoom.clamped, draft: zoom.clamped)
             window?.invalidateCursorRects(for: self)
         }
@@ -568,6 +589,13 @@ final class EditorCanvasView: NSView {
         }
         if var pan = zoomDrag {
             let point = convert(event.locationInWindow, from: nil)
+            if !pan.hasBegun {
+                guard hypot(point.x - pan.point.x, point.y - pan.point.y) >= 3 else { return }
+                prepareGesture(camera: false)
+                pan.origin = zoom.clamped
+                pan.draft = pan.origin
+                pan.hasBegun = true
+            }
             let next = ZoomPlacement(scale: pan.origin.scale,
                 x: pan.origin.x - (point.x - pan.point.x) / max(1, contentRect.width * pan.origin.scale),
                 y: pan.origin.y - (point.y - pan.point.y) / max(1, contentRect.height * pan.origin.scale)).clamped
@@ -581,6 +609,13 @@ final class EditorCanvasView: NSView {
         guard var drag else { return }
         let point = convert(event.locationInWindow, from: nil)
         let translation = CGSize(width: point.x - drag.point.x, height: point.y - drag.point.y)
+        if !drag.hasBegun {
+            guard hypot(translation.width, translation.height) >= 3 else { return }
+            prepareGesture(camera: true)
+            drag.origin = placement
+            drag.draft = placement
+            drag.hasBegun = true
+        }
         var next = drag.origin
         if let corner = drag.corner {
             next = next.resized(by: translation, corner: corner, in: canvasRect.size, cameraAspect: cameraAspect)
@@ -629,6 +664,7 @@ final class EditorCanvasView: NSView {
             zoom = pan.draft
             window?.invalidateCursorRects(for: self)
             if pan.draft != pan.origin { onZoomCommit?(pan.draft, "Pan recording") }
+            if pan.hasBegun { onEditingEnded?() }
             return
         }
         guard let drag else { return }
@@ -638,6 +674,7 @@ final class EditorCanvasView: NSView {
         if drag.draft != drag.origin {
             onCommit?(drag.draft, drag.corner == nil ? "Move camera" : "Resize camera")
         }
+        if drag.hasBegun { onEditingEnded?() }
     }
 
     override func keyDown(with event: NSEvent) {
@@ -657,8 +694,10 @@ final class EditorCanvasView: NSView {
 
     override func magnify(with event: NSEvent) {
         guard acceptsTrackpad(event), event.magnification.isFinite else { return }
-        if event.phase.contains(.cancelled) { cancelOperation(nil); return }
-        if event.phase.contains(.began) { beginTrackpad(.pinch) }
+        if event.phase.contains(.cancelled) {
+            if trackpad != nil { cancelOperation(nil) }
+            return
+        }
         if event.magnification != 0 {
             beginTrackpad(.pinch)
             let point = convert(event.locationInWindow, from: nil)
@@ -679,15 +718,12 @@ final class EditorCanvasView: NSView {
     override func scrollWheel(with event: NSEvent) {
         guard acceptsTrackpad(event) else { return }
         if event.phase.contains(.cancelled) || event.momentumPhase.contains(.cancelled) {
-            cancelOperation(nil)
+            if trackpad != nil { cancelOperation(nil) }
             return
         }
         let dx = event.scrollingDeltaX
         let dy = event.scrollingDeltaY
-        if zoom.scale > 1, event.phase.contains(.began) || event.momentumPhase.contains(.began) {
-            beginTrackpad(.pan)
-        }
-        if zoom.scale > 1, dx.isFinite, dy.isFinite, dx != 0 || dy != 0 {
+        if canPan, dx.isFinite, dy.isFinite, dx != 0 || dy != 0 {
             beginTrackpad(.pan)
             // AppKit has already applied the user's natural-scroll preference.
             // Convert deltas into source viewport offsets. Moving the viewport
@@ -716,6 +752,7 @@ final class EditorCanvasView: NSView {
         let active = guidePressID != nil || scribbleStart != nil || trackpad != nil || zoomDrag != nil || drag != nil
         guard active else { return false }
         var changed = false
+        let prepared = trackpad != nil || zoomDrag?.hasBegun == true || drag?.hasBegun == true
         if let trackpad { zoom = trackpad.origin; changed = trackpad.draft != trackpad.origin }
         else if let zoomDrag { zoom = zoomDrag.origin; changed = zoomDrag.draft != zoomDrag.origin }
         if let drag { placement = drag.origin; changed = changed || drag.draft != drag.origin }
@@ -732,7 +769,7 @@ final class EditorCanvasView: NSView {
         updateLayers()
         CATransaction.commit()
         window?.invalidateCursorRects(for: self)
-        if changed {
+        if changed || prepared {
             if toolChange, let onToolCancel { onToolCancel() }
             else { onCancel?() }
         }
@@ -754,8 +791,27 @@ final class EditorCanvasView: NSView {
         if trackpad?.kind == kind { return }
         finishTrackpad()
         window?.makeFirstResponder(self)
-        onZoomBegin?()
+        prepareGesture(camera: false)
         trackpad = TrackpadGesture(kind: kind, origin: zoom, draft: zoom)
+    }
+
+    /// The host may inspect a selected edit before manipulation. Obtain its
+    /// authoritative pose synchronously: a later SwiftUI configure intentionally
+    /// preserves the gesture's frozen origin and cannot safely rebase it.
+    private func prepareGesture(camera: Bool) {
+        if camera { onBegin?() } else { onZoomBegin?() }
+        if let pose = prepareEditingPose?() {
+            zoom = pose.zoom.clamped
+            placement = pose.placement
+            if var pending = drag, !pending.hasBegun {
+                pending.origin = placement
+                pending.draft = placement
+                drag = pending
+            }
+        }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        updateLayers()
+        CATransaction.commit()
     }
 
     private func previewTrackpad(_ next: ZoomPlacement) {
@@ -772,6 +828,7 @@ final class EditorCanvasView: NSView {
         if gesture.draft != gesture.origin {
             onZoomCommit?(gesture.draft, gesture.kind == .pinch ? "Zoom recording" : "Pan recording")
         }
+        onEditingEnded?()
     }
 
     private func snap(_ value: Double) -> Double {

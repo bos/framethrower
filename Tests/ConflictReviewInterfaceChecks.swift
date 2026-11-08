@@ -21,12 +21,14 @@ struct ConflictReviewInterfaceChecks {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
+        var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov",
+            cursorFilename: "missing-pointer.json", duration: 12)
         project.state.zoomKeyframes = [ZoomKeyframe(time: 1, scale: 2, transition: .smooth, duration: 1),
             ZoomKeyframe(time: 6, scale: 2.5, transition: .smooth, duration: 1),
             ZoomKeyframe(time: 9, scale: 1, transition: .smooth, duration: 1)]
         project.state.pipKeyframes.append(PIPKeyframe(time: 2,
             placement: PIPPlacement(x: 0.15, y: 0.2, scale: 0.38), transition: .smooth, duration: 2))
+        project.state.editAnchors = [EditAnchor(time: 4)]
         let box1 = EditorRegion(time: 0, rect: .init(x: 0.1, y: 0.1, width: 0.25, height: 0.3))
         let box2 = EditorRegion(time: 0, rect: .init(x: 0.6, y: 0.5, width: 0.3, height: 0.3))
         project.state.regions = [box1, box2]
@@ -380,6 +382,47 @@ struct ConflictReviewInterfaceChecks {
         }
         let componentID = editor.project.state.zoomKeyframes[0].id
         let animationID = TimelineAnimationID(lane: .screen, componentID: componentID)
+        guard let camera = timeline.animationGeometry().first(where: { $0.animation.lane == .camera && $0.animation.end > 0 }),
+              let initialCamera = timeline.animationGeometry().first(where: { $0.animation.lane == .camera && $0.animation.end == 0 }),
+              let pointer = timeline.animationGeometry().first(where: { $0.animation.lane == .pointer }),
+              let reference = timeline.animationGeometry().first(where: { $0.animation.isReference }) else {
+            throw Failure.failed("Selection fixture needs Screen, both Camera cases, Pointer and a reference mark")
+        }
+        let selectionProject = editor.project
+        let selectionTime = playback.time
+        let visibleZoom = canvas.zoom, visibleCamera = canvas.placement
+        let sourceViewport = canvas.testPattern?.screenViewport, cameraViewport = canvas.testPattern?.cameraViewport
+        let sourceFrame = canvas.testPattern?.screenFrame, cameraFrame = canvas.testPattern?.cameraFrame
+        try require(visibleZoom == editor.editingState.zoom(at: selectionTime) &&
+                    visibleCamera == editor.editingState.placement(at: selectionTime),
+                    "Paused preview must initially show source time rather than a previously selected edit's destination")
+        for id in [animationID, initialCamera.animation.id, camera.animation.id, pointer.animation.id, reference.animation.id, animationID] {
+            guard let item = timeline.animationGeometry().first(where: { $0.animation.id == id }) else {
+                throw Failure.failed("Selectable lane item disappeared")
+            }
+            let click = CGPoint(x: item.body.midX, y: item.body.midY)
+            var missingChoice = false
+            timeline.presentAnimationMenu = { menu, _ in
+                guard let index = menu.items.firstIndex(where: { ($0.representedObject as? TimelineAnimationID) == id }) else {
+                    missingChoice = true; return
+                }
+                menu.performActionForItem(at: index)
+            }
+            timeline.mouseDown(with: mouse(.leftMouseDown, click, in: timeline, window: window))
+            try require(playback.time == selectionTime, "Selecting a lane item cannot seek on mouse-down")
+            timeline.mouseUp(with: mouse(.leftMouseUp, click, in: timeline, window: window))
+            timeline.presentAnimationMenu = nil
+            try await settle(host)
+            try require(!missingChoice && timeline.selectedAnimationID == id && playback.time == selectionTime && timeline.playhead == selectionTime &&
+                        canvas.zoom == visibleZoom && canvas.placement == visibleCamera &&
+                        canvas.testPattern?.screenViewport == sourceViewport && canvas.testPattern?.cameraViewport == cameraViewport &&
+                        canvas.testPattern?.screenFrame == sourceFrame && canvas.testPattern?.cameraFrame == cameraFrame &&
+                        canvas.frame == fixedCanvas && timeline.frame == fixedTimeline && window.frame == fixedWindow &&
+                        editor.project == selectionProject && editor.draftState == nil,
+                        "Selecting \(item.animation.label) in \(id.lane) must highlight only that item without moving source time, screen/PIP pixels, layout or history (selected=\(String(describing: timeline.selectedAnimationID)), time \(selectionTime)→\(playback.time), zoom \(visibleZoom)→\(canvas.zoom), camera \(visibleCamera)→\(canvas.placement), project=\(editor.project == selectionProject))")
+        }
+        try await canvasManipulation(host: host, window: window, timeline: timeline, canvas: canvas,
+            editor: editor, playback: playback, screenID: animationID, cameraID: initialCamera.animation.id)
         guard let geometry = timeline.animationGeometry().first(where: { $0.animation.id == animationID }) else {
             throw Failure.failed("Screen animation geometry missing")
         }
@@ -389,8 +432,8 @@ struct ConflictReviewInterfaceChecks {
         try require(playback.time == playhead, "Mouse-down must not seek before click versus drag is known")
         timeline.mouseUp(with: mouse(.leftMouseUp, point, in: timeline, window: window))
         try await settle(host)
-        try require(timeline.selectedAnimationID == animationID && abs(playback.time - geometry.animation.end) < 0.000001,
-                    "A completed plain click selects the animation and inspects its destination")
+        try require(timeline.selectedAnimationID == animationID && playback.time == playhead && canvas.zoom == visibleZoom && canvas.placement == visibleCamera,
+                    "A completed plain click selects the animation while retaining the current source frame")
         let baseline = editor.project
         let destination = CGPoint(x: point.x + timeline.x(for: 3) - timeline.x(for: 1), y: point.y)
         timeline.mouseDown(with: mouse(.leftMouseDown, point, in: timeline, window: window))
@@ -423,6 +466,98 @@ struct ConflictReviewInterfaceChecks {
         try require(editor.project == committed && editor.draftState == nil && editor.project.undoHistory == committed.undoHistory &&
                     canvas.frame == fixedCanvas && timeline.frame == fixedTimeline && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
                     "Escape cancels the complete ripple preview, preserves history and cannot resize or activate media")
+    }
+    static func canvasManipulation(host: NSView, window: NSWindow, timeline: RecordingTimelineView,
+                                   canvas: EditorCanvasView, editor: ProjectEditor, playback: EditorPlayback,
+                                   screenID: TimelineAnimationID, cameraID: TimelineAnimationID) async throws {
+        let baseline = editor.project.state
+        func select(_ id: TimelineAnimationID) async throws {
+            playback.seek(6)
+            try await settle(host)
+            let item = timeline.animationGeometry().first { $0.animation.id == id }!
+            let point = CGPoint(x: item.body.midX, y: item.body.midY)
+            var missingChoice = false
+            timeline.presentAnimationMenu = { menu, _ in
+                guard let index = menu.items.firstIndex(where: { ($0.representedObject as? TimelineAnimationID) == id }) else {
+                    missingChoice = true; return
+                }
+                menu.performActionForItem(at: index)
+            }
+            timeline.mouseDown(with: mouse(.leftMouseDown, point, in: timeline, window: window))
+            timeline.mouseUp(with: mouse(.leftMouseUp, point, in: timeline, window: window))
+            timeline.presentAnimationMenu = nil
+            try await settle(host)
+            try require(!missingChoice && timeline.selectedAnimationID == id && playback.time == 6,
+                        "Passive selection or explicit overlap-chooser selection cannot inspect the manipulation target")
+        }
+        try await select(screenID)
+        let start = CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.minY + canvas.contentRect.height * 0.1)
+        let end = CGPoint(x: start.x + 40, y: start.y + 20)
+        canvas.mouseDown(with: mouse(.leftMouseDown, start, in: canvas, window: window))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, CGPoint(x: start.x + 1, y: start.y), in: canvas, window: window))
+        try require(playback.time == 6 && editor.draftState == nil, "Click jitter cannot inspect or edit a remote target")
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, end, in: canvas, window: window))
+        try await settle(host)
+        let target = baseline.zoom(at: 1)
+        let expected = ZoomPlacement(scale: target.scale,
+            x: target.x - 40 / (canvas.contentRect.width * target.scale),
+            y: target.y - 20 / (canvas.contentRect.height * target.scale)).clamped
+        let actualPan = canvas.zoom
+        try require(playback.time == 1 && abs(actualPan.scale - expected.scale) < 0.000001 &&
+                    abs(actualPan.x - expected.x) < 0.000001 && abs(actualPan.y - expected.y) < 0.000001 &&
+                    editor.draftState?.zoom(at: 1) == actualPan,
+                    "The first deliberate Pan delta inspects and revises the selected 1s target using its 2× origin")
+        canvas.mouseUp(with: mouse(.leftMouseUp, end, in: canvas, window: window))
+        try await settle(host)
+        try require(playback.time == 1 && canvas.zoom == actualPan && canvas.testPattern?.screenViewport == actualPan.viewport(in: playback.sourceSize),
+                    "Pan release cannot snap back to the unrelated later frame")
+        try require(editor.undo(), "One ordinary Undo restores the complete prepared Pan")
+        try await settle(host)
+        try require(editor.project.state == baseline && editor.draftState == nil, "Pan Undo retains all other edit points")
+        try await select(cameraID)
+        let visibleRect = canvas.testPattern!.cameraFrame
+        let cameraStart = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
+        let cameraEnd = CGPoint(x: cameraStart.x - 40, y: cameraStart.y - 20)
+        canvas.mouseDown(with: mouse(.leftMouseDown, cameraStart, in: canvas, window: window))
+        try require(playback.time == 6, "Clicking a camera without moving cannot inspect its selected initial target")
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, cameraEnd, in: canvas, window: window))
+        try await settle(host)
+        let originalCamera = baseline.placement(at: 0)
+        let targetRect = originalCamera.frame(in: canvas.canvasRect.size, cameraAspect: playback.cameraAspect)
+        var expectedCamera = originalCamera
+        expectedCamera.x -= 40 / (canvas.canvasRect.width - targetRect.width)
+        expectedCamera.y -= 20 / (canvas.canvasRect.height - targetRect.height)
+        let actualCamera = editor.draftState?.placement(at: 0)
+        try require(playback.time == 0 && actualCamera.map { abs($0.x - expectedCamera.x) < 0.000001 && abs($0.y - expectedCamera.y) < 0.000001 && $0.scale == expectedCamera.scale } == true &&
+                    canvas.testPattern?.cameraFrame == actualCamera!.frame(in: canvas.canvasRect.size, cameraAspect: playback.cameraAspect)
+                        .offsetBy(dx: canvas.canvasRect.minX, dy: canvas.canvasRect.minY),
+                    "The first PIP delta is based on initial-camera geometry, not the later visible camera")
+        canvas.mouseUp(with: mouse(.leftMouseUp, cameraEnd, in: canvas, window: window))
+        try await settle(host)
+        try require(canvas.placement == actualCamera && playback.time == 0, "PIP release preserves the same prepared target pose")
+        try require(editor.undo(), "One ordinary Undo restores the complete prepared PIP change")
+        try await settle(host)
+        try require(editor.project.state == baseline, "PIP Undo preserves Screen and all other camera edits")
+        try await select(screenID)
+        canvas.mouseDown(with: mouse(.leftMouseDown, start, in: canvas, window: window))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, end, in: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, end, in: canvas, window: window))
+        try await settle(host)
+        let earlierDraft = editor.draftState
+        playback.seek(6)
+        try await settle(host)
+        canvas.mouseDown(with: mouse(.leftMouseDown, start, in: canvas, window: window))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, CGPoint(x: start.x - 40, y: start.y - 20), in: canvas, window: window))
+        try await settle(host)
+        try require(playback.time == 1 && editor.draftState != earlierDraft, "Escape fixture has an actual second prepared manipulation")
+        canvas.cancelOperation(nil)
+        canvas.mouseUp(with: mouse(.leftMouseUp, end, in: canvas, window: window))
+        try await settle(host)
+        try require(playback.time == 6 && editor.draftState == earlierDraft && canvas.zoom == baseline.zoom(at: 6),
+                    "Escape restores the original 6s frame and earlier completed draft, canceling only the held manipulation")
+        _ = editor.cancelDraft()
+        playback.seek(6)
+        try await settle(host)
     }
     static func mouse(_ type: NSEvent.EventType, _ point: CGPoint, in view: NSView, window: NSWindow,
                       flags: NSEvent.ModifierFlags = []) -> NSEvent {

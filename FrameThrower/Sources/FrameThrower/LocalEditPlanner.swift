@@ -149,6 +149,7 @@ enum LocalEditPlanner {
         ]
         let contextText = String(decoding: try JSONSerialization.data(withJSONObject: compact, options: .sortedKeys), as: UTF8.self)
         let guidance = EditorAgentControls.tools(for: route) != nil ? editControlGuidance
+            : usesAbsoluteBoxMove(route, context: context) ? absoluteMoveGuidance
             : usesRelativeBoxMove(route, context: context) ? relativeMoveGuidance
             : usesDurationMove(route, context: context) ? durationGuidance
             : usesNamedReferences(route, context: context) ? namedGuidance : numericGuidance
@@ -212,9 +213,9 @@ enum LocalEditPlanner {
             A rejected plan is not accepted user intent. In particular, do not
             inherit an unrequested full-frame waypoint from a rejected call.
             Timeline labels describe current actions, such as Zoom D, Pan G,
-            Full frame E, Hold F, or Ref A. Their letter is the stable identity.
+            Full frame E, Hold F, or Reference A. Their letter is the stable identity.
             Accept each edit's descriptive label, legacy Edit label, or bare letter;
-            changing the action word never creates a different edit. Ref marks
+            changing the action word never creates a different edit. Reference marks
             add no framing change. Hold boundaries explicitly keep an existing
             view; they are not extra movements. Do not add consecutive movement
             steps to the same target merely to fill time; use hold_seconds.
@@ -225,7 +226,8 @@ enum LocalEditPlanner {
         let messages = try conversationMessages(system: system, context: contextText,
             request: request, conversation: conversation, continuation: continuation)
         let focusedTools = tools(for: route, context: context, historyInspected: historyInspected).map {
-            EditorAgentControls.focusedManagementTool($0, instruction: request, context: context)
+            focusedAbsoluteTool(EditorAgentControls.focusedManagementTool($0, instruction: request, context: context),
+                instruction: request, context: context)
         }
         return try JSONSerialization.data(withJSONObject: [
             "model": "framethrower-local", "messages": messages,
@@ -266,6 +268,10 @@ enum LocalEditPlanner {
             if let rejection = EditorAgentControls.boxIntentMismatch(instruction, toolName: name, args: args, context: context) {
                 return .rejectedPlan(rejection)
             }
+            if let expected = absoluteStart(in: instruction), usesAbsoluteBoxMove(instruction, context: context), name != "move_at_time",
+               name != "inspect_history", name != "report_history" {
+                return .rejectedPlan("The instruction gives an absolute recording time. Use move_at_time with start_seconds=\(expected), not a named edit, box source time, or playhead offset. No changes were applied.")
+            }
         }
         if let routingRequest {
             // Tool results in conversation are historical. A model must not
@@ -299,6 +305,51 @@ enum LocalEditPlanner {
         var framingConflicts: [ZoomKeyframe] = []
         let summary: String
         switch name {
+        case "move_at_time":
+            try keys(args, ["project_id", "expected_revision", "start_seconds", "from_box_label", "to_box_label", "duration_seconds", "path"])
+            let start = try number(args["start_seconds"]), duration = try number(args["duration_seconds"])
+            guard start >= 0, duration > 0, duration <= 60,
+                  let from = args["from_box_label"] as? String, let to = args["to_box_label"] as? String,
+                  let path = args["path"] as? String, ["direct", "via_full_frame"].contains(path),
+                  [from, to].allSatisfy({ $0.count <= 40 }) else { throw invalidResponse }
+            if let instruction, let expected = absoluteStart(in: instruction), abs(start - expected) > 0.000_001 {
+                return .rejectedPlan("The instruction starts at recording time \(timeLabel(expected)). Use start_seconds=\(expected), not an edit's time or a playhead offset.")
+            }
+            if let instruction, let expected = requestedDuration(in: instruction), abs(duration - expected) > 0.000_001 {
+                return .rejectedPlan("The whole movement must take \(timeLabel(expected)), as requested.")
+            }
+            if let instruction, path != relativePath(in: instruction, context: context) {
+                return .rejectedPlan("The plan changed the requested movement path. Use path=\(relativePath(in: instruction, context: context)).")
+            }
+            guard let source = resolveBox(from, context: context), let target = resolveBox(to, context: context) else {
+                return .clarification("Which numbered boxes should the movement start from and arrive at?")
+            }
+            if let instruction {
+                for (prefixes, chosen) in [(["from"], source), (["to", "into"], target)] {
+                    let requested = context.recording.state.regions.filter { region in
+                        prefixes.contains { box(region, isMentionedAfter: $0, in: instruction, context: context) }
+                    }
+                    if requested.count == 1, requested[0].id != chosen.id {
+                        return .rejectedPlan("The plan reversed the requested source and destination boxes. Keep the named from/to box identities.")
+                    }
+                }
+            }
+            let end = start + duration
+            guard end.isFinite, end < context.recording.duration else {
+                throw EditorCommandError.invalid("The proposed movement starts at \(timeLabel(start)) and ends at \(timeLabel(end)), but this recording ends at \(timeLabel(context.recording.duration)). Choose an earlier start or shorter movement.")
+            }
+            framingConflicts = overlappingFraming(in: context.recording.state, start: start, end: end)
+            commands = [.frameRegion(regionID: source.id, time: start, motion: EditorCommandMotion(transition: .jump))]
+            if path == "via_full_frame" {
+                let half = duration / 2
+                commands.append(.fullFrame(time: start + half, motion: EditorCommandMotion(transition: .smooth, duration: half)))
+                commands.append(.frameRegion(regionID: target.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: half)))
+            } else {
+                commands.append(.frameRegion(regionID: target.id, time: end, motion: EditorCommandMotion(transition: .smooth, duration: duration)))
+            }
+            summary = "\(context.recording.references.boxLabel(for: source.id) ?? from) at \(timeLabel(start)) → "
+                + (path == "via_full_frame" ? "full frame → " : "")
+                + "\(context.recording.references.boxLabel(for: target.id) ?? to) at \(timeLabel(end))."
         case "move_relative":
             var expectedKeys: Set<String> = ["project_id", "expected_revision", "from_box_label", "to_box_label", "start_delay_seconds", "arrival_seconds", "arrival_origin", "path"]
             if args["time_origin"] != nil { expectedKeys.insert("time_origin") }
@@ -570,7 +621,7 @@ enum LocalEditPlanner {
             summary = "\(movementCount) framing \(movementCount == 1 ? "movement" : "movements"): " + sequenceDetails.joined(separator: "; ") + "."
         default: throw invalidResponse
         }
-        if ["frame_edits", "move_for_duration", "move_relative", "plan_sequence"].contains(name), let instruction,
+        if ["frame_edits", "move_at_time", "move_for_duration", "move_relative", "plan_sequence"].contains(name), let instruction,
            let question = incompleteReferenceQuestion(commands, instruction: instruction, context: context) {
             return .clarification(question)
         }
@@ -992,6 +1043,18 @@ enum LocalEditPlanner {
         the visible labels if a named reference is missing or ambiguous.
         """
 
+    private static let absoluteMoveGuidance = """
+        Use move_at_time when the user gives an absolute recording time and
+        a duration for moving between two boxes. 'At 2 seconds, take 3 seconds
+        to zoom and pan from Box 9 to Box 10' means start_seconds=2 and
+        duration_seconds=3, arriving at recording time 5. Never substitute a
+        named/selected edit, a box's source timestamp, or the current playhead
+        for that absolute time. Both boxes fully specify the framing targets.
+        Use direct unless the instruction explicitly requests returning to
+        full frame along the way. 'Two seconds from now' is relative instead;
+        use move_relative for that distinct instruction.
+        """
+
     private static let durationGuidance = """
         Use move_for_duration when moving from one numbered box to another over
         a stated duration. The starting edit can be named or selected. Both boxes
@@ -1083,6 +1146,12 @@ enum LocalEditPlanner {
     }
 
     private static func normalTools(for request: String, context: LocalEditContext) -> [[String: Any]] {
+        if usesAbsoluteBoxMove(request, context: context) {
+            return tools.filter {
+                let name = ($0["function"] as? [String: Any])?["name"] as? String
+                return name == "move_at_time" || name == "ask_clarification"
+            }
+        }
         if let controls = EditorAgentControls.tools(for: request) { return controls }
         if usesRelativeBoxMove(request, context: context) {
             return tools.filter { tool in
@@ -1112,7 +1181,7 @@ enum LocalEditPlanner {
         guard usesNamedReferences(request, context: context) else {
             return tools.filter {
                 guard let name = ($0["function"] as? [String: Any])?["name"] as? String else { return false }
-                return name != "frame_edits" && name != "move_for_duration" && name != "move_relative"
+                return name != "frame_edits" && name != "move_at_time" && name != "move_for_duration" && name != "move_relative"
             }
         }
         let naming = request.range(of: "\\b(?:label|name|call|rename|note)\\b",
@@ -1126,7 +1195,7 @@ enum LocalEditPlanner {
         }
     }
     private static func usesDurationMove(_ request: String, context: LocalEditContext) -> Bool {
-        guard relativeStartDelay(in: request, context: context) == nil else { return false }
+        guard absoluteStart(in: request) == nil, relativeStartDelay(in: request, context: context) == nil else { return false }
         let hasDuration = request.range(of: "\\b(?:over|for|lasting|takes?|in)(?:\\s+|(?=[0-9]))(?:[0-9]+(?:\\.[0-9]+)?|[a-z]+(?:[- ][a-z]+){0,3})\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b",
             options: [.regularExpression, .caseInsensitive]) != nil
         let hasMovement = request.range(of: "\\b(?:pan|zoom|move|transition)\\b", options: [.regularExpression, .caseInsensitive]) != nil
@@ -1141,6 +1210,41 @@ enum LocalEditPlanner {
             return mentions("Box " + words, in: request)
         }
         return hasDuration && hasMovement && boxes.count >= 2
+    }
+
+    private static func absoluteStart(in request: String) -> Double? {
+        let word = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|and|point)"
+        let number = "(?:[0-9]+(?:\\.[0-9]+)?|" + word + "(?:[ -]+" + word + "){0,6})"
+        let pattern = "\\bat\\s+(" + number + ")\\s*(?<![A-Za-z])(?:seconds?|secs?|s)\\b(?!\\s+(?:from\\s+now|after|before)\\b)"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+        let matches = regex.matches(in: request, range: NSRange(request.startIndex..., in: request))
+        guard matches.count == 1, let match = matches.first, let range = Range(match.range(at: 1), in: request) else { return nil }
+        let raw = String(request[range]).lowercased().replacingOccurrences(of: "-", with: " ")
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .spellOut
+        guard let value = Double(raw) ?? formatter.number(from: raw)?.doubleValue, value.isFinite, value >= 0 else { return nil }
+        return value
+    }
+
+    private static func usesAbsoluteBoxMove(_ request: String, context: LocalEditContext) -> Bool {
+        absoluteStart(in: request) != nil && requestedDuration(in: request) != nil &&
+            request.range(of: "\\b(?:pan|zoom|move|transition)\\b", options: [.regularExpression, .caseInsensitive]) != nil &&
+            context.recording.state.regions.filter { box($0, isMentionedAfter: "", in: request, context: context) }.count >= 2
+    }
+
+    private static func focusedAbsoluteTool(_ tool: [String: Any], instruction: String, context: LocalEditContext) -> [String: Any] {
+        guard usesAbsoluteBoxMove(instruction, context: context), let start = absoluteStart(in: instruction),
+              let duration = requestedDuration(in: instruction), var function = tool["function"] as? [String: Any],
+              function["name"] as? String == "move_at_time", var parameters = function["parameters"] as? [String: Any],
+              var properties = parameters["properties"] as? [String: Any] else { return tool }
+        properties["start_seconds"] = ["type": "number", "enum": [start]]
+        properties["duration_seconds"] = ["type": "number", "enum": [duration]]
+        properties["path"] = ["type": "string", "enum": [relativePath(in: instruction, context: context)]]
+        parameters["properties"] = properties
+        function["parameters"] = parameters
+        var result = tool; result["function"] = function
+        return result
     }
 
     private static func usesRelativeBoxMove(_ request: String, context: LocalEditContext) -> Bool {
@@ -1210,6 +1314,12 @@ enum LocalEditPlanner {
         let scope: [String: Any] = ["project_id": ["type": "string"], "expected_revision": ["type": "string"]]
         return [
             EditorAgentControls.boxManagementTool,
+            function("move_at_time", "Start a pan/zoom between numbered boxes at an absolute recording timestamp, then arrive after the requested duration. Absolute source time overrides selections, box-source frames and the playhead. Use move_relative for seconds from now and move_for_duration for a named starting edit.", scope.merging([
+                "start_seconds": ["type": "number", "minimum": 0],
+                "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],
+                "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": 60],
+                "path": ["type": "string", "enum": ["direct", "via_full_frame"]]
+            ]) { _, b in b }),
             function("move_relative", "Move from one numbered box to another after a delay from the playhead. The app builds a smooth direct or zoom-out/zoom-in path. Keep arrival offsets separate from movement durations.", scope.merging([
                 "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],
                 "start_delay_seconds": ["type": "number", "minimum": 0],

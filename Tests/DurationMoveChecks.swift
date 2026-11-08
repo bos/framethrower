@@ -60,8 +60,10 @@ struct DurationMoveChecks {
         try require(next.zoom(at: 1) == fixture.source.rect.framing() && next.zoom(at: 6) == fixture.target.rect.framing(),
                     "both numbered boxes determine complete source and destination framings")
         let middle = next.zoom(at: 3.5), from = fixture.source.rect.framing(), to = fixture.target.rect.framing()
-        try require(abs(middle.scale - (from.scale + to.scale) / 2) < 1e-9 &&
-                    abs(middle.x - (from.x + to.x) / 2) < 1e-9 && abs(middle.y - (from.y + to.y) / 2) < 1e-9,
+        let progress = 45.0 / 91 // Current asymmetric acceleration/braking profile at half-time.
+        try require(abs(middle.scale - (from.scale + (to.scale - from.scale) * progress)) < 1e-9 &&
+                    abs(middle.x - (from.x + (to.x - from.x) * progress)) < 1e-9 &&
+                    abs(middle.y - (from.y + (to.y - from.y) * progress)) < 1e-9,
                     "pan and zoom interpolate together instead of introducing a full-frame waypoint")
         try require((0...50).allSatisfy { next.zoom(at: 1 + Double($0) / 10).scale > 2 }, "direct path never pulls out to full frame")
         try require(next.zoom(at: 0.5) == fixture.project.state.zoom(at: 0.5), "unrelated footage before the named start is unchanged")

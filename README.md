@@ -362,6 +362,9 @@ Box 2 after three seconds” starts one second after the playhead and arrives
 three seconds after that same playhead. The app builds the path from the named
 boxes and timing. A rejected model plan gets one automatic repair attempt using
 the actual rejection result; the user is not asked to repeat already stated timing.
+Absolute timing uses the recording's own clock: “At two seconds, take three
+seconds to pan and zoom from Box 1 to Box 2” starts at 2 s and arrives at 5 s,
+regardless of the playhead or selected edit.
 For a direct move without a preexisting endpoint, say “At Edit A, pan and zoom
 from Box 1 to Box 2 over five seconds.” The destination receives its own stable
 edit letter automatically. Pulling back to full frame happens only when requested.

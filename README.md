@@ -178,7 +178,8 @@ pauses playback.
 
 Pinch over the timeline to zoom its time scale around your fingers; two-finger
 scrolling navigates time. This changes only the timeline view, not the recording.
-The playhead and trim handles occupy the top rail. Persistent **Screen**, **Camera**,
+The playhead and trim handles occupy the top rail. The playhead line extends
+through every lane below it. Persistent **Screen**, **Camera**,
 and **Pointer** lanes show the recording's animations below it. Screen combines
 zoom and pan into one viewport movement. Camera has independent PIP movements.
 Pointer currently shows whole-recording style settings and recorded click ticks;
@@ -187,11 +188,12 @@ show **Not recorded**.
 
 Click an animation to select it and inspect its destination. Drag its body to
 move the entire movement, or its start/end grips to change its timing. Pull an
-instant change's start grip left to turn it into a smooth movement. The inner
-handles adjust acceleration and deceleration; tooltips report timing. Short,
+instant change's start grip left to turn it into a smooth movement. The tall
+inner grips extend above the lane and adjust acceleration and deceleration; tooltips report their purpose. Coincident ramp boundaries have
+separate grab areas linked to their exact source positions. Short,
 crowded marks show a count badge with a chooser listing their names and times;
-pinching into the timeline separates their controls. The selected animation's **×** or Delete removes only that lane's
-change, preserving other components and reference boxes.
+pinching into the timeline separates their controls. The selected animation's
+**×** or Delete removes only that lane's change, preserving other components and reference boxes.
 
 Same-lane movements stop at their neighbors with a sticky contact while they
 intersect. Moving a whole span completely past its neighbor reorders it and clears
@@ -221,8 +223,9 @@ unchanged view before a later movement.
 The strip and timeline spans show the effective transition,
 shortened when the previous edit leaves less time available. Screen and camera
 use the same motion curve, with separate settings for each component of an edit.
-Deceleration slows earlier and has a flatter settling tail while retaining the
-chosen ramp duration and arrival time.
+Deceleration retains visible late movement while keeping the chosen ramp
+duration and arrival time. Timeline and inspector speed graphs use the same
+profile as the screen and camera playback, including clipped transitions.
 **Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
 with steady holds and returns to the wider context. Suggestions are ordinary
 editable changes and applying them is one undo step.
@@ -317,7 +320,9 @@ you start drawing. Drawing retains a fixed source frame until release. Pinch and
 two-finger pan work with either tool. Switching tools cancels an unfinished mouse
 gesture while retaining earlier completed framing adjustments at that time.
 Escape cancels unfinished drawing or framing first, then exits Director mode.
-A box's X removes its guide and optional name; Undo restores both.
+A box's X, Delete, or Forward Delete removes its guide and optional name; Undo
+restores both. Selecting a box in the sidebar gives its list keyboard focus.
+Delete continues to edit text while the instruction or a name field is focused.
 
 There is one instruction field and one microphone. An optional box name is
 available from its context menu; Return saves, Escape or dismissing cancels.
@@ -589,6 +594,10 @@ Automated checks run without camera hardware or connected accounts:
 - `Tests/check-recording-timeline.sh`: native scrub and trim gestures, separate
   hit targets, draggable edit diamonds, empty-space deselection, Escape routing,
   mouse/keyboard focus cues, pinch navigation, transition bands, and bounds.
+- `Tests/check-playback-cadence.sh ARCHIVE_JSON [PROJECT_JSON]`: opt-in read-only
+  diagnosis using temporary project/conversation copies. Reports delivered native
+  vector update gaps around saved motion endpoints with Director open/closed;
+  never opens source media or invokes a model.
 - `Tests/check-preview-tools.sh`: Pan/Box routing with Director visible, live
   aspect-locked boxes, frozen drawing coordinates, cursor targets, gesture
   cancellation, trackpad momentum, and independent PIP manipulation without media.

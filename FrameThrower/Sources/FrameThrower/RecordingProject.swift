@@ -1064,6 +1064,12 @@ final class ProjectEditor: ObservableObject {
     @Published private(set) var project: RecordingProject
     /// Read inside a synchronous `$project` subscriber; nil outside publication.
     private(set) var publishingHistoryOperation: ProjectHistoryOperation?
+    private(set) var publishingActor: String?
+    func withPublishingActor<T>(_ actor: String, action: () throws -> T) rethrows -> T {
+        let previous = publishingActor; publishingActor = actor
+        defer { publishingActor = previous }
+        return try action()
+    }
     @Published private(set) var references: EditorReferences
     @Published private(set) var errorMessage: String?
     @Published private(set) var draftState: EditState?

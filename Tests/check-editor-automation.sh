@@ -8,6 +8,7 @@ taskpolicy -b swiftc -whole-module-optimization -Onone -num-threads 1 -parse-as-
   -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
   -target "$(uname -m)-apple-macos15.0" \
   "$sources/MediaProcessing.swift" "$sources/EditorRegion.swift" "$sources/RecordingProject.swift" \
+  "$sources/EditorConflictGeometry.swift" "$sources/EditorConflictReview.swift" \
   "$sources/EditorActionDescription.swift" "$sources/EditorCommand.swift" "$sources/EditorMutation.swift" \
   "$sources/EditorAgentControls.swift" "$sources/LocalEditPlanner.swift" \
   "$sources/TimelineAnimation.swift" "$sources/EditorAnimationEditing.swift" \

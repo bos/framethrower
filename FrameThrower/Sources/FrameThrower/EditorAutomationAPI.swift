@@ -66,7 +66,7 @@ enum EditorAutomationAPI {
         return [
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
             tool("inspect_editor", "Read a bounded section of current state, including manual changes. Seconds are original recording source time. Selection and playhead are separate.", object(doc.merging([
-                "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events"]],
+                "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending"]],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]
             ]) { _, b in b }, required: ["document_id", "section"]), readOnly: true),
             tool("inspect_recording", "Query bounded recorded semantic metadata on demand, never the live desktop. Search a visible label before asking for all controls. Real source frames remain unavailable while video processing is suspended.", object(doc.merging([
@@ -91,9 +91,10 @@ enum EditorAutomationAPI {
             tool("control_document", "Save, rename, Undo or Redo this recording using ordinary document behavior. Rename is undoable and keeps source filenames; Save adds no edit of its own. Return actual state and failures.", object(doc.merging([
                 "operation": ["type": "string", "enum": ["save", "rename", "undo", "redo"]], "name": text, "count": ["type": "integer", "minimum": 1, "maximum": 128], "expected_revision": text
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),
-            tool("apply_edits", "Validate and apply a typed command batch atomically with one ordinary Undo entry. Optional title joins that same transaction. Get exact mutation schemas from describe_editor_actions first. Failed validation/save applies nothing; no arbitrary file paths or executables are accepted.", object(doc.merging([
+            tool("apply_edits", "Validate and apply a typed command batch atomically with one ordinary Undo entry. Optional title joins that same transaction. Get exact mutation schemas from describe_editor_actions first. Screen movement conflicts freeze a proposal for Existing/Proposed review; do not bypass by removing movements. Resolve the returned proposal_id with review_choice keep or replace and commands:[] after the user's choice. Failed validation/save applies nothing; no arbitrary file paths or executables are accepted.", object(doc.merging([
                 "expected_revision": text, "name": text, "title": text,
-                "commands": ["type": "array", "minItems": 1, "maxItems": 128, "items": ["type": "object"]]
+                "proposal_id": text, "review_choice": ["type": "string", "enum": ["keep", "replace"]],
+                "commands": ["type": "array", "minItems": 0, "maxItems": 128, "items": ["type": "object"]]
             ]) { _, b in b }, required: ["document_id", "expected_revision", "commands"]), readOnly: false)
         ]
     }

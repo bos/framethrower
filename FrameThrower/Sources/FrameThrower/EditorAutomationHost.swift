@@ -1,6 +1,16 @@
 import Combine
 import Foundation
 
+/// A host-owned proposal, frozen to the exact document revision and prepared
+/// component identities used by both the visual comparison and its commit.
+struct EditorAutomationFramingProposal: Sendable {
+    let id: UUID
+    let conflict: EditorFramingConflict
+    let context: EditorCommandContext
+    let preparedState: EditState
+    let name: String
+}
+
 /// One open document endpoint. Transports never select a window by focus or
 /// reach into UI widgets: they use explicit identities and this shared host.
 @MainActor
@@ -26,6 +36,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     private var previewIntent = UUID()
     private var pendingPlaybackIntent: UUID?
     @Published private(set) var errorMessage: String?
+    @Published private(set) var pendingFramingProposal: EditorAutomationFramingProposal?
     var isPlaybackPending: Bool { pendingPlaybackIntent != nil }
 
     /// Both SwiftUI publication and automation await the same rebuild. A late
@@ -53,6 +64,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
 
     var selection: () -> (UUID?, UUID?, String?, String?) = { (nil, nil, nil, nil) }
     var navigate: ((String, UUID?, String?) throws -> Void)?
+    var conversationPage: ((Int, Int) throws -> [String: Any])?
 
     init(editor: ProjectEditor, playback: EditorPlayback,
          rebuild: @escaping @MainActor (ProjectEditor, EditorPlayback) async -> Void = { editor, playback in
@@ -66,11 +78,15 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         })
         projectID = editor.automationID
         documentID = UUID().uuidString
-        editor.$project.dropFirst().sink { [weak self] _ in
+        editor.$project.dropFirst().sink { [weak self] next in
+            self?.invalidateFramingProposal(for: next)
             // @Published delivers before storage changes. Sample after it has
             // completed, once per actual document operation, not render frame.
             let actor = self?.actor ?? "manual"
             Task { @MainActor [weak self] in self?.recordEvent("document_changed", actorOverride: actor) }
+        }.store(in: &subscriptions)
+        editor.$draftState.dropFirst().sink { [weak self] draft in
+            if draft != nil { self?.pendingFramingProposal = nil }
         }.store(in: &subscriptions)
     }
 
@@ -225,8 +241,19 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             guard success else { throw EditorCommandError.saveFailed(editor.errorMessage ?? "The recording could not be saved.") }
             value = try EditorAutomationAPI.object(automationContext)
         case "apply_edits":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "expected_revision", "commands", "name", "title"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "expected_revision", "commands", "name", "title", "proposal_id", "review_choice"])
             try checkRevision(args, editor: editor, required: true)
+            if args["proposal_id"] != nil || args["review_choice"] != nil {
+                guard let identity = args["proposal_id"], let choice = args["review_choice"] as? String,
+                      let commands = args["commands"] as? [Any], commands.isEmpty,
+                      args["name"] == nil, args["title"] == nil else {
+                    throw EditorAutomationError.invalid("Resolve only the frozen proposal: provide proposal_id, review_choice and an empty commands array, without a new title or action name.")
+                }
+                return try resolveFramingProposal(id: EditorAutomationAPI.uuid(identity), choice: choice)
+            }
+            invalidateFramingProposal(for: editor.project)
+            if let pendingFramingProposal { return try framingProposalResponse(pendingFramingProposal) }
+            guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
             guard let raw = args["commands"] as? [[String: Any]], !raw.isEmpty, raw.count <= 128 else { throw EditorAutomationError.invalid("Provide between 1 and 128 typed edit commands.") }
             for key in ["name", "title"] where args[key] != nil && !(args[key] is String) {
                 throw EditorAutomationError.invalid("Use text for the action name and recording title.")
@@ -238,6 +265,10 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             guard !name.isEmpty, name.count <= 256 else { throw EditorAutomationError.invalid("Use a short history action name.") }
             try Task.checkCancellation()
             do {
+                if let proposal = try prepareFramingProposal(batch, name: name, editor: editor) {
+                    pendingFramingProposal = proposal
+                    return try framingProposalResponse(proposal)
+                }
                 _ = try withAutomationChange(origin: origin) { try EditorCommandDispatcher.apply(batch, to: editor, projectID: projectID, name: name) }
             } catch let error as EditorMutationError {
                 guard case let .conflicts(items) = error else { throw error }
@@ -253,6 +284,123 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let data = try JSONSerialization.data(withJSONObject: ["ok": true, "result": value], options: [.sortedKeys])
         guard data.count <= 131_072 else { throw EditorAutomationError.invalid("This result is too large. Request paginated edits, boxes, history or events instead.") }
         return data
+    }
+
+    /// Buttons and native MCP choose the same frozen proposal. No command is
+    /// reparsed, regenerated or rebound to a changed document during resolve.
+    func resolveFramingProposal(id: UUID, choice: String) throws -> Data {
+        guard ["replace", "keep"].contains(choice) else { throw EditorAutomationError.invalid("Choose replace or keep for the pending framing proposal.") }
+        guard let editor else { throw EditorAutomationError.unavailable }
+        guard let proposal = pendingFramingProposal, proposal.id == id else {
+            throw EditorAutomationError.invalid("That framing proposal is no longer pending. Inspect the current editor before proposing another movement.")
+        }
+        guard proposal.context.projectID == projectID,
+              proposal.context.revision == (try EditorCommandDispatcher.revision(for: editor.project)) else {
+            pendingFramingProposal = nil
+            throw EditorCommandError.stale
+        }
+        guard editor.draftState == nil else {
+            pendingFramingProposal = nil
+            throw EditorCommandError.pendingDraft
+        }
+        try Task.checkCancellation()
+        if choice == "replace" {
+            let saved = withAutomationChange(origin: "automation") {
+                editor.commitDocument(state: proposal.preparedState, title: proposal.conflict.proposal.title, name: proposal.name)
+            }
+            guard saved else { throw EditorCommandError.saveFailed(editor.errorMessage ?? "The reviewed edit could not be saved.") }
+        }
+        pendingFramingProposal = nil
+        return try JSONSerialization.data(withJSONObject: ["ok": true, "result": [
+            "proposal_id": proposal.id.uuidString, "choice": choice, "applied": choice == "replace",
+            "context": try EditorAutomationAPI.object(automationContext)]], options: [.sortedKeys])
+    }
+
+    private func invalidateFramingProposal(for project: RecordingProject) {
+        if let pending = pendingFramingProposal,
+           pending.context.revision != (try? EditorCommandDispatcher.revision(for: project)) {
+            pendingFramingProposal = nil
+        }
+    }
+
+    private func framingProposalDescription(_ proposal: EditorAutomationFramingProposal) -> [String: Any] {
+        ["id": proposal.id.uuidString, "proposal_id": proposal.id.uuidString,
+         "expected_revision": proposal.context.revision, "summary": proposal.conflict.summary,
+         "question": proposal.conflict.question, "framing_ids": proposal.conflict.framingIDs.map(\.uuidString),
+         "choices": ["replace", "keep"]]
+    }
+
+    private func framingProposalResponse(_ proposal: EditorAutomationFramingProposal) throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["ok": false,
+            "error": ["code": "framing_conflict", "message": proposal.conflict.question],
+            "proposal": framingProposalDescription(proposal)], options: [.sortedKeys])
+    }
+
+    private func prepareFramingProposal(_ batch: EditorCommandBatch, name: String,
+                                       editor: ProjectEditor) throws -> EditorAutomationFramingProposal? {
+        let project = editor.project
+        // A no-op screen command in a mixed batch must not require a visual
+        // choice merely because an unrelated audio/property value changes.
+        if let prepared = try? EditorCommandDispatcher.prepare(batch, for: project, projectID: projectID),
+           prepared.zoomKeyframes == project.state.zoomKeyframes { return nil }
+        var intervals: [(Double, Double)] = []
+        var normalized = batch
+        normalized.commands = batch.commands.map { command in
+            switch command {
+            case let .mutate(mutation):
+                if mutation.lane == .screen, let timing = mutation.timing { intervals.append((timing.start, timing.end)) }
+            case let .frameRegion(_, time, motion), let .fullFrame(time, motion):
+                intervals.append((motion.transition == .smooth ? max(0, time - motion.duration) : time, time))
+            case let .holdFraming(time): intervals.append((time, time))
+            case let .reviseFraming(id, regionID):
+                if let edit = project.references.edit(in: project.state, id: id) {
+                    let point = project.state.zoomKeyframes.first { $0.id == edit.zoomID }
+                    let motion = point.map { EditorCommandMotion(transition: $0.transition, duration: $0.duration,
+                        easeIn: $0.easeIn, easeOut: $0.easeOut) } ?? EditorCommandMotion()
+                    intervals.append((motion.transition == .smooth ? max(0, edit.time - motion.duration) : edit.time, edit.time))
+                    // Capture incoming motion before removal of the old point.
+                    return .frameRegion(regionID: regionID, time: edit.time, motion: motion)
+                }
+            case let .moveBetweenEdits(from, to, _):
+                let edits = project.state.timedEdits(includeCamera: true)
+                if let a = edits.first(where: { $0.id == from }), let b = edits.first(where: { $0.id == to }) { intervals.append((a.time, b.time)) }
+            case let .moveForDuration(start, _, _, duration, _):
+                if let edit = project.references.edit(in: project.state, id: start) { intervals.append((edit.time, edit.time + duration)) }
+            default: break
+            }
+            return command
+        }
+        let explicitRemovals = Set(batch.commands.compactMap { command -> UUID? in
+            if case let .removeScreenFraming(id) = command { return id }
+            return nil
+        })
+        var previous = 0.0
+        let affected = project.state.zoomKeyframes.filter { point in
+            defer { previous = point.time }
+            guard point.time > 0, !explicitRemovals.contains(point.id) else { return false }
+            let begins = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
+            return intervals.contains { start, end in
+                if start == end {
+                    return abs(point.time - end) < 0.000_001 || (begins < end && point.time >= end)
+                }
+                return point.time > start + 0.000_001 &&
+                    (begins < end - 0.000_001 || abs(point.time - end) < 0.000_001)
+            }
+        }
+        guard !affected.isEmpty else { return nil }
+        let ids = affected.map(\.id)
+        let labels = affected.map { point -> String in
+            let edit = project.state.timedEdits(includeCamera: true).first { $0.zoomID == point.id }
+                ?? TimedEdit(id: point.id, time: point.time, zoomID: point.id, cameraID: nil)
+            return EditorActionDescription.describe(edit, in: project.state, references: project.references).shortLabel
+        }
+        let conflict = EditorFramingConflict(proposal: normalized, summary: name,
+            framingIDs: ids, question: labels.joined(separator: ", ") +
+                " already changes screen framing. Replace the existing movement and apply the proposed edit, or keep the recording unchanged?")
+        let prepared = try EditorCommandDispatcher.prepare(conflict.replacement, for: project, projectID: projectID)
+        return EditorAutomationFramingProposal(id: UUID(), conflict: conflict,
+            context: try EditorCommandDispatcher.context(editor: editor, projectID: projectID),
+            preparedState: prepared, name: name)
     }
 
     /// Native Pause always wins over an awaited automation request. Queued or
@@ -282,6 +430,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
 
     private func withAutomationChange<T>(origin: String, _ action: () throws -> T) rethrows -> T {
         let previous = actor; actor = origin; defer { actor = previous }
+        if let editor { return try editor.withPublishingActor(origin, action: action) }
         return try action()
     }
 
@@ -355,6 +504,13 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 "trim": ["start": state.trimStart, "end": state.trimEnd], "edit_count": state.timedEdits(includeCamera: editor.project.cameraFilename != nil).count,
                 "box_count": state.regions.count, "undo_count": editor.historyState.undo.count,
                 "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
+        case "pending":
+            invalidateFramingProposal(for: editor.project)
+            if let pendingFramingProposal { return ["proposal": framingProposalDescription(pendingFramingProposal)] }
+            return ["proposal": NSNull()]
+        case "conversation":
+            guard let conversationPage else { throw EditorAutomationError.unavailable }
+            return try conversationPage(offset, limit)
         case "state": return try EditorAutomationAPI.object(state)
         case "boxes": return page(try state.regions.map { region -> Any in
             ["id": region.id.uuidString, "label": editor.references.boxLabel(for: region.id) ?? "Box",

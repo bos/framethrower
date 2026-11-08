@@ -20,7 +20,8 @@ struct EditorConflictReview: Equatable, Sendable {
         return interval.lowerBound + (interval.upperBound - interval.lowerBound) / 2
     }
 
-    static func make(_ conflict: EditorFramingConflict?, project: RecordingProject, projectID: UUID) -> Self? {
+    static func make(_ conflict: EditorFramingConflict?, project: RecordingProject, projectID: UUID,
+                     preparedState: EditState? = nil) -> Self? {
         guard let conflict, conflict.proposal.projectID == projectID,
               let revision = try? EditorCommandDispatcher.revision(for: project),
               conflict.proposal.revision == revision,
@@ -34,13 +35,21 @@ struct EditorConflictReview: Equatable, Sendable {
             return nil
         }
         guard !affected.isEmpty, affected.count == conflict.framingIDs.count, affected.isSubset(of: available),
-              let proposed = try? EditorCommandDispatcher.prepare(conflict.replacement, for: project, projectID: projectID),
-              proposed.pipKeyframes == project.state.pipKeyframes,
-              proposed.cursorStyle == project.state.cursorStyle,
-              proposed.audio == project.state.audio,
-              proposed.presentation == project.state.presentation,
-              proposed.trimStart == project.state.trimStart, proposed.trimEnd == project.state.trimEnd,
-              proposed.regions == project.state.regions + addedRegions else { return nil }
+              let proposed = preparedState ?? (try? EditorCommandDispatcher.prepare(conflict.replacement, for: project, projectID: projectID)) else { return nil }
+        var candidate = project; candidate.state = proposed
+        guard (try? candidate.validate()) != nil else { return nil }
+        // Native mixed transactions may include other explicitly requested
+        // fields. Their frozen state commits atomically, while this comparison
+        // and its full-source preview remain screen-only. Legacy callers retain
+        // their stricter screen-only proposal invariant.
+        if preparedState == nil {
+            guard proposed.pipKeyframes == project.state.pipKeyframes,
+                  proposed.cursorStyle == project.state.cursorStyle,
+                  proposed.audio == project.state.audio,
+                  proposed.presentation == project.state.presentation,
+                  proposed.trimStart == project.state.trimStart, proposed.trimEnd == project.state.trimEnd,
+                  proposed.regions == project.state.regions + addedRegions else { return nil }
+        }
 
         let oldSegments = segments(in: project.state, duration: project.duration)
         let newSegments = segments(in: proposed, duration: project.duration)

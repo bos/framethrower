@@ -21,6 +21,16 @@ struct LocalModelEndpoint: Sendable {
     }
 }
 
+/// The bearer token is local process authentication, never a provider API key.
+/// Keep it out of diagnostics; callers release only their lease, not the server.
+struct LocalModelEndpointLease: Sendable {
+    let id: UUID
+    let baseURL: URL
+    let model: String
+    let token: String
+    let contextWindowSize: Int
+}
+
 enum LocalModelError: LocalizedError {
     case unavailable
     case invalidModel
@@ -81,16 +91,68 @@ struct LocalModelHTTPClient: Sendable {
     }
 }
 
-/// A single request owns the process and its authentication material. A second
-/// window receives a busy state rather than allocating another model. Requests
-/// are scoped: completion, errors, and cancellation all terminate that process.
+/// One verified Metal server stays warm across turns and native agent sessions.
+/// Its slot KV cache survives requests; only app termination owns process exit.
 actor LocalModelRuntime {
     static let shared = LocalModelRuntime()
     static let modelFilename = "Qwen3-8B-Q4_K_M.gguf"
     static let modelSHA256 = "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"
     static let modelBytes = 5_027_783_488
 
+    // Qwen Code0.27 reserves20K tokens while its first prompt count is estimated.
+    // Use real server capacity above that reserve, below Qwen3-8B's native40K window.
+    static let contextWindowSize = 32768
     private var activeRequest: UUID?
+    private var preparation: (id: UUID, task: Task<LocalModelProcess, any Error>)?
+    private var endpointLeases = Set<UUID>()
+    private let serverFactory: @Sendable () async throws -> LocalModelProcess
+
+    init(serverFactory: (@Sendable () async throws -> LocalModelProcess)? = nil) {
+        self.serverFactory = serverFactory ?? { try await Self.makeServer() }
+    }
+
+    private static func makeServer() async throws -> LocalModelProcess {
+        guard let serverURL, isInstalled else { throw LocalModelError.unavailable }
+        try verifyModel(modelURL)
+        try Task.checkCancellation()
+        let server = try LocalModelProcess(serverURL: serverURL, modelURL: modelURL)
+        do { try await server.waitUntilReady(); return server }
+        catch { await server.close(); throw error }
+    }
+
+    private func preparedServer() async throws -> LocalModelProcess {
+        let work: (id: UUID, task: Task<LocalModelProcess, any Error>)
+        if let preparation { work = preparation }
+        else {
+            let factory = serverFactory
+            work = (UUID(), Task.detached(priority: .utility) { try await factory() })
+            preparation = work
+        }
+        do {
+            let server = try await work.task.value
+            guard server.isAvailable else {
+                if preparation?.id == work.id { preparation = nil }
+                await server.close()
+                throw LocalModelError.startupFailed
+            }
+            return server
+        } catch {
+            if preparation?.id == work.id { preparation = nil }
+            throw error
+        }
+    }
+
+    func acquireEndpoint() async throws -> LocalModelEndpointLease {
+        try Task.checkCancellation()
+        let server = try await preparedServer()
+        try Task.checkCancellation()
+        guard endpointLeases.count < 64 else { throw LocalModelError.busy }
+        let id = UUID(); endpointLeases.insert(id)
+        return LocalModelEndpointLease(id: id, baseURL: server.client.endpoint.url.appendingPathComponent("v1"),
+            model: "framethrower-local", token: server.client.endpoint.token, contextWindowSize: Self.contextWindowSize)
+    }
+
+    func releaseEndpoint(_ lease: LocalModelEndpointLease) { endpointLeases.remove(lease.id) }
 
     /// Call from the native application termination notification. The process
     /// registry contains only the child launched by this runtime.
@@ -117,32 +179,12 @@ actor LocalModelRuntime {
 
     func chat(payload: Data) async throws -> Data {
         guard activeRequest == nil else { throw LocalModelError.busy }
-        guard let serverURL = Self.serverURL, Self.isInstalled else { throw LocalModelError.unavailable }
         guard payload.count <= 512 * 1024 else { throw LocalModelError.invalidResponse }
-        let requestID = UUID()
-        activeRequest = requestID
-        do {
-            let verification = Task.detached(priority: .utility) { try Self.verifyModel(Self.modelURL) }
-            try await withTaskCancellationHandler {
-                try await verification.value
-            } onCancel: { verification.cancel() }
-            try Task.checkCancellation()
-            let server = try LocalModelProcess(serverURL: serverURL, modelURL: Self.modelURL)
-            do {
-                try await server.waitUntilReady()
-                try Task.checkCancellation()
-                let response = try await server.client.request(path: "/v1/chat/completions", payload: payload)
-                await server.close()
-                activeRequest = nil
-                return response
-            } catch {
-                await server.close()
-                throw error
-            }
-        } catch {
-            activeRequest = nil
-            throw error
-        }
+        let requestID = UUID(); activeRequest = requestID
+        defer { if activeRequest == requestID { activeRequest = nil } }
+        let server = try await preparedServer()
+        try Task.checkCancellation()
+        return try await server.client.request(path: "/v1/chat/completions", payload: payload)
     }
 
     private static func verifyModel(_ url: URL) throws {
@@ -203,7 +245,7 @@ final class LocalModelProcess: @unchecked Sendable {
             "--model", modelURL.path, "--alias", "framethrower-local",
             "--host", "127.0.0.1", "--port", String(port), "--api-key-file", keyURL.path,
             "--offline", "--no-mmproj", "--fit", "off", "--threads", "4", "--threads-batch", "4", "--poll", "0",
-            "--ctx-size", "8192", "--parallel", "1", "--cache-ram", "0", "--jinja",
+            "--ctx-size", String(LocalModelRuntime.contextWindowSize), "--parallel", "1", "--cache-ram", "0", "--jinja",
             "--chat-template-kwargs", "{\"enable_thinking\":false}", "--no-webui", "--no-ui-mcp-proxy", "--no-warmup",
             "--device", "MTL0", "--n-gpu-layers", "all", "--op-offload"]
         var environment = ProcessInfo.processInfo.environment.filter { key, _ in
@@ -263,6 +305,8 @@ final class LocalModelProcess: @unchecked Sendable {
             }
         }.value
     }
+
+    var isAvailable: Bool { isProcessRunning }
 
     private var isProcessRunning: Bool {
         guard process.isRunning else { return false }

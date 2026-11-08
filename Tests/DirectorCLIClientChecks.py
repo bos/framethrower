@@ -59,6 +59,11 @@ from pathlib import Path
 if "--version" in sys.argv:
     print("Fake account CLI 1.0")
     sys.exit(0)
+stream = "--input-format" in sys.argv
+if stream and sys.argv[sys.argv.index("--output-format") + 1] != "stream-json":
+    print("Error: --input-format=stream-json requires output-format=stream-json.", file=sys.stderr); sys.exit(2)
+if stream and "--verbose" not in sys.argv:
+    print("Error: stream-json requires --verbose", file=sys.stderr); sys.exit(2)
 raw = sys.stdin.read()
 mode = os.environ.get("FT_TEST_MODE", "normal")
 audit = os.environ.get("FT_TEST_AUDIT")
@@ -111,6 +116,18 @@ if provider == "claude":
     if mode == "missing": del response["structured_output"]; response["result"] = json.dumps(result)
     if mode == "denied": response["permission_denials"] = [{"tool_name": "Read"}]
     if mode == "refusal": response["is_error"] = True; response["subtype"] = "error_max_turns"
+    if stream:
+        print(json.dumps({"type": "system", "subtype": "init", "tools": ["Read"] if mode == "stream_exposed" else ["StructuredOutput"], "mcp_servers": []}))
+        # Captured Haiku telemetry: diagnostic only, never an action or final.
+        print(json.dumps({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 175,
+            "estimated_tokens_delta": 175, "session_id": "fake", "uuid": "fake-telemetry"}))
+        # JSON in prose and formatter input is deliberately not authoritative.
+        print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": '{"tool_call":{"name":"UNTRUSTED_PROSE"}}'},
+            {"type": "tool_use", "name": "Bash" if mode == "stream_tool" else "StructuredOutput", "id": "format-call", "input": {"not":"authoritative"}}]}}), flush=True)
+        if mode in ("stream_tool", "stream_exposed"): time.sleep(30)
+        print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "unknown-call" if mode == "stream_unmatched" else "format-call", "content": "Structured output provided successfully"}]}}))
+        if mode == "stream_missing": sys.exit(0)
+        if mode == "stream_duplicate": print(json.dumps(response))
     print(json.dumps(response), flush=True)
 else:
     print(json.dumps({"type": "thread.started", "thread_id": "fake"}))
@@ -442,12 +459,12 @@ class Processes(unittest.TestCase):
         return False
 
     def test_timeout_kills_term_ignoring_descendants(self):
-        self.assert_error(self.run_client(mode="timeout", timeout=0.5), "timeout")
+        self.assert_error(self.run_client(mode="timeout", timeout=2), "timeout")
         self.assertTrue(self.pid.exists())
         self.assertTrue(self.child_dead())
 
     def test_cli_receives_unblocked_graceful_term(self):
-        self.assert_error(self.run_client(mode="graceful", timeout=0.5), "timeout")
+        self.assert_error(self.run_client(mode="graceful", timeout=2), "timeout")
         self.assertEqual(self.pid.read_text(), "TERM handled")
         self.pid.unlink()
 
@@ -491,6 +508,8 @@ class Processes(unittest.TestCase):
         audit = json.loads(self.audit.read_text())
         self.assertIn("--input-format", audit["argv"])
         self.assertEqual(audit["argv"][audit["argv"].index("--input-format") + 1], "stream-json")
+        self.assertEqual(audit["argv"][audit["argv"].index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", audit["argv"])
         wire = json.loads(audit["raw"])
         self.assertEqual(wire["type"], "user")
         blocks = wire["message"]["content"]
@@ -506,6 +525,13 @@ class Processes(unittest.TestCase):
         self.assertEqual(metrics["attachments"][0]["tool_call_id"], "previous_call")
         self.assertNotIn("base64", json.dumps(metrics))
         self.assertFalse(audit["files"])
+
+    def test_claude_image_requires_completed_final_result_and_denies_other_tools(self):
+        self.raw = json.dumps(image_payload())
+        for mode, code in (("stream_missing", "invalid_output"), ("stream_duplicate", "invalid_output"),
+                           ("stream_tool", "isolation"), ("stream_unmatched", "isolation"), ("stream_exposed", "isolation")):
+            with self.subTest(mode=mode): self.assert_error(self.run_client(mode=mode), code)
+        self.assertEqual(client.cli_error("--input-format=stream-json requires output-format=stream-json.", "claude", 1).code, "cli_configuration")
 
     def test_codex_receives_exact_private_png_files_with_matching_order(self):
         self.raw = json.dumps(image_payload())

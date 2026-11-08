@@ -424,7 +424,9 @@ def native_attachments(provider, argv, raw, directory, attachments):
             blocks += [{"type": "text", "text": "Native attachment mapping: " + json.dumps(item["manifest"], separators=(",", ":"))},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": item["base64"]}}]
         message = {"type": "user", "message": {"role": "user", "content": blocks}, "parent_tool_use_id": None}
-        return argv + ["--input-format", "stream-json"], json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
+        argv = list(argv)
+        argv[argv.index("--output-format") + 1] = "stream-json"
+        return argv + ["--input-format", "stream-json", "--verbose"], json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
     image_args = []
     for item in attachments:
         path = os.path.join(directory, item["manifest"]["id"] + ".png")
@@ -653,7 +655,7 @@ def cli_error(text, provider, status=None):
         return ClientError("rate_limited", "This account has reached the model's usage limit. Try later or choose another model.")
     if any(word in lower for word in ("model_not_found", "model not found", "unsupported model", "not supported", "not have access", "model is not available")):
         return ClientError("model_unavailable", "The requested model is unavailable to this CLI account. Choose an available model.")
-    if any(word in lower for word in ("unexpected argument", "unknown option", "unknown field", "unrecognized", "invalid config")):
+    if any(word in lower for word in ("unexpected argument", "unknown option", "unknown field", "unrecognized", "invalid config", "requires output-format")):
         return ClientError("cli_configuration", "The installed CLI does not support the required isolated configuration. Update the CLI.")
     return ClientError("cli_failed", "%s CLI failed%s. Check sign-in and model access, then retry." %
                        (provider.capitalize(), " (exit %s)" % status if status is not None else ""))
@@ -708,6 +710,74 @@ class CodexEvents:
             self.resolved_model = model
 
 
+class ClaudeEvents:
+    """Image mode uses native stream-json input AND output, as required by CLI.
+
+    StructuredOutput is the CLI's own schema formatter, not an executable app
+    command. Only the validated final result is authoritative. All other tool
+    names remain forbidden, even if a future CLI exposes one unexpectedly.
+    """
+    def __init__(self):
+        self.result = None
+        self.structured_ids = set()
+        self.error = None
+
+    def __call__(self, line):
+        try:
+            event = strict_json(line.decode("utf-8"))
+        except (UnicodeDecodeError, ClientError):
+            reject("invalid_output", "Claude returned an invalid event stream.")
+        if not isinstance(event, dict):
+            reject("invalid_output", "Claude returned an invalid event.")
+        if self.result is not None:
+            reject("invalid_output", "Claude returned events after its final result.")
+        if event.get("parent_tool_use_id") is not None:
+            reject("isolation", "Claude attempted a subagent or nested tool. No Director command was accepted.")
+        kind = event.get("type")
+        if kind == "result":
+            self.result = event
+        elif kind == "system":
+            subtype = event.get("subtype")
+            if subtype == "init":
+                tools = event.get("tools", [])
+                if not isinstance(tools, list) or any(name != "StructuredOutput" for name in tools) or event.get("mcp_servers"):
+                    reject("isolation", "Claude exposed an unexpected built-in or MCP tool. No Director command was accepted.")
+            elif subtype == "permission_denied":
+                reject("isolation", "Claude attempted a denied tool. No Director command was accepted.")
+            elif subtype not in ("api_retry", "status", "thinking_tokens", "compact_boundary", "hook_started", "hook_progress", "hook_response", "warning"):
+                reject("isolation", "Claude emitted an unsupported system event. No Director command was accepted.")
+        elif kind in ("assistant", "user"):
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+                reject("invalid_output", "Claude returned an invalid conversation event.")
+            if event.get("error"):
+                self.error = str(event["error"])[:4096]
+            for block in message["content"]:
+                if not isinstance(block, dict):
+                    reject("invalid_output", "Claude returned an invalid content block.")
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    if kind != "assistant" or block.get("name") != "StructuredOutput":
+                        reject("isolation", "Claude attempted a built-in tool. No Director command was accepted.")
+                    identifier = block.get("id")
+                    if not isinstance(identifier, str) or not identifier or len(identifier) > 200 or len(self.structured_ids) >= 8:
+                        reject("invalid_output", "Claude returned an invalid structured-output call.")
+                    self.structured_ids.add(identifier)
+                elif block_type == "tool_result":
+                    if kind != "user" or block.get("tool_use_id") not in self.structured_ids:
+                        reject("isolation", "Claude returned an unexpected tool result. No Director command was accepted.")
+                elif block_type not in ("text", "thinking", "redacted_thinking"):
+                    reject("isolation", "Claude emitted an unsupported content block. No Director command was accepted.")
+        elif kind == "rate_limit_event":
+            pass
+        elif kind in ("tool_progress", "tool_use_summary"):
+            identifiers = event.get("preceding_tool_use_ids", [event.get("tool_use_id")])
+            if not isinstance(identifiers, list) or not identifiers or any(item not in self.structured_ids for item in identifiers):
+                reject("isolation", "Claude reported an unexpected running tool. No Director command was accepted.")
+        else:
+            reject("isolation", "Claude emitted an unsupported event. No Director command was accepted.")
+
+
 def numeric_metrics(value):
     if not isinstance(value, dict):
         return None
@@ -755,7 +825,7 @@ def invoke(provider, model, raw, cli_path=None, effort=None, timeout=90):
             system += IMAGE_SYSTEM
         argv = command(provider, cli, model, effort, directory, schema, system)
         argv, native_input = native_attachments(provider, argv, raw, directory, attachments)
-        events = CodexEvents() if provider == "codex" else None
+        events = CodexEvents() if provider == "codex" else (ClaudeEvents() if attachments else None)
         code, output, stderr = run_process(argv, native_input, directory, env,
             max(0.01, timeout - (time.monotonic() - started)), events)
         metrics = {"provider": provider, "requested_model": model, "resolved_model": None,
@@ -767,10 +837,12 @@ def invoke(provider, model, raw, cli_path=None, effort=None, timeout=90):
         if provider == "claude":
             if code != 0:
                 raise cli_error(output + stderr, provider, code)
-            result = strict_json(output)
+            result = events.result if events else strict_json(output)
+            if result is None and events and events.error:
+                raise cli_error(events.error + stderr, provider, code)
             if not isinstance(result, dict):
-                reject("invalid_output", "Claude returned an invalid response object.")
-            if result.get("is_error") or str(result.get("subtype", "")).startswith("error"):
+                reject("invalid_output", "Claude did not complete a final structured response.")
+            if result.get("is_error") or str(result.get("subtype", "")).startswith("error") or (events and result.get("subtype") != "success"):
                 raise cli_error(json.dumps(result) + stderr, provider, code)
             if result.get("permission_denials"):
                 reject("isolation", "Claude attempted a denied built-in tool. No Director command was accepted.")

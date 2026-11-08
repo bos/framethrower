@@ -53,10 +53,9 @@ final class EditorTestPattern {
         let localCamera = cameraFrame.offsetBy(dx: -output.minX, dy: -output.minY)
         cameraClip.frame = localCamera
         cameraClip.isHidden = !cameraEnabled || !placement.visible
-        cameraClip.cornerRadius = placement.shape == .circle ? min(localCamera.width, localCamera.height) / 2 : 3
+        cameraClip.cornerRadius = placement.cornerRadius(in: localCamera.size)
         let cameraSource = CGSize(width: Self.sourceSize.height * cameraAspect, height: Self.sourceSize.height)
-        cameraViewport = placement.crop.rect(in: cameraSource, shape: placement.shape,
-            aspectRatio: placement.aspectRatio, zoom: placement.sourceZoom)
+        cameraViewport = placement.sourceViewport(in: cameraSource, canvas: output.size)
         // Both charts have the same fixed source chart coordinates. Normalize
         // camera aspect into that chart before applying its source crop.
         let normalizedCrop = CGRect(x: cameraViewport.minX / cameraSource.width * Self.sourceSize.width,

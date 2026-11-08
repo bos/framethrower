@@ -1381,7 +1381,7 @@ enum LocalEditPlanner {
                 switch mutation {
                 case .zoomScreen: return true
                 case let .alignScreen(_, _, _, _, policy, _): return policy != .preserve
-                case let .cameraOverlay(patch, _): return patch.scale != nil || patch.aspectRatio != nil || patch.shape != nil
+                case let .cameraOverlay(patch, _): return patch.scale != nil || patch.aspectRatio != nil || patch.shape != nil || patch.fullscreen != nil
                 case let .cameraSource(patch, _): return patch.sourceZoom != nil
                 default: return false
                 }

@@ -227,8 +227,7 @@ private final class PIPFrameComposer: @unchecked Sendable {
         let placement = state.placement(at: seconds)
         if placement.visible, seconds >= instruction.cameraStart, seconds < instruction.cameraEnd,
            let geometry = instruction.cameraGeometry, let cameraBuffer {
-            let shape = placement.shape
-            let sourceCrop = placement.crop.rect(in: geometry.size, shape: shape, aspectRatio: placement.aspectRatio, zoom: placement.sourceZoom)
+            let sourceCrop = placement.sourceViewport(in: geometry.size, canvas: canvas.size)
             let ciCrop = CGRect(x: sourceCrop.minX, y: geometry.size.height - sourceCrop.maxY,
                                 width: sourceCrop.width, height: sourceCrop.height)
             let frame = placement.frame(in: canvas.size, cameraAspect: geometry.size.width / geometry.size.height)
@@ -239,17 +238,11 @@ private final class PIPFrameComposer: @unchecked Sendable {
                                                   y: destination.height / ciCrop.height))
                 .transformed(by: CGAffineTransform(translationX: destination.minX, y: destination.minY))
                 .cropped(to: destination)
-            if shape == .circle {
-                // A one-output-pixel alpha edge keeps circles smooth at every
-                // size, without covering corners with a background-colored box.
-                let radius = destination.width / 2
-                let mask = CIFilter(name: "CIRadialGradient", parameters: [
-                    "inputCenter": CIVector(x: destination.midX, y: destination.midY),
-                    "inputRadius0": max(0, radius - 0.5), "inputRadius1": radius + 0.5,
-                    "inputColor0": CIColor(red: 1, green: 1, blue: 1),
-                    "inputColor1": CIColor(red: 0, green: 0, blue: 0)
-                ])!.outputImage!.cropped(to: destination)
-                camera = camera.applyingFilter("CIBlendWithMask", parameters: [
+            let radius = placement.cornerRadius(in: destination.size)
+            if radius > 0, let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: destination), "inputRadius": radius, "inputColor": CIColor.white
+            ])?.outputImage?.cropped(to: destination) {
+                camera = camera.applyingFilter("CIBlendWithAlphaMask", parameters: [
                     kCIInputBackgroundImageKey: CIImage(color: .clear).cropped(to: destination),
                     kCIInputMaskImageKey: mask
                 ])

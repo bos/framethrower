@@ -186,9 +186,12 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     var aspectRatio: Double = 16.0 / 9.0
     var crop: PIPCrop = PIPCrop()
     var sourceZoom: Double = 1
+    /// nil/0 retains normal overlay geometry; 1 fills the final output canvas.
+    /// Normal placement/shape remain intact so returning to zero restores them.
+    var fullscreen: Double? = nil
 
     init(x: Double = 0.95, y: Double = 0.95, scale: Double = 0.25, visible: Bool = true,
-         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1) {
+         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1, fullscreen: Double? = nil) {
         self.x = x
         self.y = y
         self.scale = scale
@@ -197,10 +200,11 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         self.aspectRatio = aspectRatio
         self.crop = crop
         self.sourceZoom = sourceZoom
+        self.fullscreen = fullscreen
     }
 
     private enum CodingKeys: String, CodingKey {
-        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom
+        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom, fullscreen
     }
 
     /// Decode defaults on each placement so old projects and every old undo/redo
@@ -215,6 +219,12 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         aspectRatio = try values.decodeIfPresent(Double.self, forKey: .aspectRatio) ?? 16.0 / 9.0
         crop = try values.decodeIfPresent(PIPCrop.self, forKey: .crop) ?? PIPCrop()
         sourceZoom = try values.decodeIfPresent(Double.self, forKey: .sourceZoom) ?? 1
+        fullscreen = try values.decodeIfPresent(Double.self, forKey: .fullscreen)
+    }
+
+    var fullscreenFraction: Double {
+        guard let fullscreen, fullscreen.isFinite else { return 0 }
+        return min(1, max(0, fullscreen))
     }
 
     func frame(in canvas: CGSize, cameraAspect: Double) -> CGRect {
@@ -227,13 +237,37 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         case .square, .circle: aspect = 1
         case .rectangle: aspect = aspectRatio.isFinite ? min(5, max(0.2, aspectRatio)) : 16.0 / 9.0
         }
-        let fraction = scale.isFinite ? min(0.5, max(0.12, scale)) : 0.25
-        let width = min(canvas.width * fraction, canvas.height * 0.8 * aspect)
+        let scaleFraction = scale.isFinite ? min(0.5, max(0.12, scale)) : 0.25
+        let width = min(canvas.width * scaleFraction, canvas.height * 0.8 * aspect)
         let height = width / aspect
         let horizontal = x.isFinite ? min(1, max(0, x)) : 0.95
         let vertical = y.isFinite ? min(1, max(0, y)) : 0.95
-        return ViewportGeometry.rect(in: canvas, size: CGSize(width: width, height: height),
-                                     travelAnchor: CGPoint(x: horizontal, y: vertical))
+        let normal = ViewportGeometry.rect(in: canvas, size: CGSize(width: width, height: height),
+                                           travelAnchor: CGPoint(x: horizontal, y: vertical))
+        let fraction = fullscreenFraction
+        guard fraction > 0 else { return normal }
+        if fraction == 1 { return CGRect(origin: .zero, size: canvas) }
+        return CGRect(x: normal.minX * (1 - fraction), y: normal.minY * (1 - fraction),
+            width: MotionInterpolation.blend(normal.width, canvas.width, progress: fraction),
+            height: MotionInterpolation.blend(normal.height, canvas.height, progress: fraction))
+    }
+
+    /// Aspect-fill the actual interpolated outline, without stretching the
+    /// camera image. Crop focus/source zoom remain independent of overlay size.
+    func sourceViewport(in source: CGSize, canvas: CGSize) -> CGRect {
+        guard fullscreenFraction > 0 else {
+            return crop.rect(in: source, shape: shape, aspectRatio: aspectRatio, zoom: sourceZoom)
+        }
+        guard source.width.isFinite, source.height.isFinite, source.width > 0, source.height > 0 else { return .zero }
+        let output = frame(in: canvas, cameraAspect: source.width / source.height)
+        guard output.width > 0, output.height > 0 else { return .zero }
+        return crop.rect(in: source, shape: .rectangle, aspectRatio: output.width / output.height, zoom: sourceZoom)
+    }
+
+    /// Supply the resolved frame.size, not the entire output canvas.
+    func cornerRadius(in frameSize: CGSize) -> Double {
+        guard frameSize.width.isFinite, frameSize.height.isFinite, frameSize.width > 0, frameSize.height > 0 else { return 0 }
+        return shape == .circle ? min(frameSize.width, frameSize.height) / 2 * (1 - fullscreenFraction) : 0
     }
 
     /// Resize from any corner while retaining its opposite corner whenever
@@ -557,7 +591,9 @@ struct EditState: Codable, Equatable, Sendable {
                                 aspectRatio: blend(previous.placement.aspectRatio, point.placement.aspectRatio),
                                 crop: PIPCrop(x: blend(previous.placement.crop.x, point.placement.crop.x),
                                               y: blend(previous.placement.crop.y, point.placement.crop.y)),
-                                sourceZoom: blend(previous.placement.sourceZoom, point.placement.sourceZoom))
+                                sourceZoom: blend(previous.placement.sourceZoom, point.placement.sourceZoom),
+                                fullscreen: previous.placement.fullscreen == nil && point.placement.fullscreen == nil ? nil :
+                                    blend(previous.placement.fullscreen ?? 0, point.placement.fullscreen ?? 0))
         }
         return previous.placement
     }
@@ -989,7 +1025,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   placement.aspectRatio.isFinite, (0.2...5).contains(placement.aspectRatio),
                   placement.crop.x.isFinite, (0...1).contains(placement.crop.x),
                   placement.crop.y.isFinite, (0...1).contains(placement.crop.y),
-                  placement.sourceZoom.isFinite, (1...3).contains(placement.sourceZoom) else {
+                  placement.sourceZoom.isFinite, (1...3).contains(placement.sourceZoom),
+                  placement.fullscreen.map({ $0.isFinite && (0...1).contains($0) }) ?? true else {
                 throw ProjectError.invalid("Camera placements must have unique, ordered times and valid positions and sizes.")
             }
             priorTime = point.time

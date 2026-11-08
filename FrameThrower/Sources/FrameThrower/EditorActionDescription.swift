@@ -139,6 +139,11 @@ struct EditorActionDescription: Equatable, Sendable {
 
     private static func cameraDetail(_ target: PIPPlacement, previous: PIPPlacement) -> String {
         if target.visible != previous.visible { return target.visible ? "Show the camera." : "Hide the camera." }
+        if target.fullscreenFraction != previous.fullscreenFraction {
+            if target.fullscreenFraction == 1 { return "Expand the camera to full screen." }
+            if target.fullscreenFraction == 0 { return "Return the camera to its picture-in-picture layout." }
+            return "Resize the camera toward full screen."
+        }
         let moved = target.x != previous.x || target.y != previous.y
         let resized = target.scale != previous.scale
         let reframed = target.shape != previous.shape || target.aspectRatio != previous.aspectRatio || target.crop != previous.crop || target.sourceZoom != previous.sourceZoom

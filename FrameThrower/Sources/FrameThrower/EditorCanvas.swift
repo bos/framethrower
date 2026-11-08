@@ -2,6 +2,81 @@ import AppKit
 import AVFoundation
 import SwiftUI
 
+/// Native controls operate on the resolved output width, not the stored normal
+/// overlay size. Keep a partial fullscreen morph continuous until it reaches its
+/// retained normal frame; ordinary overlay resizing keeps its existing behavior.
+enum EditorCameraSizing {
+    static func fraction(_ placement: PIPPlacement, in canvas: CGSize, cameraAspect: Double) -> Double {
+        guard canvas.width.isFinite, canvas.width > 0 else { return 0 }
+        return placement.frame(in: canvas, cameraAspect: cameraAspect).width / canvas.width
+    }
+    static func minimumFraction(_ placement: PIPPlacement, in canvas: CGSize, cameraAspect: Double) -> Double {
+        var minimum = placement; minimum.fullscreen = nil; minimum.scale = 0.12
+        return fraction(minimum, in: canvas, cameraAspect: cameraAspect)
+    }
+    static func sized(_ placement: PIPPlacement, to fraction: Double, in canvas: CGSize, cameraAspect: Double) -> PIPPlacement {
+        guard fraction.isFinite, canvas.width.isFinite, canvas.height.isFinite, canvas.width > 0, canvas.height > 0 else { return placement }
+        var normal = placement; normal.fullscreen = nil
+        var maximum = normal; maximum.scale = 0.5
+        let currentNormal = self.fraction(normal, in: canvas, cameraAspect: cameraAspect)
+        let maximumNormal = self.fraction(maximum, in: canvas, cameraAspect: cameraAspect)
+        let wanted = min(1, max(minimumFraction(placement, in: canvas, cameraAspect: cameraAspect), fraction))
+        if abs(wanted - self.fraction(placement, in: canvas, cameraAspect: cameraAspect)) < 1e-10 { return placement }
+        if placement.fullscreenFraction > 0 && wanted > currentNormal {
+            normal.fullscreen = min(1, max(0, (wanted - currentNormal) / max(1e-12, 1 - currentNormal)))
+        } else if wanted <= maximumNormal {
+            normal.scale = min(0.5, max(0.12, wanted))
+        } else {
+            normal = maximum
+            normal.fullscreen = min(1, max(0, (wanted - maximumNormal) / max(1e-12, 1 - maximumNormal)))
+        }
+        return normal
+    }
+    static func resized(_ placement: PIPPlacement, by translation: CGSize, corner: PIPResizeCorner,
+                        in canvas: CGSize, cameraAspect: Double) -> PIPPlacement {
+        guard translation.width.isFinite, translation.height.isFinite, translation != .zero,
+              canvas.width.isFinite, canvas.height.isFinite, canvas.width > 0, canvas.height > 0 else { return placement }
+        let original = placement.frame(in: canvas, cameraAspect: cameraAspect)
+        guard original.width > 0, original.height > 0 else { return placement }
+        let right = corner == .topRight || corner == .bottomRight
+        let down = corner == .bottomLeft || corner == .bottomRight
+        let dx = translation.width * (right ? 1 : -1), dy = translation.height * (down ? 1 : -1)
+        let delta: Double
+        if placement.fullscreenFraction == 0 && placement.shape == .rectangle { delta = dx }
+        else {
+            let x = dx / original.width, y = dy / original.height
+            delta = original.width * (abs(x) >= abs(y) ? x : y)
+        }
+        let wanted = min(canvas.width, max(canvas.width * minimumFraction(placement, in: canvas, cameraAspect: cameraAspect), original.width + delta))
+        var base = placement
+        if placement.fullscreenFraction == 0 {
+            let normal = placement.resized(by: translation, corner: corner, in: canvas, cameraAspect: cameraAspect)
+            var maximum = placement; maximum.scale = 0.5
+            if wanted <= maximum.frame(in: canvas, cameraAspect: cameraAspect).width + 1e-9 { return normal }
+            base = normal
+        }
+        let anchor = CGPoint(x: right ? original.minX : original.maxX, y: down ? original.minY : original.maxY)
+        let available = CGSize(width: right ? canvas.width - anchor.x : anchor.x,
+                               height: down ? canvas.height - anchor.y : anchor.y)
+        func candidate(_ width: Double) -> PIPPlacement { sized(base, to: width / canvas.width, in: canvas, cameraAspect: cameraAspect) }
+        var next = candidate(wanted)
+        var frame = next.frame(in: canvas, cameraAspect: cameraAspect)
+        if frame.width > available.width + 1e-9 || frame.height > available.height + 1e-9 {
+            var low = min(original.width, wanted), high = wanted
+            for _ in 0..<40 {
+                let mid = (low + high) / 2, size = candidate((low + high) / 2).frame(in: canvas, cameraAspect: cameraAspect).size
+                if size.width <= available.width && size.height <= available.height { low = mid } else { high = mid }
+            }
+            next = candidate(low); frame = next.frame(in: canvas, cameraAspect: cameraAspect)
+        }
+        if placement.fullscreenFraction > 0 && abs(frame.width - original.width) < 1e-9 && abs(frame.height - original.height) < 1e-9 { return placement }
+        let x = right ? anchor.x : anchor.x - frame.width, y = down ? anchor.y : anchor.y - frame.height
+        next.x = min(1, max(0, x / max(1e-12, canvas.width - frame.width)))
+        next.y = min(1, max(0, y / max(1e-12, canvas.height - frame.height)))
+        return next
+    }
+}
+
 struct EditorCanvasEditingPose {
     var zoom: ZoomPlacement
     var placement: PIPPlacement
@@ -288,8 +363,8 @@ final class EditorCanvasView: NSView {
         handles.isHidden = outline.isHidden
         let rect = current.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
-        outline.path = current.shape == .circle ? CGPath(ellipseIn: rect, transform: nil)
-            : CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
+        let radius = current.cornerRadius(in: rect.size)
+        outline.path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
         let circles = CGMutablePath()
         for corner in PIPResizeCorner.allCases {
             let point = cornerPoint(corner, in: rect)
@@ -498,7 +573,7 @@ final class EditorCanvasView: NSView {
                 }
                 return .frameResize(position: position, directions: .all)
             }
-            if cameraRect.contains(point) { return drag == nil ? .openHand : .closedHand }
+            if cameraRect.contains(point) { return placement.fullscreenFraction == 1 ? .arrow : (drag == nil ? .openHand : .closedHand) }
         }
         if isBoxTool { return contentRect.contains(point) ? .crosshair : .arrow }
         return canPan && canvasRect.contains(point) ? .openHand : .arrow
@@ -543,6 +618,7 @@ final class EditorCanvasView: NSView {
         let corner = cameraCorner(at: point)
         if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
             window?.makeFirstResponder(self)
+            guard corner != nil || placement.fullscreenFraction < 1 else { return }
             finishTrackpad()
             ignoresTrackpadRemainder = true
             drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
@@ -618,7 +694,7 @@ final class EditorCanvasView: NSView {
         }
         var next = drag.origin
         if let corner = drag.corner {
-            next = next.resized(by: translation, corner: corner, in: canvasRect.size, cameraAspect: cameraAspect)
+            next = EditorCameraSizing.resized(next, by: translation, corner: corner, in: canvasRect.size, cameraAspect: cameraAspect)
         } else {
             let rect = drag.origin.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             next.x = snap(next.x + translation.width / max(1, canvasRect.width - rect.width))

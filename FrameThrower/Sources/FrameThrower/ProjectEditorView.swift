@@ -1073,6 +1073,19 @@ struct ProjectEditorView: View {
             .help("Show or hide the camera at the selected edit or playhead.")
     }
 
+    private var cameraCanvasSize: CGSize {
+        PresentationGeometry(sourceSize: playback.sourceSize, presentation: canvasPresentation).outputSize
+    }
+    private var cameraWidthPercent: Double {
+        EditorCameraSizing.fraction(placement, in: cameraCanvasSize, cameraAspect: playback.cameraAspect) * 100
+    }
+    private var cameraMinimumWidthPercent: Double {
+        EditorCameraSizing.minimumFraction(placement, in: cameraCanvasSize, cameraAspect: playback.cameraAspect) * 100
+    }
+    private func cameraSized(to percent: Double) -> PIPPlacement {
+        EditorCameraSizing.sized(placement, to: percent / 100, in: cameraCanvasSize, cameraAspect: playback.cameraAspect)
+    }
+
     private var cameraControls: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
@@ -1084,18 +1097,19 @@ struct ProjectEditorView: View {
                         next.aspectRatio = min(5, max(0.2, frame.width / frame.height))
                     }
                     next.shape = shape
+                    next.fullscreen = nil
                     setPlacement(next, at: editTime, name: "Change camera shape")
                 })) {
                     ForEach(PIPShape.allCases, id: \.rawValue) { shape in Text(shape.title).tag(shape) }
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 340)
-                .help("Change the camera's outline at the selected edit or playhead. Square and Circle crop without stretching.")
+                .help("Change the camera's overlay outline at the selected edit or playhead. Changing Shape returns a fullscreen camera to its overlay.")
                 Button("Framing…") { openFraming() }
                     .help("Zoom or reposition the original camera image inside its outline.")
                     .popover(isPresented: $isFramingPresented) {
                         CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
-                            placement: state.placement(at: framingTime), preview: { crop in
+                            placement: state.placement(at: framingTime), canvasSize: cameraCanvasSize, preview: { crop in
                                 var next = state.placement(at: framingTime)
                                 next.crop = crop
                                 setPlacement(next, at: framingTime, name: "Edit")
@@ -1114,15 +1128,14 @@ struct ProjectEditorView: View {
                         }
                         .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
                     }
-                CommitSlider(title: "Size", value: placement.scale, range: 0.12...0.5, begin: { beginCameraGesture() }, preview: { value in
-                    var next = placement; next.scale = value
-                    setPlacement(next, at: editTime, name: "Edit")
+                CommitSlider(title: "Size", value: cameraWidthPercent, range: cameraMinimumWidthPercent...100,
+                    valueSuffix: "%", valueFormat: "%.0f", begin: { beginCameraGesture() }, preview: { value in
+                    setPlacement(cameraSized(to: value), at: editTime, name: "Edit")
                 }) { value in
-                    var next = placement; next.scale = value
-                    setPlacement(next, at: editTime, name: "Resize camera")
+                    setPlacement(cameraSized(to: value), at: editTime, name: "Resize camera")
                     canvasGesture = nil
-                }.frame(width: 180)
-                    .help("Resize the camera overlay. Drag any camera corner to resize directly.")
+                }.frame(width: 210)
+                    .help("Camera width as a percentage of the final canvas. 100% fills the canvas. Drag a corner to resize directly.")
                 Spacer(minLength: 0)
             }
             .frame(height: 24)
@@ -1141,8 +1154,10 @@ struct ProjectEditorView: View {
                 } label: {
                     Image(systemName: ["arrow.up.left", "arrow.up.right", "arrow.down.left", "arrow.down.right"][index])
                 }
-                .help(["Move camera to the top left", "Move camera to the top right", "Move camera to the bottom left", "Move camera to the bottom right"][index])
+                .help(placement.fullscreenFraction == 1 ? "A fullscreen camera has no position to move. Resize it to make room."
+                    : ["Move camera to the top left", "Move camera to the top right", "Move camera to the bottom left", "Move camera to the bottom right"][index])
                 .accessibilityLabel(["Camera top left", "Camera top right", "Camera bottom left", "Camera bottom right"][index])
+                .disabled(placement.fullscreenFraction == 1)
             }
         }
     }

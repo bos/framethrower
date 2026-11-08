@@ -14,9 +14,11 @@ extension PIPShape {
 struct PIPWindowShape: InsettableShape {
     var shape: PIPShape
     var insetAmount: CGFloat = 0
+    var cornerRadius: CGFloat? = nil
 
     func path(in rect: CGRect) -> Path {
         let bounds = rect.insetBy(dx: insetAmount, dy: insetAmount)
+        if let cornerRadius { return Path(roundedRect: bounds, cornerRadius: max(0, cornerRadius - insetAmount)) }
         return shape == .circle ? Path(ellipseIn: bounds) : Path(roundedRect: bounds, cornerRadius: 3)
     }
     func inset(by amount: CGFloat) -> PIPWindowShape {
@@ -32,6 +34,7 @@ struct CameraFramingPopover: View {
     let image: CGImage?
     let errorMessage: String?
     let placement: PIPPlacement
+    var canvasSize: CGSize? = nil
     var preview: (PIPCrop) -> Void = { _ in }
     var zoomPreview: (Double) -> Void = { _ in }
     var zoomCommit: (Double) -> Void = { _ in }
@@ -39,6 +42,19 @@ struct CameraFramingPopover: View {
     @State private var dragOrigin: PIPCrop?
     @State private var draft: PIPCrop?
     @State private var zoomDraft: Double?
+
+    private func framingPlacement(source: CGSize) -> PIPPlacement {
+        guard let canvasSize, placement.fullscreenFraction > 0 else { return placement }
+        let frame = placement.frame(in: canvasSize, cameraAspect: source.width / source.height)
+        var result = placement; result.shape = .rectangle; result.aspectRatio = frame.width / max(1, frame.height)
+        return result
+    }
+    private func cropOutline(source: CGSize, crop: CGRect, scale: Double) -> PIPWindowShape {
+        guard let canvasSize else { return PIPWindowShape(shape: placement.shape) }
+        let frame = placement.frame(in: canvasSize, cameraAspect: source.width / source.height)
+        let radius = placement.cornerRadius(in: frame.size) / max(1, min(frame.width, frame.height))
+        return PIPWindowShape(shape: placement.shape, cornerRadius: radius * min(crop.width, crop.height) * scale)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -48,14 +64,16 @@ struct CameraFramingPopover: View {
                 let scale = min(360 / source.width, 240 / source.height)
                 let size = CGSize(width: source.width * scale, height: source.height * scale)
                 let zoom = zoomDraft ?? placement.sourceZoom
-                let crop = (draft ?? placement.crop).rect(in: source, shape: placement.shape,
-                                                        aspectRatio: placement.aspectRatio, zoom: zoom)
+                let framing = framingPlacement(source: source)
+                let crop = (draft ?? placement.crop).rect(in: source, shape: framing.shape,
+                                                        aspectRatio: framing.aspectRatio, zoom: zoom)
+                let outline = cropOutline(source: source, crop: crop, scale: scale)
                 Image(decorative: image, scale: 1).resizable()
                     .frame(width: size.width, height: size.height)
                     .overlay(alignment: .topLeading) {
-                        PIPWindowShape(shape: placement.shape)
+                        outline
                             .strokeBorder(.white, lineWidth: 2)
-                            .background(PIPWindowShape(shape: placement.shape).fill(.white.opacity(0.08)))
+                            .background(outline.fill(.white.opacity(0.08)))
                             .frame(width: crop.width * scale, height: crop.height * scale)
                             .offset(x: crop.minX * scale, y: crop.minY * scale)
                             .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("cameraCropSource")).onChanged { value in
@@ -63,7 +81,7 @@ struct CameraFramingPopover: View {
                                 guard let origin = dragOrigin else { return }
                                 draft = origin.moved(
                                     by: CGSize(width: value.translation.width / scale, height: value.translation.height / scale),
-                                    in: source, shape: placement.shape, aspectRatio: placement.aspectRatio, zoom: zoom)
+                                    in: source, shape: framing.shape, aspectRatio: framing.aspectRatio, zoom: zoom)
                                 if let draft { preview(draft) }
                             }.onEnded { _ in
                                 if let draft { commit(draft) }

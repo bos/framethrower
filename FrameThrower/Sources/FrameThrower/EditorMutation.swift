@@ -102,16 +102,19 @@ struct EditorCameraOverlayPatch: Codable, Equatable, Sendable {
     var shape: PIPShape? = nil
     var aspectRatio: Double? = nil
     var visible: Bool? = nil
-    private enum CodingKeys: String, CodingKey, CaseIterable { case position, scale, shape, aspectRatio, visible }
-    init(position: EditorUnitPoint? = nil, scale: Double? = nil, shape: PIPShape? = nil, aspectRatio: Double? = nil, visible: Bool? = nil) {
-        self.position = position; self.scale = scale; self.shape = shape; self.aspectRatio = aspectRatio; self.visible = visible
+    /// 0 restores normal geometry; 1 fills the output with an aspect-fill crop.
+    var fullscreen: Double? = nil
+    private enum CodingKeys: String, CodingKey, CaseIterable { case position, scale, shape, aspectRatio, visible, fullscreen }
+    init(position: EditorUnitPoint? = nil, scale: Double? = nil, shape: PIPShape? = nil, aspectRatio: Double? = nil, visible: Bool? = nil, fullscreen: Double? = nil) {
+        self.position = position; self.scale = scale; self.shape = shape; self.aspectRatio = aspectRatio; self.visible = visible; self.fullscreen = fullscreen
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
         position = try c.optional(EditorUnitPoint.self, .position); scale = try c.optional(Double.self, .scale)
         shape = try c.optional(PIPShape.self, .shape); aspectRatio = try c.optional(Double.self, .aspectRatio); visible = try c.optional(Bool.self, .visible)
+        fullscreen = try c.optional(Double.self, .fullscreen)
     }
-    var isEmpty: Bool { position == nil && scale == nil && shape == nil && aspectRatio == nil && visible == nil }
+    var isEmpty: Bool { position == nil && scale == nil && shape == nil && aspectRatio == nil && visible == nil && fullscreen == nil }
 }
 
 struct EditorCameraSourcePatch: Codable, Equatable, Sendable {
@@ -395,6 +398,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             if let value = patch.shape { target.shape = value }
             if let value = patch.aspectRatio { target.aspectRatio = value }
             if let value = patch.visible { target.visible = value }
+            if let value = patch.fullscreen { target.fullscreen = value == 0 ? nil : value }
             try camera(target, timing: timing, state: &state)
         case let .cameraSource(patch, timing):
             try requireCamera(project)
@@ -426,7 +430,8 @@ enum EditorMutation: Codable, Equatable, Sendable {
             let y = axes.vertical ? destination.y - own.point.y * frame.height : frame.minY
             guard x >= -0.000_000_001, y >= -0.000_000_001,
                   x + frame.width <= output.width + 0.000_000_001, y + frame.height <= output.height + 0.000_000_001 else { throw EditorMutationError.unreachableAlignment }
-            target.x = min(1, max(0, x / (output.width - frame.width))); target.y = min(1, max(0, y / (output.height - frame.height)))
+            if output.width - frame.width > 0.000_000_001 { target.x = min(1, max(0, x / (output.width - frame.width))) }
+            if output.height - frame.height > 0.000_000_001 { target.y = min(1, max(0, y / (output.height - frame.height))) }
             let resolved = target.frame(in: output.size, cameraAspect: aspect)
             guard abs(resolved.minX - x) < 0.000_000_1, abs(resolved.minY - y) < 0.000_000_1 else { throw EditorMutationError.unreachableAlignment }
             try camera(target, timing: timing, state: &state)
@@ -484,8 +489,12 @@ enum EditorMutation: Codable, Equatable, Sendable {
             easeIn: motion.easeIn, easeOut: motion.easeOut, sourceRegionID: regionID))
         state.zoomKeyframes.sort { $0.time < $1.time }
     }
-    private func camera(_ target: PIPPlacement, timing: EditorMutationTiming, state: inout EditState) throws {
-        let baseline = state.placement(at: timing.start)
+    private func camera(_ requested: PIPPlacement, timing: EditorMutationTiming, state: inout EditState) throws {
+        var target = requested
+        var baseline = state.placement(at: timing.start)
+        // Explicit zero and absent legacy metadata describe the same geometry.
+        if target.fullscreen == 0 { target.fullscreen = nil }
+        if baseline.fullscreen == 0 { baseline.fullscreen = nil }
         guard target != baseline else { return }
         let overlaps = conflicts(in: state)
         guard overlaps.isEmpty else { throw EditorMutationError.conflicts(overlaps) }
@@ -516,7 +525,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             return value
         }
         let overlay = object(["position": point, "scale": number(0.12, 0.5), "shape": enumeration(["original", "rectangle", "square", "circle"]),
-            "aspectRatio": number(0.2, 5), "visible": ["type": "boolean"]], optional: ["position", "scale", "shape", "aspectRatio", "visible"])
+            "aspectRatio": number(0.2, 5), "visible": ["type": "boolean"], "fullscreen": number(0, 1)], optional: ["position", "scale", "shape", "aspectRatio", "visible", "fullscreen"])
         let source = object(["crop": point, "sourceZoom": number(1, 3)], optional: ["crop", "sourceZoom"])
         let pointer = object(["visible": ["type": "boolean"], "size": number(1, 4), "smoothing": number(0, 1), "clickHighlight": ["type": "boolean"]],
             optional: ["visible", "size", "smoothing", "clickHighlight"])
@@ -527,7 +536,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             operation("panScreen", "Move the original-source viewport center while preserving its zoom. Exact normalized focal coordinates; impossible bounds reject. Timing uses absolute source seconds.", ["center": point, "timing": timing]),
             operation("zoomScreen", "Set screen magnification1...3. Optional center is exact source-normalized focal point; omission retains current focus with normal bounds clamping.", ["scale": number(1, 3), "center": point, "timing": timing], optional: ["center"]),
             operation("alignScreen", "Align an exact viewport anchor to a raw Box anchor. Preserve scale for pan; explicit absolute/fitRegion permits zoom. No implicit10% padding. Unreachable alignment rejects.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "scalePolicy": policy, "timing": timing]),
-            operation("cameraOverlay", "Patch only output-camera overlay fields. Position is fraction of AVAILABLE travel, scale is fraction of output width0.12...0.5. Shape/visibility switch at arrival; this is not opacity.", ["patch": overlay, "timing": timing]),
+            operation("cameraOverlay", "Patch only output-camera overlay fields. Position is fraction of AVAILABLE travel, scale is fraction of output width0.12...0.5. fullscreen0...1 animates preserved normal placement to exact output fill, with aspect-fill cropping;0restores normal shape/size. Shape/visibility switch at arrival; this is not opacity.", ["patch": overlay, "timing": timing]),
             operation("alignCameraOverlay", "Move the camera outline without resizing or changing its source crop. Align to displayed Box using verified host geometry; unavailable geometry rejects. Source boxes project through arrival screen framing into final canvas.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "timing": timing]),
             operation("cameraSource", "Patch the camera image INSIDE its unchanged outline. Crop x/y are fractions of available oriented camera-source travel; sourceZoom1...3 is not overlay size.", ["patch": source, "timing": timing]),
             operation("pointer", "Patch whole-recording pointer style only; does not invent or retime captured pointer motion. Supply at least one field.", ["patch": pointer]),
@@ -542,7 +551,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         ["mutation_schema": ["oneOf": schemaDescriptors],
          "legacy_command_schema": ["oneOf": legacySchemas],
          "units": ["screen": "Original source-normalized focal center; top-left origin. Zoom1...3.",
-                   "cameraOverlay": "Position fractions of available output-canvas travel; scale fraction of output width0.12...0.5.",
+                   "cameraOverlay": "Position fractions of available output-canvas travel; normal scale fraction of output width0.12...0.5. fullscreen0...1 blends normal outline to exact canvas fill without erasing normal shape/placement.",
                    "cameraSource": "Oriented camera crop travel fractions0...1; sourceZoom1...3.",
                    "timing": "Absolute original-source seconds. Smooth start<end; jump start=end. End precedes recording end.",
                    "alignment": "Exact raw Box anchors; no implicit padding or silent clamp. PIP-to-Box needs verified host geometry.",

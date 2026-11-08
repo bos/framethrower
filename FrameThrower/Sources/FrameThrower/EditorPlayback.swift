@@ -35,6 +35,7 @@ final class EditorPlayback: ObservableObject {
     }
     @Published private(set) var isScrubbing = false
     private var renderedProject: RenderedProject?
+    private var cachedCursorRecording: CursorRecording?
     private let stillRequests = LatestStillFrameQueue<CGImage>()
     private var committedState: EditState?
     private var liveSources: LiveStillFrameCache?
@@ -68,10 +69,7 @@ final class EditorPlayback: ObservableObject {
     var isPreviewing: Bool { draftState != nil || pendingDraftState != nil }
     var canPlay: Bool { !isClosed && !isLoading && (MediaProcessing.isSuspended ? simulationClock != nil : renderedProject != nil) }
 
-    var cursorRecording: CursorRecording? {
-        renderedProject?.videoComposition.instructions
-            .compactMap { $0 as? PIPCompositionInstruction }.first?.cursorRecording
-    }
+    var cursorRecording: CursorRecording? { cachedCursorRecording }
 
 
     var editingTime: Double {
@@ -101,6 +99,14 @@ final class EditorPlayback: ObservableObject {
         invalidateSeeks()
         let request = generation
         let snapshot = editor.project
+        // Cursor recordings are validated JSON metadata, independent of all
+        // movie/decoder objects. Read once per rebuild, including suspended
+        // previews; missing or corrupt metadata simply produces no click ticks.
+        cachedCursorRecording = nil
+        if let filename = snapshot.cursorFilename, !filename.isEmpty, filename != ".", filename != "..",
+           !filename.contains("/"), !filename.contains("\\"), !filename.contains("\0") {
+            cachedCursorRecording = try? CursorRecording.load(from: editor.mediaURL(for: filename))
+        }
         stopSimulation()
         sourceDuration = snapshot.duration
         bounds = snapshot.state.trimStart...snapshot.state.trimEnd
@@ -604,6 +610,7 @@ final class EditorPlayback: ObservableObject {
     }
 
     func close() {
+        cachedCursorRecording = nil
         stopSimulation()
         simulationClock = nil
         generation += 1

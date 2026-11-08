@@ -10,10 +10,11 @@ struct EditorSimulationChecks {
         try require(MediaProcessing.isSuspended, "Requires the media-driver interlock")
         try await transport()
         try await playbackRates()
+        try await cursorMetadata()
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
         try vectorCanvas()
-        print("Editor simulation checks passed (actual suspended clock lifecycle, preview rates and continuous changes, trim/seek/end/restart, preview preservation, vector screen/PIP interpolation and stable canvas geometry; no AV objects or media).")
+        print("Editor simulation checks passed (actual suspended clock lifecycle, preview rates, cursor JSON cache/clicks, trim/seek/end/restart, preview preservation, vector screen/PIP interpolation and stable geometry; no AV objects or media).")
     }
     static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         guard condition() else { throw SimulationFailure.failed(message) }
@@ -171,6 +172,49 @@ struct EditorSimulationChecks {
                     "Closed or suspended rate actions never allocate AV objects")
         try require(editor.project == project && !editor.canUndo && !FileManager.default.fileExists(atPath: url.path),
                     "Preview rates never write project bytes, edit history, or exported media")
+    }
+    static func cursorMetadata() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cursor-metadata-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = CursorRecording(duration: 4, logicalWidth: 1920, logicalHeight: 1080,
+            samples: [CursorSample(time: 0, x: 0.2, y: 0.3), CursorSample(time: 4, x: 0.7, y: 0.8)],
+            clicks: [CursorClick(time: 0.5, x: 0.3, y: 0.4, button: 0), CursorClick(time: 3.5, x: 0.6, y: 0.7, button: 1)])
+        let cursorURL = directory.appendingPathComponent("pointer.json")
+        let bytes = try JSONEncoder().encode(source)
+        try bytes.write(to: cursorURL)
+        let project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov",
+            cursorFilename: cursorURL.lastPathComponent, duration: 4)
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("metadata.framethrower"))
+        let playback = EditorPlayback()
+        await playback.rebuild(editor: editor)
+        try require(playback.cursorRecording == source && playback.cursorRecording?.clicks.map(\.time) == [0.5, 3.5],
+                    "Suspended playback exposes validated pointer JSON and real click times without a renderer")
+        try require(!playback.hasMediaPlayer && playback.canvasPlayer == nil && playback.canPlay,
+                    "Loading pointer metadata cannot create media objects or disable the source-free transport")
+        let afterRead = try Data(contentsOf: cursorURL)
+        try require(afterRead == bytes, "The pointer metadata cache is read-only")
+        try Data("corrupt JSON".utf8).write(to: cursorURL)
+        try require(playback.cursorRecording == source, "The getter uses its cache instead of rereading on every UI update")
+        await playback.rebuild(editor: editor)
+        try require(playback.cursorRecording == nil && playback.errorMessage == nil,
+                    "A corrupt JSON rebuild clears stale pointer data without reporting a video failure")
+        try FileManager.default.removeItem(at: cursorURL)
+        await playback.rebuild(editor: editor)
+        try require(playback.cursorRecording == nil, "Missing cursor JSON yields an empty pointer lane")
+        try bytes.write(to: cursorURL)
+        await playback.rebuild(editor: editor)
+        try require(playback.cursorRecording == source, "A subsequent valid JSON rebuild refreshes the cache")
+        var noPointer = project
+        noPointer.cursorFilename = nil
+        let noPointerEditor = ProjectEditor(project: noPointer, url: editor.url)
+        await playback.rebuild(editor: noPointerEditor)
+        try require(playback.cursorRecording == nil, "A project without cursorFilename cannot reuse another project's cached ticks")
+        await playback.rebuild(editor: editor)
+        playback.close()
+        try require(playback.cursorRecording == nil && !playback.hasMediaPlayer && editor.project == project && !editor.canUndo,
+                    "Closing clears cursor metadata without saving, editing history, or opening source movies")
+        try require(!FileManager.default.fileExists(atPath: editor.url.path), "The metadata-only fixture never writes a recording project or media")
     }
     static func allLayers(_ layer: CALayer) -> [CALayer] { [layer] + (layer.sublayers ?? []).flatMap(allLayers) }
 }

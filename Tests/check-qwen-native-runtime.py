@@ -16,11 +16,13 @@ import threading
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'Tools'))
 qwen = importlib.import_module('DirectorAgents.qwen')
+instructions = importlib.import_module('DirectorAgents.instructions')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cli', required=True)
+    parser.add_argument('--effort', choices=('off','on'), default='off')
     args = parser.parse_args()
     requests = []
     class Handler(BaseHTTPRequestHandler):
@@ -66,9 +68,10 @@ for line in sys.stdin:
 ''')
             config = {'cli': args.cli, 'cwd': directory, 'mcp_proxy': str(proxy), 'mcp_socket': '/tmp/synthetic-unused.sock',
                 'document_id': 'synthetic-only', 'model': 'framethrower-local', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
-                'local_token': 'synthetic-local-token', 'context_window_size': 32768, 'timeout_seconds': 45,
+                'local_token': 'synthetic-local-token', 'effort': args.effort, 'context_window_size': 32768, 'timeout_seconds': 45,
                 'on_session_id': lambda native: (cwd / 'bound').write_text(native)}
-            first = qwen.run_turn({'text': 'FIRST-TURN-COBALT. Inspect the editor.', 'bootstrap_context': {'title': 'BOOTSTRAP-ONCE'}}, config)
+            literal_request = 'Zoom the camera to full screen over two seconds.'
+            first = qwen.run_turn({'text': literal_request, 'bootstrap_context': {'title': 'BOOTSTRAP-ONCE'}}, config)
             assert 'error' not in first, first
             assert first['text'] == 'Native answer cobalt.', first
             native = first['native_session_id']
@@ -83,8 +86,19 @@ for line in sys.stdin:
             assert len(requests) == 2, len(requests)
             for request in requests:
                 assert {tool['function']['name'] for tool in request['tools']} == allowed
-                assert request['chat_template_kwargs']['enable_thinking'] is False
+                assert request['chat_template_kwargs']['enable_thinking'] is (args.effort == 'on')
                 assert 1 < request['max_tokens'] <= 4096, (request['max_tokens'], len(json.dumps(request)), [(m['role'],len(str(m.get('content')))) for m in request['messages']])
+            def content_text(message):
+                content = message.get('content')
+                if isinstance(content, str): return content
+                return ''.join(part.get('text', '') for part in content if isinstance(part, dict))
+            first_messages = requests[0]['messages']
+            assert first_messages[0]['role'] == 'system'
+            assert [message['content'] for message in first_messages if message['role'] == 'system'] == [instructions.INSTRUCTIONS]
+            assert [message['role'] for message in first_messages] == ['system', 'user']
+            assert sum(content_text(message).count(literal_request) for message in first_messages if message['role'] == 'user') == 1
+            assert all(literal_request not in content_text(message) for message in first_messages if message['role'] != 'user')
+            assert 'BOOTSTRAP-ONCE' in content_text(first_messages[1])
             config['native_session_id'] = native
             second = qwen.run_turn({'text': 'SECOND-TURN. What synthetic word did I give you?',
                                    'bootstrap_context': {'title': 'MUST-NOT-REPLAY'}}, config)
@@ -92,10 +106,12 @@ for line in sys.stdin:
             assert second['native_session_id'] == native
             assert len(requests) == 3, len(requests)
             resumed = json.dumps(requests[-1]['messages'])
-            assert 'FIRST-TURN-COBALT' in resumed and 'Native answer cobalt.' in resumed
+            assert literal_request in resumed and 'Native answer cobalt.' in resumed
+            assert [message['content'] for message in requests[-1]['messages'] if message['role'] == 'system'] == [instructions.INSTRUCTIONS]
+            assert requests[-1]['messages'][-1]['role'] == 'user'
             assert 'ACTUAL-SYNTHETIC-EDITOR-RESULT' in resumed
             assert 'SECOND-TURN' in resumed and 'MUST-NOT-REPLAY' not in resumed
-            print('Qwen native offline runtime passed: official0.27.0, exact8 MCPtools, actual tool result, early binding, native transcript resume, thinkingoff and useful output budget; no real inference/media.')
+            print('Qwen native offline runtime passed: official0.27.0, exact shared system instruction and literal USER request/role order, exact8 MCPtools, actual tool result, early binding, native transcript resume, explicit thinking toggle and unchanged useful output budget; no real inference/media.')
     finally:
         server.shutdown(); server.server_close()
 

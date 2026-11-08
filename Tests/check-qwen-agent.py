@@ -54,6 +54,7 @@ class Checks(unittest.TestCase):
         self.assertEqual(result['events'][2]['message']['content'][0]['content'],'actual result')
         captured=json.loads((self.directory/'captured.json').read_text()); args=captured['args']
         self.assertIn('--safe-mode',args); self.assertIn('--chat-recording=true',args)
+        self.assertEqual(args[args.index('--system-prompt')+1],qwen.INSTRUCTIONS)
         self.assertNotIn('private-token',json.dumps(args)); self.assertIn('run_shell_command',args)
         self.assertTrue(set(qwen.EXCLUDED_TOOLS).issubset(args))
         mcp=json.loads(args[args.index('--mcp-config')+1])['mcpServers']['framethrower']
@@ -64,6 +65,17 @@ class Checks(unittest.TestCase):
         self.assertEqual(generation['contextWindowSize'],32768)
         self.assertIs(generation['extra_body']['chat_template_kwargs']['enable_thinking'],False)
         self.assertIn('bootstrap_context',captured['prompt'])
+    def test_reasoning_on_is_explicit_native_toggle(self):
+        self.configuration['effort']='on'
+        result=self.run_turn(); self.assertNotIn('error',result)
+        settings=json.loads((self.directory/'qwen-home/settings.json').read_text())
+        self.assertNotIn('reasoningEffort',settings['model'])
+        self.assertIs(settings['modelProviders']['openai'][0]['generationConfig']['extra_body']['chat_template_kwargs']['enable_thinking'],True)
+        self.assertNotIn('--reasoning-effort',json.loads((self.directory/'captured.json').read_text())['args'])
+    def test_reasoning_tiers_refused_before_cli(self):
+        self.configuration['effort']='medium'
+        self.assertIn('error',self.run_turn())
+        self.assertFalse((self.directory/'captured.json').exists())
     def test_resume_only_new_turn(self):
         first=self.run_turn('FIRST-SECRET',bootstrap_context={'old':'BOOTSTRAP'})
         self.configuration['native_session_id']=first['native_session_id']

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline adapter contract tests. No real CLI, credentials, models or desktop."""
-import importlib.util
+import importlib
 import json
 import os
 from pathlib import Path
@@ -10,9 +10,9 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("director_claude_agent", ROOT / "Tools/DirectorAgents/claude.py")
-claude = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(claude)
+sys.path.insert(0, str(ROOT / "Tools"))
+claude = importlib.import_module("DirectorAgents.claude")
+instructions = importlib.import_module("DirectorAgents.instructions")
 
 FAKE = r'''
 import json, os, pathlib, sys
@@ -139,6 +139,17 @@ class ClaudeAgentChecks(unittest.TestCase):
         self.assertIn(events[0]['actual'],sent)
         self.assertGreater(len(sent),180_000)
         self.assertNotIn('omitted',sent)
+
+    def test_shared_tool_roles_reach_native_cli_without_rewriting_user_turn(self):
+        text='Set the pointer size to2.'
+        result=claude.run_turn({'text':text},self.configuration)
+        self.assertNotIn('error',result)
+        row=self.rows()[0]; args=row['args']
+        delivered=args[args.index('--append-system-prompt')+1]
+        self.assertEqual(delivered,instructions.INSTRUCTIONS)
+        for role in ('apply_edits','inspect_editor','category="editing"','command_schema','control_document','control_preview','navigate_editor'):
+            self.assertIn(role,delivered)
+        self.assertEqual(row['text'],text)
 
     def test_native_slash_command_not_rewritten_without_updates(self):
         self.assertNotIn('error',claude.run_turn({'text':'/compact'},self.configuration))

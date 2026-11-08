@@ -1,5 +1,6 @@
 """Offline native-session/MCP adapter checks; fake CLI, no inference or media."""
-import importlib.util
+import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,9 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE = ROOT / "Tools/DirectorAgents/codex.py"
-spec = importlib.util.spec_from_file_location("director_native_codex", MODULE)
-agent = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(agent)
+TOOLS = ROOT / "Tools"
+sys.path.insert(0, str(TOOLS))
+agent = importlib.import_module("DirectorAgents.codex")
 SESSION = "00000000-0000-4000-8000-000000000001"
 OTHER = "00000000-0000-4000-8000-000000000002"
 FAKE = r'''#!PYTHON
@@ -154,9 +154,10 @@ class NativeCodexChecks(unittest.TestCase):
         self.assertEqual(call["env"]["CODEX_HOME"], "/native-cli-auth-location")
         self.assertIsNone(call["env"]["OPENAI_API_KEY"])
         self.assertIsNone(call["env"]["CODEX_API_KEY"])
-        instructions = self.cwd / "codex-director-instructions.txt"
+        instructions = Path(agent.instructions_file(str(self.cwd)))
         self.assertEqual(instructions.stat().st_mode & 0o777, 0o600)
-        self.assertIn("Use native MCP tools directly", instructions.read_text())
+        self.assertEqual(instructions.read_text(), agent.INSTRUCTIONS)
+        self.assertIn(hashlib.sha256(instructions.read_bytes()).hexdigest(), instructions.name)
     def test_captured_fail_closed_native_runtime_is_not_successful_prose(self):
         events = native_events("I could not access the editor controls, so no changes were made.")
         events.insert(1, {"type": "item.completed", "item": {"id": "runtime-warning", "type": "error", "message":
@@ -241,12 +242,41 @@ class NativeCodexChecks(unittest.TestCase):
     def test_input_is_not_silently_trimmed_and_instructions_not_overwritten(self):
         with patch.object(agent, "MAX_INPUT", 12):
             self.assertEqual(self.run_turn("a" * 13)["error"]["code"], "input_limit")
-        path = self.cwd / "codex-director-instructions.txt"
+        path = Path(agent.instructions_file(str(self.cwd)))
         path.write_text("different instructions")
         path.chmod(0o600)
         self.assertEqual(self.run_turn()["error"]["code"], "configuration")
         self.assertEqual(path.read_text(), "different instructions")
         self.assertFalse((self.cwd / "requests.jsonl").exists())
+    def test_instruction_update_resumes_same_thread_using_new_immutable_version(self):
+        original_text = "Remember this exact earlier instruction."
+        first = self.run_turn(original_text)
+        self.assertNotIn("error", first)
+        self.config["native_session_id"] = first["native_session_id"]
+        old_path = Path(agent.instructions_file(str(self.cwd)))
+        original_bytes = old_path.read_bytes()
+        legacy_path = self.cwd / "codex-director-instructions.txt"
+        legacy_path.write_text("Instructions from an older app version.\n")
+        legacy_bytes = legacy_path.read_bytes()
+        updated = agent.INSTRUCTIONS + "\nUse the latest app instruction version without replaying older turns.\n"
+        with patch.object(agent, "INSTRUCTIONS", updated):
+            second = self.run_turn("Continue our existing conversation.")
+            self.assertNotIn("error", second)
+            new_path = Path(agent.instructions_file(str(self.cwd)))
+        self.assertEqual(first["native_session_id"], second["native_session_id"])
+        self.assertNotEqual(old_path, new_path)
+        self.assertEqual(old_path.read_bytes(), original_bytes)
+        self.assertEqual(legacy_path.read_bytes(), legacy_bytes)
+        self.assertEqual(new_path.read_text(), updated)
+        self.assertIn(hashlib.sha256(new_path.read_bytes()).hexdigest(), new_path.name)
+        self.assertEqual(new_path.stat().st_mode & 0o777, 0o600)
+        calls = self.captured()
+        self.assertEqual(calls[1]["argv"][:4], ["--no-daemon", "exec", "resume", SESSION])
+        self.assertNotIn(original_text, calls[1]["prompt"])
+        overrides = [calls[1]["argv"][i+1] for i, flag in enumerate(calls[1]["argv"]) if flag == "-c"]
+        self.assertIn('model_instructions_file=' + json.dumps(str(new_path.resolve())), overrides)
+        self.assertFalse(list(self.cwd.glob(".codex-director-instructions-*")), "no incomplete published instruction versions")
+
     def test_timeout_graceful_term_and_descendant_cleanup(self):
         self.configure(events=native_events()[:2], hang=True)
         self.config["timeout"] = 2
@@ -265,8 +295,8 @@ class NativeCodexChecks(unittest.TestCase):
         self.fail("owned fake CLI process still alive: %d" % pid)
     def test_sigterm_parent_cleans_own_cli_and_preserves_partial_id(self):
         self.configure(events=native_events()[:2], hang=True)
-        driver = "import importlib.util,json,sys;s=importlib.util.spec_from_file_location('native',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);print(json.dumps(m.run_turn({'text':'test','editor_events':[]},json.loads(sys.argv[2]))),flush=True)"
-        process = subprocess.Popen([sys.executable, "-c", driver, str(MODULE), json.dumps(self.config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        driver = "import importlib,json,sys;sys.path.insert(0,sys.argv[1]);m=importlib.import_module('DirectorAgents.codex');print(json.dumps(m.run_turn({'text':'test','editor_events':[]},json.loads(sys.argv[2]))),flush=True)"
+        process = subprocess.Popen([sys.executable, "-c", driver, str(TOOLS), json.dumps(self.config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 3
             while not (self.cwd / "ready").exists() and time.monotonic() < deadline:

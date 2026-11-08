@@ -16,7 +16,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from .claude import DIRECTOR_INSTRUCTIONS
+from .instructions import INSTRUCTIONS
 
 CLI_VERSION = "0.27.0"
 CLI_COMMIT = "03b0c2435be1890a21b117860eaf389076787275"
@@ -139,8 +139,9 @@ def _setup(configuration):
     context = configuration.get("context_window_size")
     if type(context) is not int or context < 32768:
         raise AdapterError("Qwen Code requires an actual local context of at least 32,768 tokens for its native estimator safety reserve.")
-    if configuration.get("effort") not in (None, "none", "off"):
-        raise AdapterError("The verified local model runs with reasoning disabled.")
+    if configuration.get("effort") not in (None, "none", "off", "on"):
+        raise AdapterError("Qwen reasoning accepts an explicit on/off toggle, not effort tiers.")
+    reasoning_on = configuration.get("effort") == "on"
     home = Path(cwd) / "qwen-home"
     home.mkdir(mode=0o700, exist_ok=True)
     attributes = home.lstat()
@@ -151,13 +152,15 @@ def _setup(configuration):
         "general": {"enableAutoUpdate": False},
         "telemetry": {"enabled": False, "logPrompts": False},
         "security": {"auth": {"selectedType": "openai"}},
-        "model": {"name": model, "baseUrl": base, "reasoningEffort": "none"},
+        "model": {"name": model, "baseUrl": base},
         "modelProviders": {"openai": [{"id": model, "name": "FrameThrower local",
             "baseUrl": base, "envKey": "OPENAI_API_KEY",
             "capabilities": {"reasoning": {"profile": "qwen-chat-template"}},
             "generationConfig": {"contextWindowSize": context,
                 "samplingParams": {"max_tokens": min(4096, context // 4)},
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}}]}}
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": reasoning_on}}}}]}}
+    if not reasoning_on:
+        settings["model"]["reasoningEffort"] = "none"
     # This directory belongs to the broker's serialized conversation. Never
     # modify the user's Qwen configuration or authentication files.
     for name, value in (("settings.json", settings), ("system.json", {}), ("defaults.json", {})):
@@ -178,7 +181,7 @@ def _setup(configuration):
         "includeTools": list(TOOLS), "trust": True}}}
     args = [cli, "--safe-mode", "--chat-recording=true", "--output-format", "stream-json",
             "--input-format", "text", "--auth-type", "openai", "--model", model,
-            "--openai-base-url", base, "--system-prompt", DIRECTOR_INSTRUCTIONS,
+            "--openai-base-url", base, "--system-prompt", INSTRUCTIONS,
             "--mcp-config", json.dumps(mcp), "--exclude-tools", *EXCLUDED_TOOLS,
             "--allowed-tools", *("mcp__framethrower__" + tool for tool in TOOLS)]
     return args, env, cwd

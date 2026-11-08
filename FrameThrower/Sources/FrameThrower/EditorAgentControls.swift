@@ -239,7 +239,9 @@ enum EditorAgentControls {
                 let canonicalLabel = context.recording.references.boxLabel(for: box.id) ?? label
                 if action == "delete" {
                     commands.append(.removeRegion(regionID: box.id))
-                    summaries.append("Removed \(canonicalLabel).")
+                    let linked = context.recording.state.zoomKeyframes.filter { $0.sourceRegionID == box.id }.count
+                    summaries.append(linked == 0 ? "Removed \(canonicalLabel)."
+                        : "Removed \(canonicalLabel) and \(linked) linked screen \(linked == 1 ? "target" : "targets").")
                 } else {
                     guard let note = change["note"] as? String else { throw invalidResponse }
                     commands.append(.labelRegion(regionID: box.id, note: note))
@@ -619,7 +621,7 @@ enum EditorAgentControls {
         ]) { _, b in b })
     }
     static var boxManagementTool: [String: Any] {
-        function("manage_boxes", "Delete numbered reference boxes or update their optional notes. Use stable Box labels from context, never array order or the selected box when another is named. Deleting a box removes only the guide; existing framing, source-time edit marks and other boxes remain. A note describes a box; it never renames its stable Box number or deletes it. Changes execute atomically in order.", scopeProperties.merging([
+        function("manage_boxes", "Delete numbered reference boxes or update their optional notes. Use stable Box labels from context, never array order or the selected box when another is named. Deleting a box also removes screen-framing targets explicitly linked to it and joins the neighboring route; independent camera changes, other edit marks and other boxes remain. A note describes a box; it never renames its stable Box number or deletes it. Changes execute atomically in order.", scopeProperties.merging([
             "changes": ["type": "array", "minItems": 1, "maxItems": 16, "items": ["oneOf": [
                 actionSchema("delete", properties: ["box_label": ["type": "string"]]),
                 actionSchema("note", properties: ["box_label": ["type": "string"], "note": ["type": "string", "maxLength": 4096]])

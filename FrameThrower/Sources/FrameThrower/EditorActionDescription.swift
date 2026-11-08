@@ -34,9 +34,9 @@ struct EditorActionDescription: Equatable, Sendable {
         else if positionChanged { kind = .pan }
         else { kind = .hold }
 
-        let regionNames = state.regions.filter { $0.rect.framing() == target }
-            .compactMap { references.boxLabel(for: $0.id) }
-        let destination = regionNames.count == 1 ? " to " + regionNames[0] : ""
+        let destination = zoom?.sourceRegionID.flatMap { id in
+            state.regions.contains(where: { $0.id == id }) ? references.boxLabel(for: id).map { " to " + $0 } : nil
+        } ?? ""
         let factor = String(format: "%.2f×", target.scale)
         var detail: String
         switch kind {

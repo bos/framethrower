@@ -136,6 +136,10 @@ struct ProjectEditorView: View {
             animationGesture = nil
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
             if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
+            if let selectedAnimationID, !timelineAnimations.contains(where: { $0.id == selectedAnimationID }) {
+                self.selectedAnimationID = nil
+                self.selectedEditID = nil
+            }
             var oldVisual = old; oldVisual.regions = []
             var nextVisual = next; nextVisual.regions = []
             oldVisual.editAnchors = []; nextVisual.editAnchors = []
@@ -428,8 +432,7 @@ struct ProjectEditorView: View {
 
     private func removeRegion(_ id: UUID) {
         guard editor.finishDraft() else { return }
-        var next = editor.project.state
-        next.regions.removeAll { $0.id == id }
+        let next = EditorBoxConnections.removing(regionID: id, from: editor.project.state)
         if editor.commit(next, name: "Remove box"), selectedRegionID == id { selectedRegionID = nil }
     }
 
@@ -971,7 +974,8 @@ struct ProjectEditorView: View {
             scale: placement.scale, x: placement.x, y: placement.y,
             transition: existing?.transition ?? zoomTransition, duration: existing?.duration ?? zoomDuration,
             easeIn: existing == nil ? zoomEaseIn : existing?.easeIn,
-            easeOut: existing == nil ? zoomEaseOut : existing?.easeOut))
+            easeOut: existing == nil ? zoomEaseOut : existing?.easeOut,
+            sourceRegionID: existing?.placement.clamped == placement ? existing?.sourceRegionID : nil))
         next.zoomKeyframes.sort { $0.time < $1.time }
         return next
     }

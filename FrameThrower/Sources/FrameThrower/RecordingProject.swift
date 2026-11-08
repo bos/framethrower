@@ -329,6 +329,9 @@ struct ZoomKeyframe: Codable, Equatable, Identifiable, Sendable {
     var duration: Double = 0.4
     var easeIn: Double? = nil
     var easeOut: Double? = nil
+    /// The guide explicitly used as this screen target. This is independent
+    /// of the guide's drawn-at edit anchor and survives timing/ramp changes.
+    var sourceRegionID: UUID? = nil
 
     var placement: ZoomPlacement { ZoomPlacement(scale: scale, x: x, y: y) }
 }
@@ -462,6 +465,9 @@ struct EditState: Codable, Equatable, Sendable {
     var regions: [EditorRegion] = []
     var editAnchors: [EditAnchor] = []
     var audio = RecordingAudio()
+    /// Missing only in legacy states. A persisted version prevents a manually
+    /// detached target from being inferred again after a later save/reopen.
+    var boxConnectionsVersion = 1
 
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
@@ -479,7 +485,7 @@ struct EditState: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, boxConnectionsVersion
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -495,6 +501,16 @@ struct EditState: Codable, Equatable, Sendable {
         regions = try values.decodeIfPresent([EditorRegion].self, forKey: .regions) ?? []
         editAnchors = try values.decodeIfPresent([EditAnchor].self, forKey: .editAnchors) ?? []
         audio = try values.decodeIfPresent(RecordingAudio.self, forKey: .audio) ?? RecordingAudio()
+        if values.contains(.boxConnectionsVersion) {
+            boxConnectionsVersion = try values.decode(Int.self, forKey: .boxConnectionsVersion)
+            guard boxConnectionsVersion == 1 else {
+                throw DecodingError.dataCorruptedError(forKey: .boxConnectionsVersion, in: values,
+                    debugDescription: "Unsupported box connection version.")
+            }
+        } else {
+            boxConnectionsVersion = 1
+            self = EditorBoxConnections.migratingLegacy(self)
+        }
     }
 
     func zoom(at time: Double) -> ZoomPlacement {
@@ -558,6 +574,92 @@ struct EditState: Codable, Equatable, Sendable {
             pipKeyframes.append(point)
         }
         pipKeyframes.sort { $0.time < $1.time }
+    }
+}
+
+/// Persistent guide-to-target relationships. Only explicit links participate
+/// in deletion; identical placements and drawn-at anchors are not ownership.
+enum EditorBoxConnections {
+    static func linkedRegion(for point: ZoomKeyframe, in state: EditState) -> EditorRegion? {
+        guard let id = point.sourceRegionID else { return nil }
+        return state.regions.first { $0.id == id }
+    }
+
+    fileprivate static func migratingLegacy(_ state: EditState) -> EditState {
+        var result = state
+        for index in result.zoomKeyframes.indices where result.zoomKeyframes[index].sourceRegionID == nil {
+            // This is precisely the previous label inference criterion. Only a
+            // unique match is safe; a guide's editID says where it was drawn.
+            let target = result.zoomKeyframes[index].placement.clamped
+            // Legacy return-to-full-frame points had no box destination label.
+            // A large guide fitting at 1× must not claim those context points.
+            guard target.scale > 1 else { continue }
+            let matches = state.regions.filter { $0.rect.framing() == target }
+            if matches.count == 1 { result.zoomKeyframes[index].sourceRegionID = matches[0].id }
+        }
+        result.boxConnectionsVersion = 1
+        return result
+    }
+
+    /// Removes every target explicitly connected to this guide. A smooth
+    /// successor bridges the removed motion chain, keeping its own arrival and
+    /// target. Jumps/holds alone never create a new earlier motion interval.
+    static func removing(regionID: UUID, from state: EditState) -> EditState {
+        removing(regionIDs: [regionID], from: state)
+    }
+
+    /// A simultaneous deletion uses the original chain once, so removing an
+    /// excursion and its return cannot lose motion provenance between calls.
+    static func removing(regionIDs: Set<UUID>, from state: EditState) -> EditState {
+        let removedIDs = regionIDs.intersection(Set(state.regions.map(\.id)))
+        guard !removedIDs.isEmpty else { return state }
+        var result = state
+        result.regions.removeAll { removedIDs.contains($0.id) }
+        func isRemoved(_ point: ZoomKeyframe) -> Bool {
+            point.sourceRegionID.map { removedIDs.contains($0) } ?? false
+        }
+        let points = state.zoomKeyframes.sorted { $0.time < $1.time }
+        var kept: [ZoomKeyframe] = []
+        var previousTime = 0.0
+        var previousPlacement = ZoomPlacement()
+        var removedBlock = false
+        var firstMotion: (start: Double, easeIn: Double)?
+        for original in points {
+            let smooth = original.transition == .smooth && original.duration.isFinite && original.duration > 0
+            let start = smooth ? max(previousTime, original.time - original.duration) : original.time
+            let span = max(0, original.time - start)
+            let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: original.easeIn, easeOut: original.easeOut)
+            if isRemoved(original) {
+                removedBlock = true
+                if firstMotion == nil, smooth, span > 0, previousPlacement.clamped != original.placement.clamped {
+                    firstMotion = (start, ramps.easeIn)
+                }
+            } else {
+                var survivor = original
+                if removedBlock, smooth {
+                    let beginning = firstMotion?.start ?? start
+                    survivor.duration = max(0, original.time - beginning)
+                    if let firstMotion {
+                        let joined = MotionInterpolation.rampDurations(duration: survivor.duration,
+                            easeIn: firstMotion.easeIn, easeOut: ramps.easeOut)
+                        survivor.easeIn = joined.easeIn
+                        survivor.easeOut = joined.easeOut
+                    }
+                }
+                kept.append(survivor)
+                removedBlock = false; firstMotion = nil
+            }
+            previousTime = original.time
+            previousPlacement = original.placement
+        }
+        // Keep unrelated array ordering byte-for-byte where possible. Timing
+        // relationships above use source order, not the storage order.
+        var replacements: [UUID: ZoomKeyframe] = [:]
+        for point in kept { replacements[point.id] = point }
+        result.zoomKeyframes = state.zoomKeyframes.compactMap { point in
+            isRemoved(point) ? nil : replacements[point.id]
+        }
+        return result
     }
 }
 
@@ -815,6 +917,9 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        guard state.boxConnectionsVersion == 1 else {
+            throw ProjectError.invalid("This recording uses an unsupported box connection version.")
+        }
         try state.audio.validate()
         guard state.editAnchors.count <= 100_000 else {
             throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
@@ -838,6 +943,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
             throw ProjectError.invalid("Boxes must have unique identities; keep at most 256 per recording.")
         }
         for region in state.regions { try region.validate(duration: duration) }
+        let regionIDs = Set(state.regions.map(\.id))
         let presentation = state.presentation
         guard presentation.padding.isFinite, (0...0.2).contains(presentation.padding),
               presentation.cornerRadius.isFinite, (0...0.2).contains(presentation.cornerRadius),
@@ -885,6 +991,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   point.x.isFinite, (0...1).contains(point.x),
                   point.y.isFinite, (0...1).contains(point.y),
                   point.duration.isFinite, point.duration > 0,
+                  point.sourceRegionID.map({ regionIDs.contains($0) }) ?? true,
                   [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
                 throw ProjectError.invalid("Zoom points must have unique, ordered times and valid focal positions, scales, and durations.")
             }

@@ -57,6 +57,21 @@ struct EditorActionDescriptionChecks {
         try require(combinedDescription.shortLabel == "Camera E" && combinedDescription.detail.contains("Hide"),
                     "a stationary screen plus a real camera change must describe the camera action")
         try require(descriptions[1].aliases.contains("Edit B") && descriptions[1].aliases.contains("B"), "context exposes identity aliases separately")
+        var linked = state
+        let firstBox = EditorRegion(time: 0, rect: .init(x: 0.25, y: 0.25, width: 0.3, height: 0.3))
+        let secondBox = EditorRegion(time: 0, rect: firstBox.rect)
+        linked.regions = [firstBox, secondBox]
+        let framing = firstBox.rect.framing()
+        linked.zoomKeyframes[1].scale = framing.scale
+        linked.zoomKeyframes[1].x = framing.x
+        linked.zoomKeyframes[1].y = framing.y
+        var linkedReferences = references
+        linkedReferences.register(state: linked)
+        try require(!EditorActionDescription.describe(edits[1], in: linked, references: linkedReferences).detail.contains("Box"),
+                    "Matching geometry alone cannot advertise a persistent box connection")
+        linked.zoomKeyframes[1].sourceRegionID = secondBox.id
+        try require(EditorActionDescription.describe(edits[1], in: linked, references: linkedReferences).detail.contains("Box 2"),
+                    "An explicit box identity disambiguates equal rectangles and supplies the truthful destination label")
         var grouped = state
         grouped.editAnchors += [EditAnchor(time: 1.0000005), EditAnchor(time: 7.0000005)]
         grouped.editAnchors.sort { $0.time < $1.time }

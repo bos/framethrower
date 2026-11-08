@@ -662,12 +662,15 @@ struct EditorAssistantPanel: View {
         let editExists = linkedEdit != nil
         let association = editLabel.map { "from " + $0 + (editExists ? "" : " · removed") }
         let selected = region.id == selectedRegionID
+        let linkedCount = editor.editingState.zoomKeyframes.filter { $0.sourceRegionID == region.id }.count
+        let removeHelp = linkedCount == 0 ? "Remove \(label). Undo restores it."
+            : "Remove \(label) and its \(linkedCount) framing \(linkedCount == 1 ? "target" : "targets"). Undo restores them."
         return HStack(spacing: 4) {
             regionSelectButton(region, label: label, editLabel: editLabel, association: association, selected: selected)
             Button { onRemoveRegion(region.id) } label: { Image(systemName: "xmark") }
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Remove " + label)
-                .help("Remove " + label + ". Undo restores it.")
+                .help(removeHelp)
                 .padding(.trailing, 8)
         }
         .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))

@@ -6,6 +6,15 @@ private final class OffscreenConflictWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
+private final class LinkedBoxPinchEvent: NSEvent {
+    var position = CGPoint.zero
+    var eventPhase: NSEvent.Phase = []
+    var amount: CGFloat = 0
+    override var locationInWindow: NSPoint { position }
+    override var phase: NSEvent.Phase { eventPhase }
+    override var magnification: CGFloat { amount }
+}
+
 /// Production session, views, and metadata. Every media access remains blocked;
 /// nonexistent source filenames and empty native layers are intentional.
 @main @MainActor
@@ -199,7 +208,151 @@ struct ConflictReviewInterfaceChecks {
                     "Canceling a crossed trim restores the original playhead without changing saved trim/history")
         try await laneGestures(host: host, window: window, timeline: timeline, canvas: canvas, editor: editor, playback: playback)
         try await boxDeletion(host: host, window: window, canvas: canvas, editor: editor, session: session)
+        try await linkedBoxDeletion(directory: directory)
         print("Conflict review interface checks passed (native preview Pan/Box tools and sidebar/preview Delete with ordinary text editing, vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+    }
+    static func linkedBoxDeletion(directory: URL) async throws {
+        var aBox = EditorRegion(time: 0, rect: .init(x: 0.05, y: 0.15, width: 0.25, height: 0.25))
+        var bBox = EditorRegion(time: 4, rect: .init(x: 0.35, y: 0.3, width: 0.25, height: 0.25))
+        var cBox = EditorRegion(time: 8, rect: .init(x: 0.65, y: 0.6, width: 0.25, height: 0.25))
+        func linked(_ region: EditorRegion, duration: Double) -> ZoomKeyframe {
+            let fit = region.rect.framing()
+            var point = ZoomKeyframe(time: region.time, scale: fit.scale, x: fit.x, y: fit.y,
+                transition: region.time == 0 ? .jump : .smooth, duration: duration, easeIn: 1, easeOut: 1)
+            point.sourceRegionID = region.id
+            return point
+        }
+        let a = linked(aBox, duration: 0.4), b = linked(bBox, duration: 4), c = linked(cBox, duration: 4)
+        aBox.editID = a.id; bBox.editID = b.id; cBox.editID = c.id
+        let unlinked = ZoomKeyframe(time: 10, scale: 1, transition: .smooth, duration: 1)
+        var project = RecordingProject(screenFilename: "linked-screen.mov", cameraFilename: "linked-camera.mov", duration: 12)
+        project.state.regions = [aBox, bBox, cBox]
+        project.state.zoomKeyframes = [a, b, c, unlinked]
+        project.state.pipKeyframes.append(PIPKeyframe(id: b.id, time: 4,
+            placement: PIPPlacement(x: 0.8, y: 0.75, scale: 0.3, shape: .square), transition: .smooth, duration: 2))
+        project.ensureReferences()
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("linked-boxes.framethrower"))
+        let playback = EditorPlayback()
+        let assistant = EditorAssistantSession(transport: { _ in throw Failure.failed("Linked-box UI checks must never call a model") })
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: true,
+            playback: playback, assistant: assistant))
+        let window = OffscreenConflictWindow(contentRect: CGRect(x: -14000, y: -14000, width: 1200, height: 850),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
+        defer { assistant.suspend(); playback.close(); window.close() }
+        try await settle(host)
+        try await Task.sleep(for: .milliseconds(400))
+        try await settle(host)
+        guard let canvas = all(EditorCanvasView.self, in: host).first,
+              let timeline = all(RecordingTimelineView.self, in: host).first else { throw Failure.failed("Linked-box native views missing") }
+        guard let tools = all(NSSegmentedControl.self, in: host).first(where: {
+            $0.segmentCount == 2 && $0.label(forSegment: 0) == "Pan view"
+        }) else { throw Failure.failed("Linked-box preview tools missing") }
+        tools.selectedSegment = 0
+        try require(tools.sendAction(tools.action, to: tools.target), "Linked-box fixture uses actual Pan tool")
+        try await settle(host)
+        let original = editor.project.state
+        func row(_ index: Int, remove: Bool = false) throws -> (NSClipView, CGPoint) {
+            let lists = all(NSScrollView.self, in: host).filter {
+                $0.contentView.bounds.height >= 80 && $0.contentView.bounds.height <= 140 &&
+                ($0.documentView.map { all(NSTextView.self, in: $0).isEmpty } ?? false)
+            }
+            guard lists.count == 1, let clip = lists.first?.contentView else { throw Failure.failed("Linked-box sidebar list missing") }
+            let offset = CGFloat(index) * 48 + 22
+            return (clip, CGPoint(x: remove ? clip.bounds.maxX - 16 : clip.bounds.minX + 40,
+                y: clip.isFlipped ? clip.bounds.minY + offset : clip.bounds.maxY - offset))
+        }
+        func clickRow(_ index: Int, remove: Bool = false) throws {
+            let (clip, point) = try row(index, remove: remove)
+            window.sendEvent(mouse(.leftMouseDown, point, in: clip, window: window))
+            window.sendEvent(mouse(.leftMouseUp, point, in: clip, window: window))
+        }
+        func selectB() async throws {
+            let id = TimelineAnimationID(lane: .screen, componentID: b.id)
+            let item = timeline.animationGeometry().first { $0.animation.id == id }!
+            let point = CGPoint(x: item.body.midX, y: item.body.midY)
+            timeline.mouseDown(with: mouse(.leftMouseDown, point, in: timeline, window: window))
+            timeline.mouseUp(with: mouse(.leftMouseUp, point, in: timeline, window: window))
+            try await settle(host)
+            try require(timeline.selectedAnimationID == id, "Linked B Screen target must actually be selected")
+        }
+        func key(_ code: UInt16) -> NSEvent {
+            let value = code == 51 ? "\u{7f}" : "\u{f728}"
+            return NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: value, charactersIgnoringModifiers: value,
+                isARepeat: false, keyCode: code)!
+        }
+        for route in ["sidebar Delete", "preview Forward Delete", "sidebar X"] {
+            playback.seek(6); try await settle(host)
+            try await selectB()
+            let before = editor.project, cameraFrame = canvas.testPattern?.cameraFrame
+            if route == "sidebar Delete" {
+                try clickRow(1); try await settle(host)
+                window.sendEvent(key(51))
+            } else if route == "preview Forward Delete" {
+                let badge = canvas.guideBadges.first { $0.regionID == bBox.id }!
+                let point = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+                canvas.mouseDown(with: mouse(.leftMouseDown, point, in: canvas, window: window))
+                canvas.mouseUp(with: mouse(.leftMouseUp, point, in: canvas, window: window))
+                canvas.keyDown(with: key(117))
+            } else {
+                try clickRow(0); try await settle(host)
+                try clickRow(1, remove: true)
+            }
+            try await settle(host)
+            let state = editor.project.state
+            let successor = state.zoomKeyframes.first { $0.id == c.id }
+            let bridge = timeline.animationSpans.first { $0.lane == .screen && $0.componentID == c.id }
+            try require(state.regions == [aBox, cBox] && !state.zoomKeyframes.contains { $0.sourceRegionID == bBox.id } &&
+                        state.zoomKeyframes.filter { $0.id != c.id } == [a, unlinked] &&
+                        successor?.time == c.time && successor?.placement == c.placement && successor?.sourceRegionID == cBox.id &&
+                        bridge?.start == 0 && bridge?.end == 8 && state.zoom(at: 2) != a.placement &&
+                        state.zoom(at: 9.5) == original.zoom(at: 9.5) && state.pipKeyframes == original.pipKeyframes &&
+                        state.cursorStyle == original.cursorStyle && state.presentation == original.presentation && state.audio == original.audio &&
+                        playback.time == 6 && canvas.testPattern?.cameraFrame == cameraFrame &&
+                        timeline.selectedAnimationID != TimelineAnimationID(lane: .screen, componentID: b.id) &&
+                        editor.project.undoHistory.count == before.undoHistory.count + 1,
+                        "\(route) removes B and its linked Screen target in one Undo, bridges A→C at C's original8s arrival, preserves Camera/unlinked edits and source time, and clears dead Screen selection")
+            try require(editor.undo(), "One Undo restores linked-box removal")
+            try await settle(host)
+            try require(editor.project.state == original && canvas.regions.contains { $0.id == bBox.id },
+                        "Undo restores exact box, link identities, route durations and independent tracks")
+        }
+        playback.seek(6); try await settle(host); try await selectB()
+        let pinch = LinkedBoxPinchEvent()
+        pinch.position = canvas.convert(CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.midY), to: nil)
+        pinch.eventPhase = .began; pinch.amount = 0
+        canvas.magnify(with: pinch)
+        pinch.eventPhase = .changed; pinch.amount = 0.25
+        canvas.magnify(with: pinch)
+        pinch.eventPhase = .ended; pinch.amount = 0
+        canvas.magnify(with: pinch)
+        try await settle(host)
+        try require(editor.draftState == nil && editor.project.state.zoomKeyframes.first(where: { $0.id == b.id })?.sourceRegionID == bBox.id,
+                    "A genuinely clamped no-op pinch preserves the explicit box link")
+        playback.seek(6); try await settle(host)
+        let start = CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.minY + canvas.contentRect.height * 0.1)
+        let end = CGPoint(x: start.x + 30, y: start.y + 15)
+        canvas.mouseDown(with: mouse(.leftMouseDown, start, in: canvas, window: window))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, end, in: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, end, in: canvas, window: window))
+        try await settle(host)
+        let manuallyEdited = editor.draftState?.zoomKeyframes.first(where: { $0.id == b.id })
+        try require(manuallyEdited != nil && manuallyEdited?.sourceRegionID == nil && manuallyEdited?.placement != b.placement,
+                    "Actual manual reframing detaches only that Screen target from its box")
+        try require(editor.finishDraft(name: "Reframe selected target"), "Commit manual detached target")
+        try await settle(host)
+        let detached = editor.project.state
+        playback.seek(6); try await settle(host)
+        try clickRow(1, remove: true); try await settle(host)
+        try require(editor.project.state.zoomKeyframes == detached.zoomKeyframes &&
+                    editor.project.state.pipKeyframes == detached.pipKeyframes &&
+                    editor.project.state.regions == [aBox, cBox] && playback.time == 6,
+                    "Deleting a guide after manual detachment preserves the manually reframed target and all timing")
+        try require(editor.undo(), "Undo restores detached guide removal")
+        try await settle(host)
+        try require(editor.project.state == detached && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
+                    "Undo restores the guide without inferring its old link again or creating media objects")
     }
     static func boxDeletion(host: NSView, window: NSWindow, canvas: EditorCanvasView,
                             editor: ProjectEditor, session: EditorAssistantSession) async throws {

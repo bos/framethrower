@@ -238,7 +238,7 @@ enum EditorCommandDispatcher {
             return value
         }
         func put(_ placement: ZoomPlacement, at time: Double, motion: EditorCommandMotion,
-                 preserving point: ZoomKeyframe? = nil) {
+                 preserving point: ZoomKeyframe? = nil, sourceRegionID: UUID? = nil) {
             let sameTime = next.zoomKeyframes.first { abs($0.time - time) < 0.000_001 }
             let group = next.timedEdits(includeCamera: true).first { abs($0.time - time) < 0.000_001 }
             let existing = point ?? sameTime
@@ -246,10 +246,27 @@ enum EditorCommandDispatcher {
             next.zoomKeyframes.removeAll { abs($0.time - targetTime) < 0.000_001 }
             next.zoomKeyframes.append(ZoomKeyframe(id: existing?.id ?? group?.id ?? UUID(), time: targetTime,
                 scale: placement.scale, x: placement.x, y: placement.y,
-                transition: motion.transition, duration: motion.duration, easeIn: motion.easeIn, easeOut: motion.easeOut))
+                transition: motion.transition, duration: motion.duration, easeIn: motion.easeIn, easeOut: motion.easeOut,
+                sourceRegionID: sourceRegionID))
             next.zoomKeyframes.sort { $0.time < $1.time }
         }
+        var pendingRegionRemovals = Set<UUID>()
+        func flushRegionRemovals() throws {
+            guard !pendingRegionRemovals.isEmpty else { return }
+            guard pendingRegionRemovals.allSatisfy({ id in next.regions.contains(where: { $0.id == id }) }) else {
+                throw EditorCommandError.invalid("A box no longer exists. Choose an existing numbered box and try again.")
+            }
+            next = EditorBoxConnections.removing(regionIDs: pendingRegionRemovals, from: next)
+            pendingRegionRemovals.removeAll()
+        }
         for command in batch.commands {
+            // Delete neighboring route targets against the same original
+            // movement chain, independent of the order their boxes were named.
+            if case let .removeRegion(regionID) = command {
+                pendingRegionRemovals.insert(regionID)
+                continue
+            }
+            try flushRegionRemovals()
             switch command {
             case let .createEdit(time):
                 guard time.isFinite, time >= 0, time < project.duration else {
@@ -299,7 +316,7 @@ enum EditorCommandDispatcher {
             case let .frameRegion(regionID, time, motion):
                 try validTime(time)
                 try motion.validate()
-                put(try region(regionID).rect.framing(), at: time, motion: motion)
+                put(try region(regionID).rect.framing(), at: time, motion: motion, sourceRegionID: regionID)
             case let .fullFrame(time, motion):
                 try validTime(time)
                 try motion.validate()
@@ -307,7 +324,9 @@ enum EditorCommandDispatcher {
             case let .holdFraming(time):
                 try validTime(time)
                 let placement = next.zoom(at: time)
-                put(placement, at: time, motion: EditorCommandMotion(transition: .jump))
+                let prior = next.zoomKeyframes.last { $0.time <= time }
+                let source = prior?.placement.clamped == placement ? prior?.sourceRegionID : nil
+                put(placement, at: time, motion: EditorCommandMotion(transition: .jump), sourceRegionID: source)
             case let .reviseFraming(editID, regionID):
                 guard let edit = next.timedEdits(includeCamera: true).first(where: { $0.id == editID }) else {
                     throw EditorCommandError.invalid("The selected edit no longer exists. Select an edit and try again.")
@@ -315,18 +334,15 @@ enum EditorCommandDispatcher {
                 let original = next.zoomKeyframes.first { $0.id == edit.zoomID }
                 let motion = original.map { EditorCommandMotion(transition: $0.transition, duration: $0.duration,
                                                                  easeIn: $0.easeIn, easeOut: $0.easeOut) } ?? EditorCommandMotion()
-                put(try region(regionID).rect.framing(), at: edit.time, motion: motion, preserving: original)
+                put(try region(regionID).rect.framing(), at: edit.time, motion: motion, preserving: original, sourceRegionID: regionID)
             case let .labelRegion(regionID, note):
                 guard let index = next.regions.firstIndex(where: { $0.id == regionID }) else {
                     throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
                 }
                 next.regions[index].note = note
                 try next.regions[index].validate(duration: project.duration)
-            case let .removeRegion(regionID):
-                guard next.regions.contains(where: { $0.id == regionID }) else {
-                    throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
-                }
-                next.regions.removeAll { $0.id == regionID }
+            case .removeRegion:
+                break // Consecutive box removals are handled together above.
             case let .moveBetweenEdits(fromEditID, toEditID, regionID):
                 let edits = next.timedEdits(includeCamera: true)
                 guard let from = edits.first(where: { $0.id == fromEditID }),
@@ -353,11 +369,14 @@ enum EditorCommandDispatcher {
                        crossing.time - crossing.duration < from.time {
                         throw EditorCommandError.invalid("An existing framing movement crosses the starting edit. Revise that movement before adding this path.")
                     }
-                    put(next.zoom(at: from.time), at: from.time, motion: EditorCommandMotion(transition: .jump))
+                    let placement = next.zoom(at: from.time)
+                    let prior = next.zoomKeyframes.last { $0.time <= from.time }
+                    let source = prior?.placement.clamped == placement ? prior?.sourceRegionID : nil
+                    put(placement, at: from.time, motion: EditorCommandMotion(transition: .jump), sourceRegionID: source)
                 }
                 put(ZoomPlacement(), at: midpoint, motion: EditorCommandMotion(transition: .smooth, duration: duration))
                 let existing = next.zoomKeyframes.first { $0.id == to.zoomID }
-                put(target, at: to.time, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: existing)
+                put(target, at: to.time, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: existing, sourceRegionID: regionID)
             case let .moveForDuration(startEditID, fromRegionID, toRegionID, duration, viaFullFrame):
                 guard duration.isFinite, duration > 0, duration <= 60 else {
                     throw EditorCommandError.invalid("Choose a movement lasting more than zero and at most 60 seconds.")
@@ -393,7 +412,7 @@ enum EditorCommandDispatcher {
                     EditorCommandMotion(transition: $0.transition, duration: $0.duration,
                         easeIn: $0.easeIn, easeOut: $0.easeOut)
                 } ?? EditorCommandMotion(transition: .jump)
-                put(source, at: start.time, motion: startMotion, preserving: original)
+                put(source, at: start.time, motion: startMotion, preserving: original, sourceRegionID: fromRegionID)
                 if !next.timedEdits(includeCamera: true).contains(where: { abs($0.time - end) < 0.000_001 }) {
                     next.editAnchors.append(EditAnchor(time: end))
                     next.editAnchors.sort { $0.time < $1.time }
@@ -401,12 +420,13 @@ enum EditorCommandDispatcher {
                 if viaFullFrame {
                     let half = duration / 2
                     put(ZoomPlacement(), at: start.time + half, motion: EditorCommandMotion(transition: .smooth, duration: half))
-                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: half), preserving: arrival)
+                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: half), preserving: arrival, sourceRegionID: toRegionID)
                 } else {
-                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: arrival)
+                    put(target, at: end, motion: EditorCommandMotion(transition: .smooth, duration: duration), preserving: arrival, sourceRegionID: toRegionID)
                 }
             }
         }
+        try flushRegionRemovals()
         var candidate = project
         candidate.state = next
         try candidate.validate()

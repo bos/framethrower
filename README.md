@@ -324,11 +324,16 @@ you start drawing. Drawing retains a fixed source frame until release. Pinch and
 two-finger pan work with either tool. Switching tools cancels an unfinished mouse
 gesture while retaining earlier completed framing adjustments at that time.
 Escape cancels unfinished drawing or framing first, then exits Director mode.
-A box's X, Delete, or Forward Delete removes its guide and optional note; Undo
-restores both. Selecting a box in the sidebar gives its list keyboard focus.
+A box's X, Delete, or Forward Delete removes the box and its linked screen-framing
+targets. Deleting the middle box in A → B → C joins A → C, keeping C's arrival
+time. Independent camera changes remain intact. Undo restores the whole removal.
+Retiming a framing target keeps its box connection; manually reframing it detaches
+the connection. Destination labels and tooltips describe stored box connections.
+Older recordings gain connections once where a zoom target matches exactly one
+box; ambiguous matches and full-frame context views stay unlinked.
+Selecting a box in the sidebar gives its list keyboard focus.
 Delete continues to edit text while the instruction or a note field is focused.
-Director also accepts “Delete Box 4”; it removes that numbered guide without
-changing existing framing movements. The removal is one normal Undo step.
+Director also accepts “Delete Box 4” and uses the same undoable removal.
 
 There is one instruction field and one microphone. **Add note… / Edit note…**
 in a box's context menu edits its optional sidebar note; Return saves, Escape

@@ -9,6 +9,25 @@ enum PIPTransition: String, Codable, CaseIterable, Sendable {
 }
 
 enum MotionInterpolation {
+    /// Actual motion velocity relative to its peak, for timeline/inspector
+    /// graphs. Time is elapsed within the effective (already clipped) span.
+    /// This describes motion only; it does not change timing or audio fades.
+    static func normalizedSpeed(at time: Double, duration: Double,
+                                easeIn: Double? = nil, easeOut: Double? = nil) -> Double {
+        guard time.isFinite, duration.isFinite, duration > 0, time >= 0, time < duration else { return 0 }
+        let ramps = rampDurations(duration: duration, easeIn: easeIn, easeOut: easeOut)
+        if ramps.easeIn > 0, time < ramps.easeIn {
+            let sine = sin(.pi * time / ramps.easeIn / 2)
+            return min(1, max(0, sine * sine))
+        }
+        if ramps.easeOut > 0, time > duration - ramps.easeOut {
+            let elapsed = (time - (duration - ramps.easeOut)) / ramps.easeOut
+            let remainingSpeed = 1 - elapsed * elapsed
+            return min(1, max(0, remainingSpeed * remainingSpeed))
+        }
+        return 1
+    }
+
     /// All camera and screen movement arrives at the target timestamp. The
     /// preceding point bounds the start, so smooth transitions never overlap.
     static func progress(at time: Double, from previousTime: Double, to targetTime: Double,
@@ -20,16 +39,16 @@ enum MotionInterpolation {
         let beginning = max(previousTime, targetTime - duration)
         guard time > beginning, targetTime > beginning else { return 0 }
         let fraction = min(1, max(0, (time - beginning) / (targetTime - beginning)))
-        // Integrate a cosine acceleration and a softer cosine-fourth braking
-        // profile around a constant-speed middle. The chosen ramp boundaries
-        // remain exact; braking sheds speed earlier and has a flatter tail.
+        // Integrate cosine acceleration and polynomial braking around a
+        // constant-speed middle. Braking retains visible late movement instead
+        // of spending much of the chosen ramp imperceptibly close to arrival.
         // Normalize distance so velocity/acceleration join continuously and
         // every movement still reaches its target at the requested timestamp.
         let span = targetTime - beginning
         let ramps = rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
         let startRamp = ramps.easeIn / span
         let endRamp = ramps.easeOut / span
-        let distance = 1 - startRamp / 2 - 5 * endRamp / 8
+        let distance = 1 - startRamp / 2 - 7 * endRamp / 15
         func accelerate(_ fraction: Double, ramp: Double) -> Double {
             (fraction / 2 - ramp / (2 * .pi) * sin(.pi * fraction / ramp)) / distance
         }
@@ -37,9 +56,8 @@ enum MotionInterpolation {
         if fraction < startRamp { progress = accelerate(fraction, ramp: startRamp) }
         else if fraction > 1 - endRamp {
             let remaining = 1 - fraction
-            let phase = .pi * remaining / endRamp
-            let tail = 3 * remaining / 8 - endRamp / (2 * .pi) * sin(phase)
-                + endRamp / (16 * .pi) * sin(2 * phase)
+            let ratio = remaining / endRamp
+            let tail = endRamp * ratio * ratio * ratio * (4.0 / 3 - ratio + ratio * ratio / 5)
             progress = 1 - tail / distance
         } else { progress = (fraction - startRamp / 2) / distance }
         return min(1, max(0, progress))

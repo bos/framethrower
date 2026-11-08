@@ -1205,10 +1205,8 @@ private struct MotionRampStrip: View {
                     path.move(to: CGPoint(x: 6, y: 26))
                     for sample in 0...100 {
                         let time = Double(sample) / 100 * span
-                        let speed: Double
-                        if easeIn > 0 && time < easeIn { speed = (1 - cos(.pi * time / easeIn)) / 2 }
-                        else if easeOut > 0 && time > span - easeOut { speed = (1 - cos(.pi * (span - time) / easeOut)) / 2 }
-                        else { speed = 1 }
+                        let speed = MotionInterpolation.normalizedSpeed(at: time, duration: span,
+                            easeIn: easeIn, easeOut: easeOut)
                         path.addLine(to: CGPoint(x: 6 + CGFloat(sample) / 100 * width, y: 26 - 20 * speed))
                     }
                     path.addLine(to: CGPoint(x: width + 6, y: 26))

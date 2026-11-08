@@ -662,9 +662,9 @@ struct ProjectEditorView: View {
                     setZoom(next, at: editTime, name: "Center zoom")
                 }
                 .help("Keep the current magnification and move the view to the center of the recording.")
-                Menu("Suggest zooms") {
+                Menu("Zoom at clicks") {
                     ForEach([CursorZoomSuggestions.Preset.subtle, .focused], id: \.self) { preset in
-                        Button("\(preset.title) (\(String(format: "%.1f", preset.scale))×)") { suggestZooms(preset) }
+                        Button(preset.title) { suggestZooms(preset) }
                             .disabled(playback.cursorRecording?.clicks.isEmpty != false)
                             .help("Replace existing zoom changes with editable views centered on recorded mouse clicks.")
                     }
@@ -915,7 +915,7 @@ struct ProjectEditorView: View {
         next.zoomKeyframes = CursorZoomSuggestions.points(in: recording,
             range: state.trimStart...state.trimEnd, preset: preset,
             frameDuration: playback.frameDuration)
-        if editor.commit(next, name: "Suggest zooms") { selectedEditID = nil }
+        if editor.commit(next, name: "Create click zooms") { selectedEditID = nil }
     }
 
     private func beginZoomGesture() {

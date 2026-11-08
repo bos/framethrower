@@ -7,7 +7,7 @@ enum CursorZoomSuggestions {
         case subtle
         case focused
 
-        var title: String { rawValue.capitalized }
+        var title: String { self == .subtle ? "Zoom to 1.5×" : "Zoom to 2×" }
         var scale: Double { self == .subtle ? 1.5 : 2 }
     }
 

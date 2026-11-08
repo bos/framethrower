@@ -230,7 +230,7 @@ use the same motion curve, with separate settings for each component of an edit.
 Deceleration retains visible late movement while keeping the chosen ramp
 duration and arrival time. Timeline and inspector speed graphs use the same
 profile as the screen and camera playback, including clipped transitions.
-**Suggest zooms** offers Subtle and Focused suggestions from recorded click groups,
+**Zoom at clicks** creates 1.5× or 2× zooms around recorded click groups,
 with steady holds and returns to the wider context. Suggestions are ordinary
 editable changes and applying them is one undo step.
 

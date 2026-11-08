@@ -774,6 +774,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var screenFilename: String
     var cameraFilename: String?
     var cursorFilename: String?
+    var sceneFilename: String?
     var title: String?
     /// Camera start relative to the first screen frame; negative means the
     /// camera started earlier. This is independent of the editable trim.
@@ -788,6 +789,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var references = EditorReferences()
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
+         sceneFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
          captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences()) {
@@ -795,6 +797,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
         self.cursorFilename = cursorFilename
+        self.sceneFilename = sceneFilename
         self.title = title
         self.cameraOffset = cameraOffset
         self.captureFrameDuration = captureFrameDuration
@@ -808,7 +811,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, screenFilename, cameraFilename, cursorFilename, title, cameraOffset,
+        case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, cameraOffset,
              captureFrameDuration, duration, state, undoHistory, redoHistory, references
     }
 
@@ -818,6 +821,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         screenFilename = try values.decode(String.self, forKey: .screenFilename)
         cameraFilename = try values.decodeIfPresent(String.self, forKey: .cameraFilename)
         cursorFilename = try values.decodeIfPresent(String.self, forKey: .cursorFilename)
+        sceneFilename = try values.decodeIfPresent(String.self, forKey: .sceneFilename)
         title = try values.decodeIfPresent(String.self, forKey: .title)
         cameraOffset = try values.decodeIfPresent(Double.self, forKey: .cameraOffset) ?? 0
         captureFrameDuration = try values.decodeIfPresent(Double.self, forKey: .captureFrameDuration)
@@ -887,7 +891,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
             }
         }
         try Self.validateTitle(title)
-        for filename in [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }) {
+        for filename in [screenFilename, cameraFilename, cursorFilename, sceneFilename].compactMap({ $0 }) {
             guard !filename.isEmpty, filename != ".", filename != "..",
                   !filename.contains("/"), !filename.contains("\\"), !filename.contains("\0") else {
                 throw ProjectError.invalid("Project media must be adjacent files with relative filenames.")
@@ -898,6 +902,9 @@ struct RecordingProject: Codable, Equatable, Sendable {
         }
         if let cursorFilename, cursorFilename == screenFilename || cursorFilename == cameraFilename {
             throw ProjectError.invalid("Cursor metadata must use a separate source file.")
+        }
+        if let sceneFilename, [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }).contains(sceneFilename) {
+            throw ProjectError.invalid("Scene metadata must use a separate source file.")
         }
         try validate(state)
         for snapshot in undoHistory + redoHistory {
@@ -1251,7 +1258,7 @@ final class ProjectEditor: ObservableObject {
             // Reserve original names even when their files are currently
             // missing. A copy or its future journal must never become a source.
             var reserved = [url.lastPathComponent, recoveryURL.lastPathComponent] +
-                [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }
+                [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 }
             // A deleted project can still own an open window and journal.
             // Its URL must not be reused for a new independent document.
             reserved += projectURLs.filter {
@@ -1388,7 +1395,7 @@ final class ProjectEditor: ObservableObject {
     /// even if an adjacent filename or symlink happens to collide with it.
     private func validateRecoveryTarget() throws {
         let target = recoveryURL.standardizedFileURL.resolvingSymlinksInPath()
-        let originals = [url] + [project.screenFilename, project.cameraFilename, project.cursorFilename]
+        let originals = [url] + [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename]
             .compactMap { $0 }.map { mediaURL(for: $0) }
         guard !originals.contains(where: { $0.standardizedFileURL.resolvingSymlinksInPath() == target }) else {
             throw ProjectError.invalid("The recovery file cannot replace original media or the saved project.")
@@ -1444,7 +1451,7 @@ final class ProjectEditor: ObservableObject {
             candidate.ensureReferences(in: draftState)
             try candidate.validate()
             let target = url.standardizedFileURL.resolvingSymlinksInPath()
-            for filename in [candidate.screenFilename, candidate.cameraFilename, candidate.cursorFilename].compactMap({ $0 }) {
+            for filename in [candidate.screenFilename, candidate.cameraFilename, candidate.cursorFilename, candidate.sceneFilename].compactMap({ $0 }) {
                 guard mediaURL(for: filename).standardizedFileURL.resolvingSymlinksInPath() != target else {
                     throw ProjectError.invalid("The project file cannot replace original media.")
                 }

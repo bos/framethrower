@@ -19,6 +19,10 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     private var isStarting = false
     private var isStopping = false
     private var unexpectedFailureHandler: (@Sendable (any Error) -> Void)?
+    private let sceneSampler = RecordedSceneSampler()
+    private let sceneLock = NSLock()
+    private var sceneOutputURL: URL?
+    private var sceneStartHostTime: Double?
 
     /// Called once for a failure during an active take. The handler runs on the
     /// callback queue and should schedule UI/cleanup work on its owning actor.
@@ -44,7 +48,8 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
 
     @discardableResult
     func start(filter: SCContentFilter, configuration: SCStreamConfiguration,
-               outputURL: URL, quality: RecordingQuality = .compact) async throws -> Double {
+               outputURL: URL, quality: RecordingQuality = .compact,
+               sceneSource: RecordedSceneSource? = nil) async throws -> Double {
         try MediaProcessing.requireEnabled()
         try callbackQueue.sync { guard stream == nil else { throw RecorderError.alreadyRecording } }
         if quality == .highQuality { configuration.colorSpaceName = CGColorSpace.sRGB }
@@ -99,6 +104,9 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
             isStarting = true
         }
         let deadline = DispatchTime.now() + 12
+        if let sceneSource, sceneSampler.start(source: sceneSource) {
+            setSceneTarget(outputURL.deletingPathExtension().appendingPathExtension("scene.json"))
+        }
         do {
             try await CaptureOperationDeadline.run(seconds: 12, timeoutError: RecorderError.timedOut) { completion in
                 newStream.startCapture(completionHandler: completion)
@@ -122,8 +130,11 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
                 _ = try result.get()
                 isStarting = false
             }
+            setSceneStart(firstHostTime)
             return firstHostTime
         } catch {
+            sceneSampler.cancel()
+            setSceneTarget(nil)
             // Cleanup must also be bounded: framework start/stop callbacks can
             // fail to arrive after a device/permission interruption.
             if master != nil {
@@ -196,6 +207,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
             isStopping = true
             return stream
         }) else { return }
+        sceneSampler.stopCollecting()
         let deadline = DispatchTime.now() + 15
         defer {
             callbackQueue.sync {
@@ -224,6 +236,35 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
             }
         }
         try await waitForFinish(active, deadline: deadline)
+    }
+
+    /// Call only after media recording has stopped. No AX/CG query, metadata
+    /// queue drain or JSON/file work runs on a screen/audio callback or caller.
+    /// Missing/timed-out metadata never invalidates a successful recording.
+    func finishRecordedScene(duration: Double, firstFrameSourceTime: Double) async -> URL? {
+        guard let target = takeSceneTarget() else { sceneSampler.cancel(); return nil }
+        do {
+            guard let scene = try await sceneSampler.finish(screenStartHostTime: target.start,
+                duration: duration, firstFrameSourceTime: firstFrameSourceTime) else { return nil }
+            try await scene.writeAsynchronously(to: target.url)
+            return target.url
+        } catch { return nil }
+    }
+
+    private func setSceneTarget(_ url: URL?) {
+        sceneLock.lock(); defer { sceneLock.unlock() }
+        sceneOutputURL = url
+        sceneStartHostTime = nil
+    }
+    private func setSceneStart(_ time: Double) {
+        sceneLock.lock(); defer { sceneLock.unlock() }
+        if sceneOutputURL != nil { sceneStartHostTime = time }
+    }
+    private func takeSceneTarget() -> (url: URL, start: Double)? {
+        sceneLock.lock(); defer { sceneLock.unlock() }
+        defer { sceneOutputURL = nil; sceneStartHostTime = nil }
+        guard let url = sceneOutputURL, let start = sceneStartHostTime else { return nil }
+        return (url, start)
     }
 
     private func waitForFinish(_ active: SCStream, deadline: DispatchTime) async throws {

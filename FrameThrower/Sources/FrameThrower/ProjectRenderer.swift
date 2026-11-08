@@ -292,7 +292,7 @@ enum ProjectRenderer {
                        progress: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) async throws {
         try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
-        let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename].compactMap { $0 }.map {
+        let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 }.map {
             directory.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()
         }
         let files = FileManager.default

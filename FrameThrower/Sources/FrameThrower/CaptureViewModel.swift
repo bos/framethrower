@@ -1060,7 +1060,8 @@ final class CaptureViewModel: ObservableObject {
             }
             // Keep the baked cursor if mouse-only metadata capture cannot start.
             configuration.showsCursor = !activeCursorCapture
-            let screenStart = try await recorder.start(filter: filter, configuration: configuration, outputURL: outputURL, quality: quality)
+            let screenStart = try await recorder.start(filter: filter, configuration: configuration,
+                outputURL: outputURL, quality: quality, sceneSource: sceneCaptureSource(configuration: configuration))
             activeScreenStartHostTime = screenStart
             if let cameraStart { activeCameraOffset = cameraStart - screenStart }
             lastDriveFileURL = nil
@@ -1124,6 +1125,7 @@ final class CaptureViewModel: ObservableObject {
         do {
             let duration = try await AVURLAsset(url: outputURL).load(.duration).seconds
             let firstFrameTime = try await ScreenRecorder.firstVideoPresentationTime(in: outputURL)
+            let sceneURL = await recorder.finishRecordedScene(duration: duration, firstFrameSourceTime: firstFrameTime)
             var cursorFilename: String?
             if activeCursorCapture, let screenStart = activeScreenStartHostTime {
                 let recording = try cursorRecorder.finish(screenStartHostTime: screenStart,
@@ -1146,7 +1148,7 @@ final class CaptureViewModel: ObservableObject {
                 }
             }
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
-                cameraFilename: cameraFilename, cursorFilename: cursorFilename,
+                cameraFilename: cameraFilename, cursorFilename: cursorFilename, sceneFilename: sceneURL?.lastPathComponent,
                 cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration,
                 title: activeRecordingTitle, captureFrameDuration: 1.0 / 60)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
@@ -1513,6 +1515,28 @@ final class CaptureViewModel: ObservableObject {
         case .area:
             guard let id = selectedDisplayID else { return nil }
             return .area(displayBounds: CGDisplayBounds(id), sourceRect: configuration.sourceRect)
+        }
+    }
+
+    private func sceneCaptureSource(configuration: SCStreamConfiguration) -> RecordedSceneSource? {
+        switch captureKind {
+        case .window:
+            guard let window = selectedWindow,
+                  let processID = window.window.owningApplication?.processID else { return nil }
+            return RecordedSceneSource(kind: .window, windowID: window.id, processID: processID,
+                globalBounds: window.window.frame, pixelWidth: configuration.width, pixelHeight: configuration.height)
+        case .display:
+            guard let id = selectedDisplayID else { return nil }
+            return RecordedSceneSource(kind: .display, displayID: id,
+                excludedProcessIDs: [ProcessInfo.processInfo.processIdentifier], globalBounds: CGDisplayBounds(id),
+                pixelWidth: configuration.width, pixelHeight: configuration.height)
+        case .area:
+            guard let id = selectedDisplayID else { return nil }
+            let display = CGDisplayBounds(id)
+            let bounds = configuration.sourceRect.offsetBy(dx: display.minX, dy: display.minY)
+            return RecordedSceneSource(kind: .area, displayID: id,
+                excludedProcessIDs: [ProcessInfo.processInfo.processIdentifier], globalBounds: bounds,
+                pixelWidth: configuration.width, pixelHeight: configuration.height)
         }
     }
 

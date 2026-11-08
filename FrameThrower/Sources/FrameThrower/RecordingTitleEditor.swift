@@ -386,12 +386,13 @@ enum EditorSaveRouting {
     @discardableResult
     static func save(editor: ProjectEditor, window: NSWindow? = nil) -> Bool {
         if let text = (window ?? NSApplication.shared.keyWindow)?.firstResponder as? NSTextView,
-           text.isFieldEditor, let field = text.delegate as? NSTextField {
+           text.isFieldEditor, let field = text.delegate as? NSTextField,
+           let title = field as? RecordingTitleField {
             _ = field.delegate?.control?(field, textView: text,
                 doCommandBy: #selector(NSResponder.insertNewline(_:)))
             // Invalid submitted names remain editable and must not be
             // silently omitted from a Save command.
-            if let title = field as? RecordingTitleField, title.isRenaming { return false }
+            if title.isRenaming { return false }
         }
         return editor.save()
     }

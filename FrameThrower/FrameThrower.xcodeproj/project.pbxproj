@@ -54,6 +54,7 @@
 		97344A8A1EF1C8702134C52D /* TimelineAnimation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193104B3DA371A4F3C553CD9 /* TimelineAnimation.swift */; };
 		9AFD8FED94BF5747ADCFF2F0 /* WhisperSpeechSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */; };
 		A2F5AD5789E63C26BF155563 /* EditorSimulationClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C364114FB81E44BB9B569C /* EditorSimulationClock.swift */; };
+		A354EB33B712B69BFB5E2762 /* EditorAutomationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A35BF45A90404565D6EE974D /* EditorAutomationHost.swift */; };
 		A45F8859120761D8FF141387 /* LocalModelRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2B331C11DFA046948898644 /* LocalModelRuntime.swift */; };
 		A464395CCA3C53791F36D320 /* NewRecordingTitleEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE950809DC1CB6BFA752F80D /* NewRecordingTitleEditor.swift */; };
 		AF039CF0776CB6A6602A67B9 /* RecorderStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5A7848536A44F91C389E05 /* RecorderStyle.swift */; };
@@ -76,8 +77,10 @@
 		E6975D26AD6B54D22F58D32B /* AreaPreviewEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3C013F5884A583103ED27CE /* AreaPreviewEditor.swift */; };
 		E9D1C38430BA19C5DE799205 /* CaptureViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DD2537A645D90E8DF5E74A8 /* CaptureViewModel.swift */; };
 		ED08F0E2A56B7951D1EE2FE5 /* EditorTestPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16017AA0307A971C84F857D2 /* EditorTestPattern.swift */; };
+		F0CDBB4310397472FEF6A5E6 /* framethrower-mcp.py in Resources */ = {isa = PBXBuildFile; fileRef = FBB3F3EEE50A46C2A0B92BE1 /* framethrower-mcp.py */; };
 		F2CA573041A897343614C972 /* EditorPreviewCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9CAECA8A94FD573C4001A79 /* EditorPreviewCommand.swift */; };
 		F6E55078295474683AFD2ECA /* EditorMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37026AF37314A8301AF7AD6E /* EditorMutation.swift */; };
+		F810356EFCDFC2A77F6FD6A9 /* FrameThrowerMCPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FF7B9EFF4A6C91746F71D94 /* FrameThrowerMCPServer.swift */; };
 		FBE0100CC7393DD56C3313B1 /* EditorAgentControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC79B38B140B8C1AE5A79FB1 /* EditorAgentControls.swift */; };
 		FE5454804B382FF94725ED6D /* RecordingTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D9D58433C5C2899A8DE0AB9 /* RecordingTimeline.swift */; };
 		FE7F22F290D9756FD5EAA0DF /* VideoExportUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */; };
@@ -90,6 +93,7 @@
 		0ACE1582163A047FCAEB2E0A /* ProjectRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectRenderer.swift; sourceTree = "<group>"; };
 		0E7B3A94E84742A9D86BA53B /* AccountsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountsSettingsView.swift; sourceTree = "<group>"; };
 		0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhisperSpeechRuntime.swift; sourceTree = "<group>"; };
+		0FF7B9EFF4A6C91746F71D94 /* FrameThrowerMCPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameThrowerMCPServer.swift; sourceTree = "<group>"; };
 		11FDA535B37F616831BD83FD /* LocalEditPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalEditPlanner.swift; sourceTree = "<group>"; };
 		16017AA0307A971C84F857D2 /* EditorTestPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorTestPattern.swift; sourceTree = "<group>"; };
 		193104B3DA371A4F3C553CD9 /* TimelineAnimation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineAnimation.swift; sourceTree = "<group>"; };
@@ -132,6 +136,7 @@
 		9AB619FA62E1F37CBFBAAA23 /* EditorAnimationEditing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorAnimationEditing.swift; sourceTree = "<group>"; };
 		9D3BB130EE3F22DA6B2968AD /* ScribbleGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScribbleGeometry.swift; sourceTree = "<group>"; };
 		A2B331C11DFA046948898644 /* LocalModelRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelRuntime.swift; sourceTree = "<group>"; };
+		A35BF45A90404565D6EE974D /* EditorAutomationHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorAutomationHost.swift; sourceTree = "<group>"; };
 		A3C013F5884A583103ED27CE /* AreaPreviewEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AreaPreviewEditor.swift; sourceTree = "<group>"; };
 		A72294BC27EC8CEFBCBB3746 /* director-cli-client.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "director-cli-client.py"; sourceTree = "<group>"; };
 		A8C364114FB81E44BB9B569C /* EditorSimulationClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorSimulationClock.swift; sourceTree = "<group>"; };
@@ -159,6 +164,7 @@
 		F7BBDA26D39F807470DE77BD /* MissingMediaRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MissingMediaRecovery.swift; sourceTree = "<group>"; };
 		F905EC803998351752697F83 /* CursorRecording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorRecording.swift; sourceTree = "<group>"; };
 		F9CAECA8A94FD573C4001A79 /* EditorPreviewCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorPreviewCommand.swift; sourceTree = "<group>"; };
+		FBB3F3EEE50A46C2A0B92BE1 /* framethrower-mcp.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "framethrower-mcp.py"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -201,6 +207,7 @@
 				9AB619FA62E1F37CBFBAAA23 /* EditorAnimationEditing.swift */,
 				25140E53F9721D6FCF5C0BA5 /* EditorAssistantPanel.swift */,
 				4CD85A6E0CFE4E038E29F8E1 /* EditorAutomationAPI.swift */,
+				A35BF45A90404565D6EE974D /* EditorAutomationHost.swift */,
 				4A11F7AF3252973B44C5D8DD /* EditorCanvas.swift */,
 				AF2037E0803CD62EBF4D1835 /* EditorCommand.swift */,
 				CF59B425C2CA2FD4384FB63F /* EditorCommands.swift */,
@@ -214,6 +221,7 @@
 				A8C364114FB81E44BB9B569C /* EditorSimulationClock.swift */,
 				16017AA0307A971C84F857D2 /* EditorTestPattern.swift */,
 				F658B134CC765957233533CB /* FrameThrowerApp.swift */,
+				0FF7B9EFF4A6C91746F71D94 /* FrameThrowerMCPServer.swift */,
 				406ADDA36C3F496FA31EE1E6 /* InitialCameraPreviewGeometry.swift */,
 				7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */,
 				11FDA535B37F616831BD83FD /* LocalEditPlanner.swift */,
@@ -255,6 +263,7 @@
 			isa = PBXGroup;
 			children = (
 				A72294BC27EC8CEFBCBB3746 /* director-cli-client.py */,
+				FBB3F3EEE50A46C2A0B92BE1 /* framethrower-mcp.py */,
 			);
 			name = Tools;
 			path = ../Tools;
@@ -339,6 +348,7 @@
 			files = (
 				DBAB744E2DFF588E725FA9C7 /* Resources in Resources */,
 				59BD581C7DDA2AC67A0C98E1 /* director-cli-client.py in Resources */,
+				F0CDBB4310397472FEF6A5E6 /* framethrower-mcp.py in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -399,6 +409,7 @@
 				C738DF19A6E066CCF40C36F9 /* EditorAnimationEditing.swift in Sources */,
 				06C6B97302EC176D7B91C1BB /* EditorAssistantPanel.swift in Sources */,
 				0C8B16BDCFD354F435BCB640 /* EditorAutomationAPI.swift in Sources */,
+				A354EB33B712B69BFB5E2762 /* EditorAutomationHost.swift in Sources */,
 				50CDDFFC3A5D5CC7A0C5106F /* EditorCanvas.swift in Sources */,
 				1BEE1FD7AA6438FF453C5830 /* EditorCommand.swift in Sources */,
 				848FD112E1F7A0DD8E2CA642 /* EditorCommands.swift in Sources */,
@@ -412,6 +423,7 @@
 				A2F5AD5789E63C26BF155563 /* EditorSimulationClock.swift in Sources */,
 				ED08F0E2A56B7951D1EE2FE5 /* EditorTestPattern.swift in Sources */,
 				D48CD70601AD09B0BEEA52D0 /* FrameThrowerApp.swift in Sources */,
+				F810356EFCDFC2A77F6FD6A9 /* FrameThrowerMCPServer.swift in Sources */,
 				0DE7F8F2E23D992A363FB016 /* InitialCameraPreviewGeometry.swift in Sources */,
 				667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */,
 				1274EFC7B4C5B3F86639B5C2 /* LocalEditPlanner.swift in Sources */,

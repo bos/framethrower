@@ -8,6 +8,7 @@ struct FrameThrowerApp: App {
     var body: some Scene {
         Window("FrameThrower", id: "recorder") {
             ContentView(model: model)
+                .task { await EditorAutomationRegistry.shared.startServer() }
         }
         .defaultSize(width: 1100, height: 820)
         .windowStyle(.titleBar)

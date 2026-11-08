@@ -3,6 +3,16 @@ import Foundation
 
 private enum TitleCheckError: Error { case failed(String) }
 
+@MainActor
+private final class ComposerSaveCheckDelegate: NSObject, NSTextFieldDelegate {
+    var submissions = 0
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard selector == #selector(NSResponder.insertNewline(_:)) else { return false }
+        submissions += 1
+        return true
+    }
+}
+
 @main
 @MainActor
 struct RecordingTitleChecks {
@@ -185,6 +195,16 @@ struct RecordingTitleChecks {
         try require(editor.undo() && editor.displayName == "Dinner demo",
                     "saving an active name creates one reversible rename")
         field.setTitle(editor.displayName)
+
+        let composerDelegate = ComposerSaveCheckDelegate()
+        other.delegate = composerDelegate
+        window.makeFirstResponder(other)
+        guard let composerText = window.firstResponder as? NSTextView else { throw TitleCheckError.failed("missing composer field editor") }
+        composerText.string = "Leave this unsent"
+        let historyBeforeSave = editor.historyState
+        try require(EditorSaveRouting.save(editor: editor, window: window) && composerDelegate.submissions == 0 &&
+                    composerText.string == "Leave this unsent" && window.firstResponder === composerText && editor.historyState == historyBeforeSave,
+                    "Save never sends Return to another text field or submits a pending Director command")
 
         field.isEnabled = false
         field.beginRenaming()

@@ -44,6 +44,8 @@ targets:
         type: folder
       - path: ../Tools/director-cli-client.py
         buildPhase: resources
+      - path: ../Tools/framethrower-mcp.py
+        buildPhase: resources
     entitlements:
       path: Resources/FrameThrower.entitlements
       properties:

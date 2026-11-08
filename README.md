@@ -709,3 +709,43 @@ using the app's saved Slack token. Running it sends a real message.
 - Automatically detect and center an off-center face when the PIP crop is smaller
   than the full camera image. Keep the full source, retain manual framing overrides,
   and make automatic framing reversible through the existing edit history.
+
+### Editor automation (MCP)
+
+The running app exposes its open editors through a local MCP server. Configure
+an MCP client to run:
+
+```json
+{
+  "mcpServers": {
+    "framethrower": {
+      "command": "python3",
+      "args": ["/absolute/path/to/framethrower/Tools/framethrower-mcp.py"]
+    }
+  }
+}
+```
+
+Start FrameThrower and open a recording first. The stdio adapter does not launch
+or quit the app. It connects to a private, same-user Unix socket; it does not
+listen on the network. The adapter is also bundled in the app's Resources.
+
+Use `list_recordings` to obtain an open editor's `documentID`. This opaque handle
+identifies that open endpoint, even when two files contain the same persisted
+recording identity. `inspect_editor` provides bounded pages of animations,
+boxes, ordinary Undo/Redo history, and recent events. `inspect_recording` queries
+recorded window/control metadata on demand. Source-frame inspection remains
+unavailable while the video-driver interlock is enabled.
+
+`control_preview` handles play, pause, seek, playback speed, frame stepping, and
+animation/range audition. `navigate_editor` distinguishes selection from seeking.
+`control_document` saves, renames, or traverses the ordinary Undo/Redo stack.
+`apply_edits` validates a typed batch against the inspected revision and commits
+it as one Undo action; a failed batch changes nothing. Read
+`describe_editor_actions` for precise schemas and coordinate units before editing.
+Playback speed affects preview only.
+
+The domain API is shared with Director and can support richer operations than a
+future Siri/App Intents adapter exposes. Siri integration is not implemented.
+The MCP transport supports the 2026-07-28 discovery protocol and legacy 2025
+initialization. Catalogs remain fixed; large project context is fetched on demand.

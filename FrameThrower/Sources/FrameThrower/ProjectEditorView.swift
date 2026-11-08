@@ -15,6 +15,7 @@ struct ProjectEditorView: View {
     var onDuplicate: ((ProjectEditor) -> Void)?
     var isDuplicateUnavailable: Bool
     @StateObject private var playback: EditorPlayback
+    @StateObject private var automation: EditorAutomationHost
     @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
     @State private var selectedEditID: UUID?
@@ -38,7 +39,6 @@ struct ProjectEditorView: View {
     @State private var cameraFrame: CGImage?
     @State private var cameraFrameError: String?
     @StateObject private var exportSession = VideoExportSession()
-    @State private var playAfterRebuild = false
     @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
     @State private var previewTool: PreviewTool = .pan
@@ -97,7 +97,9 @@ struct ProjectEditorView: View {
         self.editor = editor
         self.onDuplicate = onDuplicate
         self.isDuplicateUnavailable = isDuplicateUnavailable
-        _playback = StateObject(wrappedValue: playback ?? EditorPlayback())
+        let playback = playback ?? EditorPlayback()
+        _playback = StateObject(wrappedValue: playback)
+        _automation = StateObject(wrappedValue: EditorAutomationHost(editor: editor, playback: playback))
         _assistant = StateObject(wrappedValue: assistant ?? EditorAssistantSession())
         _directorMode = State(initialValue: directorModeInitiallyEnabled)
         _previewTool = State(initialValue: directorModeInitiallyEnabled ? .box : .pan)
@@ -109,7 +111,7 @@ struct ProjectEditorView: View {
             player
             timeline
             inspector
-            if let message = editor.errorMessage ?? playback.errorMessage {
+            if let message = editor.errorMessage ?? playback.errorMessage ?? automation.errorMessage {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
         }
@@ -121,7 +123,7 @@ struct ProjectEditorView: View {
         .navigationTitle(editor.displayName)
         .focusedSceneObject(editor)
         .task {
-            await playback.rebuild(editor: editor)
+            await automation.rebuildPreview()
             if conflictReview != nil { reviewConflict() }
             if let time = editor.draftTime, let draft = editor.draftState {
                 playback.seek(time)
@@ -131,7 +133,9 @@ struct ProjectEditorView: View {
         }
         .onChange(of: assistant.conflictReviewID) { _, _ in reviewConflict() }
         .onChange(of: playback.time) { _, _ in refreshConflictFrame() }
-        .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame() } }
+        .onChange(of: selectedEditID) { _, _ in automation.recordEvent("selection_changed") }
+        .onChange(of: selectedRegionID) { _, _ in automation.recordEvent("selection_changed") }
+        .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame(); automation.recordEvent("preview_seek") } }
         .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: editor.project.state) { old, next in
             animationGesture = nil
@@ -146,8 +150,7 @@ struct ProjectEditorView: View {
             oldVisual.editAnchors = []; nextVisual.editAnchors = []
             guard oldVisual != nextVisual else { return }
             Task {
-                await playback.rebuild(editor: editor)
-                if playAfterRebuild { playAfterRebuild = false; playback.togglePlayback() }
+                await automation.rebuildPreview()
             }
         }
         .onChange(of: editor.draftState) { old, next in
@@ -168,8 +171,13 @@ struct ProjectEditorView: View {
             synchronizeAnimationSelection()
         }
         .onChange(of: selectedInspector) { _, _ in if animationGesture == nil { synchronizeAnimationSelection() } }
-        .onAppear { assistant.attach(to: editor) }
-        .onDisappear { assistant.suspend(); exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
+        .onAppear {
+            assistant.attach(to: editor)
+            configureAutomation()
+            assistant.attachAutomation(automation)
+            EditorAutomationRegistry.shared.register(automation)
+        }
+        .onDisappear { assistant.suspend(); EditorAutomationRegistry.shared.unregister(automation); automation.navigate = nil; automation.selection = { (nil, nil, nil, nil) }; exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             assistant.suspend()
             LocalModelRuntime.terminateOwnedProcess()
@@ -213,7 +221,6 @@ struct ProjectEditorView: View {
                 selectedRegionID: selectedRegionID, selectedEditID: selectedEditID,
                 onSelectEdit: { inspectEdit($0) }, onReviewConflict: { reviewConflict() }, onSelectRegion: { selectRegion($0) },
                 onRemoveRegion: { removeRegion($0) }, onShowOriginalFrame: { showOriginalFrame($0) }, onSubmit: {
-                    playback.pause()
                     assistant.submit(editor: editor, playhead: playback.time,
                         regionID: selectedRegionID, editID: selectedEditID)
                 }, onVoiceBegin: { playback.pause() }, onCancel: { cancelEditorInteraction() })
@@ -232,6 +239,57 @@ struct ProjectEditorView: View {
                 { playback.pause(); callback(editor) }
             },
             isBusy: exportSession.isBusy || playback.isLoading))
+    }
+
+    private func configureAutomation() {
+        let edit = $selectedEditID, box = $selectedRegionID, animation = $selectedAnimationID
+        let inspector = $selectedInspector, director = $directorMode
+        automation.selection = {
+            (edit.wrappedValue, box.wrappedValue,
+             animation.wrappedValue.map { "\($0.lane.rawValue):\($0.componentID.uuidString)" }, inspector.wrappedValue.rawValue)
+        }
+        automation.navigate = { [weak editor, weak playback] operation, id, name in
+            guard let editor, let playback else { throw EditorAutomationError.unavailable }
+            // Match native boundaries: changing inspectors or selecting a
+            // guide preserves a draft; selecting another edit/explicit seeking
+            // finishes it. Selection itself never moves source time.
+            let sameEdit = operation == "select_edit" && id.flatMap {
+                editor.references.edit(in: editor.editingState, id: $0, includeCamera: editor.project.cameraFilename != nil)?.id
+            } == edit.wrappedValue
+            if ["clear_selection", "select_edit", "go_to_edit", "go_to_box"].contains(operation) && !sameEdit {
+                guard editor.finishDraft() else { throw EditorCommandError.saveFailed(editor.errorMessage ?? "Couldn't save the current edit.") }
+            }
+            switch operation {
+            case "clear_selection": edit.wrappedValue = nil; box.wrappedValue = nil; animation.wrappedValue = nil
+            case "show_inspector":
+                guard let name, let value = EditorInspector(rawValue: name) else { throw EditorAutomationError.invalid("Unknown inspector.") }
+                inspector.wrappedValue = value
+            case "select_edit", "go_to_edit":
+                guard let id, let target = editor.references.edit(in: editor.editingState, id: id, includeCamera: editor.project.cameraFilename != nil) else { throw EditorAutomationError.invalid("That edit is no longer present.") }
+                playback.pause()
+                if sameEdit { return }
+                edit.wrappedValue = target.id; animation.wrappedValue = nil
+                if target.cameraID != nil && target.zoomID == nil { inspector.wrappedValue = .camera }
+                else if target.zoomID != nil && target.cameraID == nil { inspector.wrappedValue = .zoom }
+                let lane: TimelineAnimationLane = inspector.wrappedValue == .camera ? .camera : inspector.wrappedValue == .pointer ? .pointer : .screen
+                animation.wrappedValue = EditorAnimationEditing.animations(in: editor.editingState, references: editor.references,
+                    duration: editor.project.duration, includeCamera: editor.project.cameraFilename != nil)
+                    .first { $0.lane == lane && (lane == .pointer || $0.editID == target.id) }?.id
+                if operation == "go_to_edit" { playback.seek(target.time) }
+            case "select_box", "go_to_box":
+                guard let target = editor.editingState.regions.first(where: { $0.id == id }) else { throw EditorAutomationError.invalid("That box is no longer present.") }
+                playback.pause(); box.wrappedValue = target.id; director.wrappedValue = true
+                if operation == "go_to_box" {
+                    let associated = target.editID.flatMap {
+                        editor.references.edit(in: editor.editingState, id: $0, includeCamera: editor.project.cameraFilename != nil)
+                    }
+                    edit.wrappedValue = associated.flatMap { abs($0.time - target.time) < 0.000001 ? $0.id : nil }
+                    animation.wrappedValue = nil
+                    playback.seek(target.time)
+                }
+            default: throw EditorAutomationError.invalid("Unknown navigation action.")
+            }
+        }
     }
 
     @ToolbarContentBuilder
@@ -315,7 +373,7 @@ struct ProjectEditorView: View {
                 if playback.errorMessage != nil {
                     MissingMediaRecoveryView(editor: editor) {
                         editor.mediaRestored()
-                        Task { await playback.rebuild(editor: editor) }
+                        Task { await automation.rebuildPreview() }
                     }
                 }
             }
@@ -452,15 +510,15 @@ struct ProjectEditorView: View {
         VStack(spacing: 8) {
             HStack(spacing: 12) {
                 Button { togglePlayback() } label: {
-                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").frame(width: 22, height: 18)
+                    Image(systemName: playback.isPlaying || automation.isPlaybackPending ? "pause.fill" : "play.fill").frame(width: 22, height: 18)
                 }
-                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+                .accessibilityLabel(playback.isPlaying || automation.isPlaybackPending ? "Pause" : "Play")
                 .keyboardShortcut(.space, modifiers: [])
-                .disabled(!playback.canPlay || (conflictReview != nil && !MediaProcessing.isSuspended))
+                .disabled((!playback.canPlay && !automation.isPlaybackPending) || (conflictReview != nil && !MediaProcessing.isSuspended))
                 .help(conflictReview != nil
                     ? (MediaProcessing.isSuspended ? "Play or pause the Existing and Proposed outlines over the test pattern." : "Scrub the highlighted timeline spans to compare the pending framings.")
                     : (MediaProcessing.isSuspended ? "Play or pause edits over a drawn test pattern. Video processing stays disabled." : "Play or pause the recording."))
-                Picker("Playback speed", selection: Binding(get: { playback.playbackRate }, set: { _ = playback.setPlaybackRate($0) })) {
+                Picker("Playback speed", selection: Binding(get: { playback.playbackRate }, set: { _ = playback.setPlaybackRate($0); automation.recordEvent("preview_rate") })) {
                     ForEach(EditorPlayback.supportedPlaybackRates, id: \.self) { rate in
                         Text(rate == 0.5 ? "0.5×" : "\(Int(rate))×").tag(rate)
                     }
@@ -875,13 +933,7 @@ struct ProjectEditorView: View {
     }
 
     private func togglePlayback() {
-        guard conflictReview == nil || MediaProcessing.isSuspended else { return }
-        if playback.isPlaying { playback.pause(); return }
-        let hasDraft = editor.draftState != nil
-        playAfterRebuild = hasDraft
-        guard editor.finishDraft() else { playAfterRebuild = false; return }
-        selectedEditID = nil; selectedAnimationID = nil
-        if !hasDraft { playback.togglePlayback() }
+        automation.togglePlayback()
     }
 
     private var pointerControls: some View {

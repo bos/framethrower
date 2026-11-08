@@ -419,10 +419,59 @@ or footage. Conversation archives live in
 `~/Library/Application Support/FrameThrower/Director`. Automated checks use
 temporary directories and synthetic PCM without opening a microphone or speaker.
 
-Video processing remains suspended. Guides and framing metadata work on the
-vector test pattern; decoding footage, screenshots of footage, visual recognition,
-capture, rendering, and export remain unavailable. The text model knows only
-provided area coordinates/notes and the selected edit, and cannot inspect footage.
+The model menu beside the microphone selects local Qwen, Claude Haiku 5.5,
+Claude Sonnet 5.5, GPT-6 Luna, or GPT-6.1 Sol. Changing models preserves the
+conversation and pending question. Cloud choices require Python 3 and the
+provider's unmodified installed CLI, signed in using `claude auth login` or
+`codex login`. The app invokes that CLI with the user's own credentials and
+billing; it never reads or copies subscription tokens or requires an API key.
+Instructions and requested editing context go to the selected provider. Speech
+recognition remains on this Mac. No provider silently falls back to another.
+
+The CLI bridge uses an empty private directory, disables project customizations
+and major coding/browser/MCP capabilities, bounds input/output and execution time,
+and validates every proposed function against the offered schema. Codex does
+not expose a universal tools-off switch: its read-only sandbox and disabled
+capabilities remain necessary; unexpected execution events reject the request.
+Cancellation terminates only the bridge's owned process group.
+Organization-managed CLI policies still apply. Authentication and embedding
+follow the providers' documented [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)
+and [Codex authentication](https://learn.chatgpt.com/docs/auth) paths.
+
+Recorded scene metadata is an optional adjacent JSON sidecar. Its utility queue
+uses coalesced change notifications and a slow fallback, outside media callbacks.
+Accessibility traversal has a time/node budget; unchanged metadata is sparse,
+buffers are capped, and missing observations are reported as gaps. Window facts,
+visible menus/tabs and accessible controls refer to recording time, never the
+current desktop during editing. Editable field contents and password values
+are not collected; document URLs omit credentials, queries and fragments.
+
+Director receives capability flags rather than full scene snapshots. Targeted
+queries return bounded matching facts; window lists and single-window control
+queries provide explicit omissions and observation age. An observed target can
+become an ordinary linked Box and framing change with a source-pixel border,
+normal conflict review and one Undo. Aspect fitting and source edges can change
+the effective border. Metadata and image observations are bound to a project
+revision; stale observations cannot apply edits.
+
+Scene projections are capped at 6 KiB and reduced to fit the remaining 20 KB
+Director text budget; omissions stay explicit. Each instruction allows at most
+four scene/frame lookups. The runtime retains bounded observation IDs and only
+the most recent paired image in model context. Inspection alone creates no Undo
+entry. A read-only question can finish with an observation report.
+
+Video processing remains suspended. Actual footage extraction, capture,
+rendering and export stay unavailable. The image-capable CLI paths can accept
+explicitly requested PNG attachments; tests use static synthetic fixtures only.
+Local Qwen3-8B is text-only. Image pixels are excluded from interaction logs;
+only attachment identities, dimensions and hashes are retained there.
+
+`Tests/check-director-integrations.sh` compiles shared Director code once and
+reuses a source-fingerprinted binary across six integration suites. The
+opt-in `Tests/evaluate-director-providers.sh` compares actual editing outcomes
+and end-to-end latency on synthetic projects; `Tests/evaluate-director-vision.py
+--run` checks static PNG transport. The [audited first-pass results](Tests/Results/director-providers-2026-11-08.md)
+record the pinned cohort, raw/audited distinction and limitations.
 
 `llama.cpp` runs the optional Qwen3-8B Q4_K_M GGUF locally. The installer pins
 an official Qwen release and verifies its SHA-256 before using it. The 5.03 GB

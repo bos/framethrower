@@ -74,6 +74,8 @@
 		FBE0100CC7393DD56C3313B1 /* EditorAgentControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC79B38B140B8C1AE5A79FB1 /* EditorAgentControls.swift */; };
 		FE5454804B382FF94725ED6D /* RecordingTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D9D58433C5C2899A8DE0AB9 /* RecordingTimeline.swift */; };
 		FE7F22F290D9756FD5EAA0DF /* VideoExportUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */; };
+		A131B652559F63E0F1ECBC52 /* DirectorModelTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 280E13F250F07CB78CA9A01B /* DirectorModelTransport.swift */; };
+		E21292DD73CC6160A41F001B /* director-cli-client.py in Resources */ = {isa = PBXBuildFile; fileRef = 0088B0AA0C8A34D0AD6D5B7E /* director-cli-client.py */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -145,6 +147,8 @@
 		F658B134CC765957233533CB /* FrameThrowerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameThrowerApp.swift; sourceTree = "<group>"; };
 		F7BBDA26D39F807470DE77BD /* MissingMediaRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MissingMediaRecovery.swift; sourceTree = "<group>"; };
 		F905EC803998351752697F83 /* CursorRecording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorRecording.swift; sourceTree = "<group>"; };
+		280E13F250F07CB78CA9A01B /* DirectorModelTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorModelTransport.swift; sourceTree = "<group>"; };
+		0088B0AA0C8A34D0AD6D5B7E /* director-cli-client.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "../Tools/director-cli-client.py"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -152,6 +156,7 @@
 			isa = PBXGroup;
 			children = (
 				61AE4578ECBAB11E12BB2339 /* Resources */,
+				0088B0AA0C8A34D0AD6D5B7E /* director-cli-client.py */,
 				D0E67FE1367A31C6D0BCA2B9 /* Sources */,
 				D190839822A1BE2979F9FAC3 /* Products */,
 			);
@@ -198,6 +203,7 @@
 				7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */,
 				11FDA535B37F616831BD83FD /* LocalEditPlanner.swift */,
 				A2B331C11DFA046948898644 /* LocalModelRuntime.swift */,
+				280E13F250F07CB78CA9A01B /* DirectorModelTransport.swift */,
 				4E19BE163F528C7778577698 /* LocalSpeechInput.swift */,
 				76D0B9D32FDB084A40056FA3 /* MediaProcessing.swift */,
 				F7BBDA26D39F807470DE77BD /* MissingMediaRecovery.swift */,
@@ -308,6 +314,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				DBAB744E2DFF588E725FA9C7 /* Resources in Resources */,
+				E21292DD73CC6160A41F001B /* director-cli-client.py in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -380,6 +387,7 @@
 				667C378AA858A618EAA7728E /* KeychainStore.swift in Sources */,
 				1274EFC7B4C5B3F86639B5C2 /* LocalEditPlanner.swift in Sources */,
 				A45F8859120761D8FF141387 /* LocalModelRuntime.swift in Sources */,
+				A131B652559F63E0F1ECBC52 /* DirectorModelTransport.swift in Sources */,
 				E40EF926B48359C171B559AE /* LocalSpeechInput.swift in Sources */,
 				2A90439380D14DC1F9FC3CBB /* MediaProcessing.swift in Sources */,
 				70D9CFDED690FA8FBECE816C /* MissingMediaRecovery.swift in Sources */,

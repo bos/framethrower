@@ -21,7 +21,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConversation.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorModelTransport.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/VoiceInstructionChecks.swift" \
   -o "$check_dir/check-voice-instruction"
 "$check_dir/check-voice-instruction" > "$check_dir/result.log" 2>&1 || {

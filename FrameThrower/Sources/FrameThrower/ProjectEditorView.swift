@@ -173,6 +173,7 @@ struct ProjectEditorView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             assistant.suspend()
             LocalModelRuntime.terminateOwnedProcess()
+            DirectorModelTransport.terminateOwnedProcesses()
             _ = editor.finishDraft()
         }
         .onExitCommand { cancelEditorInteraction() }

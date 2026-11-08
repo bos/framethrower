@@ -42,6 +42,8 @@ targets:
       - path: Sources
       - path: Resources
         type: folder
+      - path: ../Tools/director-cli-client.py
+        buildPhase: resources
     entitlements:
       path: Resources/FrameThrower.entitlements
       properties:

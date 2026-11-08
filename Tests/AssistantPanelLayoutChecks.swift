@@ -64,6 +64,9 @@ struct AssistantPanelLayoutChecks {
         }
         session.instruction = "Can you improve this movement?"
         session.submit(editor: editor, playhead: 1, regionID: nil, editID: editID)
+        session.selectProvider(.claudeSonnet)
+        try require(session.isBusy && session.modelProvider == .localQwen,
+                    "A request must retain its chosen provider while it is in flight")
         for _ in 0..<20 where session.isBusy { try await Task.sleep(for: .milliseconds(20)) }
         try await settle(host)
         try require(session.awaitsClarification && session.notice == question && session.errorMessage == nil,
@@ -84,7 +87,54 @@ struct AssistantPanelLayoutChecks {
         session.conversation.event(["kind": "edit", "names": ["A new manual adjustment while following the latest conversation result"]])
         try await settle(host)
         try atBottom(transcript, "New transcript content must keep following the latest entry when already at the bottom")
-        print("Assistant panel layout checks passed (single bottom-pinned composer, bounded reference list and nonempty conversation, visible pending question and follow-latest after append; user scrolling requires live interaction verification; no microphone/model/media activity).")
+        try await checkModelSelection(session: session, editor: editor, host: host, window: window, question: question)
+        print("Assistant panel layout checks passed (bottom-pinned composer, bounded references/transcript, pending question and follow-latest, five model profiles at minimum width preserving dialogue/history; user scrolling requires live interaction verification; no microphone/model/cloud/media activity).")
+    }
+
+    static func checkModelSelection(session: EditorAssistantSession, editor: ProjectEditor,
+                                    host: NSView, window: NSWindow, question: String) async throws {
+        let preference = UserDefaults.standard.string(forKey: DirectorProvider.preferenceKey)
+        let conversation = session.conversation
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let exchanges = try encoder.encode(conversation.exchanges)
+        let pending = try encoder.encode(conversation.question)
+        let project = editor.project
+        session.instruction = "Keep the movement smooth."
+        window.setContentSize(NSSize(width: 280, height: 600))
+        try await settle(host)
+        let profiles = DirectorProvider.allCases
+        try require(profiles.count == 5 && Set(profiles.map(\.modelID)).count == 5,
+                    "The selector's profiles must offer distinct local Qwen and fast/balanced Claude/Codex models")
+        guard let initialComposer = all(NSTextField.self, in: host).first else {
+            throw Failure.failed("The pending answer composer must remain available")
+        }
+        let initialComposerRect = initialComposer.convert(initialComposer.bounds, to: host)
+        for profile in profiles {
+            session.selectProvider(profile)
+            try await settle(host)
+            let actualExchanges = try encoder.encode(conversation.exchanges)
+            let actualPending = try encoder.encode(conversation.question)
+            try require(session.modelProvider == profile && session.conversation === conversation &&
+                        actualExchanges == exchanges && actualPending == pending &&
+                        session.awaitsClarification && session.notice == question &&
+                        session.instruction == "Keep the movement smooth." && editor.project == project,
+                        "Changing the model must preserve the pending answer, chronological conversation and actual edit/Undo history")
+            guard let composer = all(NSTextField.self, in: host).first else {
+                throw Failure.failed("Choosing \(profile.title) removed the pending answer composer")
+            }
+            let composerRect = composer.convert(composer.bounds, to: host)
+            try require(host.bounds.size == NSSize(width: 280, height: 600) &&
+                        host.bounds.contains(composerRect) && composerRect == initialComposerRect,
+                        "Every selected profile must preserve the minimum-width panel and answer geometry (profile=\(profile.title), composer=\(composerRect), initial=\(initialComposerRect))")
+        }
+        try require(UserDefaults.standard.string(forKey: DirectorProvider.preferenceKey) == preference,
+                    "Injected model-selection tests must not change the user's provider preference")
+        guard let composer = all(NSTextField.self, in: host).first else {
+            throw Failure.failed("The pending answer composer must remain available")
+        }
+        try require(host.bounds.contains(composer.convert(composer.bounds, to: host)),
+                    "Choosing a model must leave the pending answer composer on screen at minimum width")
     }
 
     static func checkSingleComposer(_ host: NSView) throws {

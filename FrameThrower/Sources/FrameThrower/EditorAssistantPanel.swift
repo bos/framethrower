@@ -25,7 +25,8 @@ final class EditorAssistantSession: ObservableObject {
     private var currentRequestID: UUID?
     private var speechID: UUID?
     private var pendingSpeechID: UUID?
-    private let transport: @Sendable (Data) async throws -> Data
+    private let transport: (@Sendable (Data) async throws -> Data)?
+    @Published private(set) var modelProvider: DirectorProvider
     private let diagnostics: DirectorDiagnostics?
     private let persistsConversation: Bool
     private let conversationStorageURL: URL?
@@ -38,13 +39,21 @@ final class EditorAssistantSession: ObservableObject {
 
     init(transport: (@Sendable (Data) async throws -> Data)? = nil,
          diagnostics: DirectorDiagnostics? = nil, persistsConversation: Bool? = nil,
-         conversationStorageURL: URL? = nil) {
-        self.transport = transport ?? { try await LocalModelRuntime.shared.chat(payload: $0) }
+         conversationStorageURL: URL? = nil, provider: DirectorProvider? = nil) {
+        self.transport = transport
+        self.modelProvider = provider ?? (transport == nil ? .preferred : .localQwen)
         self.diagnostics = diagnostics ?? (transport == nil ? .shared : nil)
         self.persistsConversation = persistsConversation ?? (transport == nil || conversationStorageURL != nil)
         self.conversationStorageURL = conversationStorageURL
     }
     deinit { task?.cancel(); draftSaveTask?.cancel() }
+
+    func selectProvider(_ provider: DirectorProvider) {
+        guard !isBusy, provider != modelProvider else { return }
+        modelProvider = provider
+        if transport == nil { UserDefaults.standard.set(provider.rawValue, forKey: DirectorProvider.preferenceKey) }
+        record("model_provider_changed", details: ["provider": provider.rawValue, "model": provider.modelID])
+    }
 
     func attach(to editor: ProjectEditor) {
         guard observedEditor !== editor else { return }
@@ -211,7 +220,12 @@ final class EditorAssistantSession: ObservableObject {
                 question: pendingQuestion, conflict: pendingConflict)
             conversation.begin(text, requestID: token)
             persist()
+            let provider = modelProvider
+            let transport: @Sendable (Data) async throws -> Data = self.transport ?? {
+                try await DirectorModelTransport.chat(payload: $0, provider: provider)
+            }
             record("model_request", requestID: token, details: ["payload": object(payload),
+                "provider": provider.rawValue, "model": provider.modelID,
                 "routing_instruction": routingRequest, "context": DirectorConversation.object(context)])
             generation = token; currentRequestID = token
             isBusy = true; errorMessage = nil; notice = "Interpreting your instruction…"
@@ -602,13 +616,26 @@ struct EditorAssistantPanel: View {
                     Text(instructionSpeech.phase == .preparing ? "Starting microphone…" : "Recognizing…")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Text("On-device").font(.caption).foregroundStyle(.secondary)
+                    Picker("Director model", selection: Binding(get: { session.modelProvider }, set: { session.selectProvider($0) })) {
+                        Section("On this Mac") { Text(DirectorProvider.localQwen.title).tag(DirectorProvider.localQwen) }
+                        Section("Claude Code") {
+                            Text(DirectorProvider.claudeHaiku.title).tag(DirectorProvider.claudeHaiku)
+                            Text(DirectorProvider.claudeSonnet.title).tag(DirectorProvider.claudeSonnet)
+                        }
+                        Section("Codex") {
+                            Text(DirectorProvider.openAIFast.title).tag(DirectorProvider.openAIFast)
+                            Text(DirectorProvider.openAIBalanced.title).tag(DirectorProvider.openAIBalanced)
+                        }
+                    }
+                    .labelsHidden().pickerStyle(.menu).controlSize(.small)
+                    .disabled(session.isBusy)
+                    .help(session.modelProvider.help)
                 }
                 Spacer()
                 if session.isBusy {
                     ProgressView().controlSize(.small)
                     Button { session.cancel() } label: { Image(systemName: "xmark") }
-                        .help("Cancel the local editing request.").accessibilityLabel("Cancel edit request")
+                        .help("Cancel the editing request.").accessibilityLabel("Cancel edit request")
                 } else if instructionSpeech.phase == .idle {
                     Button(action: onSubmit) { Image(systemName: "arrow.up.circle.fill") }
                         .buttonStyle(.borderless).font(.title2)

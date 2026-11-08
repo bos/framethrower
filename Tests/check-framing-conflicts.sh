@@ -12,7 +12,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$sources/EditorActionDescription.swift" \
   "$sources/DirectorTranscript.swift" \
   "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources/LocalEditPlanner.swift" \
-  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" "$sources/DirectorConversation.swift" "$sources/EditorAssistantPanel.swift" \
+  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" "$sources/DirectorConversation.swift" "$sources/DirectorModelTransport.swift" "$sources/EditorAssistantPanel.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$repo_dir/Tests/FramingConflictChecks.swift" -o "$check_dir/check-framing-conflicts"

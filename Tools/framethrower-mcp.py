@@ -83,7 +83,72 @@ class Lines:
             raise ProxyError("Incomplete MCP line timed out.")
 
 
-def relay(connection, input_fd=0, output_fd=1):
+class DocumentScope:
+    """One native-agent MCP instance is bound to its recording's open handle."""
+    def __init__(self, document_id):
+        self.document_id = document_id
+        self.requests = {}
+
+    def client(self, data):
+        forwarded, replies = [], []
+        for line in data.splitlines():
+            message = json.loads(line)
+            if not isinstance(message, dict): raise ProxyError("Use one JSON-RPC object per line.")
+            method = message.get("method")
+            params = message.get("params", {})
+            if not isinstance(params, dict): raise ProxyError("JSON-RPC parameters must be an object.")
+            identifier = message.get("id")
+            reason = None
+            if method == "tools/call":
+                name, args = params.get("name"), params.get("arguments", {})
+                if not isinstance(args, dict): raise ProxyError("MCP tool arguments must be an object.")
+                if name != "list_recordings" and args.get("document_id") != self.document_id:
+                    reason = "This Director session controls only its bound recording. Use its current document_id."
+            elif method == "resources/read":
+                if not str(params.get("uri", "")).startswith("framethrower://recordings/" + self.document_id + "/"):
+                    reason = "This Director session can read only its bound recording."
+            if reason:
+                if identifier is not None:
+                    replies.append({"jsonrpc": "2.0", "id": identifier, "error": {"code": -32602, "message": reason}})
+            else:
+                if method == "notifications/cancelled":
+                    self.requests.pop(json.dumps(params.get("requestId")), None)
+                if identifier is not None:
+                    if len(self.requests) >= 64: raise ProxyError("Too many scoped MCP requests are outstanding.")
+                    self.requests[json.dumps(identifier)] = (method, params.get("name"))
+                forwarded.append(message)
+        return self.encode(forwarded), self.encode(replies)
+
+    @staticmethod
+    def encode(messages):
+        return b"".join((json.dumps(value, separators=(",", ":")) + "\n").encode() for value in messages)
+
+    def server(self, data):
+        output = []
+        for line in data.splitlines():
+            message = json.loads(line)
+            request = self.requests.pop(json.dumps(message.get("id")), None)
+            result = message.get("result")
+            if request and isinstance(result, dict):
+                method, name = request
+                if method == "tools/list":
+                    for tool in result.get("tools", []):
+                        field = tool.get("inputSchema", {}).get("properties", {}).get("document_id")
+                        if isinstance(field, dict): field["enum"] = [self.document_id]
+                elif method == "resources/list":
+                    prefix = "framethrower://recordings/" + self.document_id + "/"
+                    result["resources"] = [r for r in result.get("resources", []) if r.get("uri", "").startswith(prefix)]
+                elif method == "tools/call" and name == "list_recordings":
+                    value = result.get("structuredContent")
+                    if isinstance(value, dict):
+                        value["recordings"] = [r for r in value.get("recordings", []) if r.get("documentID") == self.document_id]
+                        value["omitted"] = 0
+                        result["content"] = [{"type": "text", "text": json.dumps(value, separators=(",", ":"))}]
+            output.append(message)
+        return self.encode(output)
+
+
+def relay(connection, input_fd=0, output_fd=1, scope=None):
     incoming, outgoing = Lines(), Lines()
     to_app, to_client = bytearray(), bytearray()
     app_progress = client_progress = time.monotonic()
@@ -112,7 +177,12 @@ def relay(connection, input_fd=0, output_fd=1):
                 if chunk:
                     if not to_app:
                         app_progress = time.monotonic()
-                    to_app.extend(incoming.feed(chunk))
+                    data = incoming.feed(chunk)
+                    if scope:
+                        data, local_replies = scope.client(data)
+                        if local_replies and not to_client: client_progress = time.monotonic()
+                        to_client.extend(local_replies)
+                    to_app.extend(data)
             if connection in readable:
                 try:
                     chunk = connection.recv(16384)
@@ -123,7 +193,8 @@ def relay(connection, input_fd=0, output_fd=1):
                 if chunk:
                     if not to_client:
                         client_progress = time.monotonic()
-                    to_client.extend(outgoing.feed(chunk))
+                    data = outgoing.feed(chunk)
+                    to_client.extend(scope.server(data) if scope else data)
             if len(to_app) > MAX_BUFFER or len(to_client) > MAX_BUFFER:
                 raise ProxyError("MCP output queue exceeded its bounded buffer.")
             if connection in writable and to_app:
@@ -149,13 +220,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", default=f"/tmp/framethrower-{os.getuid()}/control.sock",
                         help="Private app socket path (normally leave at the default).")
+    parser.add_argument("--document-id", help="Bind this native Director MCP instance to one open recording.")
     args = parser.parse_args()
     connection = None
     try:
         connection = connect(args.socket)
-        relay(connection)
+        relay(connection, scope=DocumentScope(args.document_id) if args.document_id else None)
         return 0
-    except (ProxyError, OSError) as exc:
+    except (ProxyError, OSError, ValueError) as exc:
         print(json.dumps({"error": {"code": "framethrower_mcp_unavailable", "message": str(exc)}}), file=sys.stderr, flush=True)
         return 2
     finally:

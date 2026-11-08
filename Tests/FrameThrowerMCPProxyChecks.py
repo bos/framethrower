@@ -109,6 +109,44 @@ class ProxyChecks(unittest.TestCase):
         self.assertEqual(lines.feed(b"\nnew"), b"old\n")
         lines.check(lines.since + 0.01)  # new partial has its own deadline
 
+    def test_scoped_session_only_controls_its_recording(self):
+        scope = proxy.DocumentScope("doc-a")
+        def client(identifier, name, args):
+            return scope.client(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": identifier,
+                "method": "tools/call", "params": {"name": name, "arguments": args}}]))
+        forwarded, denied = client(1, "apply_edits", {"document_id": "doc-b"})
+        self.assertEqual(forwarded, b"")
+        self.assertEqual(json.loads(denied)["error"]["code"], -32602)
+        forwarded, denied = client(2, "inspect_editor", {"document_id": "doc-a"})
+        self.assertEqual(denied, b"")
+        self.assertEqual(json.loads(forwarded)["id"], 2)
+        with self.assertRaises(proxy.ProxyError):
+            client(3, "apply_edits", [])
+        client(4, "list_recordings", {})
+        content = {"recordings": [{"documentID": "doc-a"}, {"documentID": "doc-b"}], "omitted": 7}
+        reply = scope.server(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 4, "result": {
+            "structuredContent": content, "content": [{"type": "text", "text": json.dumps(content)}]}}]))
+        result = json.loads(reply)["result"]
+        self.assertEqual(result["structuredContent"]["recordings"], [{"documentID": "doc-a"}])
+        self.assertEqual(result["structuredContent"]["omitted"], 0)
+        self.assertNotIn("doc-b", result["content"][0]["text"])
+
+    def test_scoped_resources_catalog_and_cancellation(self):
+        scope = proxy.DocumentScope("doc-a")
+        def send(message): return scope.client(proxy.DocumentScope.encode([message]))
+        send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        response = scope.server(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+            {"name": "inspect_editor", "inputSchema": {"properties": {"document_id": {"type": "string"}}}}]}}]))
+        self.assertEqual(json.loads(response)["result"]["tools"][0]["inputSchema"]["properties"]["document_id"]["enum"], ["doc-a"])
+        forwarded, denied = send({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "framethrower://recordings/doc-ab/state"}})
+        self.assertEqual(forwarded, b"")
+        self.assertIn("error", json.loads(denied))
+        send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+        cancelled = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}
+        forwarded, denied = send(cancelled)
+        self.assertEqual(json.loads(forwarded), cancelled)
+        self.assertEqual(scope.requests, {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,11 @@ targets:
         buildPhase: resources
       - path: ../Tools/framethrower-mcp.py
         buildPhase: resources
+      - path: ../Tools/director-agent-client.py
+        buildPhase: resources
+      - path: ../Tools/DirectorAgents
+        type: folder
+        buildPhase: resources
     entitlements:
       path: Resources/FrameThrower.entitlements
       properties:

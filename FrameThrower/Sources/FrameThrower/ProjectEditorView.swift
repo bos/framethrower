@@ -132,9 +132,18 @@ struct ProjectEditorView: View {
             }
         }
         .onChange(of: assistant.conflictReviewID) { _, _ in reviewConflict() }
+        .onReceive(automation.$pendingFramingProposal) { proposal in
+            guard let proposal else { assistant.clearNativeConflict(); return }
+            let host = automation
+            assistant.presentNativeConflict(id: proposal.id, conflict: proposal.conflict, context: proposal.context,
+                preparedState: proposal.preparedState) { [weak host] choice in
+                    guard let host else { throw EditorAutomationError.unavailable }
+                    return try host.resolveFramingProposal(id: proposal.id, choice: choice)
+                }
+        }
         .onChange(of: playback.time) { _, _ in refreshConflictFrame() }
-        .onChange(of: selectedEditID) { _, _ in automation.recordEvent("selection_changed") }
-        .onChange(of: selectedRegionID) { _, _ in automation.recordEvent("selection_changed") }
+        .onChange(of: selectedEditID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
+        .onChange(of: selectedRegionID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
         .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame(); automation.recordEvent("preview_seek") } }
         .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: editor.project.state) { old, next in
@@ -177,7 +186,7 @@ struct ProjectEditorView: View {
             assistant.attachAutomation(automation)
             EditorAutomationRegistry.shared.register(automation)
         }
-        .onDisappear { assistant.suspend(); EditorAutomationRegistry.shared.unregister(automation); automation.navigate = nil; automation.selection = { (nil, nil, nil, nil) }; exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
+        .onDisappear { assistant.suspend(); EditorAutomationRegistry.shared.unregister(automation); automation.navigate = nil; automation.conversationPage = nil; automation.selection = { (nil, nil, nil, nil) }; exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             assistant.suspend()
             LocalModelRuntime.terminateOwnedProcess()
@@ -244,6 +253,10 @@ struct ProjectEditorView: View {
     private func configureAutomation() {
         let edit = $selectedEditID, box = $selectedRegionID, animation = $selectedAnimationID
         let inspector = $selectedInspector, director = $directorMode
+        automation.conversationPage = { [weak assistant] offset, limit in
+            guard let assistant else { throw EditorAutomationError.unavailable }
+            return try assistant.conversationPage(offset: offset, limit: limit)
+        }
         automation.selection = {
             (edit.wrappedValue, box.wrappedValue,
              animation.wrappedValue.map { "\($0.lane.rawValue):\($0.componentID.uuidString)" }, inspector.wrappedValue.rawValue)

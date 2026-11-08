@@ -71,7 +71,7 @@ enum DirectorModelTransport {
             helperURL: helperURL ?? Bundle.main.url(forResource: "director-cli-client", withExtension: "py"), timeout: timeout)
     }
 
-    static func terminateOwnedProcesses() { DirectorCLIProcessRegistry.shared.terminateAll() }
+    static func terminateOwnedProcesses() { DirectorCLIProcessRegistry.shared.terminateAll(); DirectorNativeProcesses.shared.terminateAll() }
 }
 
 private actor DirectorCLIRuntime {

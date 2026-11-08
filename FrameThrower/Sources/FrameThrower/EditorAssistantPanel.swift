@@ -42,20 +42,30 @@ final class EditorAssistantSession: ObservableObject {
     private weak var automation: (any EditorAutomationEndpoint)?
     private var automationObservation: AnyCancellable?
     private var performingAutomation = false
+    private var nativeEventLog: [[String: Any]] = []
+    private var nativeDeliveredEvents: [String: Int] = [:]
+    private var nativeGeneration: UUID?
+    private var nativeConflictID: UUID?
+    private var nativeConflictQuestion: String?
+    private var nativeConflictRevision: String?
+    private var nativeConflictResolver: ((String) throws -> Data)?
+    private let nativeTransport: (@Sendable (Data, URL, DirectorProvider) async throws -> Data)?
     private var observedProject: RecordingProject?
     private var applyingDirectorChange = false
-    var awaitsClarification: Bool { clarification != nil || framingConflict != nil }
+    var awaitsClarification: Bool { clarification != nil || framingConflict != nil || nativeConflictID != nil }
 
     init(transport: (@Sendable (Data) async throws -> Data)? = nil,
          diagnostics: DirectorDiagnostics? = nil, persistsConversation: Bool? = nil,
          conversationStorageURL: URL? = nil, provider: DirectorProvider? = nil,
-         inspectionCache: DirectorInspectionCache? = nil) {
+         inspectionCache: DirectorInspectionCache? = nil,
+         nativeTransport: (@Sendable (Data, URL, DirectorProvider) async throws -> Data)? = nil) {
         self.transport = transport
+        self.nativeTransport = nativeTransport
         self.inspections = inspectionCache ?? DirectorInspectionCache()
         self.injectedInspections = inspectionCache != nil
         self.modelProvider = provider ?? (transport == nil ? .preferred : .localQwen)
-        self.diagnostics = diagnostics ?? (transport == nil ? .shared : nil)
-        self.persistsConversation = persistsConversation ?? (transport == nil || conversationStorageURL != nil)
+        self.diagnostics = diagnostics ?? (transport == nil && nativeTransport == nil ? .shared : nil)
+        self.persistsConversation = persistsConversation ?? ((transport == nil && nativeTransport == nil) || conversationStorageURL != nil)
         self.conversationStorageURL = conversationStorageURL
     }
     deinit { task?.cancel(); draftSaveTask?.cancel() }
@@ -94,6 +104,7 @@ final class EditorAssistantSession: ObservableObject {
         let details: [String: Any] = ["kind": "editor_navigation", "operation": event.kind,
             "actor": event.actor == "manual" ? "user" : "automation",
             "editor": DirectorConversation.object(event.context)]
+        nativeEventLog.append(details)
         conversation.event(details)
         record("editor_navigation", details: details)
         persist()
@@ -111,11 +122,13 @@ final class EditorAssistantSession: ObservableObject {
                 editor.url.deletingLastPathComponent().appendingPathComponent($0)
             })
         }
-        let history = DirectorConversation(storageURL: persistsConversation ? (conversationStorageURL ?? DirectorConversation.storageURL(for: editor.url)) : nil)
+        let history = DirectorConversation(storageURL: persistsConversation ? (conversationStorageURL ?? DirectorConversation.storageURL(for: editor.url)) : nil,
+                                           recordingID: editor.automationID)
         conversation = history
         if instruction.isEmpty { instruction = history.draftInstruction }
         if let previous = history.lastProject, previous.revision != (try? EditorCommandDispatcher.revision(for: editor.project)) {
             let event = DirectorConversation.restoredProjectEvent(from: previous, to: editor.project)
+            nativeEventLog.append(event)
             conversation.event(event)
             record("editor_changed_while_closed", details: event)
         }
@@ -148,7 +161,8 @@ final class EditorAssistantSession: ObservableObject {
         refreshConflictReview(project: next)
         var event = DirectorConversation.projectEvent(from: previous, to: next,
             operation: observedEditor?.publishingHistoryOperation)
-        event["actor"] = applyingDirectorChange ? "director" : "user"
+        event["actor"] = applyingDirectorChange ? "director" : observedEditor?.publishingActor ?? "user"
+        nativeEventLog.append(event)
         record("editor_changed", requestID: applyingDirectorChange ? currentRequestID : nil, details: event)
         if !applyingDirectorChange { conversation.event(event) }
         conversation.lastProject = DirectorProjectSnapshot(next)
@@ -156,6 +170,13 @@ final class EditorAssistantSession: ObservableObject {
     }
 
     private func refreshConflictReview(project explicitProject: RecordingProject? = nil) {
+        if nativeConflictID != nil {
+            if let project = explicitProject ?? observedEditor?.project,
+               nativeConflictRevision != (try? EditorCommandDispatcher.revision(for: project)) {
+                clearNativeConflict()
+            }
+            return
+        }
         guard let project = explicitProject ?? observedEditor?.project,
               let pending = framingConflict,
               pending.context.recording.projectID == projectID,
@@ -170,6 +191,25 @@ final class EditorAssistantSession: ObservableObject {
         reviewProposal = proposal.proposal; reviewFramingIDs = proposal.framingIDs; reviewRevision = revision
         conflictReview = EditorConflictReview.make(proposal, project: project, projectID: projectID)
         conflictReviewID = conflictReview == nil ? nil : UUID()
+    }
+
+    func presentNativeConflict(id: UUID, conflict: EditorFramingConflict, context: EditorCommandContext,
+                               preparedState: EditState, resolve: @escaping (String) throws -> Data) {
+        guard let editor = observedEditor else { return }
+        var display = conflict
+        display.proposal.projectID = projectID
+        guard let review = EditorConflictReview.make(display, project: editor.project, projectID: projectID,
+                                                     preparedState: preparedState) else { return }
+        nativeConflictID = id; nativeConflictQuestion = conflict.question
+        nativeConflictRevision = context.revision; nativeConflictResolver = resolve
+        conflictReview = review; conflictReviewID = id
+        notice = conflict.question
+    }
+
+    func clearNativeConflict() {
+        guard nativeConflictID != nil else { return }
+        nativeConflictID = nil; nativeConflictQuestion = nil; nativeConflictRevision = nil; nativeConflictResolver = nil
+        conflictReview = nil; conflictReviewID = nil
     }
 
     func beginVoiceInstruction() {
@@ -209,6 +249,10 @@ final class EditorAssistantSession: ObservableObject {
         attach(to: editor)
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        guard let transport else {
+            submitNative(text: text, editor: editor, playhead: playhead, regionID: regionID, editID: editID)
+            return
+        }
         let token = pendingSpeechID ?? UUID()
         pendingSpeechID = nil
         record("user_request", requestID: token, details: ["text": text, "playhead": playhead,
@@ -280,9 +324,6 @@ final class EditorAssistantSession: ObservableObject {
             conversation.begin(text, requestID: token)
             persist()
             let provider = modelProvider
-            let transport: @Sendable (Data) async throws -> Data = self.transport ?? {
-                try await DirectorModelTransport.chat(payload: $0, provider: provider)
-            }
             record("model_request", requestID: token, details: ["payload": object(payload),
                 "provider": provider.rawValue, "model": provider.modelID,
                 "routing_instruction": routingRequest, "context": DirectorConversation.object(context)])
@@ -619,7 +660,8 @@ final class EditorAssistantSession: ObservableObject {
     }
 
     private var pendingQuestionText: String? {
-        framingConflict.map { $0.followup ?? $0.proposal.question } ?? clarification?.question
+        if let nativeConflictQuestion { return nativeConflictQuestion }
+        return framingConflict.map { $0.followup ?? $0.proposal.question } ?? clarification?.question
     }
 
     private func commandContext(editor: ProjectEditor) throws -> EditorCommandContext {
@@ -634,6 +676,94 @@ final class EditorAssistantSession: ObservableObject {
                 references: editor.project.references, history: editor.historyState)
         }
         return try EditorCommandDispatcher.context(editor: editor, projectID: projectID)
+    }
+
+    /// Native providers own conversation state and compaction. No history
+    /// window, command-schema shim or app-side prompt budget is used here.
+    private func submitNative(text: String, editor: ProjectEditor, playhead: Double, regionID: UUID?, editID: UUID?) {
+        guard let automation else { errorMessage = "The editor's automation connection is not ready."; return }
+        let token = pendingSpeechID ?? UUID()
+        pendingSpeechID = nil
+        do {
+            let current = try automation.automationContext
+            let provider = modelProvider, family = provider.cliProvider ?? "qwen"
+            let end = nativeEventLog.count
+            let start = min(end, nativeDeliveredEvents[family] ?? 0)
+            var events = Array(nativeEventLog.dropFirst(start))
+            events.append(["kind": "current_editor", "context": DirectorConversation.object(current),
+                "playhead": playhead, "selected_box_id": regionID?.uuidString as Any? ?? NSNull(),
+                "selected_edit_id": editID?.uuidString as Any? ?? NSNull()])
+            let input: [String: Any] = ["text": text, "document_id": current.documentID,
+                "recording_id": editor.automationID.uuidString,
+                "editor_events": events,
+                "bootstrap_context": ["document_id": current.documentID, "recording_name": editor.displayName,
+                    "duration": editor.project.duration,
+                    "prior_conversation_available": !conversation.exchanges.isEmpty,
+                    "prior_conversation_query": "inspect_editor section conversation returns complete exchanges, latest page first; request earlier pages when needed."]]
+            let data = try JSONSerialization.data(withJSONObject: input)
+            record("native_agent_request", requestID: token, details: ["provider": provider.rawValue,
+                "text": text, "document_id": current.documentID, "editor_events": events])
+            conversation.begin(text, requestID: token)
+            clarification = nil; framingConflict = nil
+            currentRequestID = token; generation = token
+            isBusy = true; errorMessage = nil; notice = nil
+            nativeGeneration = token; performingAutomation = true
+            persist()
+            let send = nativeTransport ?? { request, url, provider in
+                try await DirectorAgentRuntime.shared.turn(request: request, projectURL: url, provider: provider)
+            }
+            task = Task { @MainActor [weak self, weak editor] in
+                guard let self, let editor else { return }
+                defer {
+                    if self.nativeGeneration == token { self.nativeGeneration = nil; self.performingAutomation = false }
+                    if self.generation == token { self.isBusy = false; self.task = nil; self.currentRequestID = nil }
+                }
+                do {
+                    let output = try await send(data, editor.url, provider)
+                    try Task.checkCancellation()
+                    guard self.generation == token else { return }
+                    guard let result = try JSONSerialization.jsonObject(with: output) as? [String: Any],
+                          let success = result["ok"] as? Bool else { throw DirectorModelError.rejected("The native agent returned an incomplete response. Check the editor before retrying.") }
+                    self.record("native_agent_result", requestID: token, details: result)
+                    let response = result["text"] as? String ?? ""
+                    if success {
+                        self.nativeDeliveredEvents[family] = end
+                        self.errorMessage = nil; self.notice = response.isEmpty ? nil : response
+                        self.instruction = ""
+                    } else {
+                        let failure = result["error"] as? [String: Any]
+                        self.errorMessage = failure?["message"] as? String ?? "The native agent did not complete this turn. Completed edits remain in Undo."
+                        self.notice = nil
+                    }
+                    if let question = self.nativeConflictQuestion { self.notice = question }
+                    self.finish(token, response: nil, outcome: ["status": self.nativeConflictID != nil ? "conflict" : success ? "completed" : "rejected",
+                        "summary": self.nativeConflictQuestion ?? (success
+                            ? (response.isEmpty ? "Native agent completed the turn." : response)
+                            : (self.errorMessage ?? response)),
+                        "native_reply": response,
+                        "native_session_id": result["native_session_id"] ?? NSNull(),
+                        "native_events": result["events"] ?? [], "native_usage": result["usage"] ?? [:],
+                        "history": DirectorConversation.object(editor.historyState)])
+                } catch is CancellationError {
+                    if self.generation == token {
+                        self.finish(token, response: nil, outcome: ["status": "interrupted",
+                            "summary": "Director stopped. Any completed edits remain in Undo."])
+                    }
+                } catch {
+                    guard self.generation == token else { return }
+                    self.errorMessage = error.localizedDescription
+                    self.finish(token, response: nil, outcome: ["status": "rejected", "error": error.localizedDescription])
+                }
+            }
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func conversationPage(offset: Int, limit: Int) throws -> [String: Any] {
+        guard offset >= 0, (1...16).contains(limit) else { throw EditorAutomationError.invalid("Choose an offset of zero or greater and 1–16 complete exchanges.") }
+        let retained = Array(conversation.exchanges.reversed().dropFirst(offset).prefix(limit).reversed())
+        return ["exchanges": DirectorConversation.object(retained), "total": conversation.exchanges.count,
+            "offset": offset, "limit": limit, "has_more": offset + retained.count < conversation.exchanges.count,
+            "order": "chronological within each page; offset zero selects the latest exchanges"]
     }
 
     private static func isAutomationMutation(_ call: EditorAutomationCall) -> Bool {
@@ -763,6 +893,27 @@ final class EditorAssistantSession: ObservableObject {
     /// a delayed button action from choosing a newer proposal.
     @discardableResult
     func resolveConflict(_ side: EditorConflictSide, editor: ProjectEditor, reviewID: UUID) -> Bool {
+        if nativeConflictID != nil {
+            guard !isBusy, observedEditor === editor, reviewID == nativeConflictID,
+                  let resolve = nativeConflictResolver else { return false }
+            let requestID = UUID(), choice = side == .existing ? "keep" : "replace"
+            conversation.begin(side == .existing ? "Keep the existing framing." : "Use the proposed framing.", requestID: requestID)
+            do {
+                let output = try resolve(choice)
+                let details = try JSONSerialization.jsonObject(with: output) as? [String: Any] ?? [:]
+                let summary = side == .existing ? "Kept the existing framing." : "Applied the proposed framing."
+                nativeEventLog.append(["kind": "conflict_choice", "proposal_id": reviewID.uuidString,
+                    "choice": choice, "result": details])
+                clearNativeConflict(); notice = summary; errorMessage = nil
+                finish(requestID, response: nil, outcome: ["status": "completed", "summary": summary,
+                    "interaction": "conflict_button", "choice": choice, "actual_result": details])
+                return true
+            } catch {
+                errorMessage = error.localizedDescription
+                finish(requestID, response: nil, outcome: ["status": "rejected", "error": error.localizedDescription])
+                return false
+            }
+        }
         guard !isBusy, observedEditor === editor, conflictReviewID == reviewID,
               let pending = framingConflict else { return false }
         let requestID = UUID()
@@ -809,8 +960,10 @@ final class EditorAssistantSession: ObservableObject {
     }
 
     func cancel() {
+        if let resolve = nativeConflictResolver { _ = try? resolve("keep") }
+        clearNativeConflict()
         if let id = currentRequestID {
-            finish(id, response: nil, outcome: ["status": "cancelled", "summary": "Request cancelled; no pending proposal applied."])
+            finish(id, response: nil, outcome: ["status": "cancelled", "summary": "Director stopped. Any completed edits remain in Undo."])
         } else if awaitsClarification {
             conversation.event(["kind": "question_dismissed", "actor": "user"])
             record("question_dismissed", details: [:])
@@ -825,7 +978,7 @@ final class EditorAssistantSession: ObservableObject {
     /// pending question. Explicit Cancel/Dismiss still uses cancel().
     func suspend() {
         if let id = currentRequestID {
-            finish(id, response: nil, outcome: ["status": "interrupted", "summary": "Request interrupted before completion."])
+            finish(id, response: nil, outcome: ["status": "interrupted", "summary": "Director stopped. Any completed edits remain in Undo."])
         }
         generation = UUID(); task?.cancel(); task = nil; currentRequestID = nil
         isBusy = false

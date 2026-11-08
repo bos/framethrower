@@ -15,7 +15,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
-  "$sources/DirectorConversation.swift" "$sources/DirectorModelTransport.swift" "$sources/EditorAssistantPanel.swift" \
+  "$sources/DirectorConversation.swift" "$sources/DirectorModelTransport.swift" "$sources/DirectorAgentRuntime.swift" "$sources/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/DirectorVoiceIntegrationChecks.swift" -o "$check_dir/check-director-voice-integration"
 if [ "${1:-}" = --whisper ]; then
   "$repo_dir/Tools/build-local-speech-runtime.sh" "$repo_dir/build/LocalSpeech"

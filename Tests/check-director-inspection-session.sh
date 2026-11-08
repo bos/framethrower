@@ -24,7 +24,7 @@ swiftc -whole-module-optimization -Onone -num-threads 1 -parse-as-library -warni
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConversation.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorModelTransport.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorModelTransport.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorAgentRuntime.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/DirectorInspectionSessionChecks.swift" \
   -o "$check_dir/check-director-inspection-session"
 "$check_dir/check-director-inspection-session"

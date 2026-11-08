@@ -70,6 +70,7 @@ final class DirectorConversation: ObservableObject {
     }
     private struct Archive: Codable {
         var version = 1
+        var recordingID: UUID? = nil
         var exchanges: [Exchange]
         var question: DirectorPendingQuestion?
         var conflict: DirectorPendingConflict?
@@ -85,11 +86,14 @@ final class DirectorConversation: ObservableObject {
     var draftInstruction = ""
     private var earlierSummaries: [String] = []
     let storageURL: URL?
+    private let recordingID: UUID?
 
-    init(storageURL: URL? = nil) {
+    init(storageURL: URL? = nil, recordingID: UUID? = nil) {
         self.storageURL = storageURL
+        self.recordingID = recordingID
         if let storageURL, let data = try? Data(contentsOf: storageURL), data.count <= 2_000_000,
-           let archive = try? JSONDecoder().decode(Archive.self, from: data), archive.version == 1 {
+           let archive = try? JSONDecoder().decode(Archive.self, from: data), archive.version == 1,
+           archive.recordingID == nil || recordingID == nil || archive.recordingID == recordingID {
             exchanges = archive.exchanges
             question = archive.question
             conflict = archive.conflict
@@ -242,7 +246,7 @@ final class DirectorConversation: ObservableObject {
                                                    attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             func encoded() throws -> Data {
-                try JSONEncoder().encode(Archive(exchanges: exchanges, question: question, conflict: conflict,
+                try JSONEncoder().encode(Archive(recordingID: recordingID, exchanges: exchanges, question: question, conflict: conflict,
                     lastProject: lastProject, draftInstruction: draftInstruction, earlierSummaries: earlierSummaries))
             }
             var data = try encoded()

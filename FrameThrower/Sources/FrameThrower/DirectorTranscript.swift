@@ -97,7 +97,7 @@ enum DirectorTranscript {
     /// whole-clip component. Captions and rounded descriptions are not identity.
     /// The saved conversation, model context and Undo stack remain untouched.
     private static func adjustmentTarget(_ event: [String: Any], steps: [DirectorTranscriptStep]) -> String? {
-        guard event["kind"] as? String == "edit", event["actor"] as? String != "director" else { return nil }
+        guard event["kind"] as? String == "edit", !["director", "automation"].contains(event["actor"] as? String ?? "") else { return nil }
         if !steps.isEmpty { return "edits:" + Set(steps.map { $0.id.uuidString }).sorted().joined(separator: ",") }
         guard let changes = event["changes"] as? [String: Any], !changes.isEmpty else { return nil }
         let components = Set(changes.keys.map { ["trimStart", "trimEnd"].contains($0) ? "trim" : $0 })
@@ -158,7 +158,11 @@ enum DirectorTranscript {
     private static func eventText(_ value: [String: Any]) -> String? {
         let names = (value["names"] as? [String] ?? []).joined(separator: ", ")
         switch value["kind"] as? String {
-        case "edit": return names.isEmpty ? "Recording changed manually." : "Manual change: " + names
+        case "edit":
+            if ["director", "automation"].contains(value["actor"] as? String ?? "") {
+                return names.isEmpty ? "Applied an edit." : "Applied: " + names
+            }
+            return names.isEmpty ? "Recording changed manually." : "Manual change: " + names
         case "undo": return names.isEmpty ? "Undid a change." : "Undid " + names
         case "redo": return names.isEmpty ? "Redid a change." : "Redid " + names
         case "question_dismissed": return "Question dismissed."

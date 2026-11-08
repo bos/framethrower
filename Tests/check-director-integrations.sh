@@ -8,8 +8,8 @@ root=pathlib.Path(sys.argv[1]); source=root/'FrameThrower/Sources/FrameThrower'
 production=['MediaProcessing','EditorConflictGeometry','EditorConflictReview','EditorActionDescription','DirectorTranscript',
  'EditorRegion','RecordingProject','EditorCommand','EditorMutation','EditorPreviewCommand','EditorAutomationAPI','EditorAgentControls','RecordedScene','DirectorInspection','LocalEditPlanner',
  'LocalModelRuntime','LocalSpeechInput','WhisperSpeechRuntime','WhisperSpeechSession','DirectorDiagnostics','DirectorConversation',
- 'DirectorModelTransport','EditorAssistantPanel']
-suites=['DirectorInspectionSessionChecks','EditorAssistantSessionChecks','DirectorConversationChecks','HistoryLookupChecks','FramingConflictChecks','AssistantPanelLayoutChecks','EditorAutomationPlannerChecks']
+ 'DirectorModelTransport','DirectorAgentRuntime','EditorAssistantPanel']
+suites=['DirectorInspectionSessionChecks','EditorAssistantSessionChecks','DirectorConversationChecks','HistoryLookupChecks','FramingConflictChecks','AssistantPanelLayoutChecks','EditorAutomationPlannerChecks','NativeDirectorSessionChecks','DirectorAgentRuntimeChecks']
 paths=[source/(name+'.swift') for name in production]+[root/'Tests'/(name+'.swift') for name in suites]
 flags=['-whole-module-optimization','-Onone','-num-threads','1','-parse-as-library','-warnings-as-errors','-strict-concurrency=complete','-enable-upcoming-feature','ExistentialAny','-target',platform.machine()+'-apple-macos15.0']
 fingerprint=hashlib.sha256((root/'Tests/check-director-integrations.sh').read_bytes())

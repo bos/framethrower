@@ -12,7 +12,7 @@ swiftc -j 1 -parse-as-library -warnings-as-errors -strict-concurrency=complete -
   "$sources/EditorActionDescription.swift" \
   "$sources/DirectorTranscript.swift" \
   "$sources/EditorCommand.swift" "$sources/EditorMutation.swift" "$sources/EditorPreviewCommand.swift" "$sources/EditorAutomationAPI.swift" "$sources/EditorAgentControls.swift" "$sources//RecordedScene.swift" "$sources//DirectorInspection.swift" "$sources//LocalEditPlanner.swift" \
-  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" "$sources/DirectorConversation.swift" "$sources/DirectorModelTransport.swift" "$sources/EditorAssistantPanel.swift" \
+  "$sources/LocalModelRuntime.swift" "$sources/LocalSpeechInput.swift" "$sources/DirectorDiagnostics.swift" "$sources/DirectorConversation.swift" "$sources/DirectorModelTransport.swift" "$sources/DirectorAgentRuntime.swift" "$sources/EditorAssistantPanel.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$repo_dir/Tests/ManagementIntentChecks.swift" -o "$check_dir/check-management-intent"

@@ -23,6 +23,7 @@ $sources/DirectorInspection.swift
 $sources/LocalEditPlanner.swift
 $sources/LocalModelRuntime.swift
 $sources/DirectorModelTransport.swift
+$sources/DirectorAgentRuntime.swift
 $sources/LocalSpeechInput.swift
 $sources/DirectorDiagnostics.swift
 $sources/DirectorConversation.swift

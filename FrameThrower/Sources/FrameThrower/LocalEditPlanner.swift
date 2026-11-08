@@ -260,6 +260,13 @@ enum LocalEditPlanner {
                   question.count <= 600 else { throw invalidResponse }
             return .clarification(question)
         }
+        if let instruction {
+            guard let project = args["project_id"] as? String, UUID(uuidString: project) == context.recording.projectID,
+                  args["expected_revision"] as? String == context.recording.revision else { throw EditorCommandError.stale }
+            if let rejection = EditorAgentControls.boxIntentMismatch(instruction, toolName: name, args: args, context: context) {
+                return .rejectedPlan(rejection)
+            }
+        }
         if let routingRequest {
             // Tool results in conversation are historical. A model must not
             // replay a formerly available history/management action during a
@@ -464,8 +471,10 @@ enum LocalEditPlanner {
         case "label_region":
             try keys(args, ["project_id", "expected_revision", "region_id", "label"])
             guard let note = args["label"] as? String else { throw invalidResponse }
-            commands = [.labelRegion(regionID: try uuid(args["region_id"]), note: note)]
-            summary = "Updated the box name."
+            let regionID = try uuid(args["region_id"])
+            commands = [.labelRegion(regionID: regionID, note: note)]
+            let label = context.recording.references.boxLabel(for: regionID) ?? "Box"
+            summary = note.isEmpty ? "Cleared \(label) note." : "Updated \(label) note."
         case "revise_framing":
             try keys(args, ["project_id", "expected_revision", "edit_id", "region_id"])
             let editID = try uuid(args["edit_id"])
@@ -858,7 +867,7 @@ enum LocalEditPlanner {
             case let .frameRegion(regionID, time, _):
                 includedBoxes.insert(regionID)
                 if let edit = edits.first(where: { abs($0.time - time) < 0.000_001 }) { includedEdits.insert(edit.id) }
-            case let .labelRegion(regionID, _): includedBoxes.insert(regionID)
+            case let .labelRegion(regionID, _), let .removeRegion(regionID): includedBoxes.insert(regionID)
             case let .fullFrame(time, _):
                 if let edit = edits.first(where: { abs($0.time - time) < 0.000_001 }) { includedEdits.insert(edit.id) }
             default: break
@@ -1200,6 +1209,7 @@ enum LocalEditPlanner {
     private static var tools: [[String: Any]] {
         let scope: [String: Any] = ["project_id": ["type": "string"], "expected_revision": ["type": "string"]]
         return [
+            EditorAgentControls.boxManagementTool,
             function("move_relative", "Move from one numbered box to another after a delay from the playhead. The app builds a smooth direct or zoom-out/zoom-in path. Keep arrival offsets separate from movement durations.", scope.merging([
                 "from_box_label": ["type": "string"], "to_box_label": ["type": "string"],
                 "start_delay_seconds": ["type": "number", "minimum": 0],
@@ -1228,7 +1238,7 @@ enum LocalEditPlanner {
                         "hold_seconds": ["type": "number", "minimum": 0]],
                     "required": ["region_id", "move_seconds", "hold_seconds"], "additionalProperties": false]]
             ]) { _, b in b }),
-            function("label_region", "Attach a descriptive note to a scribble without changing the video.", scope.merging([
+            function("label_region", "Attach an optional descriptive note to a box without changing framing or its stable Box number. This only edits a note; use manage_boxes to delete a box.", scope.merging([
                 "region_id": ["type": "string"], "label": ["type": "string"]]) { _, b in b }),
             function("revise_framing", "Revise an existing edit's framing, preserving its time and movement duration.", scope.merging([
                 "edit_id": ["type": "string"], "region_id": ["type": "string"]]) { _, b in b }),

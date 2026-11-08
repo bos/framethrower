@@ -193,6 +193,12 @@ enum EditorAgentControls {
     }
 
     static func tools(for request: String) -> [[String: Any]]? {
+        if literalBoxIntent(in: request) != nil { return [boxManagementTool, clarificationTool] }
+        if request.range(of: "\\b(?:delete|remove|note|label|rename)\\b", options: [.regularExpression, .caseInsensitive]) != nil,
+           request.range(of: "\\bbox(?:es)?\\b", options: [.regularExpression, .caseInsensitive]) != nil,
+           request.range(of: "\\b(?:zoom|pan|frame|camera|pointer)\\b", options: [.regularExpression, .caseInsensitive]) == nil {
+            return [boxManagementTool, clarificationTool]
+        }
         if historyAction(in: request) != nil {
             return [historyTool, historyLookupTool, clarificationTool]
         }
@@ -214,6 +220,34 @@ enum EditorAgentControls {
     static func result(name: String, args: [String: Any], context: LocalEditContext,
                        instruction: String? = nil, historyInspected: Bool = false) throws -> LocalEditResult? {
         switch name {
+        case "manage_boxes":
+            try keys(args, ["version", "project_id", "expected_revision", "changes"])
+            try scope(args, context: context)
+            if let instruction, let rejection = boxIntentMismatch(instruction, toolName: name, args: args, context: context) {
+                return .rejectedPlan(rejection)
+            }
+            guard let changes = args["changes"] as? [[String: Any]], (1...16).contains(changes.count) else { throw invalidResponse }
+            var commands: [EditorCommand] = []
+            var summaries: [String] = []
+            for change in changes {
+                guard let action = change["action"] as? String, ["delete", "note"].contains(action),
+                      let label = change["box_label"] as? String, label.count <= 40 else { throw invalidResponse }
+                try keys(change, action == "delete" ? ["action", "box_label"] : ["action", "box_label", "note"])
+                guard let box = resolveBox(label, context: context) else {
+                    return .clarification("I can’t find \(label). Which numbered box do you mean?")
+                }
+                let canonicalLabel = context.recording.references.boxLabel(for: box.id) ?? label
+                if action == "delete" {
+                    commands.append(.removeRegion(regionID: box.id))
+                    summaries.append("Removed \(canonicalLabel).")
+                } else {
+                    guard let note = change["note"] as? String else { throw invalidResponse }
+                    commands.append(.labelRegion(regionID: box.id, note: note))
+                    summaries.append(note.isEmpty ? "Cleared \(canonicalLabel) note." : "Updated \(canonicalLabel) note.")
+                }
+            }
+            return .commands(EditorCommandBatch(projectID: context.recording.projectID,
+                revision: context.recording.revision, commands: commands), summary: summaries.joined(separator: "\n"))
         case "report_history":
             try keys(args, ["version", "project_id", "expected_revision", "summary"])
             try scope(args, context: context)
@@ -381,6 +415,9 @@ enum EditorAgentControls {
     /// such as "B instead" must remain free to change the prior target.
     static func focusedManagementTool(_ tool: [String: Any], instruction: String,
                                       context: LocalEditContext) -> [String: Any] {
+        if let intent = literalBoxIntent(in: instruction) {
+            return focusedBoxManagementTool(tool, intent: intent, context: context)
+        }
         guard let intent = literalManagementIntent(in: instruction),
               var function = tool["function"] as? [String: Any], function["name"] as? String == "manage_edits",
               var parameters = function["parameters"] as? [String: Any],
@@ -411,6 +448,87 @@ enum EditorAgentControls {
         function["parameters"] = parameters
         var result = tool
         result["function"] = function
+        return result
+    }
+
+    private struct BoxManagementIntent {
+        let action: String
+        let label: String
+    }
+
+    /// Narrow only a literal single operation. The model still proposes the
+    /// command; contextual replies and compounds retain their complete schema.
+    private static func literalBoxIntent(in instruction: String) -> BoxManagementIntent? {
+        let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?")))
+            .replacingOccurrences(of: "^(?:(?:please|can you|could you|would you|will you)\\s+)+", with: "",
+                                  options: [.regularExpression, .caseInsensitive])
+        func target(_ pattern: String) -> String? {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let range = Range(match.range(at: 1), in: text), let number = Int(text[range]), number > 0 else { return nil }
+            return "Box \(number)"
+        }
+        if let label = target("^(?:delete|remove)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})$") {
+            return BoxManagementIntent(action: "delete", label: label)
+        }
+        // Notes can contain ordinary conjunctions. Only an additional command
+        // or another numbered target makes this a compound management request.
+        guard text.range(of: "[;\\n]|\\b(?:and|then|also|but|or)\\s+(?:(?:please|then)\\s+)?(?:delete|remove|set|update|edit|change|add|attach|note|label|rename|frame|zoom|pan|move|create|box\\s*[0-9]+)\\b",
+                         options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        let notePatterns = [
+            "^(?:set|update|edit|change|add|attach|clear|remove|delete)\\s+(?:(?:a|an|the)\\s+)?note\\s+(?:for|to|on|of)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:\\s*[:=].*|\\s+.*)?$",
+            "^(?:set|update|edit|change|clear|remove|delete)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:[’']s)?\\s+note(?:\\s*[:=].*|\\s+.*)?$",
+            "^(?:note|label|name|rename)\\s+(?:the\\s+)?box\\s*([0-9]{1,7})(?:\\s*[:=].+|\\s+.+)$"
+        ]
+        for pattern in notePatterns {
+            if let label = target(pattern) { return BoxManagementIntent(action: "note", label: label) }
+        }
+        return nil
+    }
+
+    private static func resolveBox(_ label: String, context: LocalEditContext) -> EditorRegion? {
+        let matches = context.recording.state.regions.filter {
+            context.recording.references.boxLabel(for: $0.id).map { normalized($0) == normalized(label) } ?? false
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    static func boxIntentMismatch(_ instruction: String, toolName: String, args: [String: Any],
+                                  context: LocalEditContext) -> String? {
+        guard let intent = literalBoxIntent(in: instruction) else { return nil }
+        let label = intent.label
+        guard let expected = resolveBox(label, context: context) else {
+            return "The instruction names \(label), which is not an existing box. Ask which visible box is intended; do not substitute another target."
+        }
+        guard toolName == "manage_boxes", let changes = args["changes"] as? [[String: Any]],
+              changes.count == 1, changes[0]["action"] as? String == intent.action else {
+            return "The instruction requests one \(intent.action) operation for \(label). Use manage_boxes with exactly that operation; do not substitute a deletion, note edit, or framing action. No changes were applied."
+        }
+        guard let actual = changes[0]["box_label"] as? String,
+              resolveBox(actual, context: context)?.id == expected.id else {
+            return "The instruction targets \(label). Apply the requested operation to that same stable box identity, not the selected box or another numbered box."
+        }
+        return nil
+    }
+
+    private static func focusedBoxManagementTool(_ tool: [String: Any], intent: BoxManagementIntent,
+                                               context: LocalEditContext) -> [String: Any] {
+        guard var function = tool["function"] as? [String: Any], function["name"] as? String == "manage_boxes",
+              var parameters = function["parameters"] as? [String: Any], var properties = parameters["properties"] as? [String: Any],
+              var changes = properties["changes"] as? [String: Any], var items = changes["items"] as? [String: Any],
+              let options = items["oneOf"] as? [[String: Any]],
+              var operation = options.first(where: { (($0["properties"] as? [String: Any])?["action"] as? [String: Any])?["const"] as? String == intent.action }),
+              var fields = operation["properties"] as? [String: Any], var target = fields["box_label"] as? [String: Any] else { return tool }
+        if let box = resolveBox(intent.label, context: context) { target["enum"] = [context.recording.references.boxLabel(for: box.id) ?? intent.label] }
+        fields["box_label"] = target
+        operation["properties"] = fields
+        items["oneOf"] = [operation]
+        changes["items"] = items
+        changes["maxItems"] = 1
+        properties["changes"] = changes
+        parameters["properties"] = properties
+        function["parameters"] = parameters
+        var result = tool; result["function"] = function
         return result
     }
 
@@ -498,6 +616,14 @@ enum EditorAgentControls {
     static var historyReportTool: [String: Any] {
         function("report_history", "Answer the user's history question using the inspected entries, without changing anything. Do not claim selective Undo, describe unavailable older entries, or imply an abandoned Redo branch is retained.", scopeProperties.merging([
             "summary": ["type": "string", "minLength": 1, "maxLength": 600]
+        ]) { _, b in b })
+    }
+    static var boxManagementTool: [String: Any] {
+        function("manage_boxes", "Delete numbered reference boxes or update their optional notes. Use stable Box labels from context, never array order or the selected box when another is named. Deleting a box removes only the guide; existing framing, source-time edit marks and other boxes remain. A note describes a box; it never renames its stable Box number or deletes it. Changes execute atomically in order.", scopeProperties.merging([
+            "changes": ["type": "array", "minItems": 1, "maxItems": 16, "items": ["oneOf": [
+                actionSchema("delete", properties: ["box_label": ["type": "string"]]),
+                actionSchema("note", properties: ["box_label": ["type": "string"], "note": ["type": "string", "maxLength": 4096]])
+            ]]]
         ]) { _, b in b })
     }
     private static var managementTool: [String: Any] {

@@ -676,14 +676,14 @@ struct EditorAssistantPanel: View {
             Button("Go to \(label)'s Frame") { onShowOriginalFrame(region.id) }
                 .help("Move the playhead to the frame where this box was drawn.")
             Divider()
-            Button("Name " + label + "…") { nameDraft = region.note; namingRegionID = region.id }
+            Button(region.note.isEmpty ? "Add note…" : "Edit note…") { nameDraft = region.note; namingRegionID = region.id }
         }
         .popover(isPresented: Binding(get: { namingRegionID == region.id }, set: { if !$0 { namingRegionID = nil } })) {
-            TextField("Name " + label, text: $nameDraft)
+            TextField("Note for " + label, text: $nameDraft)
                 .textFieldStyle(.roundedBorder).focused($nameFocused)
                 .onSubmit { saveName(region.id) }
                 .onExitCommand { namingRegionID = nil }
-                .help("Return saves the optional name. Escape or clicking outside cancels.")
+                .help("Return saves the note. Escape or clicking outside cancels.")
                 .frame(width: 220).padding(12)
                 .onAppear { nameFocused = true }
         }
@@ -726,7 +726,7 @@ struct EditorAssistantPanel: View {
         guard editor.finishDraft(), let index = editor.project.state.regions.firstIndex(where: { $0.id == id }) else { return }
         var next = editor.project.state
         next.regions[index].note = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if editor.commit(next, name: "Name box") { namingRegionID = nil }
+        if editor.commit(next, name: "Edit box note") { namingRegionID = nil }
     }
 
     @ViewBuilder private func speechStatus(_ speech: LocalSpeechInput) -> some View {

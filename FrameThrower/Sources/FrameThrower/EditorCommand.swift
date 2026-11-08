@@ -31,6 +31,7 @@ enum EditorCommand: Codable, Equatable, Sendable {
     case removeEdit(editID: UUID)
     case removeScreenFraming(editID: UUID)
     case labelRegion(regionID: UUID, note: String)
+    case removeRegion(regionID: UUID)
 
     private enum Key: String, CodingKey {
         case action, regionID, time, motion, editID, fromEditID, toEditID, note,
@@ -68,6 +69,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
             allowed = ["action", "regionID", "note"]
             self = .labelRegion(regionID: try values.decode(UUID.self, forKey: .regionID),
                                 note: try values.decode(String.self, forKey: .note))
+        case "removeRegion":
+            allowed = ["action", "regionID"]
+            self = .removeRegion(regionID: try values.decode(UUID.self, forKey: .regionID))
         case "moveBetweenEdits":
             allowed = ["action", "fromEditID", "toEditID", "regionID"]
             self = .moveBetweenEdits(fromEditID: try values.decode(UUID.self, forKey: .fromEditID),
@@ -124,6 +128,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
             try values.encode("labelRegion", forKey: .action)
             try values.encode(regionID, forKey: .regionID)
             try values.encode(note, forKey: .note)
+        case let .removeRegion(regionID):
+            try values.encode("removeRegion", forKey: .action)
+            try values.encode(regionID, forKey: .regionID)
         case let .moveBetweenEdits(fromEditID, toEditID, regionID):
             try values.encode("moveBetweenEdits", forKey: .action)
             try values.encode(fromEditID, forKey: .fromEditID)
@@ -315,6 +322,11 @@ enum EditorCommandDispatcher {
                 }
                 next.regions[index].note = note
                 try next.regions[index].validate(duration: project.duration)
+            case let .removeRegion(regionID):
+                guard next.regions.contains(where: { $0.id == regionID }) else {
+                    throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
+                }
+                next.regions.removeAll { $0.id == regionID }
             case let .moveBetweenEdits(fromEditID, toEditID, regionID):
                 let edits = next.timedEdits(includeCamera: true)
                 guard let from = edits.first(where: { $0.id == fromEditID }),

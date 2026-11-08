@@ -320,13 +320,15 @@ you start drawing. Drawing retains a fixed source frame until release. Pinch and
 two-finger pan work with either tool. Switching tools cancels an unfinished mouse
 gesture while retaining earlier completed framing adjustments at that time.
 Escape cancels unfinished drawing or framing first, then exits Director mode.
-A box's X, Delete, or Forward Delete removes its guide and optional name; Undo
+A box's X, Delete, or Forward Delete removes its guide and optional note; Undo
 restores both. Selecting a box in the sidebar gives its list keyboard focus.
-Delete continues to edit text while the instruction or a name field is focused.
+Delete continues to edit text while the instruction or a note field is focused.
+Director also accepts “Delete Box 4”; it removes that numbered guide without
+changing existing framing movements. The removal is one normal Undo step.
 
-There is one instruction field and one microphone. An optional box name is
-available from its context menu; Return saves, Escape or dismissing cancels.
-Naming is never required to use a box. Names describe guides and do not become
+There is one instruction field and one microphone. **Add note… / Edit note…**
+in a box's context menu edits its optional sidebar note; Return saves, Escape
+or dismissing cancels. Numbered box labels stay fixed. Notes do not become
 visible graphics. The microphone starts dictation; pressing it again finishes
 recognition and submits the instruction. Escape cancels. Typed instructions use
 Return or the send icon. The Apple SpeechAnalyzer fallback runs on-device on supported macOS26+
@@ -340,7 +342,7 @@ without opening the microphone or playing sound.
 
 Supported instructions add smooth region-to-region framing sequences with timed
 holds, return to full frame, revise the selected edit while preserving its timing,
-and label areas. Named references work across frames: “At Edit A, frame Box 1.
+and edit box notes. Numbered references work across frames: “At Edit A, frame Box 1.
 Between A and B, zoom out then smoothly into Box 2, arriving at B.” A two-leg
 path inserts an editable full-frame waypoint halfway between the endpoints,
 using the shared acceleration/deceleration curves. Conflicting intervening edits

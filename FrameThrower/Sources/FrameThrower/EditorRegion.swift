@@ -42,7 +42,7 @@ struct EditorRegion: Codable, Equatable, Identifiable, Sendable {
               !note.unicodeScalars.contains(where: {
                   $0.properties.generalCategory == .control && $0 != "\n" && $0 != "\t"
               }) else {
-            throw ProjectError.invalid("Use a box name of at most 4,096 characters without control characters.")
+            throw ProjectError.invalid("Use a box note of at most 4,096 characters without control characters.")
         }
     }
 }

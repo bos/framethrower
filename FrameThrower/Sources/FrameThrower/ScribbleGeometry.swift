@@ -14,13 +14,32 @@ struct ScribbleGeometry {
     }
 
     func region(from start: CGPoint, to end: CGPoint) -> EditorRegionRect? {
-        guard let a = sourcePoint(start) else { return nil }
-        let bounded = CGPoint(x: min(contentRect.maxX.nextDown, max(contentRect.minX, end.x)),
-                              y: min(contentRect.maxY.nextDown, max(contentRect.minY, end.y)))
-        guard let b = sourcePoint(bounded), abs(bounded.x - start.x) >= 5, abs(bounded.y - start.y) >= 5 else { return nil }
-        let value = EditorRegionRect(x: max(0, min(a.x, b.x)), y: max(0, min(a.y, b.y)),
-                                    width: abs(a.x - b.x), height: abs(a.y - b.y))
-        return value.isValid ? value : nil
+        guard let a = sourcePoint(start), end.x.isFinite, end.y.isFinite else { return nil }
+        let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+        let dx = (end.x - start.x) / contentRect.width * viewport.width
+        let dy = (end.y - start.y) / contentRect.height * viewport.height
+        guard dx.isFinite, dy.isFinite else { return nil }
+        // Equal source-normalized sides retain the video's actual aspect, even
+        // with a portrait source, output padding, or a clamped zoom viewport.
+        // A purely horizontal/vertical gesture grows the other axis inward.
+        let right = dx == 0 ? a.x <= viewport.midX : dx > 0
+        let down = dy == 0 ? a.y <= viewport.midY : dy > 0
+        let availableX = right ? min(1, viewport.maxX) - a.x : a.x - max(0, viewport.minX)
+        let availableY = down ? min(1, viewport.maxY) - a.y : a.y - max(0, viewport.minY)
+        var side = min(max(abs(dx), abs(dy)), availableX, availableY)
+        guard side > 0 else { return nil }
+        var value = EditorRegionRect(x: right ? a.x : a.x - side, y: down ? a.y : a.y - side,
+                                     width: side, height: side)
+        // Correct only arithmetic rounding at a source edge, shrinking both
+        // dimensions together rather than introducing an aspect mismatch.
+        if !value.isValid {
+            side = side.nextDown
+            value = EditorRegionRect(x: right ? a.x : a.x - side, y: down ? a.y : a.y - side,
+                                     width: side, height: side)
+        }
+        let projected = viewRect(value)
+        guard value.isValid, projected.width >= 5, projected.height >= 5 else { return nil }
+        return value
     }
 
     func viewRect(_ region: EditorRegionRect) -> CGRect {

@@ -1,4 +1,3 @@
-@preconcurrency import AVFoundation
 import AppKit
 import Combine
 
@@ -17,7 +16,7 @@ struct ScribbleChecks {
     static func main() throws {
         try checkGeometry()
         try checkNativeCanvas()
-        print("Scribble checks passed (source-coordinate round trips, clipping, minimum size, numbered guide badges, linked selection, badge hit targets, empty native canvas, Escape, and gesture mode boundaries).")
+        print("Scribble checks passed (video-aspect locked boxes, all drag quadrants/axis-only draws, wide/portrait/zoom/clipped viewports, final minimum size, existing free guides, native selection/Escape/mode boundaries; no AV objects or media).")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -30,7 +29,7 @@ struct ScribbleChecks {
         for placement in [ZoomPlacement(), ZoomPlacement(scale: 2, x: 0.4, y: 0.5),
                           ZoomPlacement(scale: 3, x: 0.85, y: 0.85).clamped] {
             let geometry = ScribbleGeometry(contentRect: content, zoom: placement)
-            let start = CGPoint(x: 80, y: 80), end = CGPoint(x: 600, y: 330)
+            let start = CGPoint(x: 80, y: 80), end = CGPoint(x: 600, y: 372.5)
             guard let region = geometry.region(from: start, to: end) else { throw ScribbleCheckError.failed("draw region") }
             let rect = geometry.viewRect(region)
             try require(near(rect.minX, start.x) && near(rect.minY, start.y) && near(rect.maxX, end.x) && near(rect.maxY, end.y),
@@ -38,7 +37,8 @@ struct ScribbleChecks {
             try require(geometry.sourcePoint(CGPoint(x: 39, y: 50)) == nil,
                         "source guides cannot start in output padding")
             let reverse = geometry.region(from: end, to: start)
-            try require(reverse == region, "drawing direction cannot change saved region")
+            try require(reverse.map { near($0.x, region.x) && near($0.y, region.y) && near($0.width, region.width) && near($0.height, region.height) } == true,
+                        "conforming opposite corners produce the same source rectangle in reverse")
         }
         let geometry = ScribbleGeometry(contentRect: content, zoom: ZoomPlacement())
         try require(geometry.region(from: CGPoint(x: 80, y: 80), to: CGPoint(x: 82, y: 82)) == nil,
@@ -46,14 +46,51 @@ struct ScribbleChecks {
         try require(geometry.region(from: CGPoint(x: 838, y: 468), to: CGPoint(x: 1000, y: 700)) == nil,
                     "a long pointer movement outside the frame cannot create a tiny clipped guide")
         let clipped = geometry.region(from: CGPoint(x: 80, y: 80), to: CGPoint(x: 1000, y: 700))
-        try require(clipped?.isValid == true && near(clipped!.rectMaxX, 1) && near(clipped!.rectMaxY, 1),
-                    "large areas clip to the original frame")
+        try require(clipped?.isValid == true && near(clipped!.width, clipped!.height) && near(clipped!.rectMaxY, 1) && clipped!.rectMaxX < 1,
+                    "clipping stops both dimensions together at the first source edge, retaining the aspect")
+        for content in [CGRect(x: 40, y: 20, width: 800, height: 450), CGRect(x: 20, y: 40, width: 450, height: 800)] {
+            for zoom in [ZoomPlacement(), ZoomPlacement(scale: 2, x: 0.4, y: 0.6), ZoomPlacement(scale: 3, x: 0.99, y: 0.01)] {
+                let geometry = ScribbleGeometry(contentRect: content, zoom: zoom)
+                let anchor = CGPoint(x: content.midX, y: content.midY)
+                let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+                let sourceAnchor = geometry.sourcePoint(anchor)!
+                for delta in [CGPoint(x: 120, y: 30), CGPoint(x: -120, y: 30), CGPoint(x: 120, y: -30), CGPoint(x: -120, y: -30),
+                              CGPoint(x: 120, y: 0), CGPoint(x: 0, y: 120), CGPoint(x: -120, y: 0), CGPoint(x: 0, y: -120),
+                              CGPoint(x: 10000, y: 3000), CGPoint(x: -10000, y: -3000)] {
+                    guard let box = geometry.region(from: anchor, to: CGPoint(x: anchor.x + delta.x, y: anchor.y + delta.y)) else {
+                        throw ScribbleCheckError.failed("wide/portrait quadrants and axis-only draws must create a box")
+                    }
+                    let rect = geometry.viewRect(box)
+                    let requested = max(abs(delta.x) / content.width * viewport.width,
+                                        abs(delta.y) / content.height * viewport.height)
+                    let availableX = delta.x < 0 ? sourceAnchor.x - viewport.minX : viewport.maxX - sourceAnchor.x
+                    let availableY = delta.y < 0 ? sourceAnchor.y - viewport.minY : viewport.maxY - sourceAnchor.y
+                    try require(box.isValid && near(box.width, box.height) && near(rect.width / rect.height, content.width / content.height),
+                                "new source-normalized square boxes keep the actual wide/portrait video aspect under zoom")
+                    try require(near(box.width, min(requested, availableX, availableY)),
+                                "the dominant normalized pointer displacement controls size until either visible edge stops both dimensions")
+                    try require(box.x >= viewport.minX - 1e-8 && box.y >= viewport.minY - 1e-8 &&
+                                box.rectMaxX <= viewport.maxX + 1e-8 && box.rectMaxY <= viewport.maxY + 1e-8,
+                                "clipped boxes remain inside both the visible viewport and source")
+                    let cornerX = delta.x < 0 ? box.rectMaxX : box.x
+                    let cornerY = delta.y < 0 ? box.rectMaxY : box.y
+                    try require(near(cornerX, sourceAnchor.x) && near(cornerY, sourceAnchor.y),
+                                "each quadrant retains the mouse-down source anchor")
+                }
+                try require(geometry.region(from: CGPoint(x: content.maxX - 2, y: content.maxY - 2),
+                                            to: CGPoint(x: content.maxX + 100, y: content.maxY + 100)) == nil,
+                            "an outside drag cannot create a final clipped box smaller than five pixels on either axis")
+                let oldFreeBox = EditorRegionRect(x: viewport.minX, y: viewport.minY, width: viewport.width * 0.2, height: viewport.height * 0.4)
+                let oldView = geometry.viewRect(oldFreeBox)
+                try require(near(oldView.width, content.width * 0.2) && near(oldView.height, content.height * 0.4),
+                            "existing arbitrary-aspect saved guides retain their original geometry")
+            }
+        }
     }
 
     private static func checkNativeCanvas() throws {
         try require(MediaProcessing.isSuspended, "native vector test requires video interlock")
         _ = NSApplication.shared
-        let player = AVPlayer()
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 400, height: 300),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -61,12 +98,12 @@ struct ScribbleChecks {
         window.contentView = canvas
         defer { window.close() }
         func configure(zoom: ZoomPlacement = ZoomPlacement(), camera: Bool = false) {
-            canvas.configure(player: player, image: nil, sourceSize: CGSize(width: 1920, height: 1080),
+            canvas.configure(player: nil, image: nil, sourceSize: CGSize(width: 1920, height: 1080),
                 cameraAspect: 16.0 / 9.0, placement: PIPPlacement(), cameraEnabled: camera, zoom: zoom)
             canvas.layoutSubtreeIfNeeded()
         }
         configure()
-        try require(canvas.playerLayer.player == nil && canvas.stillLayer.contents == nil,
+        try require(!canvas.hasMediaPlayerLayer && canvas.stillLayer.contents == nil,
                     "no media reaches the suspended canvas")
         var drawn: [EditorRegionRect] = []
         var selected: UUID?

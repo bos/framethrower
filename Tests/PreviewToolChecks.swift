@@ -218,6 +218,29 @@ private final class PreviewGesture: NSEvent {
         release(end)
         try require(toolCanceled == 2 && canceled == priorCanceled + 1 && canvas.zoom == initial,
             "Escape retains its ordinary cancellation route rather than the tool-switch callback")
+        var deletedRegions: [UUID] = []
+        canvas.onDeleteRegion = { deletedRegions.append($0) }
+        canvas.regions = [region]
+        canvas.selectedRegionID = region.id
+        func deleteKey(_ code: UInt16) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: code == 51 ? "\u{7f}" : "\u{f728}",
+                charactersIgnoringModifiers: code == 51 ? "\u{7f}" : "\u{f728}", isARepeat: false, keyCode: code)!
+        }
+        for (index, code) in [UInt16(51), UInt16(117)].enumerated() {
+            canvas.drawsReferenceBoxes = index == 1
+            canvas.keyDown(with: deleteKey(code))
+        }
+        try require(deletedRegions == [region.id, region.id] && canvas.zoom == initial,
+            "Backward and forward Delete remove only the selected reference box in both Pan and Box tools")
+        canvas.drawsReferenceBoxes = true
+        configure()
+        let completedBoxCount = boxes.count
+        press(start); move(end)
+        try require(canvas.referenceDraft != nil, "Delete cancellation fixture must have an unfinished visible box")
+        canvas.keyDown(with: deleteKey(51)); release(end)
+        try require(canvas.referenceDraft == nil && boxes.count == completedBoxCount && deletedRegions.count == 2,
+            "Delete during an unfinished draw cancels only that draw, preserving the previously selected box and ignoring late mouseUp")
         try require(canvas.frame == fixedFrame && !canvas.hasMediaPlayerLayer && canvas.stillLayer.contents == nil && canvas.testPattern != nil,
             "All preview-tool interactions preserve layout and use only native vector content")
         print("Preview tool checks passed (Director Pan/Box routing, badges/cursors, live locked boxes/frozen source, trackpad momentum, cancellation/late release, PIP move/resize, fixed vector layout; no AV objects/media).")

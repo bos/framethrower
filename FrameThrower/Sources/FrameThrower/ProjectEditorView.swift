@@ -162,6 +162,7 @@ struct ProjectEditorView: View {
             _ = editor.finishDraft()
         }
         .onExitCommand { cancelEditorInteraction() }
+        .onDeleteCommand { deleteSelectedBox() }
         .toolbarRole(.editor)
         .toolbar(removing: .title)
         .toolbar {
@@ -279,6 +280,7 @@ struct ProjectEditorView: View {
                 playback.pause()
             },
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
+            onDeleteRegion: { removeRegion($0) },
             conflictOutlines: conflictReview?.outlines(at: playback.time))
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay(alignment: .topTrailing) { previewTools.padding(10) }
@@ -417,6 +419,12 @@ struct ProjectEditorView: View {
         var next = editor.project.state
         next.regions.removeAll { $0.id == id }
         if editor.commit(next, name: "Remove box"), selectedRegionID == id { selectedRegionID = nil }
+    }
+
+    private func deleteSelectedBox() {
+        guard directorMode, let selectedRegionID, state.regions.contains(where: { $0.id == selectedRegionID }) else { return }
+        if let text = NSApplication.shared.keyWindow?.firstResponder as? NSTextView, text.isEditable { return }
+        removeRegion(selectedRegionID)
     }
 
     private var timeline: some View {

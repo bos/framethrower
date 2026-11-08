@@ -196,8 +196,80 @@ struct ConflictReviewInterfaceChecks {
         try require(abs(playback.time - 6) < 0.000001 && abs(editor.project.state.trimStart - 5) < 0.000001 && editor.project.undoHistory.count == 2,
                     "Canceling a crossed trim restores the original playhead without changing saved trim/history")
         try await laneGestures(host: host, window: window, timeline: timeline, canvas: canvas, editor: editor, playback: playback)
-        print("Conflict review interface checks passed (native preview Pan/Box tools, vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+        try await boxDeletion(host: host, window: window, canvas: canvas, editor: editor, session: session)
+        print("Conflict review interface checks passed (native preview Pan/Box tools and sidebar/preview Delete with ordinary text editing, vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
     }
+    static func boxDeletion(host: NSView, window: NSWindow, canvas: EditorCanvasView,
+                            editor: ProjectEditor, session: EditorAssistantSession) async throws {
+        _ = editor.cancelDraft()
+        let baseline = editor.project
+        guard let region = baseline.state.regions.first(where: { $0.id != canvas.selectedRegionID }) ?? baseline.state.regions.first else {
+            throw Failure.failed("Delete fixture needs an actual reference box")
+        }
+        func deleteKey(_ code: UInt16) -> NSEvent {
+            let value = code == 51 ? "\u{7f}" : "\u{f728}"
+            return NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: value, charactersIgnoringModifiers: value,
+                isARepeat: false, keyCode: code)!
+        }
+        session.instruction = "Delete text"
+        try await settle(host)
+        guard let field = all(NSTextField.self, in: host).first(where: { $0.placeholderString == "What would you like to change?" }) else {
+            throw Failure.failed("Actual Director text composer missing")
+        }
+        try require(window.makeFirstResponder(field), "Composer must receive real text focus")
+        guard let text = window.firstResponder as? NSTextView else { throw Failure.failed("Composer field editor missing") }
+        text.setSelectedRange(NSRange(location: text.string.utf16.count, length: 0))
+        window.sendEvent(deleteKey(51))
+        try await settle(host)
+        try require(session.instruction == "Delete tex" && editor.project == baseline,
+                    "Delete in the actual composer edits text while preserving all boxes and project history")
+        let lists = all(NSScrollView.self, in: host).filter {
+            $0.contentView.bounds.height >= 80 && $0.contentView.bounds.height <= 140 &&
+            ($0.documentView.map { all(NSTextView.self, in: $0).isEmpty } ?? false)
+        }
+        guard lists.count == 1, let list = lists.first,
+              let index = baseline.state.regions.firstIndex(where: { $0.id == region.id }) else {
+            throw Failure.failed("Actual compact sidebar box list missing or ambiguous: \(lists.map(\.frame))")
+        }
+        let clip = list.contentView
+        let offset = CGFloat(index) * 48 + 22
+        let rowPoint = CGPoint(x: clip.bounds.minX + 40,
+            y: clip.isFlipped ? clip.bounds.minY + offset : clip.bounds.maxY - offset)
+        window.sendEvent(mouse(.leftMouseDown, rowPoint, in: clip, window: window))
+        window.sendEvent(mouse(.leftMouseUp, rowPoint, in: clip, window: window))
+        try await settle(host)
+        try require(canvas.selectedRegionID == region.id && !((window.firstResponder as? NSTextView)?.isEditable ?? false),
+                    "Selecting a sidebar box moves focus out of the composer without a large focus ring")
+        window.sendEvent(deleteKey(51))
+        try await settle(host)
+        var removed = baseline.state
+        removed.regions.removeAll { $0.id == region.id }
+        try require(editor.project.state == removed && editor.project.undoHistory.count == baseline.undoHistory.count + 1 &&
+                    canvas.selectedRegionID == nil && !canvas.regions.contains { $0.id == region.id } && session.instruction == "Delete tex",
+                    "Delete from actual sidebar focus removes only that selected box, using the same single Undo action as its X")
+        try require(editor.undo(), "Ordinary Undo restores sidebar removal")
+        try await settle(host)
+        try require(editor.project.state == baseline.state && canvas.regions.contains { $0.id == region.id },
+                    "Undo restores the exact box without changing framing, camera, timing or original sources")
+        guard let badge = canvas.guideBadges.first(where: { $0.regionID == region.id }) else {
+            throw Failure.failed("Restored box has no preview badge")
+        }
+        let point = CGPoint(x: badge.frame.midX, y: badge.frame.midY)
+        canvas.mouseDown(with: mouse(.leftMouseDown, point, in: canvas, window: window))
+        canvas.mouseUp(with: mouse(.leftMouseUp, point, in: canvas, window: window))
+        try await settle(host)
+        canvas.keyDown(with: deleteKey(117))
+        try await settle(host)
+        try require(editor.project.state == removed && canvas.selectedRegionID == nil,
+                    "Forward Delete from the actual preview uses the same selected-box removal route")
+        try require(editor.undo(), "Ordinary Undo restores preview removal")
+        try await settle(host)
+        try require(editor.project.state == baseline.state && !canvas.hasMediaPlayerLayer,
+                    "Both Delete routes preserve independent edit marks and use no video layer")
+        session.instruction = ""
+    }
+
     static func previewTools(host: NSView, window: NSWindow, canvas: EditorCanvasView, timeline: RecordingTimelineView,
                              editor: ProjectEditor, playback: EditorPlayback) async throws {
         let original = editor.project, windowFrame = window.frame, playhead = playback.time

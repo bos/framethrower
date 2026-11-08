@@ -33,6 +33,7 @@ struct EditorCanvas: NSViewRepresentable {
     var onReferenceBegin: () -> Void = {}
     var onDrawRegion: (EditorRegionRect) -> Void = { _ in }
     var onSelectRegion: (UUID?) -> Void = { _ in }
+    var onDeleteRegion: (UUID) -> Void = { _ in }
     var conflictOutlines: EditorConflictOutlines? = nil
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
@@ -54,6 +55,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.onReferenceBegin = onReferenceBegin
         view.onDrawRegion = onDrawRegion
         view.onSelectRegion = onSelectRegion
+        view.onDeleteRegion = onDeleteRegion
         view.conflictOutlines = conflictOutlines
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
@@ -121,6 +123,7 @@ final class EditorCanvasView: NSView {
     var onReferenceBegin: (() -> Void)?
     var onDrawRegion: ((EditorRegionRect) -> Void)?
     var onSelectRegion: ((UUID?) -> Void)?
+    var onDeleteRegion: ((UUID) -> Void)?
     private var scribbleStart: CGPoint?
     private(set) var referenceDraft: EditorRegionRect?
     private var referenceGeometry: ScribbleGeometry?
@@ -638,6 +641,16 @@ final class EditorCanvasView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 51 || event.keyCode == 117, scribbleMode {
+            if scribbleStart != nil {
+                cancelActiveInteraction()
+                return
+            }
+            if let selectedRegionID, regions.contains(where: { $0.id == selectedRegionID }) {
+                onDeleteRegion?(selectedRegionID)
+                return
+            }
+        }
         guard event.keyCode == 53 else { super.keyDown(with: event); return }
         cancelOperation(nil)
     }

@@ -532,6 +532,7 @@ struct EditorAssistantPanel: View {
     @State private var namingRegionID: UUID?
     @State private var nameDraft = ""
     @FocusState private var nameFocused: Bool
+    @FocusState private var boxesFocused: Bool
 
     private var regions: [EditorRegion] { editor.editingState.regions }
 
@@ -549,6 +550,13 @@ struct EditorAssistantPanel: View {
                     }
                 }
                 .frame(height: min(140, CGFloat(regions.count) * 44 + CGFloat(max(0, regions.count - 1)) * 4))
+                .focusable()
+                .focusEffectDisabled()
+                .focused($boxesFocused)
+                .onDeleteCommand {
+                    guard let selectedRegionID, regions.contains(where: { $0.id == selectedRegionID }) else { return }
+                    onRemoveRegion(selectedRegionID)
+                }
                 Divider()
             }
             DirectorConversationView(conversation: session.conversation, references: editor.references,
@@ -687,7 +695,7 @@ struct EditorAssistantPanel: View {
         let tooltip: String = selected
             ? "Click again or press Escape to deselect \(label)."
             : "Use \(label) as a reference without moving the playhead. Its original frame (\(time) s) is available from the context menu."
-        return Button(action: { onSelectRegion(region.id) }, label: {
+        return Button(action: { boxesFocused = true; onSelectRegion(region.id) }, label: {
             regionButtonLabel(region, label: label, association: association, selected: selected)
         })
         .buttonStyle(.plain)

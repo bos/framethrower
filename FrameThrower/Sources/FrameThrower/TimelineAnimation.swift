@@ -77,6 +77,10 @@ enum TimelineAnimationSolver {
             return result == target ? [] : [result]
         }
 
+        if drag.handle == .move, !drag.push {
+            return moveAcrossGaps(drag, target: target, lane: lane, duration: duration)
+        }
+
         let previous = index > 0 ? lane[index - 1] : nil
         let next = index + 1 < lane.count ? lane[index + 1] : nil
         var lower: Double, upper: Double
@@ -155,6 +159,45 @@ enum TimelineAnimationSolver {
         }
         guard let result else { return nil }
         return zip(lane, result).compactMap { $0 == $1 ? nil : $1 }
+    }
+
+    /// A body can pass a neighbor only when its entire requested interval
+    /// clears it. While intersecting, stop at the contact on the approach side.
+    /// This projection is directional, rather than choosing the nearest gap,
+    /// which would jump through a partially overlapped neighbor.
+    private static func moveAcrossGaps(_ drag: AnimationDrag, target: TimelineAnimation,
+                                       lane: [TimelineAnimation], duration: Double) -> [TimelineAnimation]? {
+        let others = lane.filter { $0.id != target.id }
+        let length = target.duration
+        let desired = clamp(target.start + drag.deltaSeconds, 0, duration - length)
+        guard desired != target.start else { return [] }
+        var gaps: [ClosedRange<Double>] = []
+        for index in 0...others.count {
+            var lower = 0.0, upper = duration - length
+            if index > 0 {
+                let previous = others[index - 1]
+                lower = max(lower, previous.end, previous.end + minimumSeparation - length)
+            }
+            if index < others.count {
+                let next = others[index]
+                upper = min(upper, next.start - length, next.end - minimumSeparation - length)
+            }
+            if lower <= upper { gaps.append(lower...upper) }
+        }
+        let start: Double
+        if desired > target.start {
+            guard let gap = gaps.last(where: { $0.lowerBound <= desired }) else { return nil }
+            let projected = min(desired, gap.upperBound)
+            start = gap.upperBound - projected <= drag.snapTolerance ? gap.upperBound : projected
+        } else {
+            guard let gap = gaps.first(where: { $0.upperBound >= desired }) else { return nil }
+            let projected = max(desired, gap.lowerBound)
+            start = projected - gap.lowerBound <= drag.snapTolerance ? gap.lowerBound : projected
+        }
+        var moved = target
+        moved.start = start; moved.end = start + length
+        guard valid(moved, duration: duration), ordered((others + [moved]).sorted { $0.end < $1.end }) else { return nil }
+        return moved == target ? [] : [moved]
     }
 
     private static func valid(_ value: TimelineAnimation, duration: Double) -> Bool {

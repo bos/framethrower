@@ -15,7 +15,8 @@ struct EditorAnimationEditingChecks {
         try coincidentIndependentLabels()
         try coincidentReference()
         try clippedFollowersStayPut()
-        print("Animation editing checks passed (lane-independent stop/snap/ripple, recording bounds, duration/ramp preservation, jump-to-smooth, actual metadata, atomic gesture Undo/Redo/Escape and failed-save draft retention; no media).")
+        try reorderedMetadata()
+        print("Animation editing checks passed (lane-independent stop/snap/reorder/ripple, recording bounds, duration/ramp preservation, shared identities, clipped followers, atomic durable Undo/Redo/Escape and failed-save draft retention; no media).")
     }
     static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
         guard try condition() else { throw AnimationCheckFailure.failed(message) }
@@ -324,6 +325,94 @@ struct EditorAnimationEditingChecks {
                     EditorActionDescription.resolve("Zoom " + cameraLetter, in: result, references: project.references) == nil,
                     "A merged group cannot fabricate an unrelated Camera/Screen label by borrowing the other component's letter")
     }
+    static func reorderedMetadata() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("animation-reorder-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for lane in [TimelineAnimationLane.screen, .camera] {
+            for forward in [true, false] {
+                let shared = UUID(), middleID = UUID(), lastID = UUID(), anchorID = UUID(), replacement = UUID()
+                let sourceTime = forward ? 4.0 : 12.0
+                let sourceDuration = forward ? 1.0 : 2.0
+                var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 16)
+                project.state.zoomKeyframes = [ZoomKeyframe(id: shared, time: sourceTime, scale: 1.8, x: 0.4,
+                    transition: .smooth, duration: sourceDuration, easeIn: 0.2, easeOut: 0.3)]
+                project.state.pipKeyframes.append(PIPKeyframe(id: shared, time: sourceTime,
+                    placement: PIPPlacement(x: 0.3, y: 0.6, scale: 0.35), transition: .smooth,
+                    duration: sourceDuration, easeIn: 0.2, easeOut: 0.3))
+                let firstTime = forward ? 8.0 : 4.0, secondTime = forward ? 12.0 : 8.0
+                let firstDuration = forward ? 12.0 : 1.0, secondDuration = forward ? 2.0 : 12.0
+                if lane == .screen {
+                    project.state.zoomKeyframes += [ZoomKeyframe(id: middleID, time: firstTime, scale: 2.2,
+                        transition: .smooth, duration: firstDuration, easeIn: 0.4, easeOut: 0.6),
+                        ZoomKeyframe(id: lastID, time: secondTime, scale: 2.5, transition: .smooth, duration: secondDuration)]
+                    project.state.zoomKeyframes.sort { $0.time < $1.time }
+                } else {
+                    project.state.pipKeyframes += [PIPKeyframe(id: middleID, time: firstTime,
+                        placement: PIPPlacement(x: 0.7, y: 0.3), transition: .smooth, duration: firstDuration, easeIn: 0.4, easeOut: 0.6),
+                        PIPKeyframe(id: lastID, time: secondTime, placement: PIPPlacement(x: 0.8, y: 0.2),
+                            transition: .smooth, duration: secondDuration)]
+                    project.state.pipKeyframes.sort { $0.time < $1.time }
+                }
+                project.state.editAnchors = [EditAnchor(id: anchorID, time: sourceTime)]
+                project.state.regions = [EditorRegion(time: sourceTime, rect: .init(x: 0.2, y: 0.2, width: 0.2, height: 0.2), editID: shared)]
+                project.state.cursorStyle.size = 2
+                project.state.audio.volume = 0.6
+                project.state.trimStart = 0.5; project.state.trimEnd = 15.5
+                project.references.edits = [shared.uuidString: 1, middleID.uuidString: 2, lastID.uuidString: 3, anchorID.uuidString: 4]
+                project.ensureReferences()
+                let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("\(lane.rawValue)-\(forward).framethrower"))
+                try require(editor.save(), "Save the JSON-only reorder baseline")
+                let original = editor.project
+                let base = EditorAnimationEditing.animations(in: original.state, references: editor.references, duration: 16)
+                let id = TimelineAnimationID(lane: lane, componentID: shared)
+                let target = at(id, in: base)
+                let replacementMap = [id: replacement]
+                var final: EditorAnimationEdit?
+                for delta in forward ? [9.5, 10.0] : [-8.5, -9.0] {
+                    guard let changes = TimelineAnimationSolver.solve(AnimationDrag(id: id, handle: .move,
+                        deltaSeconds: delta, snapTolerance: 0), animations: base, duration: 16),
+                        let edit = EditorAnimationEditing.applying(changes, to: original.state, duration: 16, replacementIDs: replacementMap) else {
+                        throw AnimationCheckFailure.failed("A fully cleared \(lane.rawValue) reorder must apply to actual project metadata")
+                    }
+                    let aliases = Dictionary(uniqueKeysWithValues: edit.aliases.map { ($0.replacementID, $0.originalID) })
+                    try require(editor.updateDraft(edit.state, at: target.end, editAliases: aliases),
+                                "All reordered samples use one frozen gesture origin and identity map")
+                    final = edit
+                }
+                let edit = final!, state = edit.state
+                let projected = EditorAnimationEditing.animations(in: state, references: editor.references, duration: 16)
+                let moved = at(TimelineAnimationID(lane: lane, componentID: replacement), in: projected)
+                try near(moved.start, forward ? 13 : 1, "A fully cleared drag retains the requested translated beginning")
+                try near(moved.end, forward ? 14 : 3, "The moved animation's target crosses the original chronological neighbors")
+                try require(moved.duration == target.duration && moved.easeIn == target.easeIn && moved.easeOut == target.easeOut,
+                            "Reordering retains the selected animation's duration and acceleration/deceleration")
+                for neighborID in [middleID, lastID] {
+                    let key = TimelineAnimationID(lane: lane, componentID: neighborID)
+                    let before = at(key, in: base), after = at(key, in: projected)
+                    try require(before.start == after.start && before.end == after.end && before.easeIn == after.easeIn && before.easeOut == after.easeOut,
+                                "Reordering cannot expand a previously clipped neighbor or shift its effective interval/ramps")
+                }
+                try require(state.editAnchors == original.state.editAnchors && state.regions == original.state.regions &&
+                            state.cursorStyle == original.state.cursorStyle && state.audio == original.state.audio &&
+                            state.trimStart == original.state.trimStart && state.trimEnd == original.state.trimEnd &&
+                            (lane == .screen ? state.pipKeyframes == original.state.pipKeyframes : state.zoomKeyframes == original.state.zoomKeyframes),
+                            "A reorder leaves the stationary lane, original source anchors/boxes and all global metadata intact")
+                try require(edit.aliases == [EditorAnimationIdentityAlias(originalID: shared, replacementID: replacement, lane: lane)] &&
+                            editor.references.editLabel(for: replacement) == original.references.editLabel(for: shared),
+                            "Splitting the shared raw component retains its own allocation rather than a coincident unrelated anchor's letter")
+                let times = lane == .screen ? state.zoomKeyframes.map(\.time) : state.pipKeyframes.dropFirst().map(\.time)
+                try require(times == (forward ? [8, 12, 14] : [3, 4, 8]), "Applied source metadata is chronologically sorted after reordering")
+                try require(editor.project == original && editor.finishDraft(name: "Reorder \(lane.rawValue) animation") && editor.project.undoHistory.count == 1,
+                            "Multiple reordered previews publish one normal saved history change")
+                let reopened = try ProjectEditor.open(url: editor.url)
+                try require(reopened.project.state == state && reopened.undo() && reopened.project.state == original.state &&
+                            reopened.redo() && reopened.project.state == state,
+                            "Save/reopen and one Undo/Redo retain both the animation ordering and split identity")
+            }
+        }
+    }
+
     static func coincidentReference() throws {
         let referenceID = UUID(), screenID = UUID()
         var project = RecordingProject(screenFilename: "missing.mov", duration: 10)

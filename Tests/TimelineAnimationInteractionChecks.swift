@@ -129,7 +129,25 @@ struct TimelineAnimationInteractionChecks {
         let origin = center(geometry(first.id).body)
         down(origin); drag(CGPoint(x: origin.x + view.x(for: 2) - view.x(for: 0), y: origin.y))
         require(abs(geometry(first.id).animation.end - 5) < 0.000_001 && geometry(next.id).animation == next && view.blockedAnimationIDs.contains(next.id), "ordinary collision pushed an unrelated span or lacked collision feedback")
-        key(53)
+        // Continue the SAME gesture through the neighbor. Only a wholly
+        // cleared requested interval may reorder; no neighbor is pushed.
+        drag(CGPoint(x: origin.x + view.x(for: 4.75) - view.x(for: 0), y: origin.y))
+        require(near(geometry(first.id).animation.end, 5) && view.blockedAnimationIDs.contains(next.id), "a partially overlapping body jumped through its neighbor")
+        let cleared = CGPoint(x: origin.x + view.x(for: 5.25) - view.x(for: 0), y: origin.y)
+        drag(cleared)
+        require(near(geometry(first.id).animation.start, 7.25) && near(geometry(first.id).animation.end, 9.25) && geometry(next.id).animation == next && view.blockedAnimationIDs.isEmpty,
+                "a fully cleared move remained clamped or falsely marked conflicting")
+        up(cleared)
+        require(requests.last?.1 == true && near(requests.last?.0.deltaSeconds ?? .nan, 5.25), "reordered movement lost its final frozen-base request")
+        let backward = span(.screen, 8, 10, "Pan backward"), earlier = span(.screen, 4, 6, "Zoom earlier")
+        let leftBlocked = TimelineAnimationSolver.solve(AnimationDrag(id: backward.id, handle: .move, deltaSeconds: -3, snapTolerance: 0), animations: [earlier, backward], duration: 12)
+        let leftClear = TimelineAnimationSolver.solve(AnimationDrag(id: backward.id, handle: .move, deltaSeconds: -6.25, snapTolerance: 0), animations: [earlier, backward], duration: 12)
+        require(leftBlocked?.first.map { near($0.start, 6) } == true && leftClear?.count == 1 && leftClear?.first.map { near($0.start, 1.75) && near($0.end, 3.75) } == true, "directional reorder was not symmetric or moved an untouched neighbor")
+        let resize = TimelineAnimationSolver.solve(AnimationDrag(id: first.id, handle: .end, deltaSeconds: 5.25, snapTolerance: 0), animations: [first, next], duration: 12)
+        require(resize?.first.map { near($0.end, 5) } == true, "resize unexpectedly reordered instead of stopping at contact")
+        let tooClose = span(.screen, 8, 10, "Zoom tight")
+        let narrowGap = TimelineAnimationSolver.solve(AnimationDrag(id: first.id, handle: .move, deltaSeconds: 5.5, snapTolerance: 0), animations: [first, next, tooClose], duration: 12)
+        require(narrowGap?.first.map { near($0.end, 5) } == true, "body was projected into a gap too short to contain it")
         reset([first, next, camera], selected: first.id)
         let pushing = center(geometry(first.id).body)
         down(pushing); drag(CGPoint(x: pushing.x + view.x(for: 2) - view.x(for: 0), y: pushing.y), option: true)
@@ -210,6 +228,28 @@ struct TimelineAnimationInteractionChecks {
         require(NSApp.sendAction(deleteItem.action!, to: deleteItem.target, from: deleteItem) && deletions == [camera.id], "context menu deleted a different co-timed component")
         view.selectedAnimationID = pointer.id; deletions = []; key(51)
         require(deletions.isEmpty, "Delete created a destructive operation for readonly pointer settings")
+
+        // Real crowded case: a Hold ends where a six-millisecond Zoom
+        // starts. Both remain discoverable even when their labels overlap.
+        let hold = span(.screen, 4.6, 5, "Hold D"), tinyZoom = span(.screen, 5, 5.006, "Zoom A")
+        reset([hold, tinyZoom], selected: tinyZoom.id)
+        let crowds = view.animationCrowds()
+        require(crowds.count == 1 && Set(crowds[0].ids) == [hold.id, tinyZoom.id] && view.animationGeometry().allSatisfy { !crowds[0].frame.intersects($0.body) }, "hidden Hold/Zoom lacked a crowd badge or the badge concealed a span body")
+        var crowdMenu: NSMenu?
+        view.presentAnimationMenu = { menu, _ in crowdMenu = menu }
+        let badge = center(crowds[0].frame)
+        down(badge); up(badge)
+        require(crowdMenu?.items.count == 2 && crowdMenu?.items.contains { $0.title.contains("Hold D") && $0.title.contains("4.600–5.000") } == true && crowdMenu?.items.contains { $0.title.contains("Zoom A") && $0.title.contains("5.000–5.006") } == true && requests.isEmpty,
+                "crowd chooser did not expose each individual action and source interval")
+        let tinyItem = crowdMenu!.items.first { $0.title.contains("Zoom A") }!
+        require(NSApp.sendAction(tinyItem.action!, to: tinyItem.target, from: tinyItem), "crowded Zoom could not be selected")
+        let tinyBody = geometry(tinyZoom.id).body
+        let grab = CGPoint(x: tinyBody.maxX - 1, y: tinyBody.midY)
+        let away = CGPoint(x: grab.x + view.x(for: 0.1) - view.x(for: 0), y: grab.y)
+        crowdMenu = nil; requests = []; selections = []
+        down(grab); drag(away); up(away)
+        require(requests.last?.0.id == tinyZoom.id && requests.last?.1 == true && crowdMenu == nil && selections.isEmpty,
+                "another span's external label made an abutting short span difficult to grab")
 
         // Coincident reference targets use a chooser, not overlapping drag hits.
         let otherRef = span(.screen, 6, 6, "Ref H", reference: true)

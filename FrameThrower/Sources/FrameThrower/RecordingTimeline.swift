@@ -107,6 +107,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let frame: CGRect
         let labelFrame: CGRect
     }
+    struct AnimationCrowdGeometry: Equatable {
+        let ids: [TimelineAnimationID]
+        let frame: CGRect
+        let sourceX: CGFloat
+    }
     struct PointerClickGeometry: Equatable {
         let time: Double
         let frame: CGRect
@@ -292,6 +297,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             }
         }
         if showsAnimationLanes {
+            for crowd in animationCrowds() {
+                tooltipText[addToolTip(crowd.frame, owner: self, userData: nil)] = "\(crowd.ids.count) crowded animations or reference marks. Click to choose by name and source interval."
+            }
             for click in pointerClickGeometry() {
                 tooltipText[addToolTip(click.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] = String(format: "Recorded click at %.3f seconds.", click.time)
             }
@@ -450,6 +458,41 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
     }
 
+    /// External labels can cover a very short neighboring Hold/Zoom. Keep
+    /// every body visible and expose each crowded group in a native chooser.
+    func animationCrowds() -> [AnimationCrowdGeometry] {
+        let geometry = animationGeometry()
+        let handles = geometry.flatMap { [$0.startHandle, $0.endHandle, $0.easeInHandle, $0.easeOutHandle].compactMap { $0 } }
+        var result: [AnimationCrowdGeometry] = []
+        for lane in animationLanes() {
+            let ordered = geometry.filter { $0.animation.lane == lane.lane }.sorted {
+                $0.animation.start == $1.animation.start ? $0.animation.end < $1.animation.end : $0.animation.start < $1.animation.start
+            }
+            var groups: [[AnimationGeometry]] = []
+            for item in ordered {
+                var members = [item]
+                while let previous = groups.last,
+                      previous.contains(where: { first in members.contains { second in
+                          first.body.union(first.labelFrame).intersects(second.body.union(second.labelFrame))
+                      } }) {
+                    members = groups.removeLast() + members
+                }
+                groups.append(members)
+            }
+            for group in groups where group.count > 1 {
+                let anchor = group.reduce(CGFloat.zero) { $0 + x(for: $1.animation.end) } / CGFloat(group.count)
+                let width = max(18, CGFloat(String(group.count).count * 6 + 10))
+                let candidates = [anchor - width / 2, anchor + 6, anchor - width - 6].map {
+                    CGRect(x: min(max(railOrigin, $0), bounds.width - 12 - width), y: lane.frame.maxY, width: width, height: 11)
+                }
+                let frame = candidates.first { candidate in !handles.contains { $0.intersects(candidate) } &&
+                    !result.contains { $0.frame.intersects(candidate) } } ?? candidates[0]
+                result.append(AnimationCrowdGeometry(ids: group.map { $0.animation.id }, frame: frame, sourceX: anchor))
+            }
+        }
+        return result
+    }
+
     private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
         switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .pointer: .secondaryLabelColor }
     }
@@ -522,13 +565,41 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             outline.setLineDash([3, 2], count: 2, phase: 0); outline.lineWidth = 2; outline.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
+        for crowd in animationCrowds() {
+            NSColor.secondaryLabelColor.setStroke()
+            let leader = NSBezierPath()
+            leader.move(to: CGPoint(x: crowd.sourceX, y: crowd.frame.minY - 2))
+            leader.line(to: CGPoint(x: crowd.frame.midX, y: crowd.frame.minY + 1)); leader.stroke()
+            NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+            NSBezierPath(roundedRect: crowd.frame, xRadius: 4, yRadius: 4).fill()
+            let text = String(crowd.ids.count) as NSString
+            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold), .foregroundColor: NSColor.white]
+            let width = text.size(withAttributes: attributes).width
+            text.draw(at: CGPoint(x: crowd.frame.midX - width / 2, y: crowd.frame.minY), withAttributes: attributes)
+        }
     }
 
     private func animationTargets(at point: CGPoint) -> [AnimationGeometry] {
-        animationGeometry().filter { $0.body.contains(point) || $0.labelFrame.contains(point) }
+        let geometry = animationGeometry()
+        let bodies = geometry.filter { $0.body.contains(point) }
+        return bodies.isEmpty ? geometry.filter { $0.labelFrame.contains(point) } : bodies
     }
 
     private func beginAnimationInteraction(at point: CGPoint) {
+        animationPointerOrigin = point
+        let geometry = animationGeometry()
+        if let selected = geometry.first(where: { $0.animation.id == selectedAnimationID }) {
+            if selected.deleteButton?.contains(point) == true { animationDeleteID = selected.animation.id; return }
+            let handles: [(CGRect?, TimelineAnimationHandle)] = [(selected.easeInHandle, .easeIn), (selected.easeOutHandle, .easeOut),
+                (selected.startHandle, .start), (selected.endHandle, .end)]
+            for (frame, handle) in handles where frame?.contains(point) == true {
+                animationPointerOrigin = point
+                animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans); return
+            }
+        }
+        if let crowd = animationCrowds().first(where: { $0.frame.contains(point) }) {
+            animationPointerOrigin = point; animationChooserIDs = crowd.ids; return
+        }
         guard animationLanes().contains(where: { $0.frame.contains(point) || $0.labelFrame.contains(point) }) else { return }
         if conflictBands().contains(where: { $0.frame.contains(point) }) {
             onScrubBegan?()
@@ -539,15 +610,6 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             return
         }
         animationPointerOrigin = point
-        let geometry = animationGeometry()
-        if let selected = geometry.first(where: { $0.animation.id == selectedAnimationID }) {
-            if selected.deleteButton?.contains(point) == true { animationDeleteID = selected.animation.id; return }
-            let handles: [(CGRect?, TimelineAnimationHandle)] = [(selected.easeInHandle, .easeIn), (selected.easeOutHandle, .easeOut),
-                (selected.startHandle, .start), (selected.endHandle, .end)]
-            for (frame, handle) in handles where frame?.contains(point) == true {
-                animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans); return
-            }
-        }
         let targets = animationTargets(at: point)
         if targets.count > 1 { animationChooserIDs = targets.map { $0.animation.id }; return }
         if let target = targets.first {
@@ -599,9 +661,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 case .end: target.end += delta
                 case .easeIn, .easeOut: break
                 }
-                blockedAnimation = target
-                blockedAnimationIDs = Set(gesture.base.filter { $0.lane == target.lane && $0.id != target.id && $0.start < target.end && $0.end > target.start }.map(\.id))
-                blockedAnimationIDs.insert(target.id)
+                blockedAnimationIDs = collisionIDs(for: target, in: gesture.base)
+                blockedAnimation = blockedAnimationIDs.isEmpty ? nil : target
             }
             animationGesture = gesture; needsDisplay = true; return
         }
@@ -618,14 +679,20 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             case .easeIn, .easeOut: break
             }
             if abs(wanted.start - projected.start) > 0.000_001 || abs(wanted.end - projected.end) > 0.000_001 {
-                blockedAnimation = wanted
-                blockedAnimationIDs = Set(gesture.base.filter { $0.lane == wanted.lane && $0.id != wanted.id && !$0.isReference && $0.start < wanted.end && $0.end > wanted.start }.map(\.id))
-                blockedAnimationIDs.insert(wanted.id)
+                blockedAnimationIDs = collisionIDs(for: wanted, in: gesture.base)
+                blockedAnimation = blockedAnimationIDs.isEmpty ? nil : wanted
             }
         }
         animationGesture = gesture
         onAnimationEdit?(request, false)
         needsDisplay = true; updateTooltips()
+    }
+
+    private func collisionIDs(for wanted: TimelineAnimation, in base: [TimelineAnimation]) -> Set<TimelineAnimationID> {
+        var ids = Set(base.filter { $0.lane == wanted.lane && $0.id != wanted.id && !$0.isReference &&
+            $0.start < wanted.end && $0.end > wanted.start }.map(\.id))
+        if !ids.isEmpty || wanted.start < 0 || wanted.end > duration || wanted.start > wanted.end { ids.insert(wanted.id) }
+        return ids
     }
 
     private func endAnimationInteraction(at point: CGPoint) {
@@ -661,6 +728,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                     self.onSelectAnimation?(animation.id); return true
                 }
             }
+        }
+        for crowd in animationCrowds() {
+            actions.append(NSAccessibilityCustomAction(name: "Choose among \(crowd.ids.count) crowded animations") { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return false }
+                    self.chooseAnimations(crowd.ids, at: CGPoint(x: crowd.frame.midX, y: crowd.frame.maxY)); return true
+                }
+            })
         }
         if let id = selectedAnimationID, let selected = animationSpans.first(where: { $0.id == id && $0.editable }) {
             actions.append(NSAccessibilityCustomAction(name: "Delete \(selected.label)") { [weak self] in

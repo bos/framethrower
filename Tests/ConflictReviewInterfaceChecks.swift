@@ -209,7 +209,61 @@ struct ConflictReviewInterfaceChecks {
         try await laneGestures(host: host, window: window, timeline: timeline, canvas: canvas, editor: editor, playback: playback)
         try await boxDeletion(host: host, window: window, canvas: canvas, editor: editor, session: session)
         try await linkedBoxDeletion(directory: directory)
+        try await drawnBoxSourceTime(directory: directory)
         print("Conflict review interface checks passed (native preview Pan/Box tools and sidebar/preview Delete with ordinary text editing, vector playthrough, persistent independent lanes, native atomic/ripple/Escape editing, Screen-only conflict review, inspector-independent fixed geometry; no AV objects/media).")
+    }
+    static func drawnBoxSourceTime(directory: URL) async throws {
+        var existingBox = EditorRegion(time: 1, rect: .init(x: 0.3, y: 0.3, width: 0.4, height: 0.4))
+        var first = ZoomKeyframe(time: 1, scale: 2, transition: .smooth, duration: 1)
+        first.sourceRegionID = existingBox.id; existingBox.editID = first.id
+        var project = RecordingProject(screenFilename: "draw-source.mov", duration: 12)
+        project.state.regions = [existingBox]
+        project.state.zoomKeyframes = [first, ZoomKeyframe(time: 5, scale: 2.5, x: 0.65, y: 0.6, transition: .smooth, duration: 1)]
+        project.ensureReferences()
+        let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("draw-source.framethrower"))
+        let playback = EditorPlayback()
+        let assistant = EditorAssistantSession(transport: { _ in throw Failure.failed("Draw-source check must never call a model") })
+        let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: true,
+            playback: playback, assistant: assistant))
+        let window = OffscreenConflictWindow(contentRect: CGRect(x: -16000, y: -16000, width: 1200, height: 850),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = host; window.orderFront(nil)
+        defer { assistant.suspend(); playback.close(); window.close() }
+        try await settle(host)
+        try await Task.sleep(for: .milliseconds(400))
+        try await settle(host)
+        guard let canvas = all(EditorCanvasView.self, in: host).first,
+              let timeline = all(RecordingTimelineView.self, in: host).first else { throw Failure.failed("Draw-source native views missing") }
+        playback.seek(6); try await settle(host)
+        let id = TimelineAnimationID(lane: .screen, componentID: first.id)
+        let item = timeline.animationGeometry().first { $0.animation.id == id }!
+        let mark = CGPoint(x: item.body.midX, y: item.body.midY)
+        timeline.mouseDown(with: mouse(.leftMouseDown, mark, in: timeline, window: window))
+        timeline.mouseUp(with: mouse(.leftMouseUp, mark, in: timeline, window: window))
+        try await settle(host)
+        let original = editor.project.state, visibleZoom = canvas.zoom
+        try require(playback.time == 6 && timeline.selectedAnimationID == id && visibleZoom == original.zoom(at: 6) &&
+                    visibleZoom != original.zoom(at: 1) && canvas.drawsReferenceBoxes,
+                    "Draw-source fixture shows paused6s while the1s target is selected in Draw box")
+        let start = CGPoint(x: canvas.contentRect.midX, y: canvas.contentRect.midY)
+        let end = CGPoint(x: start.x + 70, y: start.y + 35)
+        canvas.mouseDown(with: mouse(.leftMouseDown, start, in: canvas, window: window))
+        canvas.mouseDragged(with: mouse(.leftMouseDragged, end, in: canvas, window: window))
+        guard let drawn = canvas.referenceDraft else { throw Failure.failed("Actual Draw box drag has no live source rectangle") }
+        canvas.mouseUp(with: mouse(.leftMouseUp, end, in: canvas, window: window))
+        try await settle(host)
+        let added = editor.project.state.regions.filter { $0.id != existingBox.id }
+        try require(added.count == 1 && added[0].time == 6 && added[0].rect == drawn &&
+                    editor.project.state.editAnchors.contains { $0.id == added[0].editID && $0.time == 6 } &&
+                    timeline.selectedAnimationID?.lane == .screen && timeline.selectedAnimationID?.componentID == added[0].editID &&
+                    added[0].editID != first.id && editor.project.state.zoomKeyframes == original.zoomKeyframes &&
+                    playback.time == 6 && canvas.zoom == visibleZoom && editor.project.undoHistory.count == 1,
+                    "Drawing visible6s footage saves a6s box/reference, not the selected1s edit, without changing framing or source time")
+        try require(editor.undo(), "One Undo restores drawing the source-time box")
+        try await settle(host)
+        try require(editor.project.state == original && editor.project.state.zoomKeyframes.first?.sourceRegionID == existingBox.id &&
+                    editor.project.state.regions.first?.id == existingBox.id && !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer,
+                    "Undo restores exact prior box/link identities and removes the new reference without accessing media")
     }
     static func linkedBoxDeletion(directory: URL) async throws {
         var aBox = EditorRegion(time: 0, rect: .init(x: 0.05, y: 0.15, width: 0.25, height: 0.25))

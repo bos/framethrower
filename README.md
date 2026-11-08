@@ -320,7 +320,8 @@ The preview's **Pan view / Draw box** selector chooses the mouse gesture.
 **Pan view** lets you drag a zoomed video while keeping Director and its boxes
 visible. Box badges remain selectable. The camera remains directly movable
 and resizable in either tool. **Draw box** opens Director if necessary and pauses playback when
-you start drawing. Drawing retains a fixed source frame until release. Pinch and
+you start drawing. Drawing retains a fixed source frame until release, and the
+box's timestamp comes from that visible frame even when another edit is selected. Pinch and
 two-finger pan work with either tool. Switching tools cancels an unfinished mouse
 gesture while retaining earlier completed framing adjustments at that time.
 Escape cancels unfinished drawing or framing first, then exits Director mode.

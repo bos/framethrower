@@ -43,6 +43,7 @@ struct ProjectEditorView: View {
     @State private var directorMode = false
     @State private var previewTool: PreviewTool = .pan
     @State private var selectedRegionID: UUID?
+    @State private var referenceFrameTime: Double?
     @State private var comparisonDismissedForManualEdit = false
     @State private var canvasGesture: CanvasGestureSnapshot?
     private struct CanvasGestureSnapshot {
@@ -293,6 +294,7 @@ struct ProjectEditorView: View {
                 assistant.cancel()
                 if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
                 playback.pause()
+                referenceFrameTime = playback.editingTime
             },
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
             onDeleteRegion: { removeRegion($0) },
@@ -392,12 +394,15 @@ struct ProjectEditorView: View {
     }
 
     private func addRegion(_ rect: EditorRegionRect) {
+        let sourceTime = referenceFrameTime ?? playback.editingTime
+        referenceFrameTime = nil
         guard editor.finishDraft() else { return }
         var next = editor.project.state
-        let region = next.addRegion(rect: rect, at: editTime, includeCamera: editor.project.cameraFilename != nil)
+        let region = next.addRegion(rect: rect, at: sourceTime, includeCamera: editor.project.cameraFilename != nil)
         if editor.commit(next, name: "Draw box") {
             selectedRegionID = region.id
             selectedEditID = region.editID
+            synchronizeAnimationSelection()
         }
     }
 

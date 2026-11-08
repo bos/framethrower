@@ -186,8 +186,21 @@ private final class PreviewGesture: NSEvent {
             "Direct camera corner resizing still commits normally in Pan")
         canvas.drawsReferenceBoxes = true
         configure(initial, camera: true)
-        try require(canvas.interactionCursor(at: center) === NSCursor.crosshair,
-            "Box tool consistently draws over the camera instead of secretly moving it")
+        let beforeBoxCameraCommits = pipCommits.count, beforeBoxCameraBoxes = boxes.count
+        try require(canvas.interactionCursor(at: center) === NSCursor.openHand,
+            "Draw box retains the camera's direct manipulation cursor")
+        press(center); move(CGPoint(x: center.x - 20, y: center.y - 10)); release(center)
+        configure(initial, camera: true)
+        try require(canvas.interactionCursor(at: corner) !== NSCursor.crosshair,
+            "Draw box retains camera corner resize cursors")
+        press(corner); move(CGPoint(x: corner.x - 20, y: corner.y - 10)); release(corner)
+        try require(pipCommits.count == beforeBoxCameraCommits + 2 && boxes.count == beforeBoxCameraBoxes,
+            "Camera body and corner drag normally in Draw box without accidentally creating references")
+        configure(initial, camera: true)
+        try require(canvas.interactionCursor(at: start) === NSCursor.crosshair, "Only the Draw box background uses a crosshair")
+        press(start); move(end)
+        try require(canvas.referenceDraft != nil, "Drawing outside the camera still creates a live reference")
+        canvas.cancelOperation(nil); release(end)
         var toolCanceled = 0
         canvas.onToolCancel = { toolCanceled += 1 }
         let priorCanceled = canceled, priorCommits = zoomCommits.count

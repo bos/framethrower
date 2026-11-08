@@ -318,8 +318,8 @@ same undoable operation. This adds no zoom or camera movement, so the first
 box-first workflow has an Edit A to refer to without changing the footage.
 The preview's **Pan view / Draw box** selector chooses the mouse gesture.
 **Pan view** lets you drag a zoomed video while keeping Director and its boxes
-visible. Box badges remain selectable, and the camera remains directly movable
-and resizable. **Draw box** opens Director if necessary and pauses playback when
+visible. Box badges remain selectable. The camera remains directly movable
+and resizable in either tool. **Draw box** opens Director if necessary and pauses playback when
 you start drawing. Drawing retains a fixed source frame until release. Pinch and
 two-finger pan work with either tool. Switching tools cancels an unfinished mouse
 gesture while retaining earlier completed framing adjustments at that time.

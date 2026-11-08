@@ -487,7 +487,6 @@ final class EditorCanvasView: NSView {
         guard conflictOutlines == nil else { return .arrow }
         if zoomDrag != nil { return .closedHand }
         if scribbleMode, guideBadges.contains(where: { $0.frame.contains(point) }) { return .pointingHand }
-        if isBoxTool { return contentRect.contains(point) ? .crosshair : .arrow }
         if cameraEnabled, placement.visible {
             if let corner = cameraCorner(at: point) {
                 let position: NSCursor.FrameResizePosition
@@ -501,6 +500,7 @@ final class EditorCanvasView: NSView {
             }
             if cameraRect.contains(point) { return drag == nil ? .openHand : .closedHand }
         }
+        if isBoxTool { return contentRect.contains(point) ? .crosshair : .arrow }
         return canPan && canvasRect.contains(point) ? .openHand : .arrow
     }
 
@@ -539,6 +539,15 @@ final class EditorCanvasView: NSView {
             guidePressID = badge.regionID
             return
         }
+        let rect = cameraRect
+        let corner = cameraCorner(at: point)
+        if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
+            window?.makeFirstResponder(self)
+            finishTrackpad()
+            ignoresTrackpadRemainder = true
+            drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
+            return
+        }
         if isBoxTool {
             window?.makeFirstResponder(self)
             guard scribbleGeometry.sourcePoint(point) != nil else { onSelectRegion?(nil); return }
@@ -549,15 +558,6 @@ final class EditorCanvasView: NSView {
             scribbleStart = point
             referenceDraft = nil
             onReferenceBegin?()
-            return
-        }
-        let rect = cameraRect
-        let corner = cameraCorner(at: point)
-        if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
-            window?.makeFirstResponder(self)
-            finishTrackpad()
-            ignoresTrackpadRemainder = true
-            drag = Drag(point: point, origin: placement, corner: corner, draft: placement)
             return
         }
         guard allowsZoomEditing, canvasRect.contains(point), canvasRect.width > 0, canvasRect.height > 0 else { return }

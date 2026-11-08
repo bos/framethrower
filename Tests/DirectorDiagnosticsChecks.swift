@@ -12,7 +12,22 @@ struct DirectorDiagnosticsChecks {
         try checkRotation(directory.appendingPathComponent("rotation"))
         try checkOversized(directory.appendingPathComponent("oversized"))
         try checkFailures(directory.appendingPathComponent("failures"))
+        try checkImageRedaction(directory.appendingPathComponent("images"))
         print("Director diagnostic checks passed (JSONL chronology/correlation, bounded rotation and truncation, private permissions, and nonfatal failures; no app, audio, video, or network).")
+    }
+
+    static func checkImageRedaction(_ directory: URL) throws {
+        let logger = DirectorDiagnostics(directory: directory)
+        let pixels = "data:image/png;base64,PRIVATE_SYNTHETIC_PIXELS"
+        let details: [String: Any] = ["payload": ["messages": [["role": "user", "content": [
+            ["type": "text", "text": "observation_id=fixture source_time=2 width=1000 height=600"],
+            ["type": "image_url", "image_url": ["url": pixels, "detail": "high"]]
+        ]]]]]
+        try require(logger.record("model_request", sessionID: UUID(), details: details), "Record image attachment manifest")
+        let saved = try String(contentsOf: logger.logURL, encoding: .utf8)
+        try require(!saved.contains("PRIVATE_SYNTHETIC_PIXELS") && !saved.contains("data:image/png") &&
+                    saved.contains("observation_id=fixture") && saved.contains("sha256") && saved.contains("encoded_bytes"),
+                    "Image pixels stay out of logs while inspection identity/geometry and attachment hashes survive")
     }
 
     static func require(_ value: @autoclosure () throws -> Bool, _ message: String) throws {

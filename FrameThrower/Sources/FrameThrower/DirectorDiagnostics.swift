@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Local interaction traces contain text and editing metadata supplied by the
 /// caller. They never record audio, video, credentials, or network traffic.
@@ -33,7 +34,7 @@ final class DirectorDiagnostics {
                 "sequence": next,
                 "session_id": sessionID.uuidString,
                 "event": String(event.prefix(128)),
-                "details": details
+                "details": Self.withoutImagePixels(details)
             ]
             if event.count > 128 { entry["event_truncated"] = true }
             if let requestID { entry["request_id"] = requestID.uuidString }
@@ -54,6 +55,20 @@ final class DirectorDiagnostics {
             sequence = next
             return true
         } catch { return false }
+    }
+
+    /// Keep requests debuggable without copying image pixels into interaction
+    /// logs. The corresponding inspection result retains its ID and geometry.
+    private static func withoutImagePixels(_ value: Any) -> Any {
+        if let values = value as? [Any] { return values.map(withoutImagePixels) }
+        guard let dictionary = value as? [String: Any] else { return value }
+        if dictionary["type"] as? String == "image_url" {
+            let image = dictionary["image_url"] as? [String: Any]
+            let url = image?["url"] as? String ?? ""
+            let digest = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
+            return ["type": "image_attachment", "encoded_bytes": url.utf8.count, "sha256": digest]
+        }
+        return dictionary.mapValues(withoutImagePixels)
     }
 
     private func boundedLine(_ original: [String: Any]) throws -> Data {

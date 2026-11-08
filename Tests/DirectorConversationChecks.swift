@@ -152,7 +152,9 @@ struct DirectorConversationChecks {
         session.instruction = "Name Box 1 Search results."
         session.submit(editor: fixture.editor, playhead: 0, regionID: nil, editID: nil)
         try await wait { await transport.payloads.count == 1 }
-        await transport.reply(0, try tool("label_region", fixture.scope(session).merging(["region_id": fixture.box1.id.uuidString, "label": "Search results"]) { _, b in b }))
+        await transport.reply(0, try tool("manage_boxes", fixture.scope(session).merging([
+            "version": 1, "changes": [["action": "note", "box_label": "Box 1", "note": "Search results"]]
+        ]) { _, b in b }))
         try await wait { !session.isBusy }
         try require(session.errorMessage == nil && fixture.editor.project.state.regions[0].note == "Search results", "First model action actually applies")
         var state = fixture.editor.project.state

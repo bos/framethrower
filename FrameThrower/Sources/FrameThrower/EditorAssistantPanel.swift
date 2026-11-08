@@ -26,6 +26,12 @@ final class EditorAssistantSession: ObservableObject {
     private var speechID: UUID?
     private var pendingSpeechID: UUID?
     private let transport: (@Sendable (Data) async throws -> Data)?
+    private var inspections: DirectorInspectionCache
+    private let injectedInspections: Bool
+    private var inspectionImageMessage: [String: Any]?
+    private var inspectionImageCallID: String?
+    @Published private(set) var inspectedFrames: [UUID: Data] = [:]
+    private var inspectedFrameOrder: [UUID] = []
     @Published private(set) var modelProvider: DirectorProvider
     private let diagnostics: DirectorDiagnostics?
     private let persistsConversation: Bool
@@ -39,8 +45,11 @@ final class EditorAssistantSession: ObservableObject {
 
     init(transport: (@Sendable (Data) async throws -> Data)? = nil,
          diagnostics: DirectorDiagnostics? = nil, persistsConversation: Bool? = nil,
-         conversationStorageURL: URL? = nil, provider: DirectorProvider? = nil) {
+         conversationStorageURL: URL? = nil, provider: DirectorProvider? = nil,
+         inspectionCache: DirectorInspectionCache? = nil) {
         self.transport = transport
+        self.inspections = inspectionCache ?? DirectorInspectionCache()
+        self.injectedInspections = inspectionCache != nil
         self.modelProvider = provider ?? (transport == nil ? .preferred : .localQwen)
         self.diagnostics = diagnostics ?? (transport == nil ? .shared : nil)
         self.persistsConversation = persistsConversation ?? (transport == nil || conversationStorageURL != nil)
@@ -59,6 +68,14 @@ final class EditorAssistantSession: ObservableObject {
         guard observedEditor !== editor else { return }
         projectObservation?.cancel()
         observedEditor = editor
+        inspectionImageMessage = nil
+        inspectionImageCallID = nil
+        inspectedFrames = [:]; inspectedFrameOrder = []
+        if !injectedInspections {
+            inspections = DirectorInspectionCache(recordedSceneURL: editor.project.sceneFilename.map {
+                editor.url.deletingLastPathComponent().appendingPathComponent($0)
+            })
+        }
         let history = DirectorConversation(storageURL: persistsConversation ? (conversationStorageURL ?? DirectorConversation.storageURL(for: editor.url)) : nil)
         conversation = history
         if instruction.isEmpty { instruction = history.draftInstruction }
@@ -215,6 +232,10 @@ final class EditorAssistantSession: ObservableObject {
                 recording: recording, playhead: playhead, selectedRegionID: regionID,
                 selectedEditID: editID, videoProcessingAvailable: !MediaProcessing.isSuspended)
             context.liveUI = LocalEditUIContext(playhead: playhead, selectedRegionID: regionID, selectedEditID: editID)
+            context.inspectionCapabilities = inspections.capabilities(supportsImages: modelProvider.supportsImages)
+            context.inspectionHasObservations = inspections.hasObservations
+            inspectionImageMessage = nil
+            inspectionImageCallID = nil
             let routingRequest = pendingQuestion?.request ?? text
             let payload = try modelPayload(text: text, context: context, routingRequest: routingRequest,
                 question: pendingQuestion, conflict: pendingConflict)
@@ -234,6 +255,7 @@ final class EditorAssistantSession: ObservableObject {
                 var requestPayload = payload
                 var attempt = 0
                 var historyLookups = 0
+                var sceneLookups = 0
                 do {
                     while true {
                     let data = try await transport(requestPayload)
@@ -245,7 +267,7 @@ final class EditorAssistantSession: ObservableObject {
                         self.record("ignored_response", requestID: token, details: ["reason": "superseded or cancelled"])
                         return
                     }
-                    if historyLookups > 0 {
+                    if historyLookups > 0 || sceneLookups > 0 {
                         guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
                         guard try EditorCommandDispatcher.revision(for: editor.project) == context.recording.revision else {
                             throw EditorCommandError.stale
@@ -256,12 +278,87 @@ final class EditorAssistantSession: ObservableObject {
                     // ordered conversation supplies intent, while typed command
                     // validation still enforces scope, bounds and atomicity.
                     let validationInstruction = pendingQuestion == nil ? text : nil
-                    let result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
+                    var result = try pendingConflict.map { try LocalEditPlanner.conflictResult(data, conflict: $0.proposal) }
                         ?? LocalEditPlanner.result(data, context: context, instruction: validationInstruction,
                             routingRequest: routingRequest, historyInspected: historyLookups > 0)
+                    if case let .inspection(action) = result {
+                        var inspectionBudget = 6_144
+                        switch action {
+                        case .frameObservation: break
+                        case .scene, .frame:
+                            guard sceneLookups < 4 else {
+                                throw EditorCommandError.invalid("Director reached the inspection limit. No changes were applied. Try a more specific target.")
+                            }
+                            sceneLookups += 1
+                            var lookupContext = context
+                            lookupContext.inspectionHasObservations = true
+                            let basePayload = try LocalEditPlanner.payload(request: text, context: lookupContext,
+                                routingRequest: routingRequest, historyInspected: historyLookups > 0)
+                            // Keep room for the real call/result envelope and
+                            // JSON escaping. The cache trims both rows and IDs.
+                            let remaining = 20_000 - basePayload.count - 1_024
+                            self.record("inspection_context_budget", requestID: token,
+                                details: ["base_text_bytes": basePayload.count, "available_result_bytes": remaining])
+                            guard remaining >= 1_536 else {
+                                throw EditorCommandError.invalid("This recording leaves too little model context for a scene lookup. No changes were made.")
+                            }
+                            inspectionBudget = min(6_144, remaining)
+                        }
+                        switch try await self.inspections.perform(action, project: editor.project,
+                            projectID: self.projectID, supportsImages: provider.supportsImages,
+                            maximumResultBytes: inspectionBudget) {
+                        case let .observation(observation):
+                            try Task.checkCancellation()
+                            guard self.generation == token,
+                                  try EditorCommandDispatcher.revision(for: editor.project) == context.recording.revision else {
+                                throw EditorCommandError.stale
+                            }
+                            let value = try JSONSerialization.jsonObject(with: observation.result)
+                            context.inspectionHasObservations = true
+                            if let png = observation.imagePNG {
+                                self.inspectedFrames[observation.id] = png
+                                self.inspectedFrameOrder.append(observation.id)
+                                while self.inspectedFrameOrder.count > 4 || self.inspectedFrames.values.reduce(0, { $0 + $1.count }) > 16 * 1024 * 1024 {
+                                    self.inspectedFrames.removeValue(forKey: self.inspectedFrameOrder.removeFirst())
+                                }
+                            }
+                            let facts = value as? [String: Any]
+                            let subject = observation.imagePNG != nil ? "source frame" :
+                                (facts?["detail"] as? String == "controls" ? "recorded controls" :
+                                    facts?["detail"] as? String == "search" ? "recorded targets" : "recorded windows")
+                            let requested = facts?["requested_time"] as? Double ?? observation.sourceTime
+                            let inspectionSummary = observation.imagePNG == nil && abs(requested - observation.sourceTime) > 0.1
+                                ? String(format: "Looked up %@ for %.2f s; last observed at %.2f s.", subject, requested, observation.sourceTime)
+                                : String(format: "Inspected %@ at %.2f s.", subject, observation.sourceTime)
+                            self.finish(token, response: data, outcome: ["status": "inspected", "applied": false,
+                                "inspection": value, "revision": context.recording.revision,
+                                "summary": inspectionSummary])
+                            // Persistence normalizes reused/empty provider IDs.
+                            // Images must refer to that actual retained pair.
+                            self.inspectionImageCallID = self.conversation.exchanges.last?.messages.last?.toolCallID
+                            self.inspectionImageMessage = self.inspectionImageCallID.flatMap {
+                                observation.imageMessage(toolCallID: $0)
+                            }
+                            response = nil
+                            requestPayload = try self.modelPayload(text: text, context: context, routingRequest: routingRequest,
+                                question: pendingQuestion, conflict: pendingConflict, continuation: true,
+                                historyInspected: historyLookups > 0, continuingRequestID: token)
+                            self.record("model_request", requestID: token, details: ["inspection_lookup": sceneLookups,
+                                "payload": self.object(requestPayload)])
+                            continue
+                        case let .proposal(batch, summary):
+                            result = LocalEditPlanner.observedFramingResult(batch, summary: summary, context: context)
+                        }
+                    }
+                    if case let .observationReport(id, summary) = result {
+                        _ = try self.inspections.validatedObservation(id: id, project: editor.project, projectID: self.projectID)
+                        result = .noChanges(summary)
+                    }
                     var outcome: [String: Any]
                     var appliedFrom: EditState?
                     switch result {
+                    case .inspection, .observationReport:
+                        throw EditorCommandError.invalid("The inspection did not produce a result.")
                     case let .historyLookup(request):
                         guard historyLookups < 4 else {
                             throw EditorCommandError.invalid("Director reached the history lookup limit. No changes were applied. Try naming a more specific change.")
@@ -374,6 +471,9 @@ final class EditorAssistantSession: ObservableObject {
         var budget = 12_000
         while true {
             var messages = conversation.messages(byteBudget: budget, continuing: continuingRequestID)
+            let imagePairRetained = continuation && inspectionImageCallID.map { callID in
+                messages.contains { $0["role"] as? String == "tool" && $0["tool_call_id"] as? String == callID }
+            } == true
             if let question, !continuation {
                 let active: [String: Any] = ["app_event": ["kind": "pending_question",
                     "original_instruction": question.request, "question": question.question,
@@ -381,18 +481,42 @@ final class EditorAssistantSession: ObservableObject {
                 messages.append(["role": "user", "content": String(decoding:
                     try JSONSerialization.data(withJSONObject: active, options: .sortedKeys), as: UTF8.self)])
             }
-            let payload = try conflict.map {
+            var payload = try conflict.map {
                 try LocalEditPlanner.conflictPayload(answer: text, conflict: $0.proposal, context: context,
                     question: $0.followup, conversation: messages)
             } ?? LocalEditPlanner.payload(request: text, context: context,
                 routingRequest: routingRequest, conversation: messages, continuation: continuation,
                 historyInspected: historyInspected)
-            if payload.count <= 20_000 { return payload }
+            if imagePairRetained, let inspectionImageMessage,
+               var root = try JSONSerialization.jsonObject(with: payload) as? [String: Any],
+               var ordered = root["messages"] as? [[String: Any]] {
+                // The planner validates the actual call/result continuation
+                // first. Its separate evidence block follows that paired result.
+                ordered.append(inspectionImageMessage)
+                root["messages"] = ordered
+                payload = try JSONSerialization.data(withJSONObject: root)
+            }
+            // Images have their own transport budget. Conversation and scene
+            // text still pass the ordinary small context budget independently.
+            if payload.count <= 20_000 || (inspectionImageMessage != nil && continuation &&
+                Self.textPayloadBytes(payload) <= 20_000 && payload.count <= 24 * 1024 * 1024) { return payload }
             guard budget > 0 else {
                 throw EditorCommandError.invalid("This recording has more editing state than Director can currently process. No changes were made.")
             }
             budget = budget > 1_000 ? budget / 2 : 0
         }
+    }
+
+    private static func textPayloadBytes(_ payload: Data) -> Int {
+        guard var root = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
+              var messages = root["messages"] as? [[String: Any]] else { return Int.max }
+        for index in messages.indices {
+            if let blocks = messages[index]["content"] as? [[String: Any]] {
+                messages[index]["content"] = blocks.filter { $0["type"] as? String != "image_url" }
+            }
+        }
+        root["messages"] = messages
+        return (try? JSONSerialization.data(withJSONObject: root).count) ?? Int.max
     }
 
     /// Resolve the displayed proposal directly; the captured identity prevents
@@ -574,6 +698,7 @@ struct EditorAssistantPanel: View {
                 Divider()
             }
             DirectorConversationView(conversation: session.conversation, references: editor.references,
+                inspectedFrames: session.inspectedFrames,
                 state: editor.editingState, selectedEditID: selectedEditID,
                 pendingQuestion: session.awaitsClarification ? session.notice : nil,
                 isBusy: session.isBusy, conflictReview: session.conflictReview, conflictReviewID: session.conflictReviewID,
@@ -779,6 +904,7 @@ private struct ConversationScrollPosition: Equatable {
 private struct DirectorConversationView: View {
     @ObservedObject var conversation: DirectorConversation
     let references: EditorReferences
+    let inspectedFrames: [UUID: Data]
     let state: EditState
     let selectedEditID: UUID?
     let pendingQuestion: String?
@@ -843,6 +969,11 @@ private struct DirectorConversationView: View {
     @ViewBuilder private func row(_ entry: DirectorTranscriptEntry) -> some View {
         let activeQuestion = entry.isQuestion && entry.text == pendingQuestion && entry.id == entries.last(where: \.isQuestion)?.id
         VStack(alignment: .leading, spacing: 7) {
+            if let frameID = entry.inspectedFrameID, let png = inspectedFrames[frameID], let image = NSImage(data: png) {
+                Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 140)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .accessibilityLabel("Source frame inspected by Director")
+            }
             HStack(alignment: .top, spacing: 6) {
                 Text(entry.text)
                     .font(entry.kind == .event ? .caption : .callout)

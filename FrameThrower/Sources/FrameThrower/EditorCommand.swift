@@ -20,6 +20,7 @@ struct EditorCommandMotion: Codable, Equatable, Sendable {
 /// The external contract is deliberately small and independent of a model or
 /// transport. No command accepts a path, a URL, an executable, or source pixels.
 enum EditorCommand: Codable, Equatable, Sendable {
+    case addRegion(region: EditorRegion)
     case frameRegion(regionID: UUID, time: Double, motion: EditorCommandMotion = EditorCommandMotion())
     case fullFrame(time: Double, motion: EditorCommandMotion = EditorCommandMotion())
     case holdFraming(time: Double)
@@ -35,7 +36,7 @@ enum EditorCommand: Codable, Equatable, Sendable {
 
     private enum Key: String, CodingKey {
         case action, regionID, time, motion, editID, fromEditID, toEditID, note,
-             startEditID, fromRegionID, toRegionID, duration, viaFullFrame
+             startEditID, fromRegionID, toRegionID, duration, viaFullFrame, region
     }
     private struct AnyKey: CodingKey {
         var stringValue: String
@@ -49,6 +50,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
         let action = try values.decode(String.self, forKey: .action)
         let allowed: Set<String>
         switch action {
+        case "addRegion":
+            allowed = ["action", "region"]
+            self = .addRegion(region: try values.decode(EditorRegion.self, forKey: .region))
         case "frameRegion":
             allowed = ["action", "regionID", "time", "motion"]
             self = .frameRegion(regionID: try values.decode(UUID.self, forKey: .regionID),
@@ -108,6 +112,9 @@ enum EditorCommand: Codable, Equatable, Sendable {
     func encode(to encoder: any Encoder) throws {
         var values = encoder.container(keyedBy: Key.self)
         switch self {
+        case let .addRegion(region):
+            try values.encode("addRegion", forKey: .action)
+            try values.encode(region, forKey: .region)
         case let .frameRegion(regionID, time, motion):
             try values.encode("frameRegion", forKey: .action)
             try values.encode(regionID, forKey: .regionID)
@@ -268,6 +275,14 @@ enum EditorCommandDispatcher {
             }
             try flushRegionRemovals()
             switch command {
+            case let .addRegion(region):
+                try region.validate(duration: project.duration)
+                guard region.time < project.duration,
+                      !next.regions.contains(where: { $0.id == region.id }),
+                      region.editID == nil || next.timedEdits(includeCamera: true).contains(where: { $0.id == region.editID }) else {
+                    throw EditorCommandError.invalid("The new box must have a unique identity and a valid recording time and reference.")
+                }
+                next.regions.append(region)
             case let .createEdit(time):
                 guard time.isFinite, time >= 0, time < project.duration else {
                     throw EditorCommandError.invalid("The edit mark must be inside the recording.")
@@ -316,7 +331,7 @@ enum EditorCommandDispatcher {
             case let .frameRegion(regionID, time, motion):
                 try validTime(time)
                 try motion.validate()
-                put(try region(regionID).rect.framing(), at: time, motion: motion, sourceRegionID: regionID)
+                put(try region(regionID).framing, at: time, motion: motion, sourceRegionID: regionID)
             case let .fullFrame(time, motion):
                 try validTime(time)
                 try motion.validate()
@@ -334,7 +349,7 @@ enum EditorCommandDispatcher {
                 let original = next.zoomKeyframes.first { $0.id == edit.zoomID }
                 let motion = original.map { EditorCommandMotion(transition: $0.transition, duration: $0.duration,
                                                                  easeIn: $0.easeIn, easeOut: $0.easeOut) } ?? EditorCommandMotion()
-                put(try region(regionID).rect.framing(), at: edit.time, motion: motion, preserving: original, sourceRegionID: regionID)
+                put(try region(regionID).framing, at: edit.time, motion: motion, preserving: original, sourceRegionID: regionID)
             case let .labelRegion(regionID, note):
                 guard let index = next.regions.firstIndex(where: { $0.id == regionID }) else {
                     throw EditorCommandError.invalid("That box no longer exists. Select a numbered box and try again.")
@@ -358,7 +373,7 @@ enum EditorCommandDispatcher {
                    crossing.transition == .smooth, crossing.time - crossing.duration < to.time {
                     throw EditorCommandError.invalid("An existing framing movement crosses the destination edit. Revise that movement before adding this path.")
                 }
-                let target = try region(regionID).rect.framing()
+                let target = try region(regionID).framing
                 let midpoint = from.time + (to.time - from.time) / 2
                 let duration = midpoint - from.time
                 // Materialize an unchanged starting view for a reference-only
@@ -388,8 +403,8 @@ enum EditorCommandDispatcher {
                 guard end.isFinite, end < project.duration else {
                     throw EditorCommandError.invalid("The movement would finish at or past the end of the recording. Choose a shorter duration or an earlier starting edit.")
                 }
-                let source = try region(fromRegionID).rect.framing()
-                let target = try region(toRegionID).rect.framing()
+                let source = try region(fromRegionID).framing
+                let target = try region(toRegionID).framing
                 let original = next.zoomKeyframes.first { $0.id == start.zoomID }
                 let arrival = next.zoomKeyframes.first { abs($0.time - end) < 0.000_001 }
                 guard !next.zoomKeyframes.contains(where: { $0.time > start.time + 0.000_001 && $0.time < end - 0.000_001 }) else {

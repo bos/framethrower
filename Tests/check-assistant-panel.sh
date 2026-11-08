@@ -14,7 +14,7 @@ swiftc -whole-module-optimization -Onone -num-threads 2 -parse-as-library -warni
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAgentControls.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordedScene.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorInspection.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalModelRuntime.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalSpeechInput.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechRuntime.swift" \

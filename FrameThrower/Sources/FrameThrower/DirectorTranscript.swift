@@ -44,6 +44,7 @@ struct DirectorTranscriptEntry: Identifiable, Equatable {
     var adjustmentTarget: String? = nil
     var adjustmentEventID: String? = nil
     var earlierAdjustments: [DirectorTranscriptEntry] = []
+    var inspectedFrameID: UUID? = nil
 }
 
 @MainActor
@@ -118,13 +119,17 @@ enum DirectorTranscript {
             // Older builds appended a bare list of letters. The step list
             // below replaces it with useful action descriptions.
             text = body.components(separatedBy: "\nCreated ").first ?? body
-            kind = .assistant
+            kind = status == "inspected" ? .event : .assistant
         }
         var edits = steps(value)
         if edits.isEmpty { edits = legacySteps(value, conversation: conversation, references: references) }
+        let inspection = value["inspection"] as? [String: Any]
+        let frameID = inspection?["kind"] as? String == "frame"
+            ? (inspection?["frame_id"] as? String).flatMap(UUID.init(uuidString:)) : nil
         return DirectorTranscriptEntry(id: id, kind: kind, text: text, steps: edits,
             isQuestion: status == "needs_answer" || status == "conflict",
-            isError: status == "rejected" && value["retryable"] as? Bool != true)
+            isError: status == "rejected" && value["retryable"] as? Bool != true,
+            inspectedFrameID: frameID)
     }
 
     private static func steps(_ value: [String: Any]) -> [DirectorTranscriptStep] {

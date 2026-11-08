@@ -8,7 +8,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   -target "$(uname -m)-apple-macos15.0" \
   "$sources/MediaProcessing.swift" "$sources/EditorRegion.swift" "$sources/RecordingProject.swift" \
   "$sources/EditorActionDescription.swift" "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" \
-  "$sources/LocalEditPlanner.swift" "$sources/LocalModelRuntime.swift" "$sources/DirectorTranscript.swift" \
+  "$sources//RecordedScene.swift" "$sources//DirectorInspection.swift" "$sources//LocalEditPlanner.swift" "$sources/LocalModelRuntime.swift" "$sources/DirectorTranscript.swift" \
   "$sources/DirectorConversation.swift" "$sources/EditorConflictGeometry.swift" "$sources/EditorConflictReview.swift" \
   "$repo_dir/Tests/MakeConflictReviewFixture.swift" -o "$check_dir/make-fixture"
 "$check_dir/make-fixture" "$@"

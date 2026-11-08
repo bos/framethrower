@@ -10,7 +10,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enabl
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAgentControls.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/RecordedScene.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorInspection.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/LocalEditPlanner.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/LocalModelRuntime.swift" \
   "$repo_dir/Tests/LocalEditPlannerChecks.swift" \
   -o "$check_dir/check-local-edit-planner"

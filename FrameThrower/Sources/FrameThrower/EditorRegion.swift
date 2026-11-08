@@ -33,9 +33,15 @@ struct EditorRegion: Codable, Equatable, Identifiable, Sendable {
     /// Association identifies the edit selected when this frame was marked.
     /// The source timestamp stays fixed if that edit is moved or removed.
     var editID: UUID? = nil
+    /// Observed targets can include an explicit source-pixel border already.
+    /// Nil preserves the existing breathing room for manually drawn guides.
+    var framingPadding: Double? = nil
+
+    var framing: ZoomPlacement { rect.framing(padding: framingPadding ?? 0.1) }
 
     func validate(duration: Double) throws {
-        guard time.isFinite, (0...duration).contains(time), rect.isValid else {
+        guard time.isFinite, (0...duration).contains(time), rect.isValid,
+              framingPadding.map({ $0.isFinite && (0...1).contains($0) }) ?? true else {
             throw ProjectError.invalid("A box must be inside the recording and the original screen frame.")
         }
         guard note.count <= 4_096,

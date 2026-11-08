@@ -8,7 +8,7 @@ sources="$repo_dir/FrameThrower/Sources/FrameThrower"
 swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
   "$sources/MediaProcessing.swift" "$sources/EditorRegion.swift" "$sources/RecordingProject.swift" \
   "$sources/EditorActionDescription.swift" "$sources/EditorConflictGeometry.swift" "$sources/EditorConflictReview.swift" \
-  "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources/LocalEditPlanner.swift" \
+  "$sources/EditorCommand.swift" "$sources/EditorAgentControls.swift" "$sources//RecordedScene.swift" "$sources//DirectorInspection.swift" "$sources//LocalEditPlanner.swift" \
   "$sources/LocalModelRuntime.swift" "$repo_dir/Tests/EditorConflictReviewChecks.swift" \
   -o "$check_dir/check-editor-conflict-review"
 "$check_dir/check-editor-conflict-review"

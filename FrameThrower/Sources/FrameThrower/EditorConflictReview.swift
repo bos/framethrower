@@ -27,6 +27,12 @@ struct EditorConflictReview: Equatable, Sendable {
               (try? project.validate()) != nil else { return nil }
         let affected = Set(conflict.framingIDs)
         let available = Set(project.state.zoomKeyframes.map(\.id))
+        // An inspected visual target may introduce its own linked guide as
+        // part of the proposed framing. Existing guides must remain unchanged.
+        let addedRegions = conflict.proposal.commands.compactMap { command -> EditorRegion? in
+            if case let .addRegion(region) = command { return region }
+            return nil
+        }
         guard !affected.isEmpty, affected.count == conflict.framingIDs.count, affected.isSubset(of: available),
               let proposed = try? EditorCommandDispatcher.prepare(conflict.replacement, for: project, projectID: projectID),
               proposed.pipKeyframes == project.state.pipKeyframes,
@@ -34,7 +40,7 @@ struct EditorConflictReview: Equatable, Sendable {
               proposed.audio == project.state.audio,
               proposed.presentation == project.state.presentation,
               proposed.trimStart == project.state.trimStart, proposed.trimEnd == project.state.trimEnd,
-              proposed.regions == project.state.regions else { return nil }
+              proposed.regions == project.state.regions + addedRegions else { return nil }
 
         let oldSegments = segments(in: project.state, duration: project.duration)
         let newSegments = segments(in: proposed, duration: project.duration)

@@ -594,7 +594,7 @@ enum EditorBoxConnections {
             // Legacy return-to-full-frame points had no box destination label.
             // A large guide fitting at 1× must not claim those context points.
             guard target.scale > 1 else { continue }
-            let matches = state.regions.filter { $0.rect.framing() == target }
+            let matches = state.regions.filter { $0.framing == target }
             if matches.count == 1 { result.zoomKeyframes[index].sourceRegionID = matches[0].id }
         }
         result.boxConnectionsVersion = 1

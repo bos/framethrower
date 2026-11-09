@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "Tools"))
 claude = importlib.import_module("DirectorAgents.claude")

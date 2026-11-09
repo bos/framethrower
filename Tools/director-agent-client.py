@@ -15,6 +15,10 @@ import stat
 import sys
 import tempfile
 
+# These modules also run from a signed app's Resources directory. Imports must
+# never write bytecode caches into that bundle and invalidate its signature.
+sys.dont_write_bytecode = True
+
 FAMILIES = {"claude", "codex", "qwen"}
 
 

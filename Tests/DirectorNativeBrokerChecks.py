@@ -5,6 +5,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -29,6 +32,24 @@ class NativeBrokerChecks(unittest.TestCase):
     def call(self, callback):
         with patch.object(broker.importlib, "import_module", return_value=types.SimpleNamespace(run_turn=callback)):
             return broker.run(self.payload)
+
+    def test_packaged_provider_imports_do_not_write_into_signed_resources(self):
+        resources = Path(self.tmp.name) / "Resources"
+        package = resources / "DirectorAgents"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "claude.py").write_text(
+            "def run_turn(request, configuration):\n"
+            "    configuration['on_session_id']('packaged-fixture')\n"
+            "    return {'native_session_id':'packaged-fixture','text':'Done.','events':[]}\n")
+        client = resources / "director-agent-client.py"
+        shutil.copyfile(ROOT / "Tools/director-agent-client.py", client)
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        result = subprocess.run([sys.executable, str(client)], input=json.dumps(self.payload),
+                                capture_output=True, text=True, env=environment, check=True)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertFalse((package / "__pycache__").exists())
 
     def test_binding_precedes_actions_and_resume_does_not_replay_bootstrap(self):
         seen = []

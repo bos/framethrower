@@ -9,6 +9,7 @@ struct EditorPreviewCommandChecks {
         try codec()
         try await transportAndStepping()
         try await auditions()
+        try await cutOutputTransport()
         try await cancellationAndLifecycle()
         print("Editor preview command checks passed (typed snapshots, idempotent transport, frame stepping, rates, source-range audition outside trim, pause/resume/end/seek/rebuild/close lifecycle and untouched projects/history; no AV objects/media).")
     }
@@ -26,7 +27,8 @@ struct EditorPreviewCommandChecks {
     }
 
     static func codec() throws {
-        let commands: [EditorPreviewCommand] = [.play, .pause, .seek(1.5), .setRate(2), .stepFrames(-3), .playRange(start: 1, end: 2)]
+        let commands: [EditorPreviewCommand] = [.play, .pause, .seek(1.5), .seekOutput(1.5), .setRate(2), .stepFrames(-3),
+            .stepOutputFrames(-3), .playRange(start: 1, end: 2), .playOutputRange(start: 1, end: 2)]
         for command in commands {
             try require(try JSONDecoder().decode(EditorPreviewCommand.self, from: JSONEncoder().encode(command)) == command,
                         "Typed preview requests must retain their exact action and numeric values")
@@ -138,6 +140,91 @@ struct EditorPreviewCommandChecks {
         }
         try require(editor.project == original && !editor.canUndo && !playback.hasMediaPlayer,
                     "Audition must not become a trim edit or an Undo entry")
+    }
+
+    static func cutOutputTransport() async throws {
+        var project = RecordingProject(screenFilename: "nonexistent-cut-preview.mov", duration: 14,
+            captureFrameDuration: 1.0 / 60)
+        project.state.cuts = [RecordingCut(start: 5, end: 8, crossfade: 1)]
+        let editor = ProjectEditor(project: project,
+            url: FileManager.default.temporaryDirectory.appendingPathComponent("cut-preview-\(UUID()).framethrower"))
+        let playback = EditorPlayback()
+        await playback.rebuild(editor: editor)
+        defer { playback.close() }
+        let original = editor.project
+        try near(playback.outputDuration, 10, "The finished timeline excludes the cut and one-second overlap")
+        let originalFrame = try await playback.applyPreviewCommand(.seek(5.5))
+        try require(originalFrame.time == 5.5 && originalFrame.inspectionTimeBase == "source" &&
+                    originalFrame.sourceSamples?.isEmpty == true && playback.outputSamples.isEmpty,
+                    "Explicit source inspection shows the omitted original frame, not a different kept frame at its output join")
+        let originalStep = try await playback.applyPreviewCommand(.stepFrames(1))
+        try near(originalStep.time, 5.5 + 1.0 / 60, "Source stepping can inspect a removed original frame")
+        try require(originalStep.inspectionTimeBase == "source" && playback.outputSamples.isEmpty,
+                    "Source stepping preserves the explicit original inspection mode")
+        let crossfade = try await playback.applyPreviewCommand(.seekOutput(4.25))
+        try require(crossfade.inspectionTimeBase == "output", "Output seek leaves original inspection and returns to the finished composition")
+        try near(crossfade.outputTime!, 4.25, "Output seeking retains its exact position without a dominant-source round trip")
+        let samples = crossfade.sourceSamples!
+        try require(samples.count == 2, "A crossfade exposes both actual source instants")
+        try near(samples[0].sourceTime, 4.25, "Outgoing source clock")
+        try near(samples[1].sourceTime, 8.25, "Incoming source clock")
+        try near(samples[0].weight, 0.75, "Outgoing alpha")
+        try near(samples[1].weight, 0.25, "Incoming alpha")
+        _ = try await playback.applyPreviewCommand(.seekOutput(4.6))
+        _ = try await playback.applyPreviewCommand(.setRate(5))
+        let audition = try await playback.applyPreviewCommand(.playOutputRange(start: 4.2, end: 4.8))
+        try near(audition.outputTime!, 4.2, "Starting an output audition always uses its requested start, not an old cursor inside the range")
+        try require(audition.range == .init(start: 4.2, end: 4.8) && audition.rangeTimeBase == "output" && audition.isPlaying,
+                    "Output audition coordinates are explicit in the actual snapshot")
+        try await wait { playback.outputTime > 4.24 }
+        _ = try await playback.applyPreviewCommand(.pause)
+        let paused = playback.outputTime
+        _ = try await playback.applyPreviewCommand(.setRate(2))
+        try require(playback.previewSnapshot.rangeTimeBase == "output" && playback.auditionRange != nil && !playback.isPlaying,
+                    "Pause/rate changes preserve the output range and its coordinate system")
+        _ = try await playback.applyPreviewCommand(.play)
+        try require(playback.outputTime >= paused, "Output audition resumes from its paused position")
+        try await wait { !playback.isPlaying }
+        try near(playback.outputTime, 4.8, "A crossfade audition stops at its output endpoint")
+        try require(playback.auditionRange == nil && playback.previewSnapshot.rangeTimeBase == nil,
+                    "Reaching a blended endpoint clears the audition independently of the dominant source")
+
+        _ = try await playback.applyPreviewCommand(.setRate(5))
+        let source = try await playback.applyPreviewCommand(.playRange(start: 4.8, end: 8.2))
+        try require(source.rangeTimeBase == "source" && source.time == 4.8 && playback.outputSamples.isEmpty,
+                    "Source audition inspects the original pose rather than reversing mapped crossfade endpoints")
+        try await wait { playback.time > 5.2 }
+        _ = try await playback.applyPreviewCommand(.pause)
+        try require(playback.time > 5 && playback.time < 8 && playback.outputSamples.isEmpty,
+                    "A source audition can pause on deliberately omitted footage without showing a retained join instead")
+        _ = try await playback.applyPreviewCommand(.play)
+        try await wait { !playback.isPlaying }
+        try near(playback.time, 8.2, "Original-source audition retains its exact requested source end")
+        try require(playback.auditionRange == nil, "A source audition clears at its own clock boundary")
+        let stable = playback.previewSnapshot
+        for invalid in [EditorPreviewCommand.seekOutput(-1), .seekOutput(10.1), .seekOutput(.nan),
+            .playOutputRange(start: 4, end: 4), .playOutputRange(start: 5, end: 4),
+            .playOutputRange(start: -1, end: 4), .playOutputRange(start: 1, end: 11)] {
+            try await expectFailure { _ = try await playback.applyPreviewCommand(invalid) }
+            try require(playback.previewSnapshot == stable, "Invalid output coordinates cannot partially change preview state")
+        }
+
+        var hardCut = project; hardCut.state.cuts[0].crossfade = 0
+        let hardEditor = ProjectEditor(project: hardCut,
+            url: FileManager.default.temporaryDirectory.appendingPathComponent("hard-cut-preview-\(UUID()).framethrower"))
+        let hardPlayback = EditorPlayback()
+        await hardPlayback.rebuild(editor: hardEditor)
+        defer { hardPlayback.close() }
+        _ = try await hardPlayback.applyPreviewCommand(.seekOutput(299.0 / 60))
+        let forward = try await hardPlayback.applyPreviewCommand(.stepOutputFrames(1))
+        try near(forward.outputTime!, 5, "Output frame stepping advances over a cut without moving backward to its join")
+        try near(forward.time, 8, "The next output frame uses the next retained source section")
+        let backward = try await hardPlayback.applyPreviewCommand(.stepOutputFrames(-1))
+        try near(backward.outputTime!, 299.0 / 60, "Backward output stepping crosses the join using output cadence")
+        try near(backward.time, 299.0 / 60, "Backward stepping selects the outgoing retained source frame")
+        try require(editor.project == original && !editor.canUndo && !hardEditor.canUndo &&
+                    !FileManager.default.fileExists(atPath: editor.url.path) && !playback.hasMediaPlayer && !hardPlayback.hasMediaPlayer,
+                    "All cut preview operations remain transient and construct no AV/media objects")
     }
 
     static func cancellationAndLifecycle() async throws {

@@ -22,6 +22,12 @@ struct ProjectEditorView: View {
     @State private var presentationDraft: CanvasPresentation?
     @State private var audioGestureTime: Double?
     @State private var timelineFitRequest: UUID?
+    @State private var timelineTimeBase: EditorCutTimeBase = .output
+    @State private var cutSelection: ClosedRange<Double>?
+    @State private var selectedCutID: UUID?
+    @State private var cutDuration = 0.5
+    @State private var cutPopoverAnchor = UnitPoint.center
+    @State private var timelineError: String?
     @State private var movingEditState: EditState?
     @State private var selectedAnimationID: TimelineAnimationID?
     @State private var animationGesture: AnimationGestureSnapshot?
@@ -90,6 +96,89 @@ struct ProjectEditorView: View {
             .filter { $0.lane != .pointer || editor.project.cursorFilename != nil }
     }
 
+    private var timeMapResult: Result<RecordingTimeMap, any Error> {
+        Result { try playback.timingMap(for: state, duration: editor.project.duration) }
+    }
+    private var timelineMap: RecordingTimeMap? { try? timeMapResult.get() }
+    private var timeMapError: String? { if case let .failure(error) = timeMapResult { return error.localizedDescription }; return nil }
+    private var isSourceTimeline: Bool { timelineTimeBase == .source }
+    private var timelineDuration: Double { isSourceTimeline ? editor.project.duration : timelineMap?.outputDuration ?? playback.outputDuration }
+    private var timelinePosition: Double { isSourceTimeline ? playback.time : playback.outputTime }
+    private var timelineIsIdentity: Bool { state.cuts.isEmpty && state.trimStart == 0 && state.trimEnd == editor.project.duration }
+    private var outputProjection: TimelineOutputProjection? {
+        guard !isSourceTimeline, !timelineIsIdentity, let map = timelineMap else { return nil }
+        return TimelineOutputProjection(animations: timelineAnimations, map: map)
+    }
+    private var displayedAnimations: [TimelineAnimation] { outputProjection?.animations ?? timelineAnimations }
+    private var displayedAnimationID: TimelineAnimationID? {
+        guard let selectedAnimationID else { return nil }
+        guard let projection = outputProjection else { return selectedAnimationID }
+        return projection.animations.first { projection.sourceIDs[$0.id] == selectedAnimationID }?.id
+    }
+    private var canvasOutputSamples: [EditorCanvasSample] {
+        guard !isSourceTimeline, conflictReview == nil else { return [] }
+        return playback.outputSamples.map {
+            EditorCanvasSample(sourceTime: $0.sourceTime, weight: $0.weight,
+                zoom: state.zoom(at: $0.sourceTime), placement: state.placement(at: $0.sourceTime))
+        }
+    }
+    private var isBlendedCanvas: Bool { canvasOutputSamples.count > 1 }
+    private var hasAmbiguousFramingTarget: Bool { isBlendedCanvas && selectedEdit == nil && selectedAnimationTime == nil }
+    private var timelineClipBands: [TimelineClipBand] {
+        if !isSourceTimeline {
+            return (timelineMap?.clips ?? []).enumerated().map { index, clip in
+                TimelineClipBand(id: "clip-\(index)", start: clip.outputStart, end: clip.outputEnd, excluded: false, label: "Clip \(index + 1)")
+            }
+        }
+        let cuts = state.cuts.sorted { $0.start < $1.start }
+        var bands: [TimelineClipBand] = []; var cursor = 0.0
+        for cut in cuts {
+            if cursor < cut.start { bands.append(TimelineClipBand(id: "source-\(cursor)", start: cursor, end: cut.start, excluded: false, label: "Source")) }
+            bands.append(TimelineClipBand(id: cut.id.uuidString, start: cut.start, end: cut.end, excluded: true, label: "Removed")); cursor = cut.end
+        }
+        if cursor < editor.project.duration { bands.append(TimelineClipBand(id: "source-\(cursor)", start: cursor, end: editor.project.duration, excluded: false, label: "Source")) }
+        return bands
+    }
+    private var timelineCutMarkers: [TimelineCutMarker] {
+        if isSourceTimeline {
+            return state.cuts.map { cut in
+                TimelineCutMarker(id: cut.id, start: cut.start, end: cut.end,
+                    help: String(format: "Removed source %.3f–%.3f s. Click to restore or change its join.", cut.start, cut.end),
+                    label: cut.crossfade > 0 ? "Fade" : "Cut", showsTransitionSpan: false)
+            }
+        }
+        return (timelineMap?.joins ?? []).map { join in
+            TimelineCutMarker(id: join.id, start: join.outputStart, end: join.outputEnd,
+                help: String(format: "%@ · requested %.3f s, effective %.3f s. Click to change or restore the section.", join.duration > 0 ? "Crossfade" : "Cut", join.requestedDuration, join.duration))
+        }
+    }
+    private var timelineConflicts: [EditorConflictSpan] {
+        let spans = (conflictReview?.existingSpans ?? []) + (conflictReview?.proposedSpans ?? [])
+        guard !isSourceTimeline, let map = timelineMap else { return spans }
+        return spans.flatMap { span -> [EditorConflictSpan] in
+            if span.isInstant {
+                guard let time = map.outputTime(for: span.start) else { return [] }
+                return [EditorConflictSpan(id: span.id, side: span.side, start: time, end: time, label: span.label, help: span.help)]
+            }
+            return map.clips.enumerated().compactMap { index, clip in
+                let a = max(span.start, clip.sourceStart), b = min(span.end, clip.sourceEnd)
+                guard a < b else { return nil }
+                return EditorConflictSpan(id: "\(span.id)-\(index)", side: span.side,
+                    start: clip.outputStart + a - clip.sourceStart, end: clip.outputStart + b - clip.sourceStart,
+                    label: span.label, help: span.help)
+            }
+        }
+    }
+    private var timelineConflictOverlaps: [ClosedRange<Double>] {
+        let ranges = conflictReview?.overlapIntervals ?? []
+        guard !isSourceTimeline, let map = timelineMap else { return ranges }
+        return ranges.flatMap { range in map.clips.compactMap { clip -> ClosedRange<Double>? in
+            let a = max(range.lowerBound, clip.sourceStart), b = min(range.upperBound, clip.sourceEnd)
+            guard a <= b else { return nil }
+            return (clip.outputStart + a - clip.sourceStart)...(clip.outputStart + b - clip.sourceStart)
+        } }
+    }
+
     init(editor: ProjectEditor, directorModeInitiallyEnabled: Bool = false,
          playback: EditorPlayback? = nil,
          assistant: EditorAssistantSession? = nil,
@@ -111,7 +200,7 @@ struct ProjectEditorView: View {
             player
             timeline
             inspector
-            if let message = editor.errorMessage ?? playback.errorMessage ?? automation.errorMessage {
+            if let message = timelineError ?? timeMapError ?? editor.errorMessage ?? playback.errorMessage ?? automation.errorMessage {
                 Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
         }
@@ -179,6 +268,27 @@ struct ProjectEditorView: View {
             playback.seek(time)
             synchronizeAnimationSelection()
         }
+        .onChange(of: timelineTimeBase) { _, _ in
+            cutSelection = nil; selectedCutID = nil
+            automation.timelineTimeBase = timelineTimeBase.rawValue
+            // External seeks and ordinary Play already changed the clock. Do
+            // not pause them again while reflecting that state in the picker.
+            if isSourceTimeline != playback.isInspectingSource {
+                playback.pause(); playback.endScrubbing()
+                if isSourceTimeline { playback.seek(playback.time) }
+                else { playback.seekOutput(playback.outputTime) }
+            }
+        }
+        .onChange(of: playback.isInspectingSource) { _, source in
+            timelineTimeBase = source ? .source : .output
+            automation.timelineTimeBase = source ? "source" : "output"
+        }
+        .onChange(of: state.trimStart) { _, _ in cutSelection = nil }
+        .onChange(of: state.trimEnd) { _, _ in cutSelection = nil }
+        .onChange(of: state.cuts) { _, _ in
+            cutSelection = nil
+            if let selectedCutID, !state.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
+        }
         .onChange(of: selectedInspector) { _, _ in if animationGesture == nil { synchronizeAnimationSelection() } }
         .onAppear {
             assistant.attach(to: editor)
@@ -194,7 +304,11 @@ struct ProjectEditorView: View {
             _ = editor.finishDraft()
         }
         .onExitCommand { cancelEditorInteraction() }
-        .onDeleteCommand { deleteSelectedBox() }
+        .onDeleteCommand {
+            if cutSelection != nil { cutSelectedSection() }
+            else if let selectedCutID { applyCutMutation(.restoreCut(cutID: selectedCutID), name: "Restore section") }
+            else { deleteSelectedBox() }
+        }
         .toolbarRole(.editor)
         .toolbar(removing: .title)
         .toolbar {
@@ -251,6 +365,7 @@ struct ProjectEditorView: View {
     }
 
     private func configureAutomation() {
+        automation.timelineTimeBase = timelineTimeBase.rawValue
         let edit = $selectedEditID, box = $selectedRegionID, animation = $selectedAnimationID
         let inspector = $selectedInspector, director = $directorMode
         automation.conversationPage = { [weak assistant] offset, limit in
@@ -324,7 +439,7 @@ struct ProjectEditorView: View {
     private var player: some View {
         EditorCanvas(player: playback.canvasPlayer, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
-            placement: state.placement(at: playback.time), cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil,
+            placement: state.placement(at: playback.time), cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil && !isBlendedCanvas,
             showsCameraPattern: editor.project.cameraFilename != nil && conflictReview == nil,
             showsStill: !playback.isPlaying,
             onBegin: { beginCameraGesture() },
@@ -349,20 +464,21 @@ struct ProjectEditorView: View {
             prepareEditingPose: { EditorCanvasEditingPose(zoom: state.zoom(at: dragTime), placement: state.placement(at: dragTime)) },
             onEditingEnded: { canvasGesture = nil },
             zoom: conflictReview == nil ? state.zoom(at: playback.time) : ZoomPlacement(),
-            allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil,
+            allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil && !isBlendedCanvas,
             panEditingScale: zoom.scale,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
             onZoomCommit: { next, name in setZoom(next, at: dragTime, name: name); canvasGesture = nil },
             presentation: canvasPresentation, nativeSourceSize: playback.sourceSize,
-            scribbleMode: directorMode && conflictReview == nil,
+            scribbleMode: directorMode && conflictReview == nil && !isBlendedCanvas,
             drawsReferenceBoxes: previewTool == .box,
-            regions: conflictReview == nil ? state.regions : [],
+            regions: conflictReview == nil && !isBlendedCanvas ? state.regions : [],
             regionLabels: Dictionary(uniqueKeysWithValues: state.regions.compactMap { region in
                 editor.references.boxLabel(for: region.id).map { (region.id, $0) }
             }),
             selectedRegionID: selectedRegionID,
             onReferenceBegin: {
+                cutSelection = nil; selectedCutID = nil
                 assistant.cancel()
                 if playback.isPlaying { selectedEditID = nil; selectedAnimationID = nil }
                 playback.pause()
@@ -370,7 +486,7 @@ struct ProjectEditorView: View {
             },
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
             onDeleteRegion: { removeRegion($0) },
-            conflictOutlines: conflictReview?.outlines(at: playback.time))
+            conflictOutlines: conflictReview?.outlines(at: playback.time), outputSamples: canvasOutputSamples)
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay(alignment: .topTrailing) { previewTools.padding(10) }
             .overlay(alignment: .bottomLeading) {
@@ -479,6 +595,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectRegion(_ id: UUID?) {
+        cutSelection = nil; selectedCutID = nil
         guard id == nil || state.regions.contains(where: { $0.id == id }) else { return }
         playback.pause()
         selectedRegionID = selectedRegionID == id ? nil : id
@@ -486,6 +603,7 @@ struct ProjectEditorView: View {
     }
 
     private func cancelEditorInteraction() {
+        if cutSelection != nil || selectedCutID != nil { cutSelection = nil; selectedCutID = nil; return }
         if conflictReview != nil { assistant.cancel(); return }
         if let snapshot = canvasGesture { restoreCanvasGesture(snapshot); return }
         if animationGesture != nil { cancelAnimationGesture() }
@@ -540,16 +658,29 @@ struct ProjectEditorView: View {
                 .frame(width: 170)
                 .accessibilityLabel("Playback speed")
                 .help("Preview playback speed. Exported video keeps its original timing.")
+                Picker("Timeline", selection: $timelineTimeBase) {
+                    Text("Finished").tag(EditorCutTimeBase.output)
+                    Text("Source").tag(EditorCutTimeBase.source).disabled(!playback.supportsSourceAudition)
+                }
+                .pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 160)
+                .disabled(animationGesture != nil || canvasGesture != nil)
+                .help(playback.supportsSourceAudition
+                    ? "Finished shows exported time and joins. Source shows the complete recording, including trimmed or removed sections, and lets you adjust animation timing."
+                    : "Finished shows exported time and joins. Original Source inspection is unavailable for this composed preview.")
+                Button { cutSelectedSection() } label: { Image(systemName: "scissors") }
+                    .accessibilityLabel("Cut section").help("Remove the range selected in the Clips row. Source edits stay available for restoration.")
+                    .disabled(cutSelection == nil || playback.isLoading)
                 Spacer(minLength: 0)
-                Text("\(playback.time, specifier: "%.2f") / \(editor.project.duration, specifier: "%.2f") s")
+                Text("\(timelinePosition, specifier: "%.2f") / \(timelineDuration, specifier: "%.2f") s")
                     .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
             }.frame(height: 24)
-            RecordingTimeline(duration: editor.project.duration, trimStart: state.trimStart,
-                trimEnd: state.trimEnd, playhead: playback.time,
+            RecordingTimeline(duration: timelineDuration, trimStart: isSourceTimeline ? state.trimStart : 0,
+                trimEnd: isSourceTimeline ? state.trimEnd : timelineDuration, playhead: timelinePosition,
                 onInteractionBegan: { playback.pause() },
-                onSeek: { if editor.draftState == nil { playback.scrub(to: $0) } },
+                onSeek: { if editor.draftState == nil { if isSourceTimeline { playback.scrubSource(to: $0) } else { playback.scrubOutput(to: $0) } } },
                 onScrubBegan: {
                     guard editor.finishDraft() else { return }
+                    cutSelection = nil; selectedCutID = nil
                     selectedEditID = nil
                     selectedAnimationID = nil
                     playback.beginScrubbing()
@@ -557,7 +688,7 @@ struct ProjectEditorView: View {
                 onScrubEnded: { playback.endScrubbing() },
                 onTrim: { start, end in setTrim(start, end) },
                 onTrimPlayhead: { position in selectedEditID = nil; selectedAnimationID = nil; playback.seek(position) },
-                edits: edits.map { timelineMarker($0) },
+                edits: isSourceTimeline ? edits.map { timelineMarker($0) } : [],
                 selectedEditID: selectedEditID,
                 onSelectEdit: { selectEdit($0) },
                 frameDuration: frameDuration,
@@ -565,25 +696,111 @@ struct ProjectEditorView: View {
                 onCancelMoveEdit: { cancelMove() },
                 onDeselectEdit: { deselectEdit() },
                 onCancelEdit: { cancelDraft() }, fitRequest: timelineFitRequest,
-                conflictSpans: (conflictReview?.existingSpans ?? []) + (conflictReview?.proposedSpans ?? []),
-                conflictOverlaps: conflictReview?.overlapIntervals ?? [],
+                conflictSpans: timelineConflicts,
+                conflictOverlaps: timelineConflictOverlaps,
                 showsAnimationLanes: true,
-                pointerClickTimes: playback.cursorRecording?.clicks.map(\.time) ?? [],
-                animations: timelineAnimations, selectedAnimationID: selectedAnimationID,
-                onSelectAnimation: { selectAnimation($0) },
+                pointerClickTimes: (playback.cursorRecording?.clicks.map(\.time) ?? []).compactMap { isSourceTimeline ? $0 : timelineMap?.outputTime(for: $0) },
+                animations: displayedAnimations, selectedAnimationID: displayedAnimationID,
+                onSelectAnimation: { selectAnimation(outputProjection?.sourceIDs[$0] ?? $0) },
                 onAnimationEdit: { editAnimation($0, final: $1) },
                 onAnimationCancel: { cancelAnimationGesture() },
-                onDeleteAnimation: { deleteAnimation($0) })
-                .frame(height: RecordingTimeline.animationLaneHeight)
+                onDeleteAnimation: { if isSourceTimeline || timelineIsIdentity { deleteAnimation($0) } },
+                showsClipLane: true, showsTrimHandles: isSourceTimeline,
+                allowsSeekingOutsideTrim: isSourceTimeline, clockID: timelineTimeBase.rawValue,
+                clipBands: timelineClipBands, cutMarkers: timelineCutMarkers,
+                selectedCutID: selectedCutID, selectedRange: cutSelection,
+                onRangeSelection: { range in
+                    cutSelection = range; selectedCutID = nil
+                    if range != nil { clearEditingSelectionForCut() }
+                },
+                onSelectCut: { id in
+                    clearEditingSelectionForCut()
+                    cutSelection = nil; selectedCutID = id
+                    let requested = state.cuts.first(where: { $0.id == id })?.crossfade ?? 0
+                    cutDuration = requested > 0 ? requested : 0.5
+                }, onCutRange: { cutSelectedSection() },
+                onRestoreCut: { applyCutMutation(.restoreCut(cutID: $0), name: "Restore section") },
+                onCutAnchor: { cutPopoverAnchor = $0 }, sourceEnvelopes: outputProjection?.envelopes ?? [:])
+                .frame(height: RecordingTimeline.clipLaneHeight)
+                .popover(isPresented: Binding(get: { selectedCutID != nil }, set: { if !$0 { selectedCutID = nil } }),
+                    attachmentAnchor: .point(cutPopoverAnchor)) { cutControls }
                 .contextMenu {
                     Button("Hold current framing") { holdCurrentFraming() }
+                        .disabled(isBlendedCanvas)
                         .help("Keep this view still until the playhead before a later smooth movement.")
                     Divider()
                     Button("Fit Timeline") { timelineFitRequest = UUID() }
                     Button("Reset trim") { setTrim(0, editor.project.duration) }
                         .disabled(state.trimStart == 0 && state.trimEnd == editor.project.duration)
+                    if !state.cuts.isEmpty {
+                        Menu("Restore section") {
+                            ForEach(state.cuts) { cut in
+                                Button(String(format: "Source %.3f–%.3f s", cut.start, cut.end)) { applyCutMutation(.restoreCut(cutID: cut.id), name: "Restore section") }
+                            }
+                        }
+                    }
                 }
         }
+    }
+
+    @ViewBuilder
+    private var cutControls: some View {
+        if let id = selectedCutID, let cut = state.cuts.first(where: { $0.id == id }) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(String(format: "Removed source %.3f–%.3f s", cut.start, cut.end)).font(.caption).monospacedDigit()
+                Picker("Join", selection: Binding(get: { cut.crossfade > 0 }, set: { fade in
+                    applyCutMutation(.cutTransition(cutID: id, duration: fade ? (cutDuration > 0 ? cutDuration : 0.5) : 0), name: "Change transition")
+                })) {
+                    Text("Cut").tag(false); Text("Crossfade").tag(true)
+                }.pickerStyle(.segmented)
+                if cut.crossfade > 0 {
+                    Slider(value: $cutDuration, in: 0...max(1, editor.project.duration, cut.crossfade), onEditingChanged: { editing in
+                        if !editing { setCutDuration(id) }
+                    }).accessibilityLabel("Crossfade duration")
+                    HStack {
+                        Text("Duration")
+                        TextField("Seconds", value: $cutDuration, format: .number.precision(.fractionLength(0...3)))
+                            .frame(width: 80).onSubmit { setCutDuration(id) }
+                            .help("Press Return to apply. Dismiss to cancel the typed value.")
+                        Text("s")
+                    }
+                    if let join = timelineMap?.joins.first(where: { $0.id == id }) {
+                        if join.duration + 0.000001 < cut.crossfade {
+                            Text(String(format: "Only %.3f s fits in the adjacent sections.", join.duration)).font(.caption).monospacedDigit()
+                                .help("The requested duration is retained when trims change.")
+                        }
+                    } else { Text("A crossfade needs kept footage on both sides.").font(.caption).foregroundStyle(.secondary) }
+                }
+                Button("Restore section") { applyCutMutation(.restoreCut(cutID: id), name: "Restore section") }
+            }.padding(16).frame(width: 310)
+        }
+    }
+
+    private func clearEditingSelectionForCut() {
+        selectedEditID = nil; selectedAnimationID = nil; selectedRegionID = nil
+    }
+
+    private func setCutDuration(_ id: UUID) {
+        guard cutDuration.isFinite, cutDuration >= 0 else { timelineError = "Enter a finite transition duration of zero or more seconds."; return }
+        applyCutMutation(.cutTransition(cutID: id, duration: cutDuration), name: "Change transition")
+    }
+
+    private func cutSelectedSection() {
+        guard let range = cutSelection, range.lowerBound < range.upperBound else { return }
+        applyCutMutation(.cutSection(start: range.lowerBound, end: range.upperBound, timeBase: timelineTimeBase), name: "Cut section")
+    }
+
+    private func applyCutMutation(_ mutation: EditorMutation, name: String) {
+        playback.pause(); assistant.cancel()
+        guard editor.finishDraft() else { return }
+        var edited = state
+        do {
+            try mutation.apply(to: &edited, project: editor.project)
+            guard editor.commit(edited, name: name) else { return }
+            timelineError = nil; cutSelection = nil
+            if let selectedCutID, !edited.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
+
+        } catch { timelineError = error.localizedDescription }
     }
 
     private func setTrim(_ start: Double, _ end: Double) {
@@ -611,14 +828,21 @@ struct ProjectEditorView: View {
                 .labelsHidden()
                 .frame(width: 420, height: 24)
                 Spacer(minLength: 0)
-                if selectedInspector == .camera { cameraVisibility }
+                if selectedInspector == .camera {
+                    cameraVisibility.disabled(hasAmbiguousFramingTarget)
+                        .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Show or hide the camera overlay.")
+                }
             }
             .frame(height: 24)
             Group {
                 switch selectedInspector {
-                case .zoom: zoomControls
+                case .zoom:
+                    zoomControls.disabled(hasAmbiguousFramingTarget)
+                        .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Adjust screen framing.")
                 case .pointer: pointerControls
-                case .camera: cameraControls
+                case .camera:
+                    cameraControls.disabled(hasAmbiguousFramingTarget)
+                        .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Adjust the camera overlay.")
                 case .audio: audioControls
                 case .canvas:
                     PresentationControls(presentation: canvasPresentation,
@@ -791,6 +1015,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectEdit(_ id: UUID) {
+        cutSelection = nil; selectedCutID = nil
         if id == selectedEditID { playback.pause(); return }
         guard editor.finishDraft(), let edit = edits.first(where: { $0.id == id }) else { return }
         selectedEditID = id
@@ -828,6 +1053,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectAnimation(_ id: TimelineAnimationID) {
+        cutSelection = nil; selectedCutID = nil
         playback.pause()
         if selectedAnimationID == id { return }
         guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id }) else { return }
@@ -867,7 +1093,9 @@ struct ProjectEditorView: View {
         selectedInspector = request.id.lane == .camera ? .camera : .zoom
         selectedAnimationID = request.id
         let current = changes.first(where: { $0.id == request.id }) ?? original
-        playback.seek(request.handle == .start ? current.start : current.end)
+        let position = request.handle == .start ? current.start : current.end
+        if !isSourceTimeline && timelineIsIdentity { playback.seekOutput(position) }
+        else { playback.seek(position) }
         if final {
             guard editor.finishDraft(name: gesture.name) else { return }
             selectedAnimationID = TimelineAnimationID(lane: request.id.lane, componentID: component)
@@ -881,7 +1109,9 @@ struct ProjectEditorView: View {
         animationGesture = nil
         selectedEditID = gesture.selection
         selectedAnimationID = gesture.animationSelection
-        playback.cancelPreview(); playback.seek(gesture.playhead)
+        playback.cancelPreview()
+        if !isSourceTimeline && timelineIsIdentity { playback.seekOutput(gesture.playhead) }
+        else { playback.seek(gesture.playhead) }
     }
 
     private func deleteAnimation(_ id: TimelineAnimationID) {

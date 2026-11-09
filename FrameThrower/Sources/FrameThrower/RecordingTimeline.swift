@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import CryptoKit
 
 struct RecordingTimelineMarker: Identifiable, Equatable {
     let id: UUID
@@ -14,8 +15,71 @@ struct RecordingTimelineMarker: Identifiable, Equatable {
     var maximumTime: Double? = nil
 }
 
+
+/// UI-only projection. Source identities remain authoritative; fragments never
+/// become new document edits, and their velocity curves keep the source clock.
+struct TimelineSourceEnvelope: Equatable {
+    let animation: TimelineAnimation
+    let sourceOffset: Double
+}
+struct TimelineClipBand: Equatable, Identifiable {
+    let id: String
+    let start: Double
+    let end: Double
+    let excluded: Bool
+    let label: String
+}
+struct TimelineCutMarker: Equatable, Identifiable {
+    let id: UUID
+    let start: Double
+    let end: Double
+    let help: String
+    var label: String? = nil
+    var showsTransitionSpan = true
+    var badgeLabel: String { label ?? (end > start ? String(format: "%.3gs", end - start) : "Cut") }
+}
+struct TimelineOutputProjection {
+    var animations: [TimelineAnimation] = []
+    var sourceIDs: [TimelineAnimationID: TimelineAnimationID] = [:]
+    var envelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:]
+
+    init(animations: [TimelineAnimation], map: RecordingTimeMap) {
+        for original in animations {
+            if original.lane == .pointer {
+                var item = original; item.start = 0; item.end = map.outputDuration; item.editable = false
+                self.animations.append(item); sourceIDs[item.id] = original.id
+                continue
+            }
+            if original.isInstant {
+                guard let position = map.outputTime(for: original.start) else { continue }
+                var item = original; item.start = position; item.end = position; item.editable = false
+                self.animations.append(item); sourceIDs[item.id] = original.id
+                continue
+            }
+            for (index, clip) in map.clips.enumerated() {
+                let start = max(original.start, clip.sourceStart), end = min(original.end, clip.sourceEnd)
+                guard start < end else { continue }
+                var item = original
+                // Fixed clip boundaries make identity independent of view size,
+                // magnification and playback position.
+                let key = "\(original.componentID.uuidString):\(clip.sourceStart.bitPattern):\(clip.sourceEnd.bitPattern)"
+                let digest = Array(SHA256.hash(data: Data(key.utf8)).prefix(16))
+                let uuid = UUID(uuid: (digest[0],digest[1],digest[2],digest[3],digest[4],digest[5],digest[6],digest[7],digest[8],digest[9],digest[10],digest[11],digest[12],digest[13],digest[14],digest[15]))
+                item.id = TimelineAnimationID(lane: original.lane, componentID: uuid)
+                item.start = clip.outputStart + start - clip.sourceStart
+                item.end = clip.outputStart + end - clip.sourceStart
+                item.editable = false
+                item.help = original.help + String(format: " Source %.3f–%.3f s (clip %d). Adjust timing in Source mode.", start, end, index + 1)
+                self.animations.append(item); sourceIDs[item.id] = original.id
+                envelopes[item.id] = TimelineSourceEnvelope(animation: original, sourceOffset: clip.sourceStart - clip.outputStart)
+            }
+        }
+    }
+}
+
 struct RecordingTimeline: NSViewRepresentable {
     static let animationLaneHeight: CGFloat = 150
+    static let clipLaneHeight: CGFloat = 180
     let duration: Double
     let trimStart: Double
     let trimEnd: Double
@@ -46,9 +110,40 @@ struct RecordingTimeline: NSViewRepresentable {
     var onAnimationCancel: () -> Void = {}
     var onDeleteAnimation: (TimelineAnimationID) -> Void = { _ in }
 
+    var showsClipLane = false
+    var showsTrimHandles = true
+    var allowsSeekingOutsideTrim = false
+    var clockID = "source"
+    var clipBands: [TimelineClipBand] = []
+    var cutMarkers: [TimelineCutMarker] = []
+    var selectedCutID: UUID?
+    var selectedRange: ClosedRange<Double>?
+    var onRangeSelection: (ClosedRange<Double>?) -> Void = { _ in }
+    var onSelectCut: (UUID) -> Void = { _ in }
+    var onCutRange: () -> Void = {}
+    var onRestoreCut: (UUID) -> Void = { _ in }
+    var onCutAnchor: (UnitPoint) -> Void = { _ in }
+    var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:]
+
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
-        view.duration = duration
+        view.setClock(clockID, duration: duration)
+        view.showsClipLane = showsClipLane
+        view.showsTrimHandles = showsTrimHandles
+        view.allowsSeekingOutsideTrim = allowsSeekingOutsideTrim
+        view.clipBands = clipBands
+        view.cutMarkers = cutMarkers
+        view.selectedCutID = selectedCutID
+        view.selectedRange = selectedRange
+        view.onRangeSelection = onRangeSelection
+        let selectCut = onSelectCut, anchorCut = onCutAnchor
+        view.onSelectCut = { [weak view] id in
+            if let anchor = view?.cutAnchor(for: id) { anchorCut(anchor) }
+            selectCut(id)
+        }
+        view.onCutRange = onCutRange
+        view.onRestoreCut = onRestoreCut
+        view.sourceEnvelopes = sourceEnvelopes
         view.trimStart = trimStart
         view.trimEnd = trimEnd
         view.playhead = playhead
@@ -178,9 +273,94 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var conflictOverlaps: [ClosedRange<Double>] = [] {
         didSet { if conflictOverlaps != oldValue { needsDisplay = true; updateTooltips() } }
     }
+    var showsClipLane = false { didSet { if oldValue != showsClipLane { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } } }
+    var showsTrimHandles = true { didSet { needsDisplay = true } }
+    var allowsSeekingOutsideTrim = false
+    var clipBands: [TimelineClipBand] = [] { didSet { if oldValue != clipBands { needsDisplay = true; updateTooltips() } } }
+    var cutMarkers: [TimelineCutMarker] = [] { didSet { if oldValue != cutMarkers { needsDisplay = true; updateTooltips() } } }
+    var selectedCutID: UUID? { didSet { needsDisplay = true } }
+    var selectedRange: ClosedRange<Double>? { didSet { needsDisplay = true } }
+    var onRangeSelection: ((ClosedRange<Double>?) -> Void)?
+    var onSelectCut: ((UUID) -> Void)?
+    var onCutRange: (() -> Void)?
+    var onRestoreCut: ((UUID) -> Void)?
+    var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:] { didSet { needsDisplay = true } }
+    private var clipOrigin: CGPoint?
+    private var clipRange: ClosedRange<Double>?
+    private var clockID = "source"
+    private var hasClock = false
+    private var savedViewports: [String: (Double, Double)] = [:]
+    private var laneOffset: CGFloat { showsClipLane ? 30 : 0 }
+
+    func setClock(_ id: String, duration value: Double) {
+        if !hasClock {
+            hasClock = true; clockID = id; duration = value
+            setViewport(start: 0, span: value); return
+        }
+        if id != clockID {
+            savedViewports[clockID] = (visibleStart, visibleDuration)
+            cancelAnimationGesture(); drag = nil; scrubTime = nil; clipOrigin = nil; clipRange = nil
+            clockID = id
+            duration = value
+            let saved = savedViewports[id] ?? (0, value)
+            setViewport(start: saved.0, span: saved.1)
+        } else { duration = value }
+    }
+
+    var clipLaneFrame: CGRect { CGRect(x: railOrigin, y: 38, width: railWidth, height: 26) }
+    func cutMarkerFrames() -> [(TimelineCutMarker, CGRect)] {
+        cutMarkers.filter { $0.end >= visibleStart && $0.start <= visibleStart + visibleDuration }.map {
+            let left = max(railOrigin, x(for: $0.start)), right = min(bounds.width - 12, x(for: $0.end))
+            let textWidth = ($0.badgeLabel as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 9, weight: .medium)]).width
+            let width = min(80, max(28, ceil(textWidth) + 10))
+            return ($0, CGRect(x: max(railOrigin, min((left + right) / 2 - width / 2, bounds.width - 12 - width)), y: 42, width: width, height: 18))
+        }
+    }
+    func cutAnchor(for id: UUID) -> UnitPoint? {
+        guard let frame = cutMarkerFrames().first(where: { $0.0.id == id })?.1 else { return nil }
+        return UnitPoint(x: min(1, max(0, (frame.midX - bounds.minX) / max(1, bounds.width))),
+            y: min(1, max(0, (frame.midY - bounds.minY) / max(1, bounds.height))))
+    }
+    func cutTransitionFrames() -> [(TimelineCutMarker, CGRect)] {
+        cutMarkers.filter { $0.showsTransitionSpan && $0.end > $0.start && $0.end >= visibleStart && $0.start <= visibleStart + visibleDuration }.map {
+            ($0, CGRect(x: x(for: $0.start), y: 40, width: max(1, x(for: $0.end) - x(for: $0.start)), height: 22))
+        }
+    }
+    private func drawClipLane() {
+        ("Clips" as NSString).draw(at: CGPoint(x: 8, y: 44), withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+        NSColor.black.withAlphaComponent(0.13).setFill(); NSBezierPath(roundedRect: clipLaneFrame, xRadius: 3, yRadius: 3).fill()
+        NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: clipLaneFrame).addClip()
+        for band in clipBands {
+            let rect = CGRect(x: x(for: band.start), y: 40, width: max(1, x(for: band.end) - x(for: band.start)), height: 22)
+            (band.excluded ? NSColor.secondaryLabelColor.withAlphaComponent(0.15) : NSColor.controlAccentColor.withAlphaComponent(0.3)).setFill()
+            NSBezierPath(roundedRect: rect.width > 2 ? rect.insetBy(dx: 1, dy: 0) : rect, xRadius: 2, yRadius: 2).fill()
+            if rect.width > 45 { (band.label as NSString).draw(in: rect.insetBy(dx: 5, dy: 6), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]) }
+        }
+        for (_, rect) in cutTransitionFrames() {
+            NSColor.systemTeal.withAlphaComponent(0.4).setFill(); NSBezierPath(rect: rect).fill()
+            let lines = NSBezierPath(); lines.move(to: CGPoint(x: rect.minX, y: rect.minY)); lines.line(to: CGPoint(x: rect.maxX, y: rect.maxY)); lines.move(to: CGPoint(x: rect.minX, y: rect.maxY)); lines.line(to: CGPoint(x: rect.maxX, y: rect.minY)); NSColor.systemTeal.setStroke(); lines.stroke()
+        }
+        if let range = clipRange ?? selectedRange {
+            let rect = CGRect(x: x(for: range.lowerBound), y: 39, width: max(1, x(for: range.upperBound) - x(for: range.lowerBound)), height: 24)
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill(); NSBezierPath(rect: rect).fill()
+            NSColor.controlAccentColor.setStroke(); NSBezierPath(rect: rect).stroke()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        for (cut, frame) in cutMarkerFrames() {
+            (cut.id == selectedCutID ? NSColor.controlAccentColor : NSColor.windowBackgroundColor).setFill()
+            NSBezierPath(roundedRect: frame, xRadius: 4, yRadius: 4).fill()
+            let text = cut.badgeLabel as NSString
+            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9, weight: .medium),
+                .foregroundColor: cut.id == selectedCutID ? NSColor.white : NSColor.labelColor]
+            let size = text.size(withAttributes: attributes)
+            text.draw(at: CGPoint(x: frame.midX - size.width / 2, y: frame.midY - size.height / 2), withAttributes: attributes)
+        }
+    }
+
     var duration = 1.0 {
         didSet {
             guard duration != oldValue else { return }
+            clipOrigin = nil; clipRange = nil
             let wasOverview = visibleStart == 0 && abs(visibleDuration - oldValue) < 0.000_001
             constrainViewport(reset: wasOverview)
         }
@@ -248,7 +428,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? RecordingTimeline.animationLaneHeight : 72) }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? (showsClipLane ? RecordingTimeline.clipLaneHeight : RecordingTimeline.animationLaneHeight) : 72) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -285,6 +465,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
         tooltipText[base] = showsAnimationLanes ? "Drag spans to move; selected edges resize and tall bars adjust ramps. Option-drag pushes neighbors. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        if showsClipLane {
+            tooltipText[addToolTip(clipLaneFrame, owner: self, userData: nil)] = "Drag a range, then use Cut section or Delete. Click a join to change its transition or restore the excluded source."
+            for (cut, frame) in cutMarkerFrames() { tooltipText[addToolTip(frame, owner: self, userData: nil)] = cut.help + " Delete restores this section." }
+        }
         for band in conflictBands() {
             let side = band.span.side == .existing ? "Existing" : "Proposed"
             tooltipText[addToolTip(band.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] =
@@ -338,7 +522,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
         let retained = CGRect(x: x(for: start), y: 21, width: max(1, x(for: end) - x(for: start)), height: 6).intersection(rail)
         if !retained.isNull { NSBezierPath(rect: retained).fill() }
-        for boundary in [start, end] where markerIsVisible(boundary) {
+        for boundary in (showsTrimHandles ? [start, end] : []) where markerIsVisible(boundary) {
             let handle = CGRect(x: x(for: boundary) - 5, y: 14, width: 10, height: 20)
             NSColor.controlAccentColor.setFill()
             NSBezierPath(roundedRect: handle, xRadius: 3, yRadius: 3).fill()
@@ -362,6 +546,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         thumb.fill()
         }
         if showsAnimationLanes {
+            if showsClipLane { drawClipLane() }
             drawAnimationLanes()
             drawTimeTicks()
             // The time indicator stays visible over every span without adding
@@ -414,7 +599,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     func animationLanes() -> [AnimationLaneGeometry] {
         TimelineAnimationLane.allCases.enumerated().map { index, lane in
-            let y = CGFloat(40 + index * 30)
+            let y = CGFloat(40 + index * 30) + laneOffset
             let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .pointer: "Pointer" }
             return AnimationLaneGeometry(lane: lane, title: title,
                 frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
@@ -424,7 +609,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     func pointerClickGeometry() -> [PointerClickGeometry] {
         pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
-            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 123, width: 2, height: 3))
+            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 123 + laneOffset, width: 2, height: 3))
         }
     }
 
@@ -522,8 +707,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard !animation.isInstant, !animation.isReference, animation.lane != .pointer else {
             return NSBezierPath(roundedRect: item.body, xRadius: 2, yRadius: 2)
         }
-        let span = animation.duration
-        let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: animation.easeIn, easeOut: animation.easeOut)
+        let profile = sourceEnvelopes[animation.id]
+        let source = profile?.animation ?? animation
+        let sourceOffset = profile?.sourceOffset ?? 0
+        let span = source.duration
+        let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: source.easeIn, easeOut: source.easeOut)
         var samples = [0.0, span, ramps.easeIn, span - ramps.easeOut, span / 2]
         for (start, length) in [(0.0, ramps.easeIn), (span - ramps.easeOut, ramps.easeOut)] where length > 0 {
             for index in 0...16 { samples.append(start + length * Double(index) / 16) }
@@ -534,10 +722,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         if ramps.easeOut == 0 { samples.append(span.nextDown) }
         let envelope = NSBezierPath()
         envelope.move(to: CGPoint(x: x(for: animation.start), y: item.body.maxY))
-        for elapsed in Set(samples).sorted() {
+        let lower = animation.start + sourceOffset - source.start
+        let upper = animation.end + sourceOffset - source.start
+        samples += [lower, upper]
+        for elapsed in Set(samples).sorted() where elapsed >= lower && elapsed <= upper {
             let speed = MotionInterpolation.normalizedSpeed(at: elapsed, duration: span,
-                easeIn: animation.easeIn, easeOut: animation.easeOut)
-            envelope.line(to: CGPoint(x: x(for: animation.start + elapsed),
+                easeIn: source.easeIn, easeOut: source.easeOut)
+            envelope.line(to: CGPoint(x: x(for: source.start + elapsed - sourceOffset),
                 y: item.body.maxY - CGFloat(speed) * (item.body.height - 3)))
         }
         envelope.line(to: CGPoint(x: x(for: animation.end), y: item.body.maxY))
@@ -558,7 +749,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
         drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
         NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: CGRect(x: railOrigin, y: 38, width: railWidth, height: 90)).addClip()
+        NSBezierPath(rect: CGRect(x: railOrigin, y: 38 + laneOffset, width: railWidth, height: 90)).addClip()
         for item in animationGeometry() {
             let animation = item.animation
             let selected = animation.id == (animationGesture?.id ?? selectedAnimationID)
@@ -843,7 +1034,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func conflictBands() -> [ConflictBand] {
         conflictSpans.compactMap { span in
             guard let frame = conflictFrame(start: span.start, end: span.end,
-                y: showsAnimationLanes ? (span.side == .existing ? 41 : 63) : (span.side == .existing ? 2 : 8), height: 3) else { return nil }
+                y: showsAnimationLanes ? (span.side == .existing ? 41 : 63) + laneOffset : (span.side == .existing ? 2 : 8), height: 3) else { return nil }
             return ConflictBand(span: span, frame: frame)
         }
     }
@@ -860,7 +1051,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func drawConflictReview(keptStart: Double, keptEnd: Double) {
-        let lane = CGRect(x: railOrigin, y: showsAnimationLanes ? 40 : 0, width: railWidth, height: showsAnimationLanes ? 26 : 12)
+        let lane = CGRect(x: railOrigin, y: showsAnimationLanes ? 40 + laneOffset : 0, width: railWidth, height: showsAnimationLanes ? 26 : 12)
         func draw(alpha: CGFloat) {
             for interval in conflictOverlaps {
                 guard let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: lane.minY, height: lane.height) else { continue }
@@ -1112,7 +1303,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         while tick <= last + step * 0.000_001 {
             let position = x(for: tick)
             let path = NSBezierPath()
-            let tickY: CGFloat = showsAnimationLanes ? 130 : 57
+            let tickY: CGFloat = showsAnimationLanes ? 130 + laneOffset : 57
             path.move(to: CGPoint(x: position, y: tickY))
             path.line(to: CGPoint(x: position, y: tickY + 3))
             NSColor.tertiaryLabelColor.setStroke()
@@ -1120,7 +1311,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let text = String(format: "%.*f s", decimals, tick) as NSString
             let width = text.size(withAttributes: attributes).width
             let labelX = min(max(position - width / 2, 0), bounds.width - width)
-            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? 134 : 61), withAttributes: attributes)
+            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? 134 + laneOffset : 61), withAttributes: attributes)
             tick += step
         }
     }
@@ -1209,10 +1400,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         needsDisplay = true
         window?.makeFirstResponder(self)
         onInteractionBegan?()
+        if showsClipLane, clipLaneFrame.contains(point) {
+            clipOrigin = point; clipRange = nil
+            return
+        }
         let rampHit = showsAnimationLanes && animationGeometry().contains {
             $0.easeInHandle?.contains(point) == true || $0.easeOutHandle?.contains(point) == true
         }
-        if showsAnimationLanes, point.y >= 38 || rampHit {
+        if showsAnimationLanes, point.y >= 38 + laneOffset || rampHit {
             beginAnimationInteraction(at: point)
             return
         }
@@ -1252,7 +1447,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let startDistance = markerIsVisible(trimStart) ? abs(point.x - x(for: trimStart)) : .infinity
         let endDistance = markerIsVisible(trimEnd) ? abs(point.x - x(for: trimEnd)) : .infinity
         let interaction: Interaction
-        if point.y >= 12, min(startDistance, endDistance) <= 12 {
+        if showsTrimHandles, point.y >= 12, min(startDistance, endDistance) <= 12 {
             interaction = startDistance <= endDistance ? .start : .end
         } else { interaction = .scrub }
         let origin: Double
@@ -1268,6 +1463,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let origin = clipOrigin {
+            let point = convert(event.locationInWindow, from: nil)
+            if abs(point.x - origin.x) >= 3 {
+                let a = time(for: origin.x), b = time(for: point.x)
+                clipRange = min(a, b)...max(a, b); onRangeSelection?(clipRange); needsDisplay = true
+            }
+            return
+        }
         if showsAnimationLanes, animationGesture != nil { dragAnimation(with: event); return }
         guard var drag else { return }
         let point = convert(event.locationInWindow, from: nil)
@@ -1302,6 +1505,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if clipOrigin != nil {
+            let point = convert(event.locationInWindow, from: nil)
+            clipOrigin = nil
+            if let range = clipRange { onRangeSelection?(range) }
+            else if let (cut, _) = cutMarkerFrames().first(where: { $0.1.contains(point) }) { onRangeSelection?(nil); onSelectCut?(cut.id) }
+            else { onRangeSelection?(nil); onScrubBegan?(); seek(time(for: point.x)); onScrubEnded?(); scrubTime = nil }
+            clipRange = nil; needsDisplay = true; return
+        }
         if showsAnimationLanes, animationGesture != nil || animationClickID != nil || animationDeleteID != nil || animationChooserIDs != nil || animationEmptyClick {
             endAnimationInteraction(at: convert(event.locationInWindow, from: nil)); return
         }
@@ -1328,6 +1539,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if clipOrigin != nil || selectedRange != nil {
+            clipOrigin = nil; clipRange = nil; onRangeSelection?(nil); needsDisplay = true; return
+        }
         if let activeAnimationMenu { activeAnimationMenu.cancelTracking(); self.activeAnimationMenu = nil; return }
         if showsAnimationLanes, animationGesture != nil || animationClickID != nil || animationDeleteID != nil || animationChooserIDs != nil || animationEmptyClick {
             cancelAnimationGesture(); return
@@ -1350,6 +1564,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { cancelOperation(nil); return }
+        if showsClipLane, selectedRange != nil, event.keyCode == 51 || event.keyCode == 117 {
+            onInteractionBegan?(); onCutRange?(); return
+        }
+        if showsClipLane, let id = selectedCutID, event.keyCode == 51 || event.keyCode == 117 {
+            if cutMarkers.contains(where: { $0.id == id }) { onInteractionBegan?(); onRestoreCut?(id) }
+            return
+        }
         if showsAnimationLanes, event.keyCode == 51 || event.keyCode == 117 {
             guard let id = selectedAnimationID, animationSpans.contains(where: { $0.id == id && $0.editable }) else { return }
             cancelAnimationGesture(); onInteractionBegan?(); onDeleteAnimation?(id); return
@@ -1381,7 +1602,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func seek(_ value: Double) {
-        let bounded = min(max(value, trimStart), trimEnd)
+        let bounded = min(max(value, allowsSeekingOutsideTrim ? 0 : trimStart), allowsSeekingOutsideTrim ? duration : trimEnd)
         scrubTime = bounded
         onSeek?(bounded)
         needsDisplay = true

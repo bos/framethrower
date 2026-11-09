@@ -489,6 +489,236 @@ struct RecordingAudio: Codable, Equatable, Sendable {
     }
 }
 
+/// An excluded half-open interval in original source seconds. The requested
+/// crossfade is in output seconds and is never rewritten by trimming.
+struct RecordingCut: Codable, Equatable, Sendable, Identifiable {
+    var id: UUID
+    var start: Double
+    var end: Double
+    var crossfade: Double
+
+    init(id: UUID = UUID(), start: Double, end: Double, crossfade: Double = 0) {
+        self.id = id; self.start = start; self.end = end; self.crossfade = crossfade
+    }
+    private enum CodingKeys: String, CodingKey { case id, start, end, crossfade }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        start = try values.decode(Double.self, forKey: .start)
+        end = try values.decode(Double.self, forKey: .end)
+        crossfade = try values.decodeIfPresent(Double.self, forKey: .crossfade) ?? 0
+    }
+}
+
+/// Pure source/output timing. Source edits and observations retain their original
+/// timestamps; a transition evaluates two independently composed source moments.
+struct RecordingTimeMap: Equatable, Sendable {
+    struct Clip: Equatable, Sendable {
+        let sourceStart: Double
+        let sourceEnd: Double
+        let outputStart: Double
+        let outputEnd: Double
+    }
+    struct Join: Equatable, Sendable, Identifiable {
+        let id: UUID
+        let outputStart: Double
+        let outputEnd: Double
+        let duration: Double
+        let requestedDuration: Double
+        let outgoingClipIndex: Int
+        let incomingClipIndex: Int
+    }
+    struct Sample: Equatable, Sendable {
+        let clipIndex: Int
+        let sourceTime: Double
+        let weight: Double
+    }
+    let clips: [Clip]
+    let joins: [Join]
+    let outputDuration: Double
+
+    init(duration: Double, trimStart: Double, trimEnd: Double, cuts: [RecordingCut]) throws {
+        guard duration.isFinite, duration > 0, trimStart.isFinite, trimEnd.isFinite,
+              trimStart >= 0, trimEnd <= duration, trimStart < trimEnd else {
+            throw ProjectError.invalid("Keep a nonempty trim range inside the original recording.")
+        }
+        let ordered = cuts.sorted { $0.start < $1.start }
+        var identities = Set<UUID>()
+        var priorEnd: Double?
+        for cut in ordered {
+            guard cut.start.isFinite, cut.end.isFinite, cut.crossfade.isFinite,
+                  cut.start >= 0, cut.end <= duration, cut.start < cut.end, cut.crossfade >= 0,
+                  identities.insert(cut.id).inserted else {
+                throw ProjectError.invalid("Cuts need unique identities, a nonempty source range inside the recording, and a finite nonnegative crossfade.")
+            }
+            if let priorEnd, cut.start <= priorEnd {
+                throw ProjectError.invalid("Combine touching or overlapping cuts into one excluded range.")
+            }
+            priorEnd = cut.end
+        }
+        var ranges: [(start: Double, end: Double)] = []
+        var position = trimStart
+        for cut in ordered where cut.end > trimStart && cut.start < trimEnd {
+            let start = max(trimStart, cut.start), end = min(trimEnd, cut.end)
+            if start > position { ranges.append((position, start)) }
+            position = end
+        }
+        if position < trimEnd { ranges.append((position, trimEnd)) }
+        guard !ranges.isEmpty else { throw ProjectError.invalid("Cuts must leave some footage inside the trim range.") }
+        let byStart = Dictionary(uniqueKeysWithValues: ordered.map { ($0.start, $0) })
+        let boundaries: [RecordingCut] = try ranges.dropLast().map { range in
+            guard let cut = byStart[range.end] else { throw ProjectError.invalid("A cut boundary could not be resolved.") }
+            return cut
+        }
+        let lengths = ranges.map { $0.end - $0.start }
+        let effective = Self.effectiveFades(requested: boundaries.map(\.crossfade), lengths: lengths)
+        var mapped: [Clip] = []
+        var mappedJoins: [Join] = []
+        for (index, range) in ranges.enumerated() {
+            let start = index == 0 ? 0 : mapped[index - 1].outputEnd - effective[index - 1]
+            mapped.append(Clip(sourceStart: range.start, sourceEnd: range.end,
+                               outputStart: start, outputEnd: start + lengths[index]))
+            if index > 0 {
+                let cut = boundaries[index - 1], fade = effective[index - 1]
+                mappedJoins.append(Join(id: cut.id, outputStart: start, outputEnd: start + fade,
+                    duration: fade, requestedDuration: cut.crossfade,
+                    outgoingClipIndex: index - 1, incomingClipIndex: index))
+            }
+        }
+        clips = mapped; joins = mappedJoins; outputDuration = mapped.last!.outputEnd
+    }
+
+    private struct FadeEvent {
+        let level: Double
+        let clip: Int
+        let version: Int
+    }
+    private struct FadeHeap {
+        private var events: [FadeEvent] = []
+        private func precedes(_ a: FadeEvent, _ b: FadeEvent) -> Bool {
+            a.level < b.level || (a.level == b.level && a.clip < b.clip)
+        }
+        mutating func push(_ event: FadeEvent) {
+            events.append(event)
+            var index = events.count - 1
+            while index > 0 {
+                let parent = (index - 1) / 2
+                guard precedes(events[index], events[parent]) else { break }
+                events.swapAt(index, parent); index = parent
+            }
+        }
+        mutating func pop() -> FadeEvent? {
+            guard let first = events.first, let last = events.popLast() else { return nil }
+            guard !events.isEmpty else { return first }
+            events[0] = last
+            var index = 0
+            while index * 2 + 1 < events.count {
+                var child = index * 2 + 1
+                if child + 1 < events.count && precedes(events[child + 1], events[child]) { child += 1 }
+                guard precedes(events[child], events[index]) else { break }
+                events.swapAt(index, child); index = child
+            }
+            return first
+        }
+    }
+
+    /// Max-min proportional allocation in O(n log n). Active fades grow as
+    /// weight*level; a saturated clip freezes its incident fades. Versioned heap
+    /// events avoid rescanning every clip after each exhausted handle budget.
+    private static func effectiveFades(requested: [Double], lengths: [Double]) -> [Double] {
+        guard let largest = requested.max(), largest > 0 else { return requested }
+        let weights = requested.map { $0 / largest }
+        var values = Array(repeating: 0.0, count: requested.count)
+        var active = weights.map { $0 > 0 }
+        var fixed = Array(repeating: 0.0, count: lengths.count)
+        var slopes = lengths.indices.map { clip in
+            [clip - 1, clip].filter { weights.indices.contains($0) }.reduce(0.0) { $0 + weights[$1] }
+        }
+        var versions = Array(repeating: 0, count: lengths.count)
+        var heap = FadeHeap()
+        for clip in lengths.indices where slopes[clip] > 0 {
+            heap.push(FadeEvent(level: min(largest, lengths[clip] / slopes[clip]), clip: clip, version: 0))
+        }
+        var level = 0.0
+        while let event = heap.pop() {
+            guard event.version == versions[event.clip], slopes[event.clip] > 0 else { continue }
+            level = max(level, min(largest, event.level))
+            if level >= largest {
+                for edge in requested.indices where active[edge] { values[edge] = requested[edge] }
+                break
+            }
+            let edges = [event.clip - 1, event.clip].filter { active.indices.contains($0) && active[$0] }
+            for edge in edges {
+                active[edge] = false
+                values[edge] = min(requested[edge], weights[edge] * level)
+                for clip in [edge, edge + 1] {
+                    let incident = [clip - 1, clip].filter { active.indices.contains($0) }
+                    fixed[clip] = incident.filter { !active[$0] }.reduce(0.0) { $0 + values[$1] }
+                    slopes[clip] = incident.filter { active[$0] }.reduce(0.0) { $0 + weights[$1] }
+                    versions[clip] += 1
+                    if slopes[clip] > 0 {
+                        let next = max(level, min(largest, max(0, lengths[clip] - fixed[clip]) / slopes[clip]))
+                        heap.push(FadeEvent(level: next, clip: clip, version: versions[clip]))
+                    }
+                }
+            }
+        }
+        // Floating-point addition at a saturated shared boundary can overshoot
+        // by an ulp. A conservative proportional correction only decreases fades.
+        for clip in lengths.indices {
+            let edges = [clip - 1, clip].filter { values.indices.contains($0) }
+            let left = edges.first.map { values[$0] } ?? 0
+            let right = edges.count == 2 ? values[edges[1]] : 0
+            if left > lengths[clip] - right {
+                let factor = (1 / (left / lengths[clip] + right / lengths[clip])).nextDown
+                for edge in edges { values[edge] *= max(0, factor) }
+            }
+        }
+        return values
+    }
+
+    /// Half-open output samples, with an explicit final endpoint for inspection.
+    /// Invisible zero-weight branches are omitted; positive weights sum to one.
+    func samples(at outputTime: Double) -> [Sample] {
+        guard outputTime.isFinite, outputTime >= 0, outputTime <= outputDuration else { return [] }
+        if outputTime == outputDuration, let last = clips.last {
+            return [Sample(clipIndex: clips.count - 1, sourceTime: last.sourceEnd, weight: 1)]
+        }
+        var result: [Sample] = []
+        for (index, clip) in clips.enumerated() where outputTime >= clip.outputStart && outputTime < clip.outputEnd {
+            var weight = 1.0
+            if index > 0 {
+                let join = joins[index - 1]
+                if join.duration > 0 && outputTime < join.outputEnd {
+                    weight = min(1, max(0, (outputTime - join.outputStart) / join.duration))
+                }
+            }
+            if index < joins.count {
+                let join = joins[index]
+                if join.duration > 0 && outputTime >= join.outputStart {
+                    weight = min(weight, max(0, (join.outputEnd - outputTime) / join.duration))
+                }
+            }
+            if weight > 0 {
+                result.append(Sample(clipIndex: index,
+                    sourceTime: min(clip.sourceEnd, clip.sourceStart + (outputTime - clip.outputStart)), weight: weight))
+            }
+        }
+        let sum = result.reduce(0.0) { $0 + $1.weight }
+        guard sum > 0 else { return [] }
+        return result.map { Sample(clipIndex: $0.clipIndex, sourceTime: $0.sourceTime, weight: $0.weight / sum) }
+    }
+
+    /// Excluded source instants have no output position. During a crossfade two
+    /// distinct retained source instants intentionally map to the same output time.
+    func outputTime(for sourceTime: Double) -> Double? {
+        guard sourceTime.isFinite else { return nil }
+        if sourceTime == clips.last?.sourceEnd { return outputDuration }
+        guard let clip = clips.first(where: { sourceTime >= $0.sourceStart && sourceTime < $0.sourceEnd }) else { return nil }
+        return clip.outputStart + (sourceTime - clip.sourceStart)
+    }
+}
+
 struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
@@ -499,6 +729,7 @@ struct EditState: Codable, Equatable, Sendable {
     var regions: [EditorRegion] = []
     var editAnchors: [EditAnchor] = []
     var audio = RecordingAudio()
+    var cuts: [RecordingCut] = []
     /// Missing only in legacy states. A persisted version prevents a manually
     /// detached target from being inferred again after a later save/reopen.
     var boxConnectionsVersion = 1
@@ -506,7 +737,7 @@ struct EditState: Codable, Equatable, Sendable {
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
-         editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio()) {
+         editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = []) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -516,10 +747,11 @@ struct EditState: Codable, Equatable, Sendable {
         self.regions = regions
         self.editAnchors = editAnchors
         self.audio = audio
+        self.cuts = cuts
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, boxConnectionsVersion
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, boxConnectionsVersion
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -535,6 +767,7 @@ struct EditState: Codable, Equatable, Sendable {
         regions = try values.decodeIfPresent([EditorRegion].self, forKey: .regions) ?? []
         editAnchors = try values.decodeIfPresent([EditAnchor].self, forKey: .editAnchors) ?? []
         audio = try values.decodeIfPresent(RecordingAudio.self, forKey: .audio) ?? RecordingAudio()
+        cuts = try values.decodeIfPresent([RecordingCut].self, forKey: .cuts) ?? []
         if values.contains(.boxConnectionsVersion) {
             boxConnectionsVersion = try values.decode(Int.self, forKey: .boxConnectionsVersion)
             guard boxConnectionsVersion == 1 else {
@@ -969,6 +1202,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
             throw ProjectError.invalid("This recording uses an unsupported box connection version.")
         }
         try state.audio.validate()
+        _ = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts)
         guard state.editAnchors.count <= 100_000 else {
             throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
         }

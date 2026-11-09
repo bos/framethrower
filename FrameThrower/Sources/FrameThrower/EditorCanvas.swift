@@ -82,6 +82,13 @@ struct EditorCanvasEditingPose {
     var placement: PIPPlacement
 }
 
+struct EditorCanvasSample {
+    var sourceTime: Double
+    var weight: Double
+    var zoom: ZoomPlacement
+    var placement: PIPPlacement
+}
+
 /// Pixels and drag geometry stay inside one native view. Neither decoded image
 /// dimensions nor a camera gesture can become a SwiftUI layout proposal.
 struct EditorCanvas: NSViewRepresentable {
@@ -118,6 +125,7 @@ struct EditorCanvas: NSViewRepresentable {
     var onSelectRegion: (UUID?) -> Void = { _ in }
     var onDeleteRegion: (UUID) -> Void = { _ in }
     var conflictOutlines: EditorConflictOutlines? = nil
+    var outputSamples: [EditorCanvasSample] = []
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -146,7 +154,7 @@ struct EditorCanvas: NSViewRepresentable {
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
             placement: placement, cameraEnabled: cameraEnabled, showsCameraPattern: showsCameraPattern, zoom: zoom,
-            presentation: presentation, nativeSourceSize: nativeSourceSize)
+            presentation: presentation, nativeSourceSize: nativeSourceSize, outputSamples: outputSamples)
     }
 }
 
@@ -170,6 +178,8 @@ final class EditorCanvasView: NSView {
     }
     var hasMediaPlayerLayer: Bool { mediaLayer != nil }
     private(set) var testPattern: EditorTestPattern?
+    private(set) var incomingTestPattern: EditorTestPattern?
+    private var outputSamples: [EditorCanvasSample] = []
     let stillLayer = CALayer()
     private let canvasBorder = CALayer()
     private let outline = CAShapeLayer()
@@ -304,7 +314,8 @@ final class EditorCanvasView: NSView {
     func configure(player: AVPlayer?, image: CGImage?, sourceSize: CGSize,
                    cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool,
                    showsCameraPattern: Bool? = nil, zoom: ZoomPlacement = ZoomPlacement(),
-                   presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil) {
+                   presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil,
+                   outputSamples: [EditorCanvasSample] = []) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if MediaProcessing.isSuspended {
@@ -331,6 +342,7 @@ final class EditorCanvasView: NSView {
         self.cameraEnabled = cameraEnabled
         self.showsCameraPattern = showsCameraPattern ?? cameraEnabled
         self.placement = placement
+        self.outputSamples = outputSamples
         // Frame delivery and SwiftUI updates may arrive between native gesture
         // samples. Continue from the gesture's viewport, never from an older
         // frame's configuration.
@@ -356,8 +368,21 @@ final class EditorCanvasView: NSView {
         canvasBorder.frame = canvasRect
         let current = drag?.draft ?? placement
         if MediaProcessing.isSuspended {
-            testPattern?.update(in: bounds, sourceSize: sourceSize, presentation: presentation, zoom: zoom,
-                placement: current, cameraEnabled: showsCameraPattern, cameraAspect: cameraAspect)
+            let usesOutputSamples = drag == nil && trackpad == nil && zoomDrag == nil && !outputSamples.isEmpty
+            let first = usesOutputSamples ? outputSamples.first : nil
+            testPattern?.update(in: bounds, sourceSize: sourceSize, presentation: presentation, zoom: first?.zoom ?? zoom,
+                placement: first?.placement ?? current, cameraEnabled: showsCameraPattern, cameraAspect: cameraAspect)
+            if usesOutputSamples, outputSamples.count == 2, let second = outputSamples.last {
+                if incomingTestPattern == nil, let testPattern {
+                    let pattern = EditorTestPattern()
+                    incomingTestPattern = pattern
+                    layer?.insertSublayer(pattern.layer, above: testPattern.layer)
+                }
+                incomingTestPattern?.layer.isHidden = false
+                incomingTestPattern?.layer.opacity = Float(min(1, max(0, second.weight)))
+                incomingTestPattern?.update(in: bounds, sourceSize: sourceSize, presentation: presentation,
+                    zoom: second.zoom, placement: second.placement, cameraEnabled: showsCameraPattern, cameraAspect: cameraAspect)
+            } else { incomingTestPattern?.layer.isHidden = true }
         }
         outline.isHidden = !cameraEnabled || !current.visible
         handles.isHidden = outline.isHidden

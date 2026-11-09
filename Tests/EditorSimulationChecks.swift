@@ -124,6 +124,25 @@ struct EditorSimulationChecks {
         canvas.layoutSubtreeIfNeeded()
         try require(canvas.frame == fixedFrame && canvas.testPattern?.screenFrame == canvas.contentRect && !canvas.hasMediaPlayerLayer,
                     "Changing the output aspect updates internal presentation geometry without reallocating the view")
+        let outgoing = EditorCanvasSample(sourceTime: 2.4, weight: 0.6, zoom: .init(scale: 1.2, x: 0.3, y: 0.4),
+            placement: .init(x: 0.1, y: 0.2, shape: .circle))
+        let incoming = EditorCanvasSample(sourceTime: 7.4, weight: 0.4, zoom: .init(scale: 2, x: 0.7, y: 0.6),
+            placement: .init(x: 0.8, y: 0.7, scale: 0.4))
+        canvas.configure(player: nil, image: nil, sourceSize: EditorTestPattern.sourceSize,
+            cameraAspect: 16.0 / 9.0, placement: outgoing.placement, cameraEnabled: false, showsCameraPattern: true,
+            outputSamples: [outgoing, incoming])
+        canvas.layoutSubtreeIfNeeded()
+        try require(canvas.testPattern?.screenViewport == outgoing.zoom.viewport(in: EditorTestPattern.sourceSize) &&
+            canvas.incomingTestPattern?.screenViewport == incoming.zoom.viewport(in: EditorTestPattern.sourceSize),
+            "A crossfade must compose the two original-source poses independently")
+        try require(canvas.testPattern?.layer.opacity == 1 && canvas.incomingTestPattern?.layer.opacity == 0.4 &&
+            canvas.incomingTestPattern?.layer.isHidden == false && canvas.frame == fixedFrame,
+            "The full incoming composition blends over the opaque outgoing composition without layout changes")
+        try require(allLayers(canvas.incomingTestPattern!.layer).allSatisfy { $0.contents == nil } && !canvas.hasMediaPlayerLayer,
+            "Crossfade simulation stays entirely vector-based")
+        canvas.configure(player: nil, image: nil, sourceSize: EditorTestPattern.sourceSize,
+            cameraAspect: 16.0 / 9.0, placement: outgoing.placement, cameraEnabled: false, showsCameraPattern: true)
+        try require(canvas.incomingTestPattern?.layer.isHidden == true, "Leaving a transition must remove the second branch")
     }
     static func playbackRates() async throws {
         let project = RecordingProject(screenFilename: "no-rate-source.mov", duration: 20,

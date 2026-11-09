@@ -65,6 +65,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     var selection: () -> (UUID?, UUID?, String?, String?) = { (nil, nil, nil, nil) }
     var navigate: ((String, UUID?, String?) throws -> Void)?
     var conversationPage: ((Int, Int) throws -> [String: Any])?
+    var timelineTimeBase = "output"
 
     init(editor: ProjectEditor, playback: EditorPlayback,
          rebuild: @escaping @MainActor (ProjectEditor, EditorPlayback) async -> Void = { editor, playback in
@@ -97,7 +98,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             return EditorAutomationContext(documentID: documentID, name: editor.displayName,
                 revision: try EditorCommandDispatcher.revision(for: editor.project), hasDraft: editor.draftState != nil,
                 preview: playback?.previewSnapshot, selectedEditID: selected.0, selectedBoxID: selected.1,
-                selectedAnimationID: selected.2, inspector: selected.3, recordingID: editor.automationID)
+                selectedAnimationID: selected.2, inspector: selected.3, recordingID: editor.automationID,
+                timelineTimeBase: timelineTimeBase)
         }
     }
     var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { events.eraseToAnyPublisher() }
@@ -140,7 +142,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let value: Any
         switch name {
         case "inspect_editor":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time", "time_base"])
             value = try inspect(args, editor: editor)
         case "inspect_recording":
             try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "query", "window_id", "kind", "limit"])
@@ -186,7 +188,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 intent = previewIntent
                 if pendingPlaybackIntent != intent { pendingPlaybackIntent = nil }
                 switch command {
-                case .play, .playRange: pendingPlaybackIntent = intent; ownsPlaybackIntent = true
+                case .play, .playRange, .playOutputRange: pendingPlaybackIntent = intent; ownsPlaybackIntent = true
                 default: break
                 }
             }
@@ -239,6 +241,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             default: throw EditorAutomationError.invalid("Choose save, rename, undo or redo.")
             }
             guard success else { throw EditorCommandError.saveFailed(editor.errorMessage ?? "The recording could not be saved.") }
+            await rebuildPreview()
             var receipt = try EditorAutomationAPI.object(automationContext) as! [String: Any]
             receipt["project_metadata_saved"] = true
             value = receipt
@@ -280,6 +283,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                         "animation_id": "\($0.lane.rawValue):\($0.componentID.uuidString)",
                         "start": $0.start, "end": $0.end] as [String: Any] }]])
             }
+            await rebuildPreview()
             value = try inspect(["section": "summary"], editor: editor)
         default: throw EditorAutomationError.invalid("Unknown editor action.")
         }
@@ -422,7 +426,14 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             defer { if pendingPlaybackIntent == intent { pendingPlaybackIntent = nil } }
             do {
                 guard previewIntent == intent else { return }
-                let data = try JSONSerialization.data(withJSONObject: ["document_id": documentID, "operation": "play"])
+                var fields: [String: Any] = ["document_id": documentID, "operation": "play"]
+                if timelineTimeBase == "source" {
+                    let range = playback.previewSourceBounds
+                    let start = playback.time >= range.upperBound ? range.lowerBound : max(range.lowerBound, playback.time)
+                    fields["operation"] = "play_range"; fields["time_base"] = "source"
+                    fields["start"] = start; fields["end"] = range.upperBound
+                }
+                let data = try JSONSerialization.data(withJSONObject: fields)
                 _ = try await perform("control_preview", arguments: data, origin: "manual", expectedPreviewIntent: intent)
             } catch is CancellationError {
                 // A later Pause deliberately superseded this intent.
@@ -447,11 +458,17 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
 
     private func previewCommand(_ args: [String: Any], editor: ProjectEditor) throws -> EditorPreviewCommand {
         guard let playback, let operation = args["operation"] as? String else { throw EditorPreviewError.unavailable }
+        if let base = args["time_base"], !(base is String) { throw EditorAutomationError.invalid("Choose source or output time.") }
+        let timeBase = args["time_base"] as? String ?? "source"
+        guard ["source", "output"].contains(timeBase) else { throw EditorAutomationError.invalid("Choose source or output time.") }
         let fields: Set<String>
         let command: EditorPreviewCommand
         func time(_ name: String) throws -> Double {
             let time = try EditorAutomationAPI.number(args[name])
-            guard playback.previewSourceBounds.contains(time) else { throw EditorPreviewError.invalidTime }
+            let bounds = timeBase == "output" ? 0...playback.outputDuration : playback.previewSourceBounds
+            guard bounds.contains(time) else {
+                throw EditorAutomationError.invalid("Choose a finite \(timeBase) time inside the \(timeBase == "output" ? "finished" : "original") recording.")
+            }
             return time
         }
         switch operation {
@@ -459,18 +476,23 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             guard playback.canPlay else { throw EditorPreviewError.unavailable }
             fields = []; command = .play
         case "pause": fields = []; command = .pause
-        case "seek": fields = ["time"]; command = .seek(try time("time"))
+        case "seek":
+            fields = ["time", "time_base"]
+            let target = try time("time")
+            command = timeBase == "output" ? .seekOutput(target) : .seek(target)
         case "set_rate":
             fields = ["rate"]; let rate = try EditorAutomationAPI.number(args["rate"])
             guard [0.5, 1.0, 2.0, 5.0].contains(rate) else { throw EditorPreviewError.unsupportedRate }
             command = .setRate(rate)
         case "step_frames":
             guard playback.canPlay else { throw EditorPreviewError.unavailable }
-            fields = ["frames"]; command = .stepFrames(try EditorAutomationAPI.integer(args["frames"]))
+            fields = ["frames", "time_base"]
+            let frames = try EditorAutomationAPI.integer(args["frames"])
+            command = timeBase == "output" ? .stepOutputFrames(frames) : .stepFrames(frames)
         case "play_range":
-            fields = ["start", "end"]; let start = try time("start"), end = try time("end")
+            fields = ["start", "end", "time_base"]; let start = try time("start"), end = try time("end")
             guard start < end else { throw EditorPreviewError.invalidRange }
-            command = .playRange(start: start, end: end)
+            command = timeBase == "output" ? .playOutputRange(start: start, end: end) : .playRange(start: start, end: end)
         case "play_animation":
             fields = ["animation_id", "edit_id"]
             let animations = EditorAnimationEditing.animations(in: editor.editingState, references: editor.references,
@@ -484,16 +506,50 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 matches = animations.filter { $0.editID == uuid || $0.componentID == uuid }
             } else { throw EditorAutomationError.invalid("Identify one animation, including its lane when an edit changes more than one lane.") }
             guard matches.count == 1, let animation = matches.first else { throw EditorAutomationError.invalid("Choose one nonempty animation range from inspect_editor edits.") }
-            command = .playRange(start: animation.start, end: animation.end)
+            let state = editor.editingState
+            if state.cuts.isEmpty {
+                command = .playRange(start: animation.start, end: animation.end)
+            } else {
+                let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
+                    trimEnd: state.trimEnd, cuts: state.cuts)
+                // A source interval can project to overlapping output branches.
+                // Project each retained intersection; never reverse endpoint
+                // mappings or choose just the dominant branch of a crossfade.
+                let intervals = map.clips.compactMap { clip -> ClosedRange<Double>? in
+                    let start = max(animation.start, clip.sourceStart), end = min(animation.end, clip.sourceEnd)
+                    guard start < end else { return nil }
+                    let outputStart = start == clip.sourceStart ? clip.outputStart :
+                        min(clip.outputEnd, max(clip.outputStart, clip.outputStart + (start - clip.sourceStart)))
+                    let outputEnd = end == clip.sourceEnd ? clip.outputEnd :
+                        min(clip.outputEnd, max(clip.outputStart, clip.outputStart + (end - clip.sourceStart)))
+                    guard outputStart < outputEnd else { return nil }
+                    return outputStart...outputEnd
+                }
+                guard let start = intervals.map(\.lowerBound).min(), let end = intervals.map(\.upperBound).max(), start < end else {
+                    throw EditorAutomationError.invalid("That animation has no retained footage in the finished recording. Restore its cut or inspect the original source.")
+                }
+                command = .playOutputRange(start: start, end: end)
+            }
         default: throw EditorAutomationError.invalid("Unknown playback action.")
         }
         try EditorAutomationAPI.keys(args, allowed: fields.union(["document_id", "operation"]))
+        if !playback.supportsSourceAudition {
+            switch command {
+            case .seek, .stepFrames, .playRange: throw EditorPreviewError.sourceAuditionUnavailable
+            default: break
+            }
+        }
         return command
     }
 
     private func inspect(_ args: [String: Any], editor: ProjectEditor) throws -> Any {
-        if args["section"] as? String != "state", args["component"] != nil || args["time"] != nil {
-            throw EditorAutomationError.invalid("Component and source time are available only for section=state.")
+        if let base = args["time_base"], !(base is String) { throw EditorAutomationError.invalid("Choose source or output time.") }
+        let section = args["section"] as? String
+        if section != "state", args["component"] != nil {
+            throw EditorAutomationError.invalid("Component is available only for section=state.")
+        }
+        if !["state", "timing"].contains(section ?? ""), args["time"] != nil || args["time_base"] != nil {
+            throw EditorAutomationError.invalid("Time coordinates are available only for section=state or timing.")
         }
         let offset = try args["offset"].map { try EditorAutomationAPI.integer($0) } ?? 0
         let limit = try args["limit"].map { try EditorAutomationAPI.integer($0) } ?? 8
@@ -504,8 +560,33 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         }
         let state = editor.editingState
         switch args["section"] as? String {
+        case "timing":
+            let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, cuts: state.cuts)
+            guard args["time_base"] == nil || args["time_base"] as? String == "output" else {
+                throw EditorAutomationError.invalid("Timing inspection uses output seconds. Use state component inspection for original-source values.")
+            }
+            let position = try args["time"].map { try EditorAutomationAPI.number($0) } ?? playback?.outputTime ?? 0
+            guard position >= 0, position <= map.outputDuration else { throw EditorPreviewError.invalidTime }
+            return ["source_duration": editor.project.duration, "output_duration": map.outputDuration,
+                "output_time": position, "source_samples": map.samples(at: position).map {
+                    ["clip_index": $0.clipIndex, "source_time": $0.sourceTime, "weight": $0.weight] as [String: Any]
+                },
+                "time_base": "output", "cut_count": state.cuts.count,
+                "cuts": page(try state.cuts.map { try EditorAutomationAPI.object($0) }),
+                "clips": page(map.clips.enumerated().map { index, clip in
+                    ["clip_index": index, "source_start": clip.sourceStart, "source_end": clip.sourceEnd,
+                     "output_start": clip.outputStart, "output_end": clip.outputEnd] as [String: Any]
+                }),
+                "joins": page(map.joins.map { join in
+                    ["id": join.id.uuidString, "output_start": join.outputStart, "output_end": join.outputEnd,
+                     "requested_duration": join.requestedDuration, "effective_duration": join.duration] as [String: Any]
+                })]
         case "summary", "view":
+            let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, cuts: state.cuts)
             return ["context": try EditorAutomationAPI.object(automationContext), "duration": editor.project.duration,
+                "source_duration": editor.project.duration, "output_duration": map.outputDuration, "cut_count": state.cuts.count,
                 "trim": ["start": state.trimStart, "end": state.trimEnd], "edit_count": state.timedEdits(includeCamera: editor.project.cameraFilename != nil).count,
                 "box_count": state.regions.count, "undo_count": editor.historyState.undo.count,
                 "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
@@ -518,7 +599,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             return try conversationPage(offset, limit)
         case "state":
             if args["component"] != nil { return try inspectComponent(args, editor: editor) }
-            guard args["time"] == nil else { throw EditorAutomationError.invalid("Choose a state component when specifying source time.") }
+            guard args["time"] == nil && args["time_base"] == nil else { throw EditorAutomationError.invalid("Choose a state component when specifying time coordinates.") }
             return try EditorAutomationAPI.object(state)
         case "boxes": return page(try state.regions.map { region -> Any in
             ["id": region.id.uuidString, "label": editor.references.boxLabel(for: region.id) ?? "Box",
@@ -540,7 +621,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                             "redo": try historyDetails(.redo, offset: offset, limit: limit, editor: editor)]]
         case "events": return ["page": page(recentEvents), "first_retained_sequence": recentEvents.first?["sequence"] ?? eventSequence,
                                 "last_sequence": eventSequence, "retained_limit": 128]
-        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, history, state or events.")
+        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, history, state, timing or events.")
         }
     }
 
@@ -552,19 +633,33 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas or trim.")
         }
         let context = try automationContext
-        let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
-        guard time.isFinite, time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
         let state = editor.editingState
-        let value: Any
-        switch component {
-        case "screen": value = try EditorAutomationAPI.object(state.zoom(at: time))
-        case "camera": value = try EditorAutomationAPI.object(state.placement(at: time))
-        case "pointer": value = try EditorAutomationAPI.object(state.cursorStyle)
-        case "audio": value = try EditorAutomationAPI.object(state.audio)
-        case "canvas": value = try EditorAutomationAPI.object(state.presentation)
-        default: value = ["start": state.trimStart, "end": state.trimEnd]
+        let timeBase = args["time_base"] as? String ?? "source"
+        guard ["source", "output"].contains(timeBase) else { throw EditorAutomationError.invalid("Choose source or output time.") }
+        func value(at sourceTime: Double) throws -> Any {
+            switch component {
+            case "screen": return try EditorAutomationAPI.object(state.zoom(at: sourceTime))
+            case "camera": return try EditorAutomationAPI.object(state.placement(at: sourceTime))
+            case "pointer": return try EditorAutomationAPI.object(state.cursorStyle)
+            case "audio": return try EditorAutomationAPI.object(state.audio)
+            case "canvas": return try EditorAutomationAPI.object(state.presentation)
+            default: return ["start": state.trimStart, "end": state.trimEnd]
+            }
         }
-        var result: [String: Any] = ["component": component, "source_time": time, "value": value,
+        if timeBase == "output" {
+            let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, cuts: state.cuts)
+            let position = try args["time"].map { try EditorAutomationAPI.number($0) } ?? playback?.outputTime ?? 0
+            guard position >= 0, position <= map.outputDuration else { throw EditorPreviewError.invalidTime }
+            return ["component": component, "time_base": "output", "output_time": position,
+                "context": try EditorAutomationAPI.object(context), "samples": try map.samples(at: position).map {
+                    ["clip_index": $0.clipIndex, "source_time": $0.sourceTime, "weight": $0.weight,
+                     "value": try value(at: $0.sourceTime)] as [String: Any]
+                }]
+        }
+        let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
+        guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
+        var result: [String: Any] = ["component": component, "source_time": time, "value": try value(at: time),
             "scope": ["screen", "camera"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }

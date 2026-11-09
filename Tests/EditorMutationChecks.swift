@@ -46,7 +46,8 @@ struct EditorMutationChecks {
             .cameraOverlay(.init(position: .init(x: 0, y: 0), scale: 0.2, shape: .circle, visible: false), timing: interval),
             .cameraSource(.init(crop: PIPCrop(x: 0.2, y: 0.5), sourceZoom: 2), timing: interval),
             .alignCameraOverlay(regionID: regionID, subjectAnchor: .center, targetAnchor: .center, axes: .both, timing: interval),
-            .pointer(.init(size: 2)), .audio(.init(volume: 0.5)), .canvas(.init(padding: 0.1)), .trim(start: 1, end: 9)]
+            .pointer(.init(size: 2)), .audio(.init(volume: 0.5)), .canvas(.init(padding: 0.1)), .trim(start: 1, end: 9),
+            .cutSection(start: 2, end: 3, timeBase: .source), .restoreCut(cutID: regionID), .cutTransition(cutID: regionID, duration: 0.5)]
         for value in samples {
             let data = try JSONEncoder().encode(EditorCommand.mutate(value))
             try require(try JSONDecoder().decode(EditorCommand.self, from: data) == .mutate(value), "every mutation roundtrips through existing command decoder")
@@ -65,7 +66,13 @@ struct EditorMutationChecks {
             try rejects({ _ = try JSONDecoder().decode(EditorMutation.self, from: Data(json.utf8)) }, "unknown, null, wrong-type and cross-subject fields reject")
         }
         let schema = try JSONSerialization.jsonObject(with: EditorMutation.schemaData()) as! [String: Any]
-        try require((schema["oneOf"] as? [Any])?.count == samples.count, "catalog covers all mutation cases")
+        let descriptors = schema["oneOf"] as! [[String: Any]]
+        let names = descriptors.compactMap { (($0["properties"] as? [String: Any])?["operation"] as? [String: Any])?["const"] as? String }
+        try require(Set(names).count == descriptors.count, "catalog operation names are unique")
+        for sample in samples {
+            let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(sample)) as! [String: Any]
+            try require(names.contains(encoded["operation"] as! String), "catalog exposes each tested operation")
+        }
         try require(JSONSerialization.isValidJSONObject(EditorMutation.documentation), "catalog documentation is serializable")
     }
 

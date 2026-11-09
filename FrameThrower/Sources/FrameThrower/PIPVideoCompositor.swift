@@ -52,6 +52,35 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
 
 }
 
+/// Cut compositions request at most two simultaneous retained branches. Track
+/// IDs alternate between clips; source timestamps still drive every visual edit.
+final class CutCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
+    struct Branch {
+        let screenTrackID: CMPersistentTrackID
+        let cameraTrackID: CMPersistentTrackID?
+    }
+    let timeRange: CMTimeRange
+    let enablePostProcessing = false
+    let containsTweening = true
+    let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
+    let requiredSourceTrackIDs: [NSValue]?
+    let timingMap: RecordingTimeMap
+    let branches: [Branch]
+    let template: PIPCompositionInstruction
+
+    init(timingMap: RecordingTimeMap, branches: [Branch], template: PIPCompositionInstruction) {
+        self.timingMap = timingMap; self.branches = branches; self.template = template
+        timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: timingMap.outputDuration, preferredTimescale: 60_000))
+        requiredSourceTrackIDs = Set(branches.flatMap { [$0.screenTrackID] + [$0.cameraTrackID].compactMap { $0 } })
+            .sorted().map { NSNumber(value: $0) }
+        super.init()
+    }
+    func applying(_ state: EditState, renderSize: CGSize? = nil) -> CutCompositionInstruction {
+        CutCompositionInstruction(timingMap: timingMap, branches: branches,
+            template: template.applying(state, preservePreviewFrames: false, renderSize: renderSize))
+    }
+}
+
 struct PIPSourceGeometry: Sendable {
     let size: CGSize
     /// Maps source top-left coordinates to oriented, origin-normalized top-left coordinates.
@@ -141,8 +170,30 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
     }
 
     private func render(_ request: AVAsynchronousVideoCompositionRequest) throws -> CVPixelBuffer {
-        guard let instruction = request.videoCompositionInstruction as? PIPCompositionInstruction,
-              let output = request.renderContext.newPixelBuffer() else {
+        guard let output = request.renderContext.newPixelBuffer() else {
+            throw NSError(domain: "FrameThrower.Compositor", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "A recording frame could not be allocated."])
+        }
+        if let cut = request.videoCompositionInstruction as? CutCompositionInstruction {
+            let canvas = CGRect(origin: .zero, size: cut.template.renderSize)
+            var blended: CIImage?
+            for sample in cut.timingMap.samples(at: request.compositionTime.seconds) {
+                let branch = cut.branches[sample.clipIndex]
+                let image = composer.image(screen: request.sourceFrame(byTrackID: branch.screenTrackID),
+                    camera: branch.cameraTrackID.flatMap { request.sourceFrame(byTrackID: $0) },
+                    instruction: cut.template, state: cut.template.state, at: sample.sourceTime,
+                    renderSize: cut.template.renderSize)
+                if let outgoing = blended {
+                    blended = outgoing.applyingFilter("CIDissolveTransition", parameters: [
+                        kCIInputTargetImageKey: image, kCIInputTimeKey: sample.weight
+                    ]).cropped(to: canvas)
+                } else { blended = image }
+            }
+            let image = blended ?? CIImage(color: .black).cropped(to: canvas)
+            composer.context.render(image, to: output, bounds: canvas, colorSpace: composer.colorSpace)
+            return output
+        }
+        guard let instruction = request.videoCompositionInstruction as? PIPCompositionInstruction else {
             throw NSError(domain: "FrameThrower.Compositor", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "A recording frame could not be rendered."])
         }

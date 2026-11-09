@@ -195,7 +195,8 @@ struct EditorMutationGeometry: Equatable, Sendable {
     var cameraAspect: Double?
 }
 
-enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim }
+enum EditorCutTimeBase: String, Codable, Sendable { case source, output }
+enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing }
 enum EditorMutationSubject: String, Codable, Sendable { case screenViewport, cameraOverlay, cameraSource }
 
 struct EditorMutationEffect: Equatable, Sendable {
@@ -242,9 +243,13 @@ enum EditorMutation: Codable, Equatable, Sendable {
     case audio(EditorAudioPatch)
     case canvas(EditorCanvasPatch)
     case trim(start: Double, end: Double)
+    case cutSection(start: Double, end: Double, timeBase: EditorCutTimeBase, crossfade: Double? = nil)
+    case restoreCut(cutID: UUID)
+    case cutTransition(cutID: UUID, duration: Double)
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end
+        case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end,
+             timeBase, crossfade, cutID, duration
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
@@ -270,6 +275,15 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case "audio": try c.only([.operation, .patch]); self = .audio(try c.decode(EditorAudioPatch.self, forKey: .patch))
         case "canvas": try c.only([.operation, .patch]); self = .canvas(try c.decode(EditorCanvasPatch.self, forKey: .patch))
         case "trim": try c.only([.operation, .start, .end]); self = .trim(start: try c.decode(Double.self, forKey: .start), end: try c.decode(Double.self, forKey: .end))
+        case "cutSection":
+            try c.only([.operation, .start, .end, .timeBase, .crossfade])
+            self = .cutSection(start: try c.decode(Double.self, forKey: .start), end: try c.decode(Double.self, forKey: .end),
+                timeBase: try c.decode(EditorCutTimeBase.self, forKey: .timeBase), crossfade: try c.optional(Double.self, .crossfade))
+        case "restoreCut":
+            try c.only([.operation, .cutID]); self = .restoreCut(cutID: try c.decode(UUID.self, forKey: .cutID))
+        case "cutTransition":
+            try c.only([.operation, .cutID, .duration])
+            self = .cutTransition(cutID: try c.decode(UUID.self, forKey: .cutID), duration: try c.decode(Double.self, forKey: .duration))
         default: throw EditorMutationError.invalid("The requested mutation operation is not supported.")
         }
     }
@@ -294,6 +308,12 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .audio(patch): try c.encode("audio", forKey: .operation); try c.encode(patch, forKey: .patch)
         case let .canvas(patch): try c.encode("canvas", forKey: .operation); try c.encode(patch, forKey: .patch)
         case let .trim(start, end): try c.encode("trim", forKey: .operation); try c.encode(start, forKey: .start); try c.encode(end, forKey: .end)
+        case let .cutSection(start, end, timeBase, crossfade):
+            try c.encode("cutSection", forKey: .operation); try c.encode(start, forKey: .start); try c.encode(end, forKey: .end)
+            try c.encode(timeBase, forKey: .timeBase); try c.encodeIfPresent(crossfade, forKey: .crossfade)
+        case let .restoreCut(id): try c.encode("restoreCut", forKey: .operation); try c.encode(id, forKey: .cutID)
+        case let .cutTransition(id, duration):
+            try c.encode("cutTransition", forKey: .operation); try c.encode(id, forKey: .cutID); try c.encode(duration, forKey: .duration)
         }
     }
 
@@ -312,6 +332,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case .audio: .audio
         case .canvas: .canvas
         case .trim: .trim
+        case .cutSection, .restoreCut, .cutTransition: .timing
         }
     }
     func effects(duration: Double) -> [EditorMutationEffect] {
@@ -454,6 +475,16 @@ enum EditorMutation: Codable, Equatable, Sendable {
             if let value = patch.cornerRadius { state.presentation.cornerRadius = value }
             if let value = patch.background { state.presentation.background = value }
         case let .trim(start, end): state.trimStart = start; state.trimEnd = end
+        case let .cutSection(start, end, timeBase, crossfade):
+            state = try EditorCutEditing.cutting(start: start, end: end, timeBase: timeBase,
+                crossfade: crossfade, state: state, duration: project.duration)
+        case let .restoreCut(id):
+            guard state.cuts.contains(where: { $0.id == id }) else { throw EditorMutationError.invalid("That cut no longer exists.") }
+            state.cuts.removeAll { $0.id == id }
+        case let .cutTransition(id, duration):
+            guard duration.isFinite, duration >= 0 else { throw EditorMutationError.invalid("Crossfade duration must be a finite, nonnegative number of output seconds.") }
+            guard let index = state.cuts.firstIndex(where: { $0.id == id }) else { throw EditorMutationError.invalid("That cut no longer exists.") }
+            state.cuts[index].crossfade = duration
         }
     }
 
@@ -542,7 +573,13 @@ enum EditorMutation: Codable, Equatable, Sendable {
             operation("pointer", "Patch whole-recording pointer style only; does not invent or retime captured pointer motion. Supply at least one field.", ["patch": pointer]),
             operation("audio", "Patch master recorded audio: volume0...1, mute, fade seconds0...5 relative to kept trim. Preserves source offsets and relative levels. Supply at least one field.", ["patch": audio]),
             operation("canvas", "Patch whole-recording output presentation. Padding/corner radius are fractions0...0.2; background RGB0...1. Source coordinates and PIP travel remain unchanged.", ["patch": canvas]),
-            operation("trim", "Keep a nonempty original-source interval. Does not retime keyframes or overwrite requested audio fades.", ["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0]])]
+            operation("trim", "Keep a nonempty original-source interval. Does not retime keyframes or overwrite requested audio fades.", ["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0]]),
+            operation("cutSection", "Exclude a half-open interval without deleting source edits. timeBase is required: source uses original seconds; output resolves against the current edited timeline and rejects endpoints inside an ambiguous crossfade. Touching/overlapping cuts merge, retaining the earliest existing cut identity and requested fade unless crossfade is supplied. New cuts default to a hard cut. crossfade is requested output seconds; effective overlap may be shorter when neighboring clips lack room.",
+                ["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0],
+                 "timeBase": enumeration(["source", "output"]), "crossfade": ["type": "number", "minimum": 0]], optional: ["crossfade"]),
+            operation("restoreCut", "Restore an excluded source section by its actual cutID. Keeps source animations, boxes and identities unchanged; removes that cut's join. Later output coordinates change.", ["cutID": ["type": "string", "format": "uuid"]]),
+            operation("cutTransition", "Set the requested crossfade at a cutID in output seconds; zero is a hard cut. Retains requested duration even if effective overlap must shrink to fit neighboring clips. Inspect the time map for requested and effective durations.",
+                ["cutID": ["type": "string", "format": "uuid"], "duration": ["type": "number", "minimum": 0]])]
     }
     static func schemaData() throws -> Data {
         try JSONSerialization.data(withJSONObject: ["oneOf": schemaDescriptors], options: [.sortedKeys])
@@ -554,6 +591,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
                    "cameraOverlay": "Position fractions of available output-canvas travel; normal scale fraction of output width0.12...0.5. fullscreen0...1 blends normal outline to exact canvas fill without erasing normal shape/placement.",
                    "cameraSource": "Oriented camera crop travel fractions0...1; sourceZoom1...3.",
                    "timing": "Absolute original-source seconds. Smooth start<end; jump start=end. End precedes recording end.",
+                   "cuts": "cutSection requires timeBase source or output, with a half-open start<end range. Crossfade duration is output seconds; inspect requested/effective duration. Cuts preserve every source-time edit.",
                    "alignment": "Exact raw Box anchors; no implicit padding or silent clamp. PIP-to-Box needs verified host geometry.",
                    "partial_updates": "Unspecified patch fields remain unchanged. Shape and visible are discrete arrival changes, not opacity.",
                    "conflicts": "Existing same-lane movements must be resolved explicitly. Screen and camera are independent lanes."],
@@ -573,13 +611,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
                 "screen": ["panScreen", "zoomScreen", "alignScreen", "frameRegion", "fullFrame", "holdFraming", "reviseFraming", "moveBetweenEdits", "moveForDuration"],
                 "camera": ["cameraOverlay", "alignCameraOverlay", "cameraSource"],
                 "global": ["pointer", "audio", "canvas", "trim"],
+                "timing": ["cutSection", "restoreCut", "cutTransition"],
                 "boxes": ["addRegion", "labelRegion", "removeRegion"],
                 "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming"]],
                 "subjects": [
                     "screen": "Main recorded screen viewport. panScreen preserves zoom; zoomScreen changes screen magnification; alignScreen matches Box anchors. These do not resize the PIP camera.",
                     "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or hides it; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
                     "cameraSource": "Camera image inside the unchanged PIP outline. cameraSource changes sourceZoom or crop, preserving the overlay size/position and main screen framing."],
-                "units": "Seconds are original source time. Screen points are normalized source focal centers; camera positions are fractions of available OUTPUT travel. Pan preserves size. Exact alignment rejects unreachable bounds. Get one operation's schema before apply_edits; unknown camera/screen intent requires clarification.",
+                "units": "Animation seconds are original source time. cutSection requires explicit timeBase source/output; crossfade duration is output seconds. Screen points are normalized source focal centers; camera positions are fractions of available OUTPUT travel. Pan preserves size. Exact alignment rejects unreachable bounds. Get one operation's schema before apply_edits; unknown camera/screen intent requires clarification.",
                 "query": "Specify operation by exact name; '*' returns all schemas explicitly."]
         }
         if operation == "*" { return documentation }
@@ -588,8 +627,10 @@ enum EditorMutation: Codable, Equatable, Sendable {
         }) {
             let command: [String: Any] = ["type": "object", "properties": ["action": ["type": "string", "const": "mutate"], "mutation": schema],
                 "required": ["action", "mutation"], "additionalProperties": false]
-            return ["operation": operation, "command_schema": command,
-                "units": "Absolute original-source start/end; duration=end-start. Smooth start<end; jump start=end. Unspecified patch fields stay unchanged; null is unsupported. Camera overlay, camera source crop, and screen viewport are different subjects. Bounds/overlaps fail atomically."]
+            let units = ["cutSection", "restoreCut", "cutTransition"].contains(operation)
+                ? "Cut ranges require explicit timeBase source/output and start<end. Output endpoints with two different contributing source instants reject; choose source coordinates explicitly. Crossfade duration is requested output seconds, with effective overlap reported by the time map. Omitted crossfade preserves an existing merged cut's fade and defaults to zero only for a new cut. null is unsupported. Source edits are preserved."
+                : "Absolute original-source start/end; duration=end-start. Smooth start<end; jump start=end. Unspecified patch fields stay unchanged; null is unsupported. Camera overlay, camera source crop, and screen viewport are different subjects. Bounds/overlaps fail atomically."
+            return ["operation": operation, "command_schema": command, "units": units]
         }
         if let schema = legacySchemas.first(where: {
             (($0["properties"] as? [String: Any])?["action"] as? [String: Any])?["const"] as? String == operation
@@ -632,6 +673,64 @@ enum EditorMutation: Codable, Equatable, Sendable {
             action("removeScreenFraming", "Remove only the screen keyframe UUID, preserving independent camera and the named source moment.", ["editID": uuid]),
             action("labelRegion", "Update a Box's optional note, never its stable Box number.", ["regionID": uuid, "note": ["type": "string", "maxLength": 4096]]),
             action("removeRegion", "Remove a Box and explicitly linked screen targets, joining the remaining route; preserve independent camera and other marks.", ["regionID": uuid])]
+    }
+}
+
+/// Shared pure timing edit boundary for native UI and command adapters. Source
+/// keyframes/guides are deliberately not rewritten when footage is omitted.
+enum EditorCutEditing {
+    static func sourceRange(start: Double, end: Double, timeBase: EditorCutTimeBase,
+                            state: EditState, duration: Double) throws -> Range<Double> {
+        guard start.isFinite, end.isFinite, start >= 0, start < end else {
+            throw EditorMutationError.invalid("Choose a nonempty, finite cut interval with start before end.")
+        }
+        let map = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts)
+        if timeBase == .source {
+            guard end <= duration else { throw EditorMutationError.invalid("The source cut must be inside the original recording.") }
+            return start..<end
+        }
+        guard end <= map.outputDuration else { throw EditorMutationError.invalid("The output cut must be inside the edited recording.") }
+        func source(_ output: Double) throws -> Double {
+            let samples = map.samples(at: output).filter { $0.weight > 0 }
+            guard let first = samples.first else {
+                throw EditorMutationError.invalid("That output cut boundary has no source frame.")
+            }
+            guard samples.allSatisfy({ abs($0.sourceTime - first.sourceTime) <= 0.000_000_001 }) else {
+                throw EditorMutationError.invalid("That output cut boundary is inside a crossfade with two different source frames. Use explicit source coordinates or move the boundary outside the crossfade.")
+            }
+            return first.sourceTime
+        }
+        let sourceStart = try source(start), sourceEnd = try source(end)
+        guard sourceStart < sourceEnd else {
+            throw EditorMutationError.invalid("Those output boundaries do not define an ordered source interval.")
+        }
+        return sourceStart..<sourceEnd
+    }
+
+    static func cutting(start: Double, end: Double, timeBase: EditorCutTimeBase,
+                        crossfade: Double? = nil, state: EditState, duration: Double) throws -> EditState {
+        if let crossfade, !crossfade.isFinite || crossfade < 0 {
+            throw EditorMutationError.invalid("Crossfade duration must be a finite, nonnegative number of output seconds.")
+        }
+        let range = try sourceRange(start: start, end: end, timeBase: timeBase, state: state, duration: duration)
+        var lower = range.lowerBound, upper = range.upperBound
+        var merged: [RecordingCut] = []
+        var remaining: [RecordingCut] = []
+        for cut in state.cuts.sorted(by: { $0.start < $1.start }) {
+            if cut.end >= lower && cut.start <= upper {
+                lower = min(lower, cut.start); upper = max(upper, cut.end)
+                merged.append(cut)
+            } else { remaining.append(cut) }
+        }
+        let first = merged.first
+        remaining.append(RecordingCut(id: first?.id ?? UUID(), start: lower, end: upper,
+            crossfade: crossfade ?? first?.crossfade ?? 0))
+        var next = state
+        next.cuts = remaining.sorted { $0.start < $1.start }
+        // Reject removing the complete trim; effective fades are derived while
+        // their requested values stay intact for future restore/trim changes.
+        _ = try RecordingTimeMap(duration: duration, trimStart: next.trimStart, trimEnd: next.trimEnd, cuts: next.cuts)
+        return next
     }
 }
 

@@ -261,6 +261,14 @@ struct NativeDirectorLiveChecks {
             try FileManager.default.createDirectory(at: nativeDirectory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let settings = NativeTurnSettings(provider: provider, model: model, effort: effort, cli: cli, python: python, lease: lease)
             var expectedSession: String?
+            if CommandLine.arguments.contains("--cuts") {
+                try await cutChecks(fixture) { text, offset in
+                    _ = try await sendTurn(text, number: offset + 1, settings: settings, fixture: fixture,
+                        repo: repo, artifacts: artifacts, expectedSession: &expectedSession)
+                }
+                print("Native \(provider)/\(model) cut checks passed: create, revise crossfade, restore; one persistent conversation, metadata only.")
+                return
+            }
             let recall = "What did I ask you to change, and over what duration? Do not change anything."
             var turns = ["Zoom the camera to full screen over two seconds."]
             var index = 0
@@ -374,6 +382,32 @@ struct NativeDirectorLiveChecks {
                     "Clear selection must be observable without seeking.")
         try require(fixture.editor.project == project, "Headless navigation changed document/history.")
         print("Native fixture navigation checks passed: observable inspector/selection, explicit go-to seeks, select-only preserves time/history.")
+    }
+
+    private static func cutChecks(_ fixture: LiveFixture,
+                                 send: @MainActor (String, Int) async throws -> Void) async throws {
+        let original = fixture.editor.project
+        let turns = ["Cut out the section from 2 to 4 seconds on the finished timeline, with a half-second crossfade.",
+                     "Make that crossfade one second long.", "Restore that removed section."]
+        for (offset, text) in turns.enumerated() {
+            try await send(text, offset)
+            let project = fixture.editor.project
+            var withoutCuts = project.state; withoutCuts.cuts = []
+            try require(withoutCuts == original.state && project.title == original.title,
+                "Cut request changed unrelated source edits, audio, camera, boxes or title.")
+            try require(project.undoHistory.count == original.undoHistory.count + offset + 1 && project.redoHistory.isEmpty,
+                "Each requested timing action must create one ordinary Undo entry.")
+            if offset < 2 {
+                try require(project.state.cuts.count == 1, "Expected one excluded section.")
+                let cut = project.state.cuts[0]
+                try require(abs(cut.start - 2) < 0.000001 && abs(cut.end - 4) < 0.000001 &&
+                    abs(cut.crossfade - (offset == 0 ? 0.5 : 1)) < 0.000001,
+                    "Wrong cut endpoints or requested crossfade duration.")
+                try require(abs(fixture.playback.outputDuration - (offset == 0 ? 11.5 : 11)) < 0.000001,
+                    "Actual playback did not adopt the cut timing.")
+            } else { try require(project.state == original.state, "Restoring a section must restore every original edit.") }
+            try require(try ProjectEditor.open(url: fixture.editor.url).project == project, "Timing edit was not saved.")
+        }
     }
 
     private static func capabilityChecks(_ fixture: LiveFixture,

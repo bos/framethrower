@@ -16,6 +16,7 @@ struct EditorAutomationContext: Codable, Equatable, Sendable {
     var inspector: String?
     /// Persistent recording identity; documentID is an open endpoint handle.
     var recordingID: UUID? = nil
+    var timelineTimeBase: String? = nil
 }
 
 struct EditorAutomationEvent: Sendable {
@@ -65,10 +66,11 @@ enum EditorAutomationAPI {
         }
         return [
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
-            tool("inspect_editor", "Read current editor metadata. For section=state, component returns only that value; time evaluates exact original-source seconds, otherwise the preview playhead. Omit component for the full state. Component/time are valid only with section=state; time requires component. Selection and playhead are separate.", object(doc.merging([
-                "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending"]],
+            tool("inspect_editor", "Read current editor metadata. section=timing returns kept sections, cut joins and both source/output durations. For section=state, component returns one source value by default; time_base=output returns weighted samples of both crossfade branches. section=timing accepts output time for a read-only mapping query. Existing time/frameTime fields remain source time; preview.outputTime is finished-video time. Omit component for the full state. Component is valid only with section=state; state time requires component. Selection and playhead are separate.", object(doc.merging([
+                "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending", "timing"]],
                 "component": ["type": "string", "enum": ["screen", "camera", "pointer", "audio", "canvas", "trim"]],
                 "time": ["type": "number", "minimum": 0],
+                "time_base": ["type": "string", "enum": ["source", "output"]],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]
             ]) { _, b in b }, required: ["document_id", "section"]), readOnly: true),
             tool("inspect_recording", "Query bounded recorded semantic metadata on demand, never the live desktop. Search a visible label before asking for all controls. Real source frames remain unavailable while video processing is suspended.", object(doc.merging([
@@ -80,9 +82,9 @@ enum EditorAutomationAPI {
             tool("describe_editor_actions", "Read units and schemas for a category. Editing returns a compact operation catalog; name one operation for its exact schema, or explicitly request * for all schemas. The domain API is richer than any voice adapter.", object(doc.merging([
                 "category": ["type": "string", "enum": ["preview", "navigation", "document", "editing"]], "operation": text
             ]) { _, b in b }, required: ["document_id", "category"]), readOnly: true),
-            tool("control_preview", "Transient play/pause/source seek/frame stepping/rate or audition. Never changes edits, export timing or Undo. Play/seek finish a manual draft; pause/rate preserve it. play_animation uses a lane-qualified component identity; not an edit's endpoint.", object(doc.merging([
+            tool("control_preview", "Transient play/pause/seek/frame stepping/rate or audition. seek, step_frames and play_range accept time_base=source or output; omitted means original-source coordinates for compatibility. Use output for the finished timeline, including both crossfade branches. play_range start/end use that same time base, and the result's rangeTimeBase identifies the audition. step_frames uses the recording frame cadence in the chosen time base. Never changes edits, export timing or Undo. Play/seek finish a manual draft; pause/rate preserve it. play_animation uses a lane-qualified component identity, not an edit endpoint. With cuts it reviews all retained portions on the finished timeline and rejects an entirely removed animation; without cuts it auditions the original-source animation interval.", object(doc.merging([
                 "operation": ["type": "string", "enum": ["play", "pause", "seek", "set_rate", "step_frames", "play_range", "play_animation"]],
-                "time": number, "rate": ["type": "number", "enum": [0.5, 1, 2, 5]],
+                "time": number, "time_base": ["type": "string", "enum": ["source", "output"]], "rate": ["type": "number", "enum": [0.5, 1, 2, 5]],
                 "frames": ["type": "integer"], "start": number, "end": number,
                 "animation_id": text, "edit_id": text
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),

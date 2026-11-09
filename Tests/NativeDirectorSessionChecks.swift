@@ -11,6 +11,19 @@ private actor NativeTurnRecorder {
     }
     func values() -> [Data] { requests }
 }
+private actor PendingNativeTurn {
+    private var reply: CheckedContinuation<Data, Never>?
+    var isReady: Bool { reply != nil }
+    func turn() async -> Data {
+        await withCheckedContinuation { reply = $0 }
+    }
+    func complete(_ text: String) throws {
+        let data = try JSONSerialization.data(withJSONObject: ["ok": true,
+            "native_session_id": "pending-native-fixture", "text": text, "events": [], "usage": [:]])
+        let continuation = reply; reply = nil
+        continuation?.resume(returning: data)
+    }
+}
 @MainActor
 private final class NativeFixtureEndpoint: EditorAutomationEndpoint {
     let editor: ProjectEditor
@@ -24,6 +37,9 @@ private final class NativeFixtureEndpoint: EditorAutomationEndpoint {
             selectedEditID: nil, selectedBoxID: nil, selectedAnimationID: nil, inspector: "Camera") }
     }
     var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { publisher.eraseToAnyPublisher() }
+    func emit(_ kind: String, actor: String = "manual") throws {
+        publisher.send(.init(actor: actor, kind: kind, context: try automationContext))
+    }
     func performAutomation(_ name: String, arguments: Data) async throws -> Data { throw NativeCheckFailure.failed("Native runtime, not legacy planner, must own tool execution") }
 }
 @main @MainActor
@@ -40,6 +56,7 @@ struct NativeDirectorSessionChecks {
     }
     static func main() async throws {
         try checkExactCollectionNotifications()
+        try await checkSelectionAfterRemovingEdit()
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-native-session-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -128,6 +145,49 @@ struct NativeDirectorSessionChecks {
             failedRows.last?.text == failed.errorMessage, "infrastructure failure shows its actual cause instead of misleading model prose")
         try require(failed.instruction == "Expand the camera.", "failed native turn preserves the user's input")
         print("Native Director Session checks passed (new turns only, no app history reconstruction/truncation, actual manual events, natural replies and untouched drafts).")
+    }
+
+    static func checkSelectionAfterRemovingEdit() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-native-selection-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var project = RecordingProject(screenFilename: "never-open.mov", duration: 14)
+        let point = ZoomKeyframe(time: 5, scale: 2, transition: .smooth, duration: 3)
+        project.state.zoomKeyframes = [point]
+        let editor = ProjectEditor(project: project, url: folder.appendingPathComponent("selection.framethrower"))
+        try require(editor.save(), "prepare selected-edit metadata")
+        let endpoint = NativeFixtureEndpoint(editor), pending = PendingNativeTurn()
+        let session = EditorAssistantSession(persistsConversation: false, provider: .claudeSonnet,
+            nativeTransport: { _, _, _ in await pending.turn() })
+        session.attach(to: editor); session.attachAutomation(endpoint)
+        session.instruction = "Clear out all my edits"
+        session.submit(editor: editor, playhead: 9, regionID: nil, editID: point.id)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await pending.isReady) {
+            if ContinuousClock.now > deadline { throw NativeCheckFailure.failed("native selection turn never started") }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        defer { session.cancel() }
+        // Actual persistent edit and publication, followed by the separate
+        // manual-origin notification SwiftUI sends when selection is cleared.
+        let batch = EditorCommandBatch(projectID: editor.automationID,
+            revision: try EditorCommandDispatcher.revision(for: editor.project),
+            commands: [.removeEdit(editID: point.id)])
+        _ = try editor.withPublishingActor("automation") {
+            try EditorCommandDispatcher.apply(batch, to: editor, projectID: editor.automationID, name: "Clear all edits")
+        }
+        try endpoint.emit("selection_changed")
+        let continuedAfterSelection = session.isBusy
+        try await pending.complete("Cleared your edits. You can undo this change.")
+        try require(continuedAfterSelection, "clearing selection after a tool mutation must not cancel the native turn")
+        try await wait(session)
+        try require(session.errorMessage == nil && session.notice == "Cleared your edits. You can undo this change.",
+            "the completed tool action keeps its natural final reply")
+        try require(!session.conversation.exchanges.contains { $0.summary.contains("Stopped interpreting") },
+            "selection cleanup must not leave a false interruption in conversation history")
+        try require(editor.project.state.zoomKeyframes.isEmpty && editor.project.undoHistory.count == 1,
+            "the action remains exactly one saved Undo operation")
+        try require(editor.undo() && editor.project.state.zoomKeyframes == [point], "Undo restores the removed edit")
     }
 
     static func checkExactCollectionNotifications() throws {

@@ -92,7 +92,10 @@ final class EditorAssistantSession: ObservableObject {
         guard event.kind != "document_changed",
               !["clock_tick", "playback_tick", "playback_ended", "preview_progress"].contains(event.kind),
               !(performingAutomation && event.actor == "automation") else { return }
-        if isBusy {
+        // SwiftUI also publishes this when a completed edit removes the
+        // selected item. Selection alone must not cancel the agent's turn
+        // before it receives the tool result and explains what it did.
+        if isBusy && event.kind != "selection_changed" {
             if let id = currentRequestID {
                 finish(id, response: nil, outcome: ["status": "interrupted",
                     "summary": "Stopped interpreting after an editor action."])

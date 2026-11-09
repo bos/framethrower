@@ -953,7 +953,9 @@ struct ProjectEditorView: View {
             }
             // Tool tabs, playback values, and edit selection share one allocation.
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .frame(height: editor.project.audioSources.isEmpty ? 100 : 190, alignment: .top)
+            // Four audio rows plus the effective-fade caption set the maximum;
+            // reserve it across tabs without keeping the former extra track row.
+            .frame(height: editor.project.audioSources.isEmpty ? 100 : 144, alignment: .top)
         }
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)

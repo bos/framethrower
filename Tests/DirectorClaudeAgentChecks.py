@@ -39,6 +39,17 @@ if mode == 'extra_mcp': servers.append({"name":"unrelated","status":"connected"}
 emit({"type":"system","subtype":"init","session_id":sid,"mcp_servers":servers,"tools":["mcp__framethrower__inspect_editor"]})
 emit({"type":"assistant","session_id":sid,"message":{"role":"assistant","content":[{"type":"tool_use","id":"native-call-1","name":"Bash" if mode == 'wrong_tool' else "mcp__framethrower__inspect_editor","input":{"section":"preview"}}]}})
 emit({"type":"user","session_id":sid,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"native-call-1","content":"Actual fixture state: playhead9"}]}})
+if mode.startswith('unknown_'):
+ name='Bash' if mode=='unknown_failed_shell' else 'nonexistent_fixture_tool'
+ emit({"type":"assistant","session_id":sid,"message":{"role":"assistant","content":[{"type":"tool_use","id":"unknown-call-1","name":name,"input":{}}]}})
+ if mode!='unknown_missing_result':
+  result={"type":"tool_result","tool_use_id":"different-call" if mode=='unknown_wrong_id' else "unknown-call-1",
+          "is_error":mode not in ('unknown_executed','unknown_nonerror'),
+          "content":"<tool_use_error>Error: No such tool available: "+name+"</tool_use_error>"}
+  if mode=='unknown_executed': result['content']='The operation ran.'
+  if mode=='unknown_failed_shell': result['content']='Command failed after execution.'
+  if mode=='unknown_wrong_name': result['content']='<tool_use_error>Error: No such tool available: different_tool</tool_use_error>'
+  emit({"type":"user","session_id":sid,"message":{"role":"user","content":[result]}})
 if mode == 'malformed': print('{BROKEN',flush=True)
 if mode == 'truncated': sys.exit(0)
 if mode == 'bad_shape': emit({"type":"assistant","session_id":sid,"message":None})
@@ -182,6 +193,30 @@ class ClaudeAgentChecks(unittest.TestCase):
         self.assertEqual(result['error']['code'],'configuration')
         self.assertEqual(result['native_session_id'],'not-a-session')
         self.assertFalse((self.cwd/'invocations.jsonl').exists())
+
+    def test_native_missing_tool_rejection_can_recover(self):
+        self.mode('unknown_rejected')
+        result=claude.run_turn({'text':'Use the available editor tools.'},self.configuration)
+        self.assertNotIn('error',result)
+        self.assertEqual(result['text'],'Applied the camera adjustment.')
+        self.assertIsNotNone(result['native_session_id'])
+        self.assertEqual(len(result['events']),6)
+        rejected=result['events'][4]['message']['content'][0]
+        self.assertTrue(rejected['is_error'])
+        self.assertEqual(rejected['tool_use_id'],result['events'][3]['message']['content'][0]['id'])
+        self.assertIn('No such tool available: nonexistent_fixture_tool',rejected['content'])
+        self.assertEqual(result['events'][2]['message']['content'][0]['content'],'Actual fixture state: playhead9')
+
+    def test_unknown_execution_unresolved_and_generic_errors_remain_failures(self):
+        for mode in ('unknown_executed','unknown_missing_result','unknown_nonerror','unknown_wrong_id',
+                     'unknown_wrong_name','unknown_failed_shell'):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                result=claude.run_turn({'text':'Inspect.'},self.configuration)
+                self.assertEqual(result['error']['code'],'native_protocol')
+                self.assertIsNotNone(result['native_session_id'])
+                self.assertGreaterEqual(len(result['events']),5)
+                self.assertEqual(result['text'],'Applied the camera adjustment.')
 
     def test_invalid_configuration_or_data_no_child(self):
         bindings=[]

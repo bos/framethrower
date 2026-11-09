@@ -86,6 +86,13 @@ def _error(result, code, message):
     return result
 
 
+def _missing_tool_rejection(block, name):
+    # This is the CLI's native dispatch rejection, not an arbitrary error from
+    # a shell or MCP tool that may already have performed part of an action.
+    expected = f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>"
+    return block.get("is_error") is True and block.get("content") == expected
+
+
 def _stream(process, prompt):
     """Yield native events immediately; avoid pipe deadlocks on either stream."""
     stderr = bytearray()
@@ -183,6 +190,7 @@ def run_turn(request: dict, configuration: dict) -> dict:
         completed = None
         init_seen = False
         protocol_error = None
+        unknown_calls = {}
         for line in _stream(process, prompt):
             if not line.strip():
                 continue
@@ -217,7 +225,30 @@ def run_turn(request: dict, configuration: dict) -> dict:
                     name = block.get("name")
                     if block.get("type") == "tool_use" and (not isinstance(name, str) or (
                             name != "ToolSearch" and not name.startswith("mcp__framethrower__"))):
-                        protocol_error = "Claude attempted a tool outside the configured FrameThrower server."
+                        call_id = block.get("id")
+                        if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+                            protocol_error = "Claude emitted an unidentifiable tool attempt outside the configured server."
+                        elif call_id in unknown_calls and unknown_calls[call_id]["name"] != name:
+                            protocol_error = "Claude reused a tool identity for different tools."
+                        else:
+                            unknown_calls.setdefault(call_id, {"name": name, "result_seen": False, "rejected": False})
+            if event.get("type") == "user":
+                message = event.get("message", {})
+                content = message.get("content", []) if isinstance(message, dict) else []
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        call_id = block.get("tool_use_id")
+                        call = unknown_calls.get(call_id) if isinstance(call_id, str) else None
+                        if call is not None:
+                            # A later rejection must never mask an earlier
+                            # executed/successful result for the same identity.
+                            if call["result_seen"]:
+                                protocol_error = "Claude emitted multiple results for an unauthorized tool attempt."
+                            else:
+                                call["result_seen"] = True
+                                call["rejected"] = _missing_tool_rejection(block, call["name"])
             if event.get("type") == "result":
                 completed = event
                 if isinstance(event.get("result"), str):
@@ -225,6 +256,8 @@ def run_turn(request: dict, configuration: dict) -> dict:
                 result["usage"] = {key: event[key] for key in (
                     "usage", "modelUsage", "total_cost_usd", "duration_ms", "duration_api_ms", "num_turns"
                 ) if key in event}
+        if any(not call["rejected"] for call in unknown_calls.values()):
+            protocol_error = "Claude attempted a tool outside the configured FrameThrower server without a conclusive native missing-tool rejection."
         if protocol_error:
             return _error(result, "native_protocol", protocol_error)
         if process.returncode != 0 or (completed is not None and (

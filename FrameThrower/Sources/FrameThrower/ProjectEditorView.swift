@@ -122,6 +122,10 @@ struct ProjectEditorView: View {
         let selection: UUID?
         let animationSelection: TimelineAnimationID?
         let name: String
+        let timeBase: EditorCutTimeBase
+        let map: RecordingTimeMap?
+        let outputPlayhead: Double
+        var previewSpans: [TimelineAnimation]
     }
     private var timelineAnimations: [TimelineAnimation] {
         EditorAnimationEditing.animations(in: state, references: editor.references, duration: editor.project.duration,
@@ -130,15 +134,19 @@ struct ProjectEditorView: View {
     }
 
     private var timeMapResult: Result<RecordingTimeMap, any Error> {
-        Result { try playback.timingMap(for: state, duration: editor.project.duration) }
+        if let map = animationGesture?.map { return .success(map) }
+        return Result { try playback.timingMap(for: state, duration: editor.project.duration) }
     }
     private var timelineMap: RecordingTimeMap? { try? timeMapResult.get() }
     private var timeMapError: String? { if case let .failure(error) = timeMapResult { return error.localizedDescription }; return nil }
-    private var isSourceTimeline: Bool { timelineTimeBase == .source }
+    private var isSourceTimeline: Bool { (animationGesture?.timeBase ?? timelineTimeBase) == .source }
     private var timelineDuration: Double { isSourceTimeline ? editor.project.duration : timelineMap?.outputDuration ?? playback.outputDuration }
     private var timelinePosition: Double { isSourceTimeline ? playback.time : playback.outputTime }
     private var timelineIsIdentity: Bool { state.cuts.isEmpty && state.speedKeyframes.isEmpty && state.trimStart == 0 && state.trimEnd == editor.project.duration }
     private var outputProjection: TimelineOutputProjection? {
+        if let gesture = animationGesture, let map = gesture.map {
+            return TimelineOutputProjection(animations: gesture.previewSpans, map: map)
+        }
         guard !isSourceTimeline, !timelineIsIdentity, let map = timelineMap else { return nil }
         return TimelineOutputProjection(animations: timelineAnimations, map: map)
     }
@@ -322,6 +330,7 @@ struct ProjectEditorView: View {
             }
         }
         .onChange(of: playback.isInspectingSource) { _, source in
+            guard animationGesture == nil else { return }
             timelineTimeBase = source ? .source : .output
             automation.timelineTimeBase = source ? "source" : "output"
         }
@@ -736,7 +745,7 @@ struct ProjectEditorView: View {
                 .pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 160)
                 .disabled(animationGesture != nil || canvasGesture != nil)
                 .help(playback.supportsSourceAudition
-                    ? "Finished shows exported time and joins. Source shows the complete recording, including trimmed or removed sections, and lets you adjust animation timing."
+                    ? "Finished shows exported time and joins. Drag complete animation spans to adjust timing; use Source for spans split by cuts or fades and for removed footage."
                     : "Finished shows exported time and joins. Original Source inspection is unavailable for this composed preview.")
                 Button { cutSelectedSection() } label: { Image(systemName: "scissors") }
                     .accessibilityLabel("Cut section").help("Remove the range selected in the Clips row. Source edits stay available for restoration.")
@@ -774,8 +783,13 @@ struct ProjectEditorView: View {
                 animations: displayedAnimations, selectedAnimationID: displayedAnimationID,
                 onSelectAnimation: { selectAnimation(outputProjection?.sourceIDs[$0] ?? $0) },
                 onAnimationEdit: { editAnimation($0, final: $1) },
+                animationDragProjection: !isSourceTimeline && outputProjection != nil ? { request in
+                    projectFinishedAnimation(request)
+                } : nil,
                 onAnimationCancel: { cancelAnimationGesture() },
-                onDeleteAnimation: { if isSourceTimeline || timelineIsIdentity { deleteAnimation($0) } },
+                onDeleteAnimation: { id in
+                    if isSourceTimeline || timelineIsIdentity || outputProjection?.editableBindings[id] != nil { deleteAnimation(id) }
+                },
                 showsClipLane: true, showsCameraOpacityLane: editor.project.cameraFilename != nil, showsTrimHandles: isSourceTimeline,
                 allowsSeekingOutsideTrim: isSourceTimeline, clockID: timelineTimeBase.rawValue,
                 clipBands: timelineClipBands, cutMarkers: timelineCutMarkers,
@@ -1334,6 +1348,12 @@ struct ProjectEditorView: View {
         selectedInspector = id.lane == .camera || id.lane == .cameraOpacity ? .camera : id.lane == .speed ? .speed : .zoom
     }
 
+    private func projectFinishedAnimation(_ request: AnimationDrag) -> [TimelineAnimation]? {
+        guard !isSourceTimeline, let map = animationGesture?.map ?? timelineMap else { return nil }
+        return FinishedTimelineEditing.projectedPreview(request, animations: animationGesture?.spans ?? timelineAnimations,
+            map: map, sourceDuration: editor.project.duration)
+    }
+
     private func editAnimation(_ request: AnimationDrag, final: Bool) {
         if animationGesture == nil {
             assistant.cancel(); playback.pause()
@@ -1344,17 +1364,24 @@ struct ProjectEditorView: View {
             animationGesture = AnimationGestureSnapshot(id: request.id, state: editor.project.state, spans: spans,
                 replacements: EditorAnimationEditing.replacementIDs(for: spans), playhead: playback.time,
                 selection: selectedEditID, animationSelection: selectedAnimationID,
-                name: "\(verb) \(request.id.lane == .cameraOpacity ? "camera opacity" : request.id.lane.rawValue) animation")
+                name: "\(verb) \(request.id.lane == .cameraOpacity ? "camera opacity" : request.id.lane.rawValue) animation", timeBase: isSourceTimeline ? .source : .output,
+                map: isSourceTimeline ? nil : timelineMap, outputPlayhead: playback.outputTime, previewSpans: spans)
         }
         guard let gesture = animationGesture, gesture.id == request.id,
-              let original = gesture.spans.first(where: { $0.id == request.id }),
-              let changes = TimelineAnimationSolver.solve(request, animations: gesture.spans, duration: editor.project.duration),
+              let original = gesture.spans.first(where: { $0.id == request.id }) else { return }
+        let changes: [TimelineAnimation]?
+        if let map = gesture.map {
+            changes = FinishedTimelineEditing.changes(request, animations: gesture.spans, map: map, sourceDuration: editor.project.duration)
+        } else { changes = TimelineAnimationSolver.solve(request, animations: gesture.spans, duration: editor.project.duration) }
+        guard let changes,
               let edit = EditorAnimationEditing.applying(changes, to: gesture.state, duration: editor.project.duration,
                 replacementIDs: gesture.replacements) else { return }
         let aliases = Dictionary(uniqueKeysWithValues: edit.aliases.map { ($0.replacementID, $0.originalID) })
         // Every sample uses the same draft time. A moving endpoint must not
         // turn individual pointer samples into separate Undo entries.
         guard editor.updateDraft(edit.state, at: original.end, editAliases: aliases) else { return }
+        let preview = Dictionary(uniqueKeysWithValues: changes.map { ($0.id, $0) })
+        animationGesture?.previewSpans = gesture.spans.map { preview[$0.id] ?? $0 }
         let component = edit.aliases.first(where: { $0.lane == request.id.lane && $0.originalID == request.id.componentID })?.replacementID ?? request.id.componentID
         selectedEditID = edits.first(where: { value in
             original.isReference ? value.anchorID == component : request.id.lane == .screen ? value.zoomID == component :
@@ -1364,9 +1391,15 @@ struct ProjectEditorView: View {
         if let role = request.id.lane.audioRole { audioRole = role; selectedEditID = nil }
         selectedAnimationID = request.id
         let current = changes.first(where: { $0.id == request.id }) ?? original
-        let position = request.handle == .start ? current.start : current.end
-        if !isSourceTimeline && timelineIsIdentity { playback.seekOutput(position) }
-        else { playback.seek(position) }
+        let position: Double = switch request.handle {
+        case .start: current.start
+        case .easeIn: current.start + current.easeIn
+        case .easeOut: current.end - current.easeOut
+        case .move, .end: current.end
+        }
+        if let binding = gesture.map.flatMap({ FinishedTimelineBinding.make(animation: original, map: $0) }) {
+            playback.seekOutput(binding.clip.outputTime(for: position))
+        } else { playback.seek(position) }
         if final {
             guard editor.finishDraft(name: gesture.name) else { return }
             selectedAnimationID = TimelineAnimationID(lane: request.id.lane, componentID: component)
@@ -1381,7 +1414,7 @@ struct ProjectEditorView: View {
         selectedEditID = gesture.selection
         selectedAnimationID = gesture.animationSelection
         playback.cancelPreview()
-        if !isSourceTimeline && timelineIsIdentity { playback.seekOutput(gesture.playhead) }
+        if gesture.timeBase == .output { playback.seekOutput(gesture.outputPlayhead) }
         else { playback.seek(gesture.playhead) }
     }
 

@@ -57,6 +57,9 @@ enum TimelineSpeedProfile {
                 let start = max(previous, point.time - point.duration)
                 let ramps = MotionInterpolation.rampDurations(duration: point.time - start, easeIn: point.easeIn, easeOut: point.easeOut)
                 knots += [start, start + ramps.easeIn, point.time - ramps.easeOut]
+                for (beginning, length) in [(start, ramps.easeIn), (point.time - ramps.easeOut, ramps.easeOut)] where length > 0 {
+                    for index in 1..<16 { knots.append(beginning + length * Double(index) / 16) }
+                }
             } else if point.time > 0 { knots.append(point.time.nextDown) }
             previous = point.time
         }
@@ -85,9 +88,12 @@ struct TimelineOutputProjection {
     var animations: [TimelineAnimation] = []
     var sourceIDs: [TimelineAnimationID: TimelineAnimationID] = [:]
     var envelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:]
+    var editableBindings: [TimelineAnimationID: FinishedTimelineBinding] = [:]
 
     init(animations: [TimelineAnimation], map: RecordingTimeMap) {
         for original in animations {
+            let binding = FinishedTimelineBinding.make(animation: original, map: map)
+            if let binding { editableBindings[original.id] = binding }
             if original.lane == .pointer {
                 var item = original; item.start = 0; item.end = map.outputDuration; item.editable = false
                 self.animations.append(item); sourceIDs[item.id] = original.id
@@ -95,7 +101,8 @@ struct TimelineOutputProjection {
             }
             if original.isInstant {
                 guard let position = map.outputTime(for: original.start) else { continue }
-                var item = original; item.start = position; item.end = position; item.editable = false
+                var item = original; item.start = position; item.end = position; item.editable = binding != nil
+                if binding != nil { item.help += " Drag to adjust source timing through the finished-video clock." }
                 self.animations.append(item); sourceIDs[item.id] = original.id
                 continue
             }
@@ -108,15 +115,95 @@ struct TimelineOutputProjection {
                 let key = "\(original.componentID.uuidString):\(clip.sourceStart.bitPattern):\(clip.sourceEnd.bitPattern)"
                 let digest = Array(SHA256.hash(data: Data(key.utf8)).prefix(16))
                 let uuid = UUID(uuid: (digest[0],digest[1],digest[2],digest[3],digest[4],digest[5],digest[6],digest[7],digest[8],digest[9],digest[10],digest[11],digest[12],digest[13],digest[14],digest[15]))
-                item.id = TimelineAnimationID(lane: original.lane, componentID: uuid)
+                item.id = binding == nil ? TimelineAnimationID(lane: original.lane, componentID: uuid) : original.id
                 item.start = clip.outputTime(for: start)
                 item.end = clip.outputTime(for: end)
-                item.editable = false
-                item.help = original.help + String(format: " Source %.3f–%.3f s (clip %d). Adjust timing in Source mode.", start, end, index + 1)
+                item.editable = binding != nil
+                if binding != nil {
+                    item.easeIn = max(0, clip.outputTime(for: original.start + original.easeIn) - item.start)
+                    item.easeOut = max(0, item.end - clip.outputTime(for: original.end - original.easeOut))
+                    item.help = original.help + " Drag to adjust source timing through the finished-video clock."
+                } else {
+                    item.help = original.help + String(format: " Source %.3f–%.3f s (clip %d). Adjust timing in Source mode.", start, end, index + 1)
+                }
                 self.animations.append(item); sourceIDs[item.id] = original.id
                 envelopes[item.id] = TimelineSourceEnvelope(animation: original, sourceOffset: clip.sourceStart - clip.outputStart, clip: clip)
             }
         }
+    }
+}
+
+struct FinishedTimelineBinding {
+    let original: TimelineAnimation
+    let clip: RecordingTimeMap.Clip
+    let sourceBounds: ClosedRange<Double>
+
+    static func make(animation: TimelineAnimation, map: RecordingTimeMap) -> Self? {
+        guard animation.editable, animation.lane != .pointer else { return nil }
+        if animation.isInstant && map.outputTime(for: animation.start) == nil { return nil }
+        let matches = map.clips.enumerated().compactMap { index, clip -> Self? in
+            var lower = clip.sourceStart, upper = clip.sourceEnd
+            for join in map.joins where join.duration > 0 {
+                if join.incomingClipIndex == index { lower = max(lower, clip.sourceTime(at: join.outputEnd)) }
+                if join.outgoingClipIndex == index { upper = min(upper, clip.sourceTime(at: join.outputStart)) }
+            }
+            guard animation.start >= lower, animation.end <= upper, lower <= upper else { return nil }
+            return Self(original: animation, clip: clip, sourceBounds: lower...upper)
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    func sourceDrag(_ request: AnimationDrag) -> AnimationDrag {
+        let anchor: Double = switch request.handle {
+        case .move, .start: original.start
+        case .end: original.end
+        case .easeIn: original.start + original.easeIn
+        case .easeOut: original.end - original.easeOut
+        }
+        let destination = clip.sourceTime(at: clip.outputTime(for: anchor) + request.deltaSeconds)
+        return AnimationDrag(id: request.id, handle: request.handle, deltaSeconds: destination - anchor,
+            push: request.push, snapTolerance: 0)
+    }
+}
+
+enum FinishedTimelineEditing {
+    /// Every request uses the gesture's pre-edit map and source spans. Locked
+    /// fragments cannot be moved implicitly by an Option ripple.
+    static func changes(_ request: AnimationDrag, animations: [TimelineAnimation], map: RecordingTimeMap,
+                        sourceDuration: Double) -> [TimelineAnimation]? {
+        let projection = TimelineOutputProjection(animations: animations, map: map)
+        guard let binding = projection.editableBindings[request.id], request.deltaSeconds.isFinite else { return nil }
+        let locked = animations.map { animation in
+            var item = animation
+            item.editable = projection.editableBindings[item.id] != nil
+            return item
+        }
+        func candidate(_ delta: Double) -> [TimelineAnimation]? {
+            var output = request; output.deltaSeconds = delta
+            guard let changes = TimelineAnimationSolver.solve(binding.sourceDrag(output), animations: locked, duration: sourceDuration),
+                  changes.allSatisfy({ value in
+                      guard let bounds = projection.editableBindings[value.id]?.sourceBounds else { return false }
+                      return value.start >= bounds.lowerBound && value.end <= bounds.upperBound
+                  }) else { return nil }
+            return changes
+        }
+        if let changes = candidate(request.deltaSeconds) { return changes }
+        var lower = 0.0, upper = 1.0
+        var result = candidate(0)
+        guard result != nil else { return nil }
+        for _ in 0..<48 {
+            let middle = (lower + upper) / 2
+            if let next = candidate(request.deltaSeconds * middle) { lower = middle; result = next }
+            else { upper = middle }
+        }
+        return result
+    }
+
+    static func projectedPreview(_ request: AnimationDrag, animations: [TimelineAnimation], map: RecordingTimeMap,
+                                 sourceDuration: Double) -> [TimelineAnimation]? {
+        guard let changes = changes(request, animations: animations, map: map, sourceDuration: sourceDuration) else { return nil }
+        let values = Dictionary(uniqueKeysWithValues: changes.map { ($0.id, $0) })
+        return TimelineOutputProjection(animations: animations.map { values[$0.id] ?? $0 }, map: map).animations
     }
 }
 
@@ -150,6 +237,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var selectedAnimationID: TimelineAnimationID?
     var onSelectAnimation: (TimelineAnimationID) -> Void = { _ in }
     var onAnimationEdit: (AnimationDrag, Bool) -> Void = { _, _ in }
+    var animationDragProjection: ((AnimationDrag) -> [TimelineAnimation]?)? = nil
     var onAnimationCancel: () -> Void = {}
     var onDeleteAnimation: (TimelineAnimationID) -> Void = { _ in }
 
@@ -216,6 +304,7 @@ struct RecordingTimeline: NSViewRepresentable {
         view.selectedAnimationID = selectedAnimationID
         view.onSelectAnimation = onSelectAnimation
         view.onAnimationEdit = onAnimationEdit
+        view.animationDragProjection = animationDragProjection
         view.onAnimationCancel = onAnimationCancel
         view.onDeleteAnimation = onDeleteAnimation
         view.fit(request: fitRequest)
@@ -291,6 +380,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var selectedAnimationID: TimelineAnimationID? { didSet { if selectedAnimationID != oldValue { needsDisplay = true; updateTooltips() } } }
     var onSelectAnimation: ((TimelineAnimationID) -> Void)?
     var onAnimationEdit: ((AnimationDrag, Bool) -> Void)?
+    var animationDragProjection: ((AnimationDrag) -> [TimelineAnimation]?)?
     var onAnimationCancel: (() -> Void)?
     var onDeleteAnimation: ((TimelineAnimationID) -> Void)?
     var presentAnimationMenu: ((NSMenu, NSPoint) -> Void)?
@@ -300,6 +390,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let handle: TimelineAnimationHandle
         let origin: CGPoint
         let base: [TimelineAnimation]
+        let visibleDuration: Double
+        let railWidth: CGFloat
         var hasMoved = false
         var lastRequest: AnimationDrag?
         var valid = true
@@ -907,7 +999,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 (selected.startHandle, .start), (selected.endHandle, .end)]
             for (frame, handle) in handles where frame?.contains(point) == true {
                 animationPointerOrigin = point
-                animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans); return
+                animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans,
+                    visibleDuration: visibleDuration, railWidth: railWidth); return
             }
         }
         if let crowd = animationCrowds().first(where: { $0.frame.contains(point) }) {
@@ -927,7 +1020,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         if targets.count > 1 { animationChooserIDs = targets.map { $0.animation.id }; return }
         if let target = targets.first {
             animationClickID = target.animation.id
-            if target.animation.editable { animationGesture = AnimationGesture(id: target.animation.id, handle: .move, origin: point, base: animationSpans) }
+            if target.animation.editable { animationGesture = AnimationGesture(id: target.animation.id, handle: .move, origin: point, base: animationSpans,
+                visibleDuration: visibleDuration, railWidth: railWidth) }
         } else if let lane = animationLanes().first(where: { $0.labelFrame.contains(point) }),
                   let animation = animationSpans.first(where: { $0.lane == lane.lane }) {
             animationClickID = animation.id
@@ -937,7 +1031,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private func snappedAnimationDelta(_ delta: Double, gesture: inout AnimationGesture) -> Double {
         guard gesture.handle == .move || gesture.handle == .start || gesture.handle == .end,
               let target = gesture.base.first(where: { $0.id == gesture.id }) else { return delta }
-        let unit = visibleDuration / Double(railWidth)
+        let unit = gesture.visibleDuration / Double(gesture.railWidth)
         if let sticky = gesture.snappedDelta, abs(delta - sticky) <= unit * 10 { return sticky }
         gesture.snappedDelta = nil
         let others = gesture.base.filter { $0.id != target.id && $0.lane == target.lane && !$0.isReference }
@@ -959,11 +1053,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard gesture.hasMoved || max(abs(point.x - gesture.origin.x), abs(point.y - gesture.origin.y)) >= 3 else { return }
         gesture.hasMoved = true
         animationClickID = nil
-        let raw = Double((point.x - gesture.origin.x) / railWidth) * visibleDuration
+        let raw = Double((point.x - gesture.origin.x) / gesture.railWidth) * gesture.visibleDuration
         let delta = snappedAnimationDelta(raw, gesture: &gesture)
         let request = AnimationDrag(id: gesture.id, handle: gesture.handle, deltaSeconds: delta,
             push: event.modifierFlags.contains(.option), snapTolerance: 0)
-        guard let changed = TimelineAnimationSolver.solve(request, animations: gesture.base, duration: duration) else {
+        let candidate: [TimelineAnimation]?
+        if let animationDragProjection { candidate = animationDragProjection(request) }
+        else { candidate = TimelineAnimationSolver.solve(request, animations: gesture.base, duration: duration) }
+        guard let changed = candidate else {
             if gesture.lastRequest != nil, gesture.valid { onAnimationCancel?() }
             gesture.valid = false; gesture.lastRequest = request
             animationPreview = nil
@@ -1306,6 +1403,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func setViewport(start: Double, span: Double) {
+        guard animationGesture == nil else { return }
         guard start.isFinite, span.isFinite, duration.isFinite, duration > 0 else { return }
         visibleDuration = min(duration, max(minimumVisibleDuration, span))
         visibleStart = min(max(start, 0), max(0, duration - visibleDuration))

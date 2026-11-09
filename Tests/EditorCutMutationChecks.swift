@@ -73,7 +73,7 @@ struct EditorCutMutationChecks {
             }
         }
         let catalog = try EditorMutation.describe(operation: nil)["operations"] as! [String: [String]]
-        try require(catalog["timing"] == ["cutSection", "restoreCut", "cutTransition"], "Director discovers cuts in their own timing category")
+        try require(catalog["timing"] == ["cutSection", "restoreCut", "cutTransition", "speed"], "Director discovers cuts and saved speed in the timing category")
     }
 
     private static func sourceRecordsSurviveCutAndRestore() throws {

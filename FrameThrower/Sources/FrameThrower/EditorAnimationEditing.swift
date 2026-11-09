@@ -51,10 +51,27 @@ enum EditorAnimationEditing {
                 previous = point.time
             }
         }
+        previous = 0
+        for point in state.speedKeyframes.sorted(by: { $0.time < $1.time }) {
+            let group = groups.first { $0.speedID == point.id }
+                ?? TimedEdit(id: point.id, time: point.time, zoomID: nil, cameraID: nil, speedID: point.id)
+            let referenceID = references.edits[point.id.uuidString] != nil ? point.id : group.id
+            let speedEdit = TimedEdit(id: referenceID, time: point.time, zoomID: nil, cameraID: nil, speedID: point.id)
+            let description = EditorActionDescription.describe(speedEdit, in: state, references: references)
+            let next = state.speedKeyframes.first { $0.time > point.time }
+            let heldUntil = next.map { $0.transition == .smooth ? max(point.time, $0.time - $0.duration) : $0.time } ?? duration
+            let help = description.tooltip + String(format: " The %.2g× target continues to source %.3f s, until the next rate change or recording end.", point.rate, heldUntil)
+            result.append(animation(id: point.id, editID: group.id, lane: .speed, end: point.time,
+                previous: previous, transition: point.transition, duration: point.duration,
+                easeIn: point.easeIn, easeOut: point.easeOut,
+                label: description.shortLabel + String(format: " · %.2g×", point.rate), help: help, editable: true))
+            previous = point.time
+        }
         for anchor in state.editAnchors {
             let attachedScreen = state.zoomKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
             let attachedCamera = state.pipKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
-            guard !attachedScreen && !attachedCamera else { continue }
+            let attachedSpeed = state.speedKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
+            guard !attachedScreen && !attachedCamera && !attachedSpeed else { continue }
             let group = TimedEdit(id: anchor.id, time: anchor.time, zoomID: nil, cameraID: nil, anchorID: anchor.id)
             let description = EditorActionDescription.describe(group, in: state, references: references)
             result.append(TimelineAnimation(id: TimelineAnimationID(lane: .screen, componentID: group.id),
@@ -79,7 +96,7 @@ enum EditorAnimationEditing {
         let baseline = animations(in: state, references: EditorReferences(), duration: duration)
         var result = state
         var aliases: [EditorAnimationIdentityAlias] = []
-        let existingIDs = Set(state.zoomKeyframes.map(\.id) + state.pipKeyframes.map(\.id) + state.editAnchors.map(\.id))
+        let existingIDs = Set(state.zoomKeyframes.map(\.id) + state.pipKeyframes.map(\.id) + state.editAnchors.map(\.id) + state.speedKeyframes.map(\.id))
         var usedReplacements = Set<UUID>()
         for change in changes {
             guard let original = baseline.first(where: { $0.id == change.id }), original.editable,
@@ -97,9 +114,9 @@ enum EditorAnimationEditing {
             var newID = change.componentID
             let retimed = change.end != original.end
             let anchored = state.editAnchors.contains { $0.id == change.componentID }
-            let shared = change.lane == .screen
-                ? state.pipKeyframes.contains { $0.id == change.componentID }
-                : state.zoomKeyframes.contains { $0.id == change.componentID }
+            let shared = (change.lane != .screen && state.zoomKeyframes.contains { $0.id == change.componentID }) ||
+                (change.lane != .camera && state.pipKeyframes.contains { $0.id == change.componentID }) ||
+                (change.lane != .speed && state.speedKeyframes.contains { $0.id == change.componentID })
             if retimed && (anchored || shared) {
                 guard let replacement = replacementIDs[change.id], !existingIDs.contains(replacement),
                       usedReplacements.insert(replacement).inserted else { return nil }
@@ -134,14 +151,28 @@ enum EditorAnimationEditing {
                     if change.easeIn != original.easeIn { result.pipKeyframes[index].easeIn = change.easeIn }
                     if change.easeOut != original.easeOut { result.pipKeyframes[index].easeOut = change.easeOut }
                 }
+            case .speed:
+                guard let index = result.speedKeyframes.firstIndex(where: { $0.id == change.componentID }) else { return nil }
+                result.speedKeyframes[index].id = newID
+                result.speedKeyframes[index].time = change.end
+                if change.start != original.start || change.end != original.end {
+                    if !change.isInstant { result.speedKeyframes[index].duration = change.duration }
+                    result.speedKeyframes[index].transition = change.isInstant ? .jump : .smooth
+                    result.speedKeyframes[index].easeIn = change.easeIn
+                    result.speedKeyframes[index].easeOut = change.easeOut
+                } else {
+                    if change.easeIn != original.easeIn { result.speedKeyframes[index].easeIn = change.easeIn }
+                    if change.easeOut != original.easeOut { result.speedKeyframes[index].easeOut = change.easeOut }
+                }
             case .pointer: return nil
             }
         }
         result.zoomKeyframes.sort { $0.time < $1.time }
         result.pipKeyframes.sort { $0.time < $1.time }
+        result.speedKeyframes.sort { $0.time < $1.time }
         result.editAnchors.sort { $0.time < $1.time }
         guard ordered(result.zoomKeyframes.map(\.time)), ordered(result.pipKeyframes.map(\.time)),
-              ordered(result.editAnchors.map(\.time)) else { return nil }
+              ordered(result.editAnchors.map(\.time)), ordered(result.speedKeyframes.map(\.time)) else { return nil }
         // A source point may store a long duration whose visible start was
         // clipped by its predecessor. Keep an otherwise untouched follower's
         // original visible interval when that predecessor moves away.
@@ -164,6 +195,12 @@ enum EditorAnimationEditing {
                     result.pipKeyframes[index].transition = original.isInstant ? .jump : .smooth
                     result.pipKeyframes[index].easeIn = original.easeIn
                     result.pipKeyframes[index].easeOut = original.easeOut
+                case .speed:
+                    guard let index = result.speedKeyframes.firstIndex(where: { $0.id == original.componentID }) else { return nil }
+                    if !original.isInstant { result.speedKeyframes[index].duration = original.duration }
+                    result.speedKeyframes[index].transition = original.isInstant ? .jump : .smooth
+                    result.speedKeyframes[index].easeIn = original.easeIn
+                    result.speedKeyframes[index].easeOut = original.easeOut
                 case .pointer: break
                 }
             }

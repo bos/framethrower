@@ -10,6 +10,8 @@ final class EditorFrameStore: ObservableObject {
 @MainActor
 final class EditorPlayback: ObservableObject {
     static let supportedPlaybackRates = EditorSimulationClock.supportedRates
+    private let monotonicTime: @MainActor () -> Double
+
     private var mediaPlayer: AVPlayer?
     var player: AVPlayer {
         if let mediaPlayer { return mediaPlayer }
@@ -70,7 +72,7 @@ final class EditorPlayback: ObservableObject {
     }
     private var simulationUsesOutputTime: Bool {
         if auditionRange != nil { return auditionUsesOutputTime }
-        return committedState?.cuts.isEmpty == false
+        return committedState.map { !$0.cuts.isEmpty || !$0.speedKeyframes.isEmpty } ?? false
     }
     private var simulationBounds: ClosedRange<Double> { simulationUsesOutputTime ? outputPlaybackBounds : playbackBounds }
     private var simulationPosition: Double { simulationUsesOutputTime ? outputTime : time }
@@ -110,8 +112,8 @@ final class EditorPlayback: ObservableObject {
     func timingMap(for state: EditState, duration: Double) throws -> RecordingTimeMap {
         if duration == sourceDuration, let committedState, let timingMap,
            state.trimStart == committedState.trimStart, state.trimEnd == committedState.trimEnd,
-           state.cuts == committedState.cuts { return timingMap }
-        return try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts)
+           state.cuts == committedState.cuts, state.speedKeyframes == committedState.speedKeyframes { return timingMap }
+        return try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
     }
     var previewSourceBounds: ClosedRange<Double> { sourceBounds }
     var keptPreviewRange: EditorPreviewRange { .init(start: bounds.lowerBound, end: bounds.upperBound) }
@@ -195,7 +197,8 @@ final class EditorPlayback: ObservableObject {
             duration: sourceDuration, frameDuration: editFrameDuration)
     }
 
-    init() {
+    init(monotonicTime: @escaping @MainActor () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+        self.monotonicTime = monotonicTime
         guard !MediaProcessing.isSuspended else { return }
         observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600),
                                                    queue: .main) { [weak self] time in
@@ -235,7 +238,7 @@ final class EditorPlayback: ObservableObject {
         bounds = snapshot.state.trimStart...snapshot.state.trimEnd
         do {
             timingMap = try RecordingTimeMap(duration: snapshot.duration, trimStart: snapshot.state.trimStart,
-                trimEnd: snapshot.state.trimEnd, cuts: snapshot.state.cuts)
+                trimEnd: snapshot.state.trimEnd, cuts: snapshot.state.cuts, speedKeyframes: snapshot.state.speedKeyframes)
         } catch {
             stopSimulation(); isPlaying = false; isLoading = false
             errorMessage = error.localizedDescription
@@ -264,7 +267,7 @@ final class EditorPlayback: ObservableObject {
             editFrameDuration = snapshot.captureFrameDuration ?? 1.0 / 30
             committedState = snapshot.state
             simulationClock = EditorSimulationClock(bounds: simulationBounds, time: simulationPosition)
-            simulationClock?.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+            simulationClock?.setRate(playbackRate, at: monotonicTime())
             stillFrame = nil
             isLoading = false
             return
@@ -589,7 +592,7 @@ final class EditorPlayback: ObservableObject {
         isInspectingSource = auditionRange != nil && !auditionUsesOutputTime
         if MediaProcessing.isSuspended {
             var clock = EditorSimulationClock(bounds: simulationBounds, time: simulationPosition)
-            clock.play(at: ProcessInfo.processInfo.systemUptime, rate: playbackRate)
+            clock.play(at: monotonicTime(), rate: playbackRate)
             simulationClock = clock
             updateClockPosition(clock.time)
             isPlaying = clock.isPlaying
@@ -623,7 +626,7 @@ final class EditorPlayback: ObservableObject {
         if MediaProcessing.isSuspended {
             if var clock = simulationClock {
                 let wasPlaying = clock.isPlaying
-                clock.pause(at: ProcessInfo.processInfo.systemUptime)
+                clock.pause(at: monotonicTime())
                 simulationClock = clock
                 if wasPlaying { updateClockPosition(clock.time) }
             }
@@ -667,7 +670,7 @@ final class EditorPlayback: ObservableObject {
         if MediaProcessing.isSuspended {
             if var clock = simulationClock {
                 let wasPlaying = clock.isPlaying
-                clock.setRate(rate, at: ProcessInfo.processInfo.systemUptime)
+                clock.setRate(rate, at: monotonicTime())
                 simulationClock = clock
                 if wasPlaying { updateClockPosition(clock.time) }
                 isPlaying = clock.isPlaying
@@ -799,7 +802,7 @@ final class EditorPlayback: ObservableObject {
         time = bounded(position, to: range)
         outputTime = outputPosition(for: time)
         var clock = EditorSimulationClock(bounds: simulationBounds, time: simulationPosition)
-        _ = clock.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+        _ = clock.setRate(playbackRate, at: monotonicTime())
         simulationClock = clock
     }
 
@@ -807,7 +810,7 @@ final class EditorPlayback: ObservableObject {
         stopSimulation(); isPlaying = false
         updateSimulationPosition(position)
         var clock = EditorSimulationClock(bounds: simulationBounds, time: simulationPosition)
-        _ = clock.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+        _ = clock.setRate(playbackRate, at: monotonicTime())
         simulationClock = clock
     }
 
@@ -843,7 +846,7 @@ final class EditorPlayback: ObservableObject {
                 catch { return }
                 guard let self, !self.isClosed, self.simulationGeneration == request,
                       var clock = self.simulationClock, self.isPlaying else { return }
-                clock.advance(to: ProcessInfo.processInfo.systemUptime)
+                clock.advance(to: self.monotonicTime())
                 self.simulationClock = clock
                 self.updateClockPosition(clock.time)
                 self.isPlaying = clock.isPlaying
@@ -878,7 +881,7 @@ final class EditorPlayback: ObservableObject {
         mediaPlayer?.currentItem?.forwardPlaybackEndTime = .invalid
         if MediaProcessing.isSuspended, simulationClock != nil {
             var clock = EditorSimulationClock(bounds: simulationBounds, time: simulationPosition)
-            _ = clock.setRate(playbackRate, at: ProcessInfo.processInfo.systemUptime)
+            _ = clock.setRate(playbackRate, at: monotonicTime())
             simulationClock = clock
         }
     }

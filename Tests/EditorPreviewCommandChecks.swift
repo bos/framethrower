@@ -148,7 +148,8 @@ struct EditorPreviewCommandChecks {
         project.state.cuts = [RecordingCut(start: 5, end: 8, crossfade: 1)]
         let editor = ProjectEditor(project: project,
             url: FileManager.default.temporaryDirectory.appendingPathComponent("cut-preview-\(UUID()).framethrower"))
-        let playback = EditorPlayback()
+        var clockTime = 0.0
+        let playback = EditorPlayback(monotonicTime: { clockTime })
         await playback.rebuild(editor: editor)
         defer { playback.close() }
         let original = editor.project
@@ -176,6 +177,7 @@ struct EditorPreviewCommandChecks {
         try near(audition.outputTime!, 4.2, "Starting an output audition always uses its requested start, not an old cursor inside the range")
         try require(audition.range == .init(start: 4.2, end: 4.8) && audition.rangeTimeBase == "output" && audition.isPlaying,
                     "Output audition coordinates are explicit in the actual snapshot")
+        clockTime += 0.02
         try await wait { playback.outputTime > 4.24 }
         _ = try await playback.applyPreviewCommand(.pause)
         let paused = playback.outputTime
@@ -184,6 +186,7 @@ struct EditorPreviewCommandChecks {
                     "Pause/rate changes preserve the output range and its coordinate system")
         _ = try await playback.applyPreviewCommand(.play)
         try require(playback.outputTime >= paused, "Output audition resumes from its paused position")
+        clockTime += 1
         try await wait { !playback.isPlaying }
         try near(playback.outputTime, 4.8, "A crossfade audition stops at its output endpoint")
         try require(playback.auditionRange == nil && playback.previewSnapshot.rangeTimeBase == nil,
@@ -193,11 +196,13 @@ struct EditorPreviewCommandChecks {
         let source = try await playback.applyPreviewCommand(.playRange(start: 4.8, end: 8.2))
         try require(source.rangeTimeBase == "source" && source.time == 4.8 && playback.outputSamples.isEmpty,
                     "Source audition inspects the original pose rather than reversing mapped crossfade endpoints")
+        clockTime += 0.1
         try await wait { playback.time > 5.2 }
         _ = try await playback.applyPreviewCommand(.pause)
         try require(playback.time > 5 && playback.time < 8 && playback.outputSamples.isEmpty,
                     "A source audition can pause on deliberately omitted footage without showing a retained join instead")
         _ = try await playback.applyPreviewCommand(.play)
+        clockTime += 1
         try await wait { !playback.isPlaying }
         try near(playback.time, 8.2, "Original-source audition retains its exact requested source end")
         try require(playback.auditionRange == nil, "A source audition clears at its own clock boundary")

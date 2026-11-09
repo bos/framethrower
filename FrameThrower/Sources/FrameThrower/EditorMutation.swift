@@ -196,7 +196,7 @@ struct EditorMutationGeometry: Equatable, Sendable {
 }
 
 enum EditorCutTimeBase: String, Codable, Sendable { case source, output }
-enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing, content }
+enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing, content, speed }
 enum EditorMutationSubject: String, Codable, Sendable { case screenViewport, cameraOverlay, cameraSource }
 
 struct EditorMutationEffect: Equatable, Sendable {
@@ -246,6 +246,8 @@ enum EditorMutation: Codable, Equatable, Sendable {
     case cutSection(start: Double, end: Double, timeBase: EditorCutTimeBase, crossfade: Double? = nil)
     case restoreCut(cutID: UUID)
     case cutTransition(cutID: UUID, duration: Double)
+    case speed(rate: Double, timing: EditorMutationTiming, timeBase: EditorCutTimeBase = .source, preservesPitch: Bool? = nil)
+    case removeAnimation(animationID: String)
     case addContentLayer(ContentLayer)
     case updateContentLayer(ContentLayer)
     case removeContentLayer(layerID: UUID)
@@ -253,7 +255,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end,
-             timeBase, crossfade, cutID, duration, layer, layerID, index
+             timeBase, crossfade, cutID, duration, layer, layerID, index, rate, preservesPitch, animationID
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
@@ -288,6 +290,13 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case "cutTransition":
             try c.only([.operation, .cutID, .duration])
             self = .cutTransition(cutID: try c.decode(UUID.self, forKey: .cutID), duration: try c.decode(Double.self, forKey: .duration))
+        case "speed":
+            try c.only([.operation, .rate, .timing, .timeBase, .preservesPitch])
+            self = .speed(rate: try c.decode(Double.self, forKey: .rate), timing: try c.decode(EditorMutationTiming.self, forKey: .timing),
+                timeBase: try c.optional(EditorCutTimeBase.self, .timeBase) ?? .source,
+                preservesPitch: try c.optional(Bool.self, .preservesPitch))
+        case "removeAnimation":
+            try c.only([.operation, .animationID]); self = .removeAnimation(animationID: try c.decode(String.self, forKey: .animationID))
         case "addContentLayer":
             try c.only([.operation, .layer]); self = .addContentLayer(try c.decode(ContentLayer.self, forKey: .layer))
         case "updateContentLayer":
@@ -327,6 +336,11 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .restoreCut(id): try c.encode("restoreCut", forKey: .operation); try c.encode(id, forKey: .cutID)
         case let .cutTransition(id, duration):
             try c.encode("cutTransition", forKey: .operation); try c.encode(id, forKey: .cutID); try c.encode(duration, forKey: .duration)
+        case let .speed(rate, timing, base, pitch):
+            try c.encode("speed", forKey: .operation); try c.encode(rate, forKey: .rate); try c.encode(timing, forKey: .timing)
+            try c.encode(base, forKey: .timeBase)
+            try c.encodeIfPresent(pitch, forKey: .preservesPitch)
+        case let .removeAnimation(id): try c.encode("removeAnimation", forKey: .operation); try c.encode(id, forKey: .animationID)
         case let .addContentLayer(layer): try c.encode("addContentLayer", forKey: .operation); try c.encode(layer, forKey: .layer)
         case let .updateContentLayer(layer): try c.encode("updateContentLayer", forKey: .operation); try c.encode(layer, forKey: .layer)
         case let .removeContentLayer(id): try c.encode("removeContentLayer", forKey: .operation); try c.encode(id, forKey: .layerID)
@@ -339,6 +353,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         switch self {
         case let .panScreen(_, value), let .zoomScreen(_, _, value), let .alignScreen(_, _, _, _, _, value),
              let .cameraOverlay(_, value), let .alignCameraOverlay(_, _, _, _, value), let .cameraSource(_, value): value
+        case let .speed(_, value, base, _): base == .source ? value : nil
         default: nil
         }
     }
@@ -351,6 +366,8 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case .canvas: .canvas
         case .trim: .trim
         case .cutSection, .restoreCut, .cutTransition: .timing
+        case .speed: .speed
+        case let .removeAnimation(id): EditorMutationLane(rawValue: String(id.split(separator: ":").first ?? "")) ?? .timing
         case .addContentLayer, .updateContentLayer, .removeContentLayer, .reorderContentLayer: .content
         }
     }
@@ -384,6 +401,8 @@ enum EditorMutation: Codable, Equatable, Sendable {
             for point in state.zoomKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
         } else if lane == .camera {
             for point in state.pipKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
+        } else if lane == .speed {
+            for point in state.speedKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
         }
         return result
     }
@@ -398,7 +417,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
     }
 
     private func applyUnchecked(to state: inout EditState, project: RecordingProject, geometry: EditorMutationGeometry?) throws {
-        if let timing { try timing.validate(duration: project.duration) }
+        // Speed envelopes may arrive at the exclusive footage end and can span
+        // the full source; their own validation follows below.
+        if lane != .speed, let timing { try timing.validate(duration: project.duration) }
         switch self {
         case let .panScreen(center, timing):
             guard center.isValid else { throw EditorMutationError.invalid("Use a normalized source focal point inside the recording.") }
@@ -504,6 +525,64 @@ enum EditorMutation: Codable, Equatable, Sendable {
             guard duration.isFinite, duration >= 0 else { throw EditorMutationError.invalid("Crossfade duration must be a finite, nonnegative number of output seconds.") }
             guard let index = state.cuts.firstIndex(where: { $0.id == id }) else { throw EditorMutationError.invalid("That cut no longer exists.") }
             state.cuts[index].crossfade = duration
+        case let .speed(rate, requestedTiming, base, pitch):
+            guard rate.isFinite, RecordingRetime.supportedRates.contains(rate) else {
+                throw EditorMutationError.invalid("Export speed must be between 0.1× and 8×.")
+            }
+            var timing = requestedTiming
+            if base == .output {
+                let original = project.state
+                let map = try RecordingTimeMap(duration: project.duration, trimStart: original.trimStart,
+                    trimEnd: original.trimEnd, cuts: original.cuts, speedKeyframes: original.speedKeyframes)
+                func source(_ time: Double) throws -> Double {
+                    guard time.isFinite, time >= 0, time <= map.outputDuration else {
+                        throw EditorMutationError.invalid("The speed change must use times inside the pre-edit output timeline.")
+                    }
+                    let samples = map.samples(at: time)
+                    guard let first = samples.first, samples.allSatisfy({ abs($0.sourceTime - first.sourceTime) <= 0.000000001 }) else {
+                        throw EditorMutationError.invalid("That speed boundary has two source frames in a crossfade. Use explicit source times.")
+                    }
+                    return first.sourceTime
+                }
+                timing.start = try source(requestedTiming.start); timing.end = try source(requestedTiming.end)
+                if let ease = requestedTiming.easeIn { timing.easeIn = try source(requestedTiming.start + ease) - timing.start }
+                if let ease = requestedTiming.easeOut { timing.easeOut = timing.end - (try source(requestedTiming.end - ease)) }
+            }
+            guard timing.start.isFinite, timing.end.isFinite, timing.start >= 0, timing.end <= project.duration,
+                  timing.transition == .smooth ? timing.start < timing.end : timing.start == timing.end,
+                  [timing.easeIn, timing.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                throw EditorMutationError.invalid("A speed ramp needs an ordered source interval inside the recording; a jump uses one source time.")
+            }
+            if let pitch { state.preservesAudioPitch = pitch }
+            let baseline = state.speed(at: timing.start)
+            guard rate != baseline else { return }
+            let overlaps = EditorMutation.speed(rate: rate, timing: timing).conflicts(in: state)
+            guard overlaps.isEmpty else { throw EditorMutationError.conflicts(overlaps) }
+            if timing.transition == .smooth, !state.speedKeyframes.contains(where: { abs($0.time - timing.start) < 0.000001 }) {
+                state.speedKeyframes.append(RecordingSpeedKeyframe(time: timing.start, rate: baseline, transition: .jump))
+            }
+            let existing = state.speedKeyframes.first { abs($0.time - timing.end) < 0.000001 }
+            state.speedKeyframes.removeAll { abs($0.time - timing.end) < 0.000001 }
+            state.speedKeyframes.append(RecordingSpeedKeyframe(id: existing?.id ?? UUID(), time: existing?.time ?? timing.end,
+                rate: rate, transition: timing.transition, duration: timing.motion.duration, easeIn: timing.easeIn, easeOut: timing.easeOut))
+            state.speedKeyframes.sort { $0.time < $1.time }
+        case let .removeAnimation(id):
+            let pieces = id.split(separator: ":", omittingEmptySubsequences: false)
+            guard pieces.count == 2, let component = UUID(uuidString: String(pieces[1])) else {
+                throw EditorMutationError.invalid("Use an actual lane-qualified animation identity from inspect_editor edits.")
+            }
+            switch pieces[0] {
+            case "screen":
+                guard state.zoomKeyframes.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That screen animation no longer exists.") }
+                state.zoomKeyframes.removeAll { $0.id == component }
+            case "camera":
+                guard state.pipKeyframes.contains(where: { $0.id == component && $0.time > 0 }) else { throw EditorMutationError.invalid("That camera animation cannot be removed.") }
+                state.pipKeyframes.removeAll { $0.id == component && $0.time > 0 }
+            case "speed":
+                guard state.speedKeyframes.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That speed animation no longer exists.") }
+                state.speedKeyframes.removeAll { $0.id == component }
+            default: throw EditorMutationError.invalid("Choose a screen, camera or speed animation; pointer styling is not a removable animation.")
+            }
         case let .addContentLayer(layer):
             guard !state.contentLayers.contains(where: { $0.id == layer.id }) else { throw EditorMutationError.invalid("That content layer identity is already in use.") }
             state.contentLayers.append(layer)
@@ -581,6 +660,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
         let point = object(["x": number(0, 1), "y": number(0, 1)])
         let timing = object(["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0],
             "transition": enumeration(["jump", "smooth"]), "easeIn": number(0, 60), "easeOut": number(0, 60)], optional: ["transition", "easeIn", "easeOut"])
+        let speedTiming = object(["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0],
+            "transition": enumeration(["jump", "smooth"]), "easeIn": ["type": "number", "minimum": 0],
+            "easeOut": ["type": "number", "minimum": 0]], optional: ["transition", "easeIn", "easeOut"])
         let anchors = enumeration(EditorRectAnchor.allCases.map(\.rawValue)), axes = enumeration(["horizontal", "vertical", "both"])
         let policy: [String: Any] = ["oneOf": [object(["kind": ["type": "string", "const": "preserve"]]),
             object(["kind": ["type": "string", "const": "fitRegion"]]), object(["kind": ["type": "string", "const": "absolute"], "scale": number(1, 3)])]]
@@ -622,6 +704,11 @@ enum EditorMutation: Codable, Equatable, Sendable {
             operation("alignCameraOverlay", "Move the camera outline without resizing or changing its source crop. Align to displayed Box using verified host geometry; unavailable geometry rejects. Source boxes project through arrival screen framing into final canvas.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "timing": timing]),
             operation("cameraSource", "Patch the camera image INSIDE its unchanged outline. Crop x/y are fractions of available oriented camera-source travel; sourceZoom1...3 is not overlay size.", ["patch": source, "timing": timing]),
             operation("pointer", "Patch whole-recording pointer style only; does not invent or retime captured pointer motion. Supply at least one field.", ["patch": pointer]),
+            operation("speed", "Change exported recording speed, not transient preview speed. rate0.1...8 is source-seconds per output-second. timeBase defaults to source; output endpoints and ramps resolve through the PRE-EDIT timing map (ambiguous crossfades reject). timing arrives at end; smooth inserts the evaluated baseline at start and ramps to the target, which persists afterward. Jump has start=end. Keep source anchors unchanged. Optional preservesPitch changes the whole recording's audio-pitch policy (defaulttrue); an unchanged rate changes only that policy without creating a point. For a constant-speed section use jumps to the requested rate at its source start and back to the prior rate at its source end. Translate output references using the PRE-EDIT timing map before this batch; never recompute later command times midway through the same requested range.",
+                ["rate": number(0.1, 8), "timing": speedTiming, "timeBase": enumeration(["source", "output"]),
+                 "preservesPitch": ["type": "boolean"]], optional: ["timeBase", "preservesPitch"]),
+            operation("removeAnimation", "Remove one lane-qualified screen, camera or speed component from inspect_editor edits (animationID=lane:UUID). Independent components at the same time remain. Initial camera and whole-recording pointer style cannot be removed this way.",
+                ["animationID": ["type": "string"]]),
             operation("audio", "Patch master recorded audio: volume0...1, mute, fade seconds0...5 relative to kept trim. Preserves source offsets and relative levels. Supply at least one field.", ["patch": audio]),
             operation("canvas", "Patch whole-recording output presentation. Padding/corner radius are fractions0...0.2; background RGB0...1. Source coordinates and PIP travel remain unchanged.", ["patch": canvas]),
             operation("trim", "Keep a nonempty original-source interval. Does not retime keyframes or overwrite requested audio fades.", ["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0]]),
@@ -663,9 +750,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
                 "screen": ["panScreen", "zoomScreen", "alignScreen", "frameRegion", "fullFrame", "holdFraming", "reviseFraming", "moveBetweenEdits", "moveForDuration"],
                 "camera": ["cameraOverlay", "alignCameraOverlay", "cameraSource"],
                 "global": ["pointer", "audio", "canvas", "trim"],
-                "timing": ["cutSection", "restoreCut", "cutTransition"],
+                "timing": ["cutSection", "restoreCut", "cutTransition", "speed"],
                 "boxes": ["addRegion", "labelRegion", "removeRegion"],
-                "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming"]],
+                "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming", "removeAnimation"]],
                 "subjects": [
                     "screen": "Main recorded screen viewport. panScreen preserves zoom; zoomScreen changes screen magnification; alignScreen matches Box anchors. These do not resize the PIP camera.",
                     "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or hides it; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
@@ -679,7 +766,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
         }) {
             let command: [String: Any] = ["type": "object", "properties": ["action": ["type": "string", "const": "mutate"], "mutation": schema],
                 "required": ["action", "mutation"], "additionalProperties": false]
-            let units = ["cutSection", "restoreCut", "cutTransition"].contains(operation)
+            let units = operation == "speed"
+                ? "rate is source seconds per output second (0.1...8). timeBase defaults to source; output times/ramps resolve through the original batch map and reject ambiguous crossfades. Smooth start<end; jump start=end; arrival may equal recording end. The target persists until the next speed point. preservesPitch is a whole-recording policy. This changes exported timing; control_preview.set_rate does not."
+                : ["cutSection", "restoreCut", "cutTransition"].contains(operation)
                 ? "Cut ranges require explicit timeBase source/output and start<end. Output endpoints with two different contributing source instants reject; choose source coordinates explicitly. Crossfade duration is requested output seconds, with effective overlap reported by the time map. Omitted crossfade preserves an existing merged cut's fade and defaults to zero only for a new cut. null is unsupported. Source edits are preserved."
                 : "Absolute original-source start/end; duration=end-start. Smooth start<end; jump start=end. Unspecified patch fields stay unchanged; null is unsupported. Camera overlay, camera source crop, and screen viewport are different subjects. Bounds/overlaps fail atomically."
             return ["operation": operation, "command_schema": command, "units": units]
@@ -736,7 +825,8 @@ enum EditorCutEditing {
         guard start.isFinite, end.isFinite, start >= 0, start < end else {
             throw EditorMutationError.invalid("Choose a nonempty, finite cut interval with start before end.")
         }
-        let map = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts)
+        let map = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts,
+            speedKeyframes: state.speedKeyframes)
         if timeBase == .source {
             guard end <= duration else { throw EditorMutationError.invalid("The source cut must be inside the original recording.") }
             return start..<end
@@ -781,7 +871,8 @@ enum EditorCutEditing {
         next.cuts = remaining.sorted { $0.start < $1.start }
         // Reject removing the complete trim; effective fades are derived while
         // their requested values stay intact for future restore/trim changes.
-        _ = try RecordingTimeMap(duration: duration, trimStart: next.trimStart, trimEnd: next.trimEnd, cuts: next.cuts)
+        _ = try RecordingTimeMap(duration: duration, trimStart: next.trimStart, trimEnd: next.trimEnd, cuts: next.cuts,
+            speedKeyframes: next.speedKeyframes)
         return next
     }
 }

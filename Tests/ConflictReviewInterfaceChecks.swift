@@ -116,8 +116,8 @@ struct ConflictReviewInterfaceChecks {
                     all(NSTextField.self, in: host).contains { $0.placeholderString == "Your answer…" },
                     "A conflict automatically reveals its question without resizing the window or timeline")
         let lanes = timeline.animationLanes()
-        try require(Set(lanes.map(\.lane)) == [.screen, .camera, .pointer],
-                    "All three persistent animation lanes remain visible during Director review")
+        try require(Set(lanes.map(\.lane)) == [.screen, .camera, .speed, .pointer],
+                    "All four persistent animation lanes remain visible during Director review")
         let screenLane = lanes.first { $0.lane == .screen }!.frame
         let cameraLane = lanes.first { $0.lane == .camera }!.frame
         let pointerLane = lanes.first { $0.lane == .pointer }!.frame
@@ -584,7 +584,7 @@ struct ConflictReviewInterfaceChecks {
             try require(cameraShapeVisible == (name == "Camera"),
                         "The native tab change must actually update the inspector's controls")
             try require(canvas.frame == fixedCanvas && timeline.frame == fixedTimeline && window.frame == fixedWindow &&
-                        Set(timeline.animationLanes().map(\.lane)) == [.screen, .camera, .pointer],
+                        Set(timeline.animationLanes().map(\.lane)) == [.screen, .camera, .speed, .pointer],
                         "Changing inspector tabs cannot hide a timeline lane or resize the preview/timeline")
         }
         let componentID = editor.project.state.zoomKeyframes[0].id

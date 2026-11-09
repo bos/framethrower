@@ -511,17 +511,15 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 command = .playRange(start: animation.start, end: animation.end)
             } else {
                 let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
-                    trimEnd: state.trimEnd, cuts: state.cuts)
+                    trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
                 // A source interval can project to overlapping output branches.
                 // Project each retained intersection; never reverse endpoint
                 // mappings or choose just the dominant branch of a crossfade.
                 let intervals = map.clips.compactMap { clip -> ClosedRange<Double>? in
                     let start = max(animation.start, clip.sourceStart), end = min(animation.end, clip.sourceEnd)
                     guard start < end else { return nil }
-                    let outputStart = start == clip.sourceStart ? clip.outputStart :
-                        min(clip.outputEnd, max(clip.outputStart, clip.outputStart + (start - clip.sourceStart)))
-                    let outputEnd = end == clip.sourceEnd ? clip.outputEnd :
-                        min(clip.outputEnd, max(clip.outputStart, clip.outputStart + (end - clip.sourceStart)))
+                    let outputStart = clip.outputTime(for: start)
+                    let outputEnd = clip.outputTime(for: end)
                     guard outputStart < outputEnd else { return nil }
                     return outputStart...outputEnd
                 }
@@ -562,7 +560,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         switch args["section"] as? String {
         case "timing":
             let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
-                trimEnd: state.trimEnd, cuts: state.cuts)
+                trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
             guard args["time_base"] == nil || args["time_base"] as? String == "output" else {
                 throw EditorAutomationError.invalid("Timing inspection uses output seconds. Use state component inspection for original-source values.")
             }
@@ -572,7 +570,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 "output_time": position, "source_samples": map.samples(at: position).map {
                     ["clip_index": $0.clipIndex, "source_time": $0.sourceTime, "weight": $0.weight] as [String: Any]
                 },
-                "time_base": "output", "cut_count": state.cuts.count,
+                "time_base": "output", "cut_count": state.cuts.count, "speed_count": state.speedKeyframes.count, "preserves_audio_pitch": state.preservesAudioPitch,
                 "cuts": page(try state.cuts.map { try EditorAutomationAPI.object($0) }),
                 "clips": page(map.clips.enumerated().map { index, clip in
                     ["clip_index": index, "source_start": clip.sourceStart, "source_end": clip.sourceEnd,
@@ -584,9 +582,9 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 })]
         case "summary", "view":
             let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
-                trimEnd: state.trimEnd, cuts: state.cuts)
+                trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
             return ["context": try EditorAutomationAPI.object(automationContext), "duration": editor.project.duration,
-                "source_duration": editor.project.duration, "output_duration": map.outputDuration, "cut_count": state.cuts.count,
+                "source_duration": editor.project.duration, "output_duration": map.outputDuration, "cut_count": state.cuts.count, "speed_count": state.speedKeyframes.count, "preserves_audio_pitch": state.preservesAudioPitch,
                 "trim": ["start": state.trimStart, "end": state.trimEnd], "edit_count": state.timedEdits(includeCamera: editor.project.cameraFilename != nil).count,
                 "box_count": state.regions.count, "content_layer_count": state.contentLayers.count, "undo_count": editor.historyState.undo.count,
                 "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
@@ -636,7 +634,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     /// never seeks, finishes a gesture, creates history or opens source media.
     private func inspectComponent(_ args: [String: Any], editor: ProjectEditor) throws -> [String: Any] {
         guard let component = args["component"] as? String,
-              ["screen", "camera", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
+              ["screen", "camera", "speed", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
             throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas, trim or layers.")
         }
         let context = try automationContext
@@ -647,6 +645,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             switch component {
             case "screen": return try EditorAutomationAPI.object(state.zoom(at: sourceTime))
             case "camera": return try EditorAutomationAPI.object(state.placement(at: sourceTime))
+            case "speed": return ["rate": state.speed(at: sourceTime), "preservesPitch": state.preservesAudioPitch] as [String: Any]
             case "pointer": return try EditorAutomationAPI.object(state.cursorStyle)
             case "audio": return try EditorAutomationAPI.object(state.audio)
             case "canvas": return try EditorAutomationAPI.object(state.presentation)
@@ -659,7 +658,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         }
         if timeBase == "output" {
             let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
-                trimEnd: state.trimEnd, cuts: state.cuts)
+                trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
             let position = try args["time"].map { try EditorAutomationAPI.number($0) } ?? playback?.outputTime ?? 0
             guard position >= 0, position <= map.outputDuration else { throw EditorPreviewError.invalidTime }
             return ["component": component, "time_base": "output", "output_time": position,
@@ -671,7 +670,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
         guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
         var result: [String: Any] = ["component": component, "source_time": time, "value": try value(at: time),
-            "scope": ["screen", "camera", "layers"].contains(component) ? "source_time" : "recording",
+            "scope": ["screen", "camera", "speed", "layers"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
         return result

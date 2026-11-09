@@ -3,7 +3,7 @@ import CoreGraphics
 import CryptoKit
 import Foundation
 
-enum PIPTransition: String, Codable, CaseIterable, Sendable {
+enum PIPTransition: String, Codable, CaseIterable, Hashable, Sendable {
     case jump
     case smooth
 }
@@ -491,7 +491,7 @@ struct RecordingAudio: Codable, Equatable, Sendable {
 
 /// An excluded half-open interval in original source seconds. The requested
 /// crossfade is in output seconds and is never rewritten by trimming.
-struct RecordingCut: Codable, Equatable, Sendable, Identifiable {
+struct RecordingCut: Codable, Hashable, Sendable, Identifiable {
     var id: UUID
     var start: Double
     var end: Double
@@ -510,6 +510,133 @@ struct RecordingCut: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// A final-recording playback rate, arriving at an original-source timestamp.
+/// It is independent of the editor's temporary review speed.
+struct RecordingSpeedKeyframe: Codable, Hashable, Identifiable, Sendable {
+    var id = UUID()
+    var time: Double
+    var rate: Double
+    var transition: PIPTransition = .smooth
+    var duration = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
+
+    init(id: UUID = UUID(), time: Double, rate: Double, transition: PIPTransition = .smooth,
+         duration: Double = 0.4, easeIn: Double? = nil, easeOut: Double? = nil) {
+        self.id = id; self.time = time; self.rate = rate; self.transition = transition
+        self.duration = duration; self.easeIn = easeIn; self.easeOut = easeOut
+    }
+}
+
+enum RecordingRetime {
+    static let supportedRates = 0.1...8.0
+    /// A tenth of a millisecond of output-clock curvature per linear cell.
+    /// Preview, inverse queries, video and every audio track share these cells.
+    static let maximumOutputError = 0.0001
+
+    struct Segment: Equatable, Sendable {
+        let sourceStart: Double
+        let sourceEnd: Double
+        let outputStart: Double
+        let outputEnd: Double
+        var rate: Double { (sourceEnd - sourceStart) / (outputEnd - outputStart) }
+        func sourceTime(at outputTime: Double) -> Double {
+            sourceStart + min(1, max(0, (outputTime - outputStart) / (outputEnd - outputStart))) * (sourceEnd - sourceStart)
+        }
+        func outputTime(for sourceTime: Double) -> Double {
+            outputStart + min(1, max(0, (sourceTime - sourceStart) / (sourceEnd - sourceStart))) * (outputEnd - outputStart)
+        }
+        func shifted(by offset: Double) -> Self {
+            .init(sourceStart: sourceStart, sourceEnd: sourceEnd, outputStart: outputStart + offset, outputEnd: outputEnd + offset)
+        }
+    }
+
+    static func validate(points: [RecordingSpeedKeyframe], duration: Double) throws {
+        var ids = Set<UUID>(), previous = -Double.infinity
+        for point in points {
+            guard point.time.isFinite, point.time >= 0, point.time <= duration, point.time > previous,
+                  ids.insert(point.id).inserted, point.rate.isFinite, supportedRates.contains(point.rate),
+                  point.duration.isFinite, point.duration > 0,
+                  [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                throw ProjectError.invalid("Speed changes need unique, ordered source times, rates from 0.1× to 8×, and valid ramp durations.")
+            }
+            previous = point.time
+        }
+    }
+
+    static func rate(at time: Double, points: [RecordingSpeedKeyframe]) -> Double {
+        guard time.isFinite, time >= 0 else { return 1 }
+        var low = 0, high = points.count
+        while low < high {
+            let mid = (low + high) / 2
+            if points[mid].time <= time { low = mid + 1 } else { high = mid }
+        }
+        let previousRate = low > 0 ? points[low - 1].rate : 1
+        let previousTime = low > 0 ? points[low - 1].time : 0
+        guard low < points.count else { return previousRate }
+        let point = points[low]
+        return MotionInterpolation.blend(previousRate, point.rate,
+            progress: MotionInterpolation.progress(at: time, from: previousTime, to: point.time,
+                duration: point.duration, transition: point.transition, easeIn: point.easeIn, easeOut: point.easeOut))
+    }
+
+    /// Integrate ds/rate(s), splitting at every discontinuity and ramp boundary.
+    /// Adaptive Simpson quadrature also checks clock curvature; a duration-only
+    /// error test would miss a symmetric acceleration/deceleration interval.
+    static func segments(start: Double, end: Double, points: [RecordingSpeedKeyframe]) throws -> [Segment] {
+        guard start.isFinite, end.isFinite, start >= 0, end > start else { return [] }
+        var knots = [start, end], previousTime = 0.0
+        for point in points {
+            knots.append(point.time)
+            if point.transition == .smooth {
+                let beginning = max(previousTime, point.time - point.duration)
+                let ramps = MotionInterpolation.rampDurations(duration: point.time - beginning, easeIn: point.easeIn, easeOut: point.easeOut)
+                knots += [beginning, beginning + ramps.easeIn, point.time - ramps.easeOut]
+            }
+            previousTime = point.time
+        }
+        knots = Set(knots.filter { $0 >= start && $0 <= end }).sorted()
+        var result: [Segment] = [], output = 0.0
+        func append(_ a: Double, _ b: Double, _ elapsed: Double) throws {
+            guard elapsed.isFinite, elapsed > 0, output + elapsed > output, result.count < 100_000 else {
+                throw ProjectError.invalid("This speed curve could not be represented accurately. Shorten the speed ramp or simplify its changes.")
+            }
+            result.append(.init(sourceStart: a, sourceEnd: b, outputStart: output, outputEnd: output + elapsed))
+            output += elapsed
+        }
+        for (a, b) in zip(knots, knots.dropFirst()) {
+            // At a hard speed change the preceding cell must use the left limit.
+            func f(_ t: Double) -> Double { 1 / rate(at: t == b ? b.nextDown : t, points: points) }
+            func refine(_ left: Double, _ right: Double, _ fl: Double, _ fm: Double, _ fr: Double,
+                        _ whole: Double, _ depth: Int) throws {
+                if fl == fm && fm == fr {
+                    try append(left, right, (right - left) * fm)
+                    return
+                }
+                let mid = left + (right - left) / 2
+                let q1 = f(left + (mid - left) / 2), q3 = f(mid + (right - mid) / 2)
+                let first = (mid - left) / 6 * (fl + 4 * q1 + fm)
+                let second = (right - mid) / 6 * (fm + 4 * q3 + fr)
+                let total = first + second
+                let curvature = abs(first - total / 2)
+                let integralError = abs(total - whole) / 15
+                if curvature <= maximumOutputError && integralError <= 1e-10 * max(1, total) {
+                    try append(left, right, total + (total - whole) / 15)
+                } else {
+                    guard depth < 24, mid > left, mid < right else {
+                        throw ProjectError.invalid("This speed ramp is too short or too long to represent accurately.")
+                    }
+                    try refine(left, mid, fl, q1, fm, first, depth + 1)
+                    try refine(mid, right, fm, q3, fr, second, depth + 1)
+                }
+            }
+            let middle = a + (b - a) / 2, fa = f(a), fm = f(middle), fb = f(b)
+            try refine(a, b, fa, fm, fb, (b - a) / 6 * (fa + 4 * fm + fb), 0)
+        }
+        return result
+    }
+}
+
 /// Pure source/output timing. Source edits and observations retain their original
 /// timestamps; a transition evaluates two independently composed source moments.
 struct RecordingTimeMap: Equatable, Sendable {
@@ -518,6 +645,28 @@ struct RecordingTimeMap: Equatable, Sendable {
         let sourceEnd: Double
         let outputStart: Double
         let outputEnd: Double
+        let segments: [RecordingRetime.Segment]
+
+        func sourceTime(at outputTime: Double) -> Double {
+            var low = 0, high = segments.count
+            while low < high {
+                let mid = (low + high) / 2
+                if segments[mid].outputEnd <= outputTime { low = mid + 1 } else { high = mid }
+            }
+            guard !segments.isEmpty else { return sourceStart }
+            let cell = segments[min(low, segments.count - 1)]
+            return cell.sourceTime(at: outputTime)
+        }
+        func outputTime(for sourceTime: Double) -> Double {
+            var low = 0, high = segments.count
+            while low < high {
+                let mid = (low + high) / 2
+                if segments[mid].sourceEnd <= sourceTime { low = mid + 1 } else { high = mid }
+            }
+            guard !segments.isEmpty else { return outputStart }
+            let cell = segments[min(low, segments.count - 1)]
+            return cell.outputTime(for: sourceTime)
+        }
     }
     struct Join: Equatable, Sendable, Identifiable {
         let id: UUID
@@ -537,11 +686,13 @@ struct RecordingTimeMap: Equatable, Sendable {
     let joins: [Join]
     let outputDuration: Double
 
-    init(duration: Double, trimStart: Double, trimEnd: Double, cuts: [RecordingCut]) throws {
+    init(duration: Double, trimStart: Double, trimEnd: Double, cuts: [RecordingCut],
+         speedKeyframes: [RecordingSpeedKeyframe] = []) throws {
         guard duration.isFinite, duration > 0, trimStart.isFinite, trimEnd.isFinite,
               trimStart >= 0, trimEnd <= duration, trimStart < trimEnd else {
             throw ProjectError.invalid("Keep a nonempty trim range inside the original recording.")
         }
+        try RecordingRetime.validate(points: speedKeyframes, duration: duration)
         let ordered = cuts.sorted { $0.start < $1.start }
         var identities = Set<UUID>()
         var priorEnd: Double?
@@ -570,14 +721,16 @@ struct RecordingTimeMap: Equatable, Sendable {
             guard let cut = byStart[range.end] else { throw ProjectError.invalid("A cut boundary could not be resolved.") }
             return cut
         }
-        let lengths = ranges.map { $0.end - $0.start }
+        let cells = try ranges.map { try RecordingRetime.segments(start: $0.start, end: $0.end, points: speedKeyframes) }
+        let lengths = cells.map { $0.last!.outputEnd }
         let effective = Self.effectiveFades(requested: boundaries.map(\.crossfade), lengths: lengths)
         var mapped: [Clip] = []
         var mappedJoins: [Join] = []
         for (index, range) in ranges.enumerated() {
             let start = index == 0 ? 0 : mapped[index - 1].outputEnd - effective[index - 1]
             mapped.append(Clip(sourceStart: range.start, sourceEnd: range.end,
-                               outputStart: start, outputEnd: start + lengths[index]))
+                               outputStart: start, outputEnd: start + lengths[index],
+                               segments: cells[index].map { $0.shifted(by: start) }))
             if index > 0 {
                 let cut = boundaries[index - 1], fade = effective[index - 1]
                 mappedJoins.append(Join(id: cut.id, outputStart: start, outputEnd: start + fade,
@@ -701,7 +854,7 @@ struct RecordingTimeMap: Equatable, Sendable {
             }
             if weight > 0 {
                 result.append(Sample(clipIndex: index,
-                    sourceTime: min(clip.sourceEnd, clip.sourceStart + (outputTime - clip.outputStart)), weight: weight))
+                    sourceTime: clip.sourceTime(at: outputTime), weight: weight))
             }
         }
         let sum = result.reduce(0.0) { $0 + $1.weight }
@@ -715,7 +868,7 @@ struct RecordingTimeMap: Equatable, Sendable {
         guard sourceTime.isFinite else { return nil }
         if sourceTime == clips.last?.sourceEnd { return outputDuration }
         guard let clip = clips.first(where: { sourceTime >= $0.sourceStart && sourceTime < $0.sourceEnd }) else { return nil }
-        return clip.outputStart + (sourceTime - clip.sourceStart)
+        return clip.outputTime(for: sourceTime)
     }
 }
 
@@ -869,6 +1022,8 @@ struct EditState: Codable, Equatable, Sendable {
     var audio = RecordingAudio()
     var cuts: [RecordingCut] = []
     var contentLayers: [ContentLayer] = []
+    var speedKeyframes: [RecordingSpeedKeyframe] = []
+    var preservesAudioPitch = true
     /// Missing only in legacy states. A persisted version prevents a manually
     /// detached target from being inferred again after a later save/reopen.
     var boxConnectionsVersion = 1
@@ -877,7 +1032,7 @@ struct EditState: Codable, Equatable, Sendable {
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
          editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = [],
-         contentLayers: [ContentLayer] = []) {
+         contentLayers: [ContentLayer] = [], speedKeyframes: [RecordingSpeedKeyframe] = [], preservesAudioPitch: Bool = true) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -889,10 +1044,13 @@ struct EditState: Codable, Equatable, Sendable {
         self.audio = audio
         self.cuts = cuts
         self.contentLayers = contentLayers
+        self.speedKeyframes = speedKeyframes
+        self.preservesAudioPitch = preservesAudioPitch
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion,
+             speedKeyframes, preservesAudioPitch
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -910,6 +1068,8 @@ struct EditState: Codable, Equatable, Sendable {
         audio = try values.decodeIfPresent(RecordingAudio.self, forKey: .audio) ?? RecordingAudio()
         cuts = try values.decodeIfPresent([RecordingCut].self, forKey: .cuts) ?? []
         contentLayers = try values.decodeIfPresent([ContentLayer].self, forKey: .contentLayers) ?? []
+        speedKeyframes = try values.decodeIfPresent([RecordingSpeedKeyframe].self, forKey: .speedKeyframes) ?? []
+        preservesAudioPitch = try values.decodeIfPresent(Bool.self, forKey: .preservesAudioPitch) ?? true
         if values.contains(.boxConnectionsVersion) {
             boxConnectionsVersion = try values.decode(Int.self, forKey: .boxConnectionsVersion)
             guard boxConnectionsVersion == 1 else {
@@ -921,6 +1081,8 @@ struct EditState: Codable, Equatable, Sendable {
             self = EditorBoxConnections.migratingLegacy(self)
         }
     }
+
+    func speed(at time: Double) -> Double { RecordingRetime.rate(at: time, points: speedKeyframes) }
 
     func zoom(at time: Double) -> ZoomPlacement {
         guard time.isFinite, time >= 0 else { return ZoomPlacement() }
@@ -1089,13 +1251,15 @@ struct TimedEdit: Identifiable, Equatable {
     let zoomID: UUID?
     let cameraID: UUID?
     let anchorID: UUID?
+    let speedID: UUID?
 
-    init(id: UUID, time: Double, zoomID: UUID?, cameraID: UUID?, anchorID: UUID? = nil) {
+    init(id: UUID, time: Double, zoomID: UUID?, cameraID: UUID?, anchorID: UUID? = nil, speedID: UUID? = nil) {
         self.id = id
         self.time = time
         self.zoomID = zoomID
         self.cameraID = cameraID
         self.anchorID = anchorID
+        self.speedID = speedID
     }
 }
 
@@ -1112,11 +1276,20 @@ extension EditState {
                 }
             }
         }
+        for speed in speedKeyframes {
+            if let index = result.firstIndex(where: { abs($0.time - speed.time) < 0.000001 }) {
+                let combined = result[index]
+                result[index] = TimedEdit(id: combined.id, time: combined.time, zoomID: combined.zoomID,
+                    cameraID: combined.cameraID, anchorID: combined.anchorID, speedID: speed.id)
+            } else {
+                result.append(TimedEdit(id: speed.id, time: speed.time, zoomID: nil, cameraID: nil, speedID: speed.id))
+            }
+        }
         for anchor in editAnchors {
             if let index = result.firstIndex(where: { abs($0.time - anchor.time) < 0.000001 }) {
                 let combined = result[index]
                 result[index] = TimedEdit(id: anchor.id, time: anchor.time, zoomID: combined.zoomID,
-                                         cameraID: combined.cameraID, anchorID: anchor.id)
+                                         cameraID: combined.cameraID, anchorID: anchor.id, speedID: combined.speedID)
             } else {
                 result.append(TimedEdit(id: anchor.id, time: anchor.time, zoomID: nil, cameraID: nil, anchorID: anchor.id))
             }
@@ -1145,15 +1318,18 @@ extension EditState {
     mutating func remove(_ edit: TimedEdit) {
         zoomKeyframes.removeAll { $0.id == edit.zoomID }
         pipKeyframes.removeAll { $0.id == edit.cameraID && $0.time > 0 }
+        speedKeyframes.removeAll { $0.id == edit.speedID }
         editAnchors.removeAll { $0.id == edit.anchorID }
     }
 
     mutating func move(_ edit: TimedEdit, to time: Double) {
         if let index = zoomKeyframes.firstIndex(where: { $0.id == edit.zoomID }) { zoomKeyframes[index].time = time }
         if let index = pipKeyframes.firstIndex(where: { $0.id == edit.cameraID && $0.time > 0 }) { pipKeyframes[index].time = time }
+        if let index = speedKeyframes.firstIndex(where: { $0.id == edit.speedID }) { speedKeyframes[index].time = time }
         if let index = editAnchors.firstIndex(where: { $0.id == edit.anchorID }) { editAnchors[index].time = time }
         zoomKeyframes.sort { $0.time < $1.time }
         pipKeyframes.sort { $0.time < $1.time }
+        speedKeyframes.sort { $0.time < $1.time }
         editAnchors.sort { $0.time < $1.time }
     }
 }
@@ -1332,9 +1508,13 @@ struct RecordingProject: Codable, Equatable, Sendable {
         if let sceneFilename, [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }).contains(sceneFilename) {
             throw ProjectError.invalid("Scene metadata must use a separate source file.")
         }
-        try validate(state)
+        // Visual-only history commonly repeats the same timing. Compile each
+        // distinct plan once per validation, without retaining global state or
+        // skipping validation of any other snapshot properties.
+        var timingPlans = Set<TimingSignature>()
+        try validate(state, timingPlans: &timingPlans)
         for snapshot in undoHistory + redoHistory {
-            try validate(snapshot.state)
+            try validate(snapshot.state, timingPlans: &timingPlans)
             try Self.validateTitle(snapshot.title)
         }
     }
@@ -1349,7 +1529,14 @@ struct RecordingProject: Codable, Equatable, Sendable {
         }
     }
 
-    private func validate(_ state: EditState) throws {
+    private struct TimingSignature: Hashable {
+        let trimStart: Double
+        let trimEnd: Double
+        let cuts: [RecordingCut]
+        let speed: [RecordingSpeedKeyframe]
+    }
+
+    private func validate(_ state: EditState, timingPlans: inout Set<TimingSignature>) throws {
         guard state.contentLayers.count <= 256, Set(state.contentLayers.map(\.id)).count == state.contentLayers.count else {
             throw ProjectError.invalid("Keep at most 256 content layers with unique identities.")
         }
@@ -1359,7 +1546,12 @@ struct RecordingProject: Codable, Equatable, Sendable {
             throw ProjectError.invalid("This recording uses an unsupported box connection version.")
         }
         try state.audio.validate()
-        _ = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts)
+        let timing = TimingSignature(trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts, speed: state.speedKeyframes)
+        if !timingPlans.contains(timing) {
+            _ = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts,
+                speedKeyframes: state.speedKeyframes)
+            timingPlans.insert(timing)
+        }
         guard state.editAnchors.count <= 100_000 else {
             throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
         }
@@ -1372,7 +1564,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
                 throw ProjectError.invalid("Reference marks must have unique identities and ordered times inside the recording.")
             }
             let componentTimes = [state.zoomKeyframes.first(where: { $0.id == anchor.id })?.time,
-                                  state.pipKeyframes.first(where: { $0.id == anchor.id })?.time].compactMap { $0 }
+                                  state.pipKeyframes.first(where: { $0.id == anchor.id })?.time,
+                                  state.speedKeyframes.first(where: { $0.id == anchor.id })?.time].compactMap { $0 }
             guard componentTimes.allSatisfy({ abs($0 - anchor.time) < 0.000001 }) else {
                 throw ProjectError.invalid("An edit and its reference mark must share the same time.")
             }
@@ -1915,6 +2108,12 @@ final class ProjectEditor: ObservableObject {
         for id in Set(oldCamera.keys).union(newCamera.keys) where oldCamera[id] != newCamera[id] {
             if let old = oldCamera[id] { times.append(old.time) }
             if let new = newCamera[id] { times.append(new.time) }
+        }
+        let oldSpeed = Dictionary(uniqueKeysWithValues: previous.speedKeyframes.map { ($0.id, $0) })
+        let newSpeed = Dictionary(uniqueKeysWithValues: next.speedKeyframes.map { ($0.id, $0) })
+        for id in Set(oldSpeed.keys).union(newSpeed.keys) where oldSpeed[id] != newSpeed[id] {
+            if let old = oldSpeed[id] { times.append(old.time) }
+            if let new = newSpeed[id] { times.append(new.time) }
         }
         let oldAnchors = Dictionary(uniqueKeysWithValues: previous.editAnchors.map { ($0.id, $0) })
         let newAnchors = Dictionary(uniqueKeysWithValues: next.editAnchors.map { ($0.id, $0) })

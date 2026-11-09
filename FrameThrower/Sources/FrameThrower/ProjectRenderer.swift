@@ -103,7 +103,7 @@ enum ProjectRenderer {
         guard duration.isFinite, duration > 0, time(duration) > .zero else {
             throw RenderError.invalidVideo(project.screenFilename)
         }
-        if !project.state.cuts.isEmpty {
+        if !project.state.cuts.isEmpty || !project.state.speedKeyframes.isEmpty {
             return try await makeCutPreview(project: project, directory: directory, screenAsset: screenAsset,
                 screenSource: screenSource, duration: duration)
         }
@@ -197,7 +197,7 @@ enum ProjectRenderer {
                                        screenAsset: AVAsset, screenSource: AVAssetTrack,
                                        duration: Double) async throws -> RenderedProject {
         let map = try RecordingTimeMap(duration: project.duration, trimStart: project.state.trimStart,
-            trimEnd: min(project.state.trimEnd, duration), cuts: project.state.cuts)
+            trimEnd: min(project.state.trimEnd, duration), cuts: project.state.cuts, speedKeyframes: project.state.speedKeyframes)
         let screenGeometry = try await geometry(of: screenSource)
         let renderSize = PresentationGeometry(sourceSize: screenGeometry.size, presentation: project.state.presentation).outputSize
         let composition = AVMutableComposition()
@@ -237,24 +237,38 @@ enum ProjectRenderer {
         var audioSegments: [RenderedProject.CutAudioSegment] = []
         for (index, clip) in map.clips.enumerated() {
             let lane = index % 2
-            try screenTracks[lane].insertTimeRange(CMTimeRange(start: time(clip.sourceStart), end: time(clip.sourceEnd)),
-                of: screenSource, at: time(clip.outputStart))
+            // A single shared piecewise clock retimes screen, camera and every
+            // audio source. Insert/scale each cell before adding its successor;
+            // scaling therefore never moves an already-placed later segment.
+            func insert(_ source: AVAssetTrack, into track: AVMutableCompositionTrack,
+                        sourceStart: Double, sourceEnd: Double, offset: Double = 0) throws {
+                for cell in clip.segments {
+                    let start = max(cell.sourceStart, sourceStart), end = min(cell.sourceEnd, sourceEnd)
+                    guard end > start else { continue }
+                    let at = time(cell.outputTime(for: start))
+                    let targetEnd = time(cell.outputTime(for: end))
+                    let range = CMTimeRange(start: time(start - offset), end: time(end - offset))
+                    guard range.duration > .zero, targetEnd > at else { continue }
+                    try track.insertTimeRange(range, of: source, at: at)
+                    track.scaleTimeRange(CMTimeRange(start: at, duration: range.duration), toDuration: targetEnd - at)
+                }
+            }
+            try insert(screenSource, into: screenTracks[lane], sourceStart: clip.sourceStart, sourceEnd: clip.sourceEnd)
             if let cameraSource {
                 let start = max(clip.sourceStart, cameraStart), end = min(clip.sourceEnd, cameraEnd)
                 if end > start {
-                    try cameraTracks[lane].insertTimeRange(CMTimeRange(start: time(start - project.cameraOffset), end: time(end - project.cameraOffset)),
-                        of: cameraSource, at: time(clip.outputStart + (start - clip.sourceStart)))
+                    try insert(cameraSource, into: cameraTracks[lane], sourceStart: start, sourceEnd: end, offset: project.cameraOffset)
                 }
             }
             for sourceIndex in audioSources.indices {
                 let range = CMTimeRangeGetIntersection(audioRanges[sourceIndex],
                     otherRange: CMTimeRange(start: time(clip.sourceStart), end: time(clip.sourceEnd)))
                 guard range.duration > .zero else { continue }
-                let outputStart = clip.outputStart + (range.start.seconds - clip.sourceStart)
+                let outputStart = clip.outputTime(for: range.start.seconds)
                 let track = audioTracks[sourceIndex][lane]
-                try track.insertTimeRange(range, of: audioSources[sourceIndex], at: time(outputStart))
+                try insert(audioSources[sourceIndex], into: track, sourceStart: range.start.seconds, sourceEnd: range.end.seconds)
                 audioSegments.append(.init(trackID: track.trackID, clipIndex: index,
-                    outputStart: outputStart, outputEnd: outputStart + range.duration.seconds))
+                    outputStart: outputStart, outputEnd: clip.outputTime(for: range.end.seconds)))
             }
             branches.append(.init(screenTrackID: screenTracks[lane].trackID,
                 cameraTrackID: cameraTracks.isEmpty ? nil : cameraTracks[lane].trackID))
@@ -282,7 +296,7 @@ enum ProjectRenderer {
     /// The audio branches use the same linear cut gains as video. Multiplying
     /// by master fades is quadratic where ramps overlap; bounded subdivision
     /// approximates that product to <0.0001 gain instead of introducing a bump.
-    private static func cutAudioMix(for state: EditState, timingMap: RecordingTimeMap,
+    static func cutAudioMix(for state: EditState, timingMap: RecordingTimeMap,
                                     segments: [RenderedProject.CutAudioSegment]) -> AVAudioMix? {
         guard !segments.isEmpty else { return nil }
         let master = state.audio.envelope(trimStart: 0, trimEnd: timingMap.outputDuration)
@@ -311,6 +325,7 @@ enum ProjectRenderer {
         mix.inputParameters = Set(segments.map(\.trackID)).sorted().map { trackID in
             let parameters = AVMutableAudioMixInputParameters()
             parameters.trackID = trackID
+            parameters.audioTimePitchAlgorithm = state.preservesAudioPitch ? .spectral : .varispeed
             parameters.setVolume(0, at: .zero)
             for segment in segments.filter({ $0.trackID == trackID }).sorted(by: { $0.outputStart < $1.outputStart }) {
                 var knots = [segment.outputStart, segment.outputEnd] + master.map(\.time)

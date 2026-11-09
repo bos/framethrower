@@ -43,7 +43,7 @@ struct CutTimelineChecks {
         let window = NSWindow(contentRect: CGRect(x: -10000, y: -10000, width: 980, height: 240),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        let view = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 900, height: 180))
+        let view = RecordingTimelineView(frame: CGRect(x: 20, y: 20, width: 900, height: RecordingTimeline.clipLaneHeight))
         window.contentView!.addSubview(view)
         view.showsAnimationLanes = true; view.showsClipLane = true
         view.setClock("output", duration: map.outputDuration)
@@ -51,7 +51,7 @@ struct CutTimelineChecks {
         view.animationSpans = fragments; view.sourceEnvelopes = projection.envelopes
         view.selectedAnimationID = right.id
         view.cutMarkers = map.joins.map { .init(id: $0.id, start: $0.outputStart, end: $0.outputEnd, help: "Crossfade") }
-        require(view.intrinsicContentSize.height == 180 && view.animationLanes().map { $0.frame.minY } == [70,100,130], "Clips row reflowed or hid animation lanes")
+        require(view.intrinsicContentSize.height == RecordingTimeline.clipLaneHeight && view.animationLanes().map { $0.frame.minY } == [70,100,130,160], "Clips row reflowed or hid animation lanes")
         let rows = view.animationLanes()
         let joinFrame = view.cutMarkerFrames().first!.1
         require(joinFrame.width >= 20 && view.cutMarkerFrames().first!.0.end > view.cutMarkerFrames().first!.0.start, "full crossfade span/hard-cut target lost")
@@ -110,7 +110,7 @@ struct CutTimelineChecks {
         let outputViewport = (view.visibleStart, view.visibleDuration)
         view.setClock("source", duration: 12); view.trimStart = 2; view.trimEnd = 10
         view.showsTrimHandles = true; view.allowsSeekingOutsideTrim = true
-        require(view.animationLanes() == rows && view.intrinsicContentSize.height == 180, "switching clocks moved the lanes")
+        require(view.animationLanes() == rows && view.intrinsicContentSize.height == RecordingTimeline.clipLaneHeight, "switching clocks moved the lanes")
         gesture(CGPoint(x: view.x(for: 0.5), y: 8), CGPoint(x: view.x(for: 0.5), y: 8))
         require(near(seeks.last!, 0.5), "Source inspection cannot reach trimmed source for restoration")
         view.cutMarkers = [.init(id: cut.id, start: 4, end: 6, help: "Removed source", label: "Fade", showsTransitionSpan: false)]

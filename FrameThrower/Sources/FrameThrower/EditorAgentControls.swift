@@ -70,6 +70,8 @@ enum EditorHistoryInspector {
             ("screen_framing", a.zoomKeyframes != b.zoomKeyframes),
             ("camera", a.pipKeyframes != b.pipKeyframes),
             ("pointer", a.cursorStyle != b.cursorStyle), ("audio", a.audio != b.audio),
+            ("speed", a.speedKeyframes != b.speedKeyframes || a.preservesAudioPitch != b.preservesAudioPitch),
+            ("cuts", a.cuts != b.cuts),
             ("trim", a.trimStart != b.trimStart || a.trimEnd != b.trimEnd),
             ("canvas", a.presentation != b.presentation), ("boxes", a.regions != b.regions),
             ("content_layers", a.contentLayers != b.contentLayers),
@@ -107,6 +109,14 @@ enum EditorHistoryInspector {
             case "audio":
                 details.append("Audio: \(state.audio.isMuted ? "muted" : "unmuted"), volume \(seconds(state.audio.volume)), fades \(seconds(state.audio.fadeIn))/\(seconds(state.audio.fadeOut))s.")
             case "trim": details.append("Trim: \(seconds(state.trimStart))–\(seconds(state.trimEnd))s.")
+            case "speed":
+                let changed = state.speedKeyframes.filter { !other.state.speedKeyframes.contains($0) }
+                let samples = changed.prefix(2).map { "\(seconds($0.time))s → \(seconds($0.rate))×" }.joined(separator: "; ")
+                details.append("Speed: \(state.speedKeyframes.count) changes, pitch \(state.preservesAudioPitch ? "preserved" : "follows speed")\(samples.isEmpty ? "." : " (" + samples + ").")")
+            case "cuts":
+                let changed = state.cuts.filter { !other.state.cuts.contains($0) }
+                let samples = changed.prefix(2).map { "\(seconds($0.start))–\(seconds($0.end))s, crossfade \(seconds($0.crossfade))s" }.joined(separator: "; ")
+                details.append("Cuts: \(state.cuts.count) excluded sections\(samples.isEmpty ? "." : " (" + samples + ").")")
             case "content_layers":
                 let changed = state.contentLayers.filter { !other.state.contentLayers.contains($0) }
                 let samples = changed.prefix(2).map { "\($0.label): \(seconds($0.start))–\(seconds($0.end))s" }.joined(separator: "; ")

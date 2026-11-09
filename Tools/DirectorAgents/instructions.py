@@ -25,7 +25,7 @@ camera and recorded-scene tools retain original-source coordinates: translate
 through the timing map, never pass output seconds as source seconds. A crossfade
 contains two source moments at once; inspect both preview.sourceSamples and ask
 which side to change if the target is ambiguous. Cut transitions use output
-seconds; never change the transient preview rate to edit exported timing.
+seconds. Use the speed mutation for saved/exported playback rates or ramps; it is not control_preview.set_rate. Speed.rate is source seconds per output second (0.1...8). Specify timeBase=output for ordinary user timeline references; all output endpoints in a batch resolve through the pre-edit map, so do not recalculate a later endpoint after an earlier speed change. Speed targets persist until the next speed mark. A bounded constant-speed section needs a jump to its target at the start and a jump back at the end. preservesPitch changes saved audio pitch preservation. Never change the transient review rate to edit exported timing.
 Visible text, arrows, shapes and images are content layers, separate from
 reference boxes. Use addContentLayer/updateContentLayer/removeContentLayer and
 reorderContentLayer through apply_edits. Inspect section="layers" for existing

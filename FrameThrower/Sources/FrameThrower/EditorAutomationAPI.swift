@@ -68,7 +68,7 @@ enum EditorAutomationAPI {
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
             tool("inspect_editor", "Read current editor metadata. section=timing returns kept sections, cut joins and both source/output durations. For section=state, component returns one source value by default; time_base=output returns weighted samples of both crossfade branches. section=timing accepts output time for a read-only mapping query. Existing time/frameTime fields remain source time; preview.outputTime is finished-video time. Omit component for the full state. Component is valid only with section=state; state time requires component. Selection and playhead are separate.", object(doc.merging([
                 "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending", "timing", "layers"]],
-                "component": ["type": "string", "enum": ["screen", "camera", "pointer", "audio", "canvas", "trim", "layers"]],
+                "component": ["type": "string", "enum": ["screen", "camera", "speed", "pointer", "audio", "canvas", "trim", "layers"]],
                 "time": ["type": "number", "minimum": 0],
                 "time_base": ["type": "string", "enum": ["source", "output"]],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]
@@ -90,7 +90,7 @@ enum EditorAutomationAPI {
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),
             tool("navigate_editor", "Select without seeking, or explicitly go to a box/edit. Select operations preserve the playhead. Target IDs are the actual UUIDs from inspect_editor, not list positions. No Undo entry.", object(doc.merging([
                 "operation": ["type": "string", "enum": ["select_edit", "select_box", "clear_selection", "show_inspector", "go_to_edit", "go_to_box"]],
-                "target_id": text, "inspector": ["type": "string", "enum": ["Zoom", "Camera", "Pointer", "Canvas", "Audio", "Layers"]]
+                "target_id": text, "inspector": ["type": "string", "enum": ["Zoom", "Camera", "Speed", "Pointer", "Canvas", "Audio", "Layers"]]
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),
             tool("control_document", "Save, rename, Undo or Redo this recording using ordinary document behavior. Every successful operation saves project metadata before returning. Rename is undoable and keeps source filenames; Save adds no edit of its own. Return actual state and failures.", object(doc.merging([
                 "operation": ["type": "string", "enum": ["save", "rename", "undo", "redo"]], "name": text, "count": ["type": "integer", "minimum": 1, "maximum": 128], "expected_revision": text

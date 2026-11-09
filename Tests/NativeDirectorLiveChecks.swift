@@ -261,6 +261,14 @@ struct NativeDirectorLiveChecks {
             try FileManager.default.createDirectory(at: nativeDirectory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let settings = NativeTurnSettings(provider: provider, model: model, effort: effort, cli: cli, python: python, lease: lease)
             var expectedSession: String?
+            if CommandLine.arguments.contains("--recording-speed") {
+                try await speedChecks(fixture) { text, offset in
+                    _ = try await sendTurn(text, number: offset + 1, settings: settings, fixture: fixture,
+                                           repo: repo, artifacts: artifacts, expectedSession: &expectedSession)
+                }
+                print("Native \(provider)/\(model) Director speed checks passed: permanent retiming, source-time smooth ramp, review-rate independence and ordinary Undo; no media.")
+                return
+            }
             if CommandLine.arguments.contains("--cuts") {
                 try await cutChecks(fixture) { text, offset in
                     _ = try await sendTurn(text, number: offset + 1, settings: settings, fixture: fixture,
@@ -382,6 +390,45 @@ struct NativeDirectorLiveChecks {
                     "Clear selection must be observable without seeking.")
         try require(fixture.editor.project == project, "Headless navigation changed document/history.")
         print("Native fixture navigation checks passed: observable inspector/selection, explicit go-to seeks, select-only preserves time/history.")
+    }
+
+    private static func speedChecks(_ fixture: LiveFixture,
+                                   send: @MainActor (String, Int) async throws -> Void) async throws {
+        let original = fixture.editor.project
+        let turns = [
+            "Make the entire finished recording play at twice its original speed. This is a permanent exported speed change, starting at original-source time zero, not the review-speed setting. Preserve the audio pitch.",
+            "Now slow it smoothly from that 2× rate to 0.5× over original-source seconds 4 to 6, keeping 0.5× for the remainder. Keep the voice pitch unchanged.",
+            "Review it at 5× without changing the finished recording.",
+            "Undo the last permanent speed edit, keeping the review speed at 5×."
+        ]
+        var first: EditState?
+        for (offset, text) in turns.enumerated() {
+            let before = fixture.editor.project
+            try await send(text, offset)
+            let project = fixture.editor.project
+            var rest = project.state; rest.speedKeyframes = []; rest.preservesAudioPitch = true
+            try require(rest == original.state && project.title == original.title, "Speed request changed unrelated source edits or title.")
+            try require(project.state.preservesAudioPitch, "Speed request changed voice pitch.")
+            switch offset {
+            case 0:
+                try require(abs(project.state.speed(at: 0) - 2) < 1e-6 && abs(project.state.speed(at: 14) - 2) < 1e-6,
+                    "Entire recording was not made 2×.")
+                try require(abs(fixture.playback.outputDuration - 7) < 1e-6 && project.undoHistory.count == 1, "2× export needs duration7 and one Undo.")
+                first = project.state
+            case 1:
+                try require(abs(project.state.speed(at: 4) - 2) < 1e-6 && abs(project.state.speed(at: 6) - 0.5) < 1e-6 &&
+                    abs(project.state.speed(at: 14) - 0.5) < 1e-6, "Smooth speed request used wrong source times/rates.")
+                try require(project.state.speed(at: 5) > 0.5 && project.state.speed(at: 5) < 2 && project.undoHistory.count == 2,
+                    "Speed ramp was a jump or made multiple Undo entries.")
+            case 2:
+                try require(project == before && fixture.playback.playbackRate == 5, "Review-speed request changed recording edits.")
+            default:
+                try require(project.state == first && project.undoHistory.count == 1 && project.redoHistory.count == 1 && fixture.playback.playbackRate == 5,
+                    "Undo failed to distinguish saved speed from transient review speed.")
+            }
+            try require(try ProjectEditor.open(url: fixture.editor.url).project == project, "Speed edit was not saved durably.")
+            try require(!fixture.playback.hasMediaPlayer && MediaProcessing.isSuspended, "Live speed check opened media.")
+        }
     }
 
     private static func cutChecks(_ fixture: LiveFixture,

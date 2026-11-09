@@ -36,7 +36,8 @@ struct EditorSimulationChecks {
         project.state.trimStart = 0.05; project.state.trimEnd = 0.3
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("no-simulation-file-\(UUID()).framethrower")
         let editor = ProjectEditor(project: project, url: url)
-        let playback = EditorPlayback()
+        var clockTime = 0.0
+        let playback = EditorPlayback(monotonicTime: { clockTime })
         try require(!playback.hasMediaPlayer && playback.canvasPlayer == nil, "Constructing the suspended transport cannot create an AVPlayer")
         await playback.rebuild(editor: editor)
         try require(playback.canPlay && !playback.isLoading && playback.errorMessage == nil && !playback.hasMediaPlayer,
@@ -45,13 +46,16 @@ struct EditorSimulationChecks {
         playback.seek(-1)
         try near(playback.time, 0, "Source inspection clamps to the full recording")
         playback.togglePlayback()
+        clockTime += 0.05
         try await wait { playback.time > 0.08 }
         playback.pause()
         let paused = playback.time
+        clockTime += 0.1
         try await Task.sleep(for: .milliseconds(60))
         try near(playback.time, paused, "A canceled timer cannot update the paused playhead")
         playback.seek(0.29)
         playback.togglePlayback()
+        clockTime += 0.05
         try await wait { !playback.isPlaying }
         try near(playback.time, 0.3, "Playback stops at the kept end")
         playback.togglePlayback()
@@ -67,6 +71,7 @@ struct EditorSimulationChecks {
         comparison.presentation = CanvasPresentation(aspect: .square, padding: 0.1)
         playback.preview(comparison)
         playback.togglePlayback()
+        clockTime += 0.05
         try await wait { playback.time > 0.13 }
         try require(playback.isPreviewing && playback.isPlaying,
                     "Playing a source-free conflict preview must preserve its transient full-frame state")
@@ -77,6 +82,7 @@ struct EditorSimulationChecks {
         playback.togglePlayback()
         playback.close()
         let closed = playback.time
+        clockTime += 1
         try await Task.sleep(for: .milliseconds(60))
         playback.seek(0.2); playback.togglePlayback()
         try require(!playback.canPlay && !playback.isPlaying && !playback.hasMediaPlayer && playback.canvasPlayer == nil,
@@ -149,18 +155,21 @@ struct EditorSimulationChecks {
             state: EditState(trimStart: 2, trimEnd: 15, pipKeyframes: []))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("no-rate-file-\(UUID()).framethrower")
         let editor = ProjectEditor(project: project, url: url)
-        let playback = EditorPlayback()
+        var clockTime = 0.0
+        let playback = EditorPlayback(monotonicTime: { clockTime })
         try require(playback.playbackRate == 1 && playback.setPlaybackRate(2), "Preview defaults to 1× and accepts a rate before metadata loads")
         await playback.rebuild(editor: editor)
         try require(playback.playbackRate == 2 && !playback.isPlaying && !playback.hasMediaPlayer,
                     "Rebuild retains the speed without starting or creating a media player")
         playback.seek(3)
         playback.togglePlayback()
+        clockTime += 0.05
         try await wait { playback.time > 3.04 }
         let beforeChange = playback.time
         try require(playback.setPlaybackRate(5) && playback.isPlaying, "An active supported rate change keeps transport playing")
         try require(playback.time >= beforeChange && playback.time - beforeChange < 0.08,
                     "Changing rate rebases the current clock rather than scaling all elapsed playback")
+        clockTime += 0.1
         try await wait { playback.time > beforeChange + 0.3 }
         playback.pause()
         let pausedTime = playback.time
@@ -181,6 +190,7 @@ struct EditorSimulationChecks {
         try require(playback.playbackRate == 5, "Metadata rebuild retains preview speed independently of project data")
         playback.seek(14.99)
         playback.togglePlayback()
+        clockTime += 0.1
         try await wait { !playback.isPlaying }
         try near(playback.time, 15, "Fast playback still stops at the exact trim end")
         playback.togglePlayback()

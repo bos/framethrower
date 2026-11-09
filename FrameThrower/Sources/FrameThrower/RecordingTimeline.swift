@@ -21,6 +21,9 @@ struct RecordingTimelineMarker: Identifiable, Equatable {
 struct TimelineSourceEnvelope: Equatable {
     let animation: TimelineAnimation
     let sourceOffset: Double
+    var clip: RecordingTimeMap.Clip? = nil
+    func sourceTime(at output: Double) -> Double { clip?.sourceTime(at: output) ?? output + sourceOffset }
+    func outputTime(for source: Double) -> Double { clip?.outputTime(for: source) ?? source - sourceOffset }
 }
 struct TimelineClipBand: Equatable, Identifiable {
     let id: String
@@ -38,6 +41,46 @@ struct TimelineCutMarker: Equatable, Identifiable {
     var showsTransitionSpan = true
     var badgeLabel: String { label ?? (end > start ? String(format: "%.3gs", end - start) : "Cut") }
 }
+struct TimelineSpeedSample: Equatable {
+    var time: Double
+    var rate: Double
+}
+
+enum TimelineSpeedProfile {
+    /// Draw actual source rates through holds; do not draw the movement's
+    /// velocity envelope, which returns to zero at arrival.
+    static func curves(points: [RecordingSpeedKeyframe], duration: Double, map: RecordingTimeMap?) -> [[TimelineSpeedSample]] {
+        var knots = [0.0, duration], previous = 0.0
+        for point in points {
+            knots.append(point.time)
+            if point.transition == .smooth {
+                let start = max(previous, point.time - point.duration)
+                let ramps = MotionInterpolation.rampDurations(duration: point.time - start, easeIn: point.easeIn, easeOut: point.easeOut)
+                knots += [start, start + ramps.easeIn, point.time - ramps.easeOut]
+            } else if point.time > 0 { knots.append(point.time.nextDown) }
+            previous = point.time
+        }
+        knots = Array(Set(knots)).sorted()
+        func rate(_ time: Double) -> Double {
+            var low = 0, high = points.count
+            while low < high { let mid = (low + high) / 2; if points[mid].time <= time { low = mid + 1 } else { high = mid } }
+            let prior = low > 0 ? points[low - 1] : nil
+            guard low < points.count else { return prior?.rate ?? 1 }
+            let point = points[low]
+            let progress = MotionInterpolation.progress(at: time, from: prior?.time ?? 0, to: point.time,
+                duration: point.duration, transition: point.transition, easeIn: point.easeIn, easeOut: point.easeOut)
+            return MotionInterpolation.blend(prior?.rate ?? 1, point.rate, progress: progress)
+        }
+        let ranges: [(Double, Double, RecordingTimeMap.Clip?)] = map.map { $0.clips.map { ($0.sourceStart, $0.sourceEnd, Optional($0)) } } ?? [(0, duration, nil)]
+        let resolution = max(2, 512 / max(1, ranges.count))
+        return ranges.map { start, end, clip in
+            var times = knots.filter { $0 >= start && $0 <= end }
+            for index in 0...resolution { times.append(start + (end - start) * Double(index) / Double(resolution)) }
+            return Set(times).sorted().map { .init(time: clip?.outputTime(for: $0) ?? $0, rate: rate($0)) }
+        }
+    }
+}
+
 struct TimelineOutputProjection {
     var animations: [TimelineAnimation] = []
     var sourceIDs: [TimelineAnimationID: TimelineAnimationID] = [:]
@@ -66,20 +109,20 @@ struct TimelineOutputProjection {
                 let digest = Array(SHA256.hash(data: Data(key.utf8)).prefix(16))
                 let uuid = UUID(uuid: (digest[0],digest[1],digest[2],digest[3],digest[4],digest[5],digest[6],digest[7],digest[8],digest[9],digest[10],digest[11],digest[12],digest[13],digest[14],digest[15]))
                 item.id = TimelineAnimationID(lane: original.lane, componentID: uuid)
-                item.start = clip.outputStart + start - clip.sourceStart
-                item.end = clip.outputStart + end - clip.sourceStart
+                item.start = clip.outputTime(for: start)
+                item.end = clip.outputTime(for: end)
                 item.editable = false
                 item.help = original.help + String(format: " Source %.3f–%.3f s (clip %d). Adjust timing in Source mode.", start, end, index + 1)
                 self.animations.append(item); sourceIDs[item.id] = original.id
-                envelopes[item.id] = TimelineSourceEnvelope(animation: original, sourceOffset: clip.sourceStart - clip.outputStart)
+                envelopes[item.id] = TimelineSourceEnvelope(animation: original, sourceOffset: clip.sourceStart - clip.outputStart, clip: clip)
             }
         }
     }
 }
 
 struct RecordingTimeline: NSViewRepresentable {
-    static let animationLaneHeight: CGFloat = 150
-    static let clipLaneHeight: CGFloat = 180
+    static let animationLaneHeight: CGFloat = 180
+    static let clipLaneHeight: CGFloat = 210
     let duration: Double
     let trimStart: Double
     let trimEnd: Double
@@ -124,6 +167,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var onRestoreCut: (UUID) -> Void = { _ in }
     var onCutAnchor: (UnitPoint) -> Void = { _ in }
     var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:]
+    var speedCurves: [[TimelineSpeedSample]] = []
 
     func makeNSView(context: Context) -> RecordingTimelineView { RecordingTimelineView() }
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
@@ -144,6 +188,7 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onCutRange = onCutRange
         view.onRestoreCut = onRestoreCut
         view.sourceEnvelopes = sourceEnvelopes
+        view.speedCurves = speedCurves
         view.trimStart = trimStart
         view.trimEnd = trimEnd
         view.playhead = playhead
@@ -285,6 +330,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var onCutRange: (() -> Void)?
     var onRestoreCut: ((UUID) -> Void)?
     var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:] { didSet { needsDisplay = true } }
+    var speedCurves: [[TimelineSpeedSample]] = [] { didSet { if speedCurves != oldValue { needsDisplay = true } } }
     private var clipOrigin: CGPoint?
     private var clipRange: ClosedRange<Double>?
     private var clockID = "source"
@@ -600,7 +646,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func animationLanes() -> [AnimationLaneGeometry] {
         TimelineAnimationLane.allCases.enumerated().map { index, lane in
             let y = CGFloat(40 + index * 30) + laneOffset
-            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .pointer: "Pointer" }
+            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .speed: "Speed"; case .pointer: "Pointer" }
             return AnimationLaneGeometry(lane: lane, title: title,
                 frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
                 labelFrame: CGRect(x: 8, y: y + 5, width: 52, height: 16))
@@ -609,7 +655,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     func pointerClickGeometry() -> [PointerClickGeometry] {
         pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
-            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 123 + laneOffset, width: 2, height: 3))
+            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 153 + laneOffset, width: 2, height: 3))
         }
     }
 
@@ -687,7 +733,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
-        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .pointer: .secondaryLabelColor }
+        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .speed: .systemOrange; case .pointer: .secondaryLabelColor }
     }
 
     func playheadLine() -> NSBezierPath {
@@ -704,7 +750,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     /// movement retains its actual ramp shape when the timeline is magnified.
     func animationEnvelope(for item: AnimationGeometry) -> NSBezierPath {
         let animation = item.animation
-        guard !animation.isInstant, !animation.isReference, animation.lane != .pointer else {
+        guard !animation.isInstant, !animation.isReference, animation.lane != .pointer, animation.lane != .speed else {
             return NSBezierPath(roundedRect: item.body, xRadius: 2, yRadius: 2)
         }
         let profile = sourceEnvelopes[animation.id]
@@ -722,13 +768,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         if ramps.easeOut == 0 { samples.append(span.nextDown) }
         let envelope = NSBezierPath()
         envelope.move(to: CGPoint(x: x(for: animation.start), y: item.body.maxY))
-        let lower = animation.start + sourceOffset - source.start
-        let upper = animation.end + sourceOffset - source.start
+        let lower = (profile?.sourceTime(at: animation.start) ?? animation.start + sourceOffset) - source.start
+        let upper = (profile?.sourceTime(at: animation.end) ?? animation.end + sourceOffset) - source.start
         samples += [lower, upper]
         for elapsed in Set(samples).sorted() where elapsed >= lower && elapsed <= upper {
             let speed = MotionInterpolation.normalizedSpeed(at: elapsed, duration: span,
                 easeIn: source.easeIn, easeOut: source.easeOut)
-            envelope.line(to: CGPoint(x: x(for: source.start + elapsed - sourceOffset),
+            envelope.line(to: CGPoint(x: x(for: profile?.outputTime(for: source.start + elapsed) ?? source.start + elapsed - sourceOffset),
                 y: item.body.maxY - CGFloat(speed) * (item.body.height - 3)))
         }
         envelope.line(to: CGPoint(x: x(for: animation.end), y: item.body.maxY))
@@ -743,13 +789,25 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
                 .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
             if lane.lane != .screen, !displayedAnimations.contains(where: { $0.lane == lane.lane }) {
-                ("Not recorded" as NSString).draw(at: CGPoint(x: railOrigin + 5, y: lane.frame.minY + 8), withAttributes: [
+                ((lane.lane == .speed ? "1×" : "Not recorded") as NSString).draw(at: CGPoint(x: railOrigin + 5, y: lane.frame.minY + 8), withAttributes: [
                     .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.tertiaryLabelColor])
             }
         }
         drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
         NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: CGRect(x: railOrigin, y: 38 + laneOffset, width: railWidth, height: 90)).addClip()
+        NSBezierPath(rect: CGRect(x: railOrigin, y: 38 + laneOffset, width: railWidth, height: 120)).addClip()
+        if let lane = animationLanes().first(where: { $0.lane == .speed }) {
+            NSColor.systemOrange.withAlphaComponent(0.8).setStroke()
+            for curve in speedCurves {
+                let path = NSBezierPath(); path.lineWidth = 1.25
+                for (index, sample) in curve.enumerated() {
+                    let fraction = log(max(0.1, min(8, sample.rate)) / 0.1) / log(80)
+                    let point = CGPoint(x: x(for: sample.time), y: lane.frame.maxY - 2 - CGFloat(fraction) * (lane.frame.height - 4))
+                    if index == 0 { path.move(to: point) } else { path.line(to: point) }
+                }
+                path.stroke()
+            }
+        }
         for item in animationGeometry() {
             let animation = item.animation
             let selected = animation.id == (animationGesture?.id ?? selectedAnimationID)

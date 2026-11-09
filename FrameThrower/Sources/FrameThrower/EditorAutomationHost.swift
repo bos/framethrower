@@ -140,7 +140,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let value: Any
         switch name {
         case "inspect_editor":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time"])
             value = try inspect(args, editor: editor)
         case "inspect_recording":
             try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "query", "window_id", "kind", "limit"])
@@ -239,15 +239,17 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             default: throw EditorAutomationError.invalid("Choose save, rename, undo or redo.")
             }
             guard success else { throw EditorCommandError.saveFailed(editor.errorMessage ?? "The recording could not be saved.") }
-            value = try EditorAutomationAPI.object(automationContext)
+            var receipt = try EditorAutomationAPI.object(automationContext) as! [String: Any]
+            receipt["project_metadata_saved"] = true
+            value = receipt
         case "apply_edits":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "expected_revision", "commands", "name", "title", "proposal_id", "review_choice"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "expected_revision", "commands", "name", "recording_title", "proposal_id", "review_choice"])
             try checkRevision(args, editor: editor, required: true)
             if args["proposal_id"] != nil || args["review_choice"] != nil {
                 guard let identity = args["proposal_id"], let choice = args["review_choice"] as? String,
                       let commands = args["commands"] as? [Any], commands.isEmpty,
-                      args["name"] == nil, args["title"] == nil else {
-                    throw EditorAutomationError.invalid("Resolve only the frozen proposal: provide proposal_id, review_choice and an empty commands array, without a new title or action name.")
+                      args["name"] == nil, args["recording_title"] == nil else {
+                    throw EditorAutomationError.invalid("Resolve only the frozen proposal: provide proposal_id, review_choice and an empty commands array, without a new recording_title or history label.")
                 }
                 return try resolveFramingProposal(id: EditorAutomationAPI.uuid(identity), choice: choice)
             }
@@ -255,12 +257,12 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             if let pendingFramingProposal { return try framingProposalResponse(pendingFramingProposal) }
             guard editor.draftState == nil else { throw EditorCommandError.pendingDraft }
             guard let raw = args["commands"] as? [[String: Any]], !raw.isEmpty, raw.count <= 128 else { throw EditorAutomationError.invalid("Provide between 1 and 128 typed edit commands.") }
-            for key in ["name", "title"] where args[key] != nil && !(args[key] is String) {
-                throw EditorAutomationError.invalid("Use text for the action name and recording title.")
+            for key in ["name", "recording_title"] where args[key] != nil && !(args[key] is String) {
+                throw EditorAutomationError.invalid("Use text for the history label and recording_title.")
             }
             let commands = try JSONDecoder().decode([EditorCommand].self, from: JSONSerialization.data(withJSONObject: raw))
             let batch = EditorCommandBatch(projectID: projectID, revision: try EditorCommandDispatcher.revision(for: editor.project),
-                                            commands: commands, title: args["title"] as? String)
+                                            commands: commands, title: args["recording_title"] as? String)
             let name = args["name"] as? String ?? "Edit with automation"
             guard !name.isEmpty, name.count <= 256 else { throw EditorAutomationError.invalid("Use a short history action name.") }
             try Task.checkCancellation()
@@ -490,6 +492,9 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     }
 
     private func inspect(_ args: [String: Any], editor: ProjectEditor) throws -> Any {
+        if args["section"] as? String != "state", args["component"] != nil || args["time"] != nil {
+            throw EditorAutomationError.invalid("Component and source time are available only for section=state.")
+        }
         let offset = try args["offset"].map { try EditorAutomationAPI.integer($0) } ?? 0
         let limit = try args["limit"].map { try EditorAutomationAPI.integer($0) } ?? 8
         guard offset >= 0, (1...16).contains(limit) else { throw EditorAutomationError.invalid("Use an offset of zero or greater and a limit of 1–16.") }
@@ -511,7 +516,10 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         case "conversation":
             guard let conversationPage else { throw EditorAutomationError.unavailable }
             return try conversationPage(offset, limit)
-        case "state": return try EditorAutomationAPI.object(state)
+        case "state":
+            if args["component"] != nil { return try inspectComponent(args, editor: editor) }
+            guard args["time"] == nil else { throw EditorAutomationError.invalid("Choose a state component when specifying source time.") }
+            return try EditorAutomationAPI.object(state)
         case "boxes": return page(try state.regions.map { region -> Any in
             ["id": region.id.uuidString, "label": editor.references.boxLabel(for: region.id) ?? "Box",
              "box": try EditorAutomationAPI.object(region)]
@@ -534,6 +542,33 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                                 "last_sequence": eventSequence, "retained_limit": 128]
         default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, history, state or events.")
         }
+    }
+
+    /// The shared model evaluates the visible saved/draft value. Inspection
+    /// never seeks, finishes a gesture, creates history or opens source media.
+    private func inspectComponent(_ args: [String: Any], editor: ProjectEditor) throws -> [String: Any] {
+        guard let component = args["component"] as? String,
+              ["screen", "camera", "pointer", "audio", "canvas", "trim"].contains(component) else {
+            throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas or trim.")
+        }
+        let context = try automationContext
+        let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
+        guard time.isFinite, time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
+        let state = editor.editingState
+        let value: Any
+        switch component {
+        case "screen": value = try EditorAutomationAPI.object(state.zoom(at: time))
+        case "camera": value = try EditorAutomationAPI.object(state.placement(at: time))
+        case "pointer": value = try EditorAutomationAPI.object(state.cursorStyle)
+        case "audio": value = try EditorAutomationAPI.object(state.audio)
+        case "canvas": value = try EditorAutomationAPI.object(state.presentation)
+        default: value = ["start": state.trimStart, "end": state.trimEnd]
+        }
+        var result: [String: Any] = ["component": component, "source_time": time, "value": value,
+            "scope": ["screen", "camera"].contains(component) ? "source_time" : "recording",
+            "context": try EditorAutomationAPI.object(context)]
+        if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
+        return result
     }
 
     /// Shared history inspector owns snapshot direction and bounded diffs. The

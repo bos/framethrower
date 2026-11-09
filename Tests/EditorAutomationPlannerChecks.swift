@@ -37,7 +37,7 @@ struct EditorAutomationPlannerChecks {
         }
         func result(_ commands: [EditorCommand], _ request: String, title: String? = nil) throws -> LocalEditResult {
             var parameters: [String: Any] = ["commands": try JSONSerialization.jsonObject(with: JSONEncoder().encode(commands))]
-            if let title { parameters["title"] = title }
+            if let title { parameters["recording_title"] = title }
             return try LocalEditPlanner.result(reply("editor_action", arguments("apply_edits", parameters)), context: context, instruction: request)
         }
         func rejected(_ commands: [EditorCommand], _ request: String, title: String? = nil) throws {

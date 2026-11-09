@@ -741,7 +741,10 @@ unavailable while the video-driver interlock is enabled.
 animation/range audition. `navigate_editor` distinguishes selection from seeking.
 `control_document` saves, renames, or traverses the ordinary Undo/Redo stack.
 `apply_edits` validates a typed batch against the inspected revision and commits
-it as one Undo action; a failed batch changes nothing. Read
+it as one Undo action; a failed batch changes nothing. Its `name` is an Undo/history
+label and does not rename the recording. Set `recording_title` only when the user
+requested an actual recording rename; it joins the same transaction. The former
+`title` argument is rejected. Read
 `describe_editor_actions` for precise schemas and coordinate units before editing.
 Playback speed affects preview only.
 

@@ -37,7 +37,7 @@ struct NativeAutomationConflictChecks {
             var args: [String: Any] = ["document_id": host.documentID,
                 "expected_revision": try EditorCommandDispatcher.revision(for: editor.project),
                 "commands": try JSONSerialization.jsonObject(with: JSONEncoder().encode(commands)), "name": "Director: Reframe"]
-            if let title { args["title"] = title }
+            if let title { args["recording_title"] = title }
             return try await call("apply_edits", args)
         }
         func call(_ name: String, _ args: [String: Any]) async throws -> [String: Any] {
@@ -143,6 +143,14 @@ struct NativeAutomationConflictChecks {
         var invalid = scope; invalid["commands"] = [["action": "fullFrame", "time": 8]]
         do { _ = try await f.call("apply_edits", invalid); throw NativeConflictFailure.failed("replanned during resolution") }
         catch is EditorAutomationError {}
+        let before = f.editor.project, bytes = try Data(contentsOf: f.editor.url)
+        for field in ["name", "recording_title", "title"] {
+            var renamed = scope; renamed[field] = "Do not replace the frozen transaction"
+            do { _ = try await f.call("apply_edits", renamed); throw NativeConflictFailure.failed("changed frozen proposal metadata") }
+            catch is EditorAutomationError {}
+            try require(f.host.pendingFramingProposal?.id == pending.id && f.editor.project == before &&
+                Data(contentsOf: f.editor.url) == bytes, "Resolution rejects new history labels/recording names and legacy title atomically")
+        }
         let kept = try await f.call("apply_edits", scope)
         try require(kept["ok"] as? Bool == true && f.host.pendingFramingProposal == nil, "same native apply tool resolves frozen choice")
         let boundary = try await f.apply([.mutate(.zoomScreen(scale: 2.5, center: nil, timing: .init(start: 5, end: 7)))])

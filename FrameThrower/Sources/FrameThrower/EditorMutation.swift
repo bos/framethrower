@@ -565,7 +565,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             ["action": "mutate", "mutation": ["operation": "audio", "patch": ["volume": 0.5, "fadeOut": 1]]]]]
     }
 
-    /// nil discovers names only; '*' explicitly requests the full reference.
+    /// nil discovers operation groups/subjects; '*' requests the full reference.
     /// An exact operation returns one complete command schema, not every track.
     static func describe(operation: String?) throws -> [String: Any] {
         guard let operation else {
@@ -575,6 +575,10 @@ enum EditorMutation: Codable, Equatable, Sendable {
                 "global": ["pointer", "audio", "canvas", "trim"],
                 "boxes": ["addRegion", "labelRegion", "removeRegion"],
                 "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming"]],
+                "subjects": [
+                    "screen": "Main recorded screen viewport. panScreen preserves zoom; zoomScreen changes screen magnification; alignScreen matches Box anchors. These do not resize the PIP camera.",
+                    "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or hides it; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
+                    "cameraSource": "Camera image inside the unchanged PIP outline. cameraSource changes sourceZoom or crop, preserving the overlay size/position and main screen framing."],
                 "units": "Seconds are original source time. Screen points are normalized source focal centers; camera positions are fractions of available OUTPUT travel. Pan preserves size. Exact alignment rejects unreachable bounds. Get one operation's schema before apply_edits; unknown camera/screen intent requires clarification.",
                 "query": "Specify operation by exact name; '*' returns all schemas explicitly."]
         }

@@ -140,11 +140,11 @@ struct EditorAutomationChecks {
         let original = f.editor.project, bytes = try Data(contentsOf: f.editor.url), revision = try f.revision
         let commands = try f.commands([.labelRegion(regionID: f.box.id, note: "Updated guide"), .createEdit(time: 7)])
         try await reject { _ = try await f.call("apply_edits", ["expected_revision": "obsolete", "commands": commands]) }
-        try await reject { _ = try await f.call("apply_edits", ["expected_revision": revision, "commands": commands, "title": 5]) }
+        try await reject { _ = try await f.call("apply_edits", ["expected_revision": revision, "commands": commands, "recording_title": 5]) }
         let invalid = try f.commands([.labelRegion(regionID: f.box.id, note: "Must roll back"), .createEdit(time: 99)])
         try await reject { _ = try await f.call("apply_edits", ["expected_revision": revision, "commands": invalid]) }
         try require(f.editor.project == original && Data(contentsOf: f.editor.url) == bytes, "Stale/type/batch failure is atomic in memory and on disk")
-        _ = try await f.call("apply_edits", ["expected_revision": revision, "commands": commands, "title": "Batch title", "name": "Automation combined edit"])
+        _ = try await f.call("apply_edits", ["expected_revision": revision, "commands": commands, "recording_title": "Batch title", "name": "Automation combined edit"])
         let edited = f.editor.project
         try require(edited.title == "Batch title" && edited.state.regions[0].note == "Updated guide" && edited.undoHistory.count == 1,
                     "Typed batch and title make one durable ordinary transaction")
@@ -157,7 +157,9 @@ struct EditorAutomationChecks {
         let undoCount = f.editor.project.undoHistory.count
         _ = try await f.call("control_document", ["operation": "save"])
         try require(f.editor.project.undoHistory.count == undoCount, "Save without draft adds no history")
-        _ = try await f.call("control_document", ["operation": "rename", "name": "  New   recording name ", "expected_revision": f.revision])
+        let renameReceipt = try await f.call("control_document", ["operation": "rename", "name": "  New   recording name ", "expected_revision": f.revision])
+        try require(result(renameReceipt)["project_metadata_saved"] as? Bool == true,
+            "Rename tells the agent its metadata was saved, rather than implying a separate Save is required")
         try require(f.editor.displayName == "New recording name" && f.editor.project.undoHistory.count == undoCount + 1 && f.editor.project.screenFilename == original.screenFilename,
                     "Rename normalizes title, retains source filenames, adds one Undo")
         _ = try await f.call("control_document", ["operation": "undo", "expected_revision": f.revision])
@@ -172,6 +174,35 @@ struct EditorAutomationChecks {
         try Data("external replacement".utf8).write(to: f.editor.url)
         try await reject { _ = try await f.call("apply_edits", ["expected_revision": f.revision, "commands": f.commands([.createEdit(time: 9)])]) }
         try require(f.editor.project == beforeFailure && Data(contentsOf: f.editor.url) == Data("external replacement".utf8), "Save collision leaves document/history and external bytes intact")
+    }
+    static func explicitRecordingRenameArgument() async throws {
+        let f = try AutomationFixture(); defer { f.close() }; await f.ready()
+        let original = f.editor.project
+        let commands = try f.commands([.labelRegion(regionID: f.box.id, note: "Note change")])
+        _ = try await f.call("apply_edits", ["expected_revision": f.revision, "commands": commands,
+            "name": "Zoom camera to full screen over 2 seconds"])
+        try require(f.editor.project.title == original.title && f.editor.displayName == original.displayName(projectURL: f.editor.url) &&
+            f.editor.undoName == "Zoom camera to full screen over 2 seconds", "History label never renames the recording")
+        let before = f.editor.project, bytes = try Data(contentsOf: f.editor.url)
+        let changed = try f.commands([.labelRegion(regionID: f.box.id, note: "Must not leak")])
+        for extra in [["title": "Accidental recording rename"], ["recording_title": "Intended", "title": "Unadvertised"]] {
+            var args: [String: Any] = ["expected_revision": try f.revision, "commands": changed]
+            for (key, value) in extra { args[key] = value }
+            try await reject { _ = try await f.call("apply_edits", args) }
+            try require(f.editor.project == before && Data(contentsOf: f.editor.url) == bytes && f.editor.draftState == nil,
+                "Unadvertised title rejects the entire batch without edits, rename or history")
+        }
+        _ = try await f.call("apply_edits", ["expected_revision": f.revision, "commands": changed,
+            "name": "Edit note and rename", "recording_title": "Requested recording name"])
+        try require(f.editor.project.title == "Requested recording name" && f.editor.project.state.regions[0].note == "Must not leak" &&
+            f.editor.project.undoHistory.count == before.undoHistory.count + 1, "Explicit recording_title joins one atomic transaction")
+        try require(f.editor.undo() && f.editor.project.state == before.state && f.editor.project.title == before.title,
+            "One Undo restores both requested rename and edit")
+        let tool = EditorAutomationAPI.tools.first { $0["name"] as? String == "apply_edits" }!
+        let properties = (tool["inputSchema"] as! [String: Any])["properties"] as! [String: Any]
+        try require(properties["title"] == nil && properties["recording_title"] != nil &&
+            ((properties["name"] as! [String: Any])["description"] as! String).contains("does not rename"),
+            "Public schema distinguishes history label from actual recording rename")
     }
     static func previewDraftAndNavigation() async throws {
         let f = try AutomationFixture(); defer { f.close() }; await f.ready()
@@ -328,7 +359,7 @@ struct EditorAutomationChecks {
     static func main() async throws {
         DispatchQueue.global().asyncAfter(deadline: .now() + 30) { Darwin.exit(2) }
         try require(MediaProcessing.isSuspended, "Media interlock must remain enabled")
-        try await discoveryAndScope(); try await copiedDocumentScopes(); try await mutationHistoryAndEvents(); try await previewDraftAndNavigation(); try await visualMutationThenPlayback(); try await richHistory(); try await rebuildIdentityAndNativePause()
+        try await discoveryAndScope(); try await copiedDocumentScopes(); try await explicitRecordingRenameArgument(); try await mutationHistoryAndEvents(); try await previewDraftAndNavigation(); try await visualMutationThenPlayback(); try await richHistory(); try await rebuildIdentityAndNativePause()
         print("Editor automation checks passed (production host/API/registry, synthetic recorded metadata, scope/revision/type guards, atomic save and shared Undo/Redo, selection versus seek, suspended preview draft/lifecycle semantics; no media/UI/model calls).")
     }
 }

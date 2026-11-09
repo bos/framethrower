@@ -65,8 +65,10 @@ enum EditorAutomationAPI {
         }
         return [
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
-            tool("inspect_editor", "Read a bounded section of current state, including manual changes. Seconds are original recording source time. Selection and playhead are separate.", object(doc.merging([
+            tool("inspect_editor", "Read current editor metadata. For section=state, component returns only that value; time evaluates exact original-source seconds, otherwise the preview playhead. Omit component for the full state. Component/time are valid only with section=state; time requires component. Selection and playhead are separate.", object(doc.merging([
                 "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending"]],
+                "component": ["type": "string", "enum": ["screen", "camera", "pointer", "audio", "canvas", "trim"]],
+                "time": ["type": "number", "minimum": 0],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]
             ]) { _, b in b }, required: ["document_id", "section"]), readOnly: true),
             tool("inspect_recording", "Query bounded recorded semantic metadata on demand, never the live desktop. Search a visible label before asking for all controls. Real source frames remain unavailable while video processing is suspended.", object(doc.merging([
@@ -88,11 +90,13 @@ enum EditorAutomationAPI {
                 "operation": ["type": "string", "enum": ["select_edit", "select_box", "clear_selection", "show_inspector", "go_to_edit", "go_to_box"]],
                 "target_id": text, "inspector": ["type": "string", "enum": ["Zoom", "Camera", "Pointer", "Canvas", "Audio"]]
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),
-            tool("control_document", "Save, rename, Undo or Redo this recording using ordinary document behavior. Rename is undoable and keeps source filenames; Save adds no edit of its own. Return actual state and failures.", object(doc.merging([
+            tool("control_document", "Save, rename, Undo or Redo this recording using ordinary document behavior. Every successful operation saves project metadata before returning. Rename is undoable and keeps source filenames; Save adds no edit of its own. Return actual state and failures.", object(doc.merging([
                 "operation": ["type": "string", "enum": ["save", "rename", "undo", "redo"]], "name": text, "count": ["type": "integer", "minimum": 1, "maximum": 128], "expected_revision": text
             ]) { _, b in b }, required: ["document_id", "operation"]), readOnly: false),
-            tool("apply_edits", "Validate and apply a typed command batch atomically with one ordinary Undo entry. Optional title joins that same transaction. Get exact mutation schemas from describe_editor_actions first. Screen movement conflicts freeze a proposal for Existing/Proposed review; do not bypass by removing movements. Resolve the returned proposal_id with review_choice keep or replace and commands:[] after the user's choice. Failed validation/save applies nothing; no arbitrary file paths or executables are accepted.", object(doc.merging([
-                "expected_revision": text, "name": text, "title": text,
+            tool("apply_edits", "Validate and apply a typed command batch atomically with one ordinary Undo entry. name is only the Undo/history label and never renames the recording. recording_title is the actual recording name; omit unless the user requested rename. Get exact mutation schemas from describe_editor_actions first. Screen movement conflicts freeze a proposal for Existing/Proposed review; do not bypass by removing movements. Resolve the returned proposal_id with review_choice keep or replace and commands:[] after the user's choice. Failed validation/save applies nothing; no arbitrary file paths or executables are accepted.", object(doc.merging([
+                "expected_revision": text,
+                "name": ["type": "string", "description": "Undo/history label only; does not rename the recording."],
+                "recording_title": ["type": "string", "description": "Actual recording name; omit unless the user requested rename."],
                 "proposal_id": text, "review_choice": ["type": "string", "enum": ["keep", "replace"]],
                 "commands": ["type": "array", "minItems": 0, "maxItems": 128, "items": ["type": "object"]]
             ]) { _, b in b }, required: ["document_id", "expected_revision", "commands"]), readOnly: false)
@@ -103,7 +107,7 @@ enum EditorAutomationAPI {
     /// arguments; only this adapter transports the nested parameters as text.
     static func directorTool(context: EditorAutomationContext) -> [String: Any] {
         ["type": "function", "function": ["name": "editor_action",
-          "description": "Use ordinary editor capabilities beyond framing. tools: control_preview (operation play/pause/seek time/set_rate rate/step_frames frames/play_range start,end/play_animation animation_id or edit_id); control_document (save/rename name/undo count/redo count); navigate_editor (select_edit/select_box/go_to_edit/go_to_box target_id/clear_selection/show_inspector inspector); inspect_editor section; inspect_recording detail,time,query; describe_editor_actions category,operation (for editing request one named operation schema); apply_edits commands,name (a brief descriptive history label; optional title joins the transaction). parameters_json is a JSON OBJECT of only the named operation's fields. Preview/navigation are transient, never framing edits. Ask when camera/main-view intent is ambiguous; exact alignment requires a typed mutation, never center-fit.",
+          "description": "Use ordinary editor capabilities beyond framing. tools: control_preview (operation play/pause/seek time/set_rate rate/step_frames frames/play_range start,end/play_animation animation_id or edit_id); control_document (save/rename name/undo count/redo count); navigate_editor (select_edit/select_box/go_to_edit/go_to_box target_id/clear_selection/show_inspector inspector); inspect_editor section; inspect_recording detail,time,query; describe_editor_actions category,operation (for editing request one named operation schema); apply_edits commands,name (Undo/history label only, does not rename; optional recording_title is the actual recording name, omit unless user requested rename). parameters_json is a JSON OBJECT of only the named operation's fields. Preview/navigation are transient, never framing edits. Ask when camera/main-view intent is ambiguous; exact alignment requires a typed mutation, never center-fit.",
           "parameters": ["type": "object", "properties": [
             "document_id": ["type": "string", "enum": [context.documentID]],
             "expected_revision": ["type": "string", "enum": [context.revision]],

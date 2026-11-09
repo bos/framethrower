@@ -1275,7 +1275,7 @@ enum LocalEditPlanner {
             default: break
             }
         }
-        let canonicalBoxes = call.name == "apply_edits" && boxChanges.count == commands.count && parameters["title"] == nil
+        let canonicalBoxes = call.name == "apply_edits" && boxChanges.count == commands.count && parameters["recording_title"] == nil && parameters["title"] == nil
         if let rejection = EditorAgentControls.boxIntentMismatch(instruction, toolName: canonicalBoxes ? "manage_boxes" : "editor_action",
             args: ["changes": boxChanges], context: context) { return .rejectedPlan(rejection) }
         if let action = EditorAgentControls.historyAction(in: instruction) {
@@ -1309,7 +1309,7 @@ enum LocalEditPlanner {
                 default: break
                 }
             }
-            guard call.name == "apply_edits", changes.count == commands.count, !changes.isEmpty, parameters["title"] == nil else {
+            guard call.name == "apply_edits", changes.count == commands.count, !changes.isEmpty, parameters["recording_title"] == nil && parameters["title"] == nil else {
                 return .rejectedPlan("The instruction manages existing edit marks. Use matching create/move/delete edit commands, not a substitute framing, document, or property action.")
             }
             let canonical: [String: Any] = ["version": 1, "project_id": context.recording.projectID.uuidString,

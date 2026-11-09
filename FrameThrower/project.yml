@@ -67,10 +67,6 @@ targets:
         NSMicrophoneUsageDescription: FrameThrower uses your microphone for recording audio and on-device editing instructions.
         CFBundleShortVersionString: "0.1.7"
         CFBundleVersion: "8"
-        GDriveClientID: ""
-        GDriveClientSecret: ""
-        SlackClientID: ""
-        SlackClientSecret: ""
         CFBundleURLTypes:
           - CFBundleURLName: "Slack OAuth"
             CFBundleURLSchemes:
@@ -84,6 +80,13 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         MACOSX_DEPLOYMENT_TARGET: '15.0'
     postBuildScripts:
+      - name: Bundle local OAuth configuration
+        script: 'python3 "$SRCROOT/../Tools/embed-oauth-config.py" --env "$SRCROOT/../.env" --output "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/OAuthConfig.plist"'
+        inputFiles:
+          - $(SRCROOT)/../Tools/embed-oauth-config.py
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/OAuthConfig.plist
+        basedOnDependencyAnalysis: false
       - name: Bundle local Metal speech runtime
         script: '"$SRCROOT/../Tools/build-local-speech-runtime.sh" "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/LocalSpeech"'
         inputFiles:

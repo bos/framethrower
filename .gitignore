@@ -6,3 +6,8 @@ xcuserdata/
 
 __pycache__/
 *.py[cod]
+
+# Local OAuth application credentials
+.env
+.env.*
+!.env.example

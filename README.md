@@ -542,8 +542,17 @@ click **Upload** beside Google Drive. Uploads are manual and show progress; succ
 uploads copy their link to the clipboard. Drive uploads create a file in the
 root of your Drive and do not change its sharing permissions.
 
-OAuth client configuration is bundled through `FrameThrower/project.yml` and
-`FrameThrower/Resources/Info.plist`; the app has no client-ID entry fields.
+Copy `.env.example` to the gitignored `.env` at the repository root and fill in
+`GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET`, `SLACK_CLIENT_ID`, and
+`SLACK_CLIENT_SECRET` before building. The build reads these literal values into
+`OAuthConfig.plist` inside the app bundle; it never writes them into tracked
+project files. The same environment variables can override the file for CI.
+Do not commit `.env` or distribute a built app with credentials you do not intend
+to share: bundling keeps credentials out of source control, but they remain
+readable in the built app. Builds without credentials still support local work;
+account connections report that the integration is not configured. The app has
+no client-ID entry fields. Run `python3 Tests/OAuthConfigurationChecks.py` to
+check the configuration pipeline without signing in or opening media.
 Google sign-in uses a loopback HTTP callback and requests the `drive` scope.
 Slack sign-in uses the existing hosted callback at
 `https://screencast-auth.bosullivan.workers.dev/slack/oauth`, which redirects to

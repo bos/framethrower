@@ -102,19 +102,19 @@ final class CaptureViewModel: ObservableObject {
     )
 
     private var clientID: String {
-        Bundle.main.object(forInfoDictionaryKey: "GDriveClientID") as? String ?? ""
+        OAuthCredentials.bundled.googleClientID
     }
 
     private var clientSecret: String {
-        Bundle.main.object(forInfoDictionaryKey: "GDriveClientSecret") as? String ?? ""
+        OAuthCredentials.bundled.googleClientSecret
     }
 
     private var slackClientID: String {
-        Bundle.main.object(forInfoDictionaryKey: "SlackClientID") as? String ?? ""
+        OAuthCredentials.bundled.slackClientID
     }
 
     private var slackClientSecret: String {
-        Bundle.main.object(forInfoDictionaryKey: "SlackClientSecret") as? String ?? ""
+        OAuthCredentials.bundled.slackClientSecret
     }
 
     let camera = CameraRecorder()
@@ -826,11 +826,11 @@ final class CaptureViewModel: ObservableObject {
 
     func authorize() async {
         guard !clientID.isEmpty else {
-            log("Missing Google OAuth client ID in Info.plist.", level: .error)
+            log("Google Drive is not configured in this build.", level: .error)
             return
         }
         guard !clientSecret.isEmpty else {
-            log("Missing Google OAuth client secret in Info.plist.", level: .error)
+            log("Google Drive is not configured in this build.", level: .error)
             return
         }
 
@@ -854,11 +854,11 @@ final class CaptureViewModel: ObservableObject {
 
     func connectSlack() async {
         guard !slackClientID.isEmpty else {
-            log("Missing Slack client ID in Info.plist.", level: .error)
+            log("Slack is not configured in this build.", level: .error)
             return
         }
         guard !slackClientSecret.isEmpty else {
-            log("Missing Slack client secret in Info.plist.", level: .error)
+            log("Slack is not configured in this build.", level: .error)
             return
         }
 
@@ -1624,12 +1624,12 @@ final class CaptureViewModel: ObservableObject {
         }
         guard !clientID.isEmpty else {
             throw OAuthClientError.serverError(
-                message: "Missing Google OAuth client ID in Info.plist."
+                message: "Google Drive is not configured in this build."
             )
         }
         if clientSecret.isEmpty {
             throw OAuthClientError.serverError(
-                message: "Missing Google OAuth client secret in Info.plist."
+                message: "Google Drive is not configured in this build."
             )
         }
 

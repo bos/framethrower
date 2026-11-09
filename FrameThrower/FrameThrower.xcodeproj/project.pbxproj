@@ -50,6 +50,7 @@
 		6FAD6B2ACDC1A15905CFB4B1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD643FF7C65778C3D5A01A54 /* ContentView.swift */; };
 		70D9CFDED690FA8FBECE816C /* MissingMediaRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7BBDA26D39F807470DE77BD /* MissingMediaRecovery.swift */; };
 		7913190FB76B6D3FFA575483 /* PIPVideoCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24ECC967558913130770853 /* PIPVideoCompositor.swift */; };
+		84320D37C1B495CFDE2CF9D8 /* OAuthCredentials.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFA6E1EFD5B8250EFCB12530 /* OAuthCredentials.swift */; };
 		848FD112E1F7A0DD8E2CA642 /* EditorCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF59B425C2CA2FD4384FB63F /* EditorCommands.swift */; };
 		87E56BD98D43F6A1C4675DFE /* CaptureRecordingSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B9A54B3BD8A1E232A6B025A /* CaptureRecordingSetup.swift */; };
 		8C0CA5410A9554534CF879D4 /* DirectorInspection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F2E0EE832567FBADB1CFF41 /* DirectorInspection.swift */; };
@@ -149,6 +150,7 @@
 		B3B0FD9E3B359AFCC12A9730 /* RecordingQuality.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingQuality.swift; sourceTree = "<group>"; };
 		BD5A7848536A44F91C389E05 /* RecorderStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderStyle.swift; sourceTree = "<group>"; };
 		BE950809DC1CB6BFA752F80D /* NewRecordingTitleEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewRecordingTitleEditor.swift; sourceTree = "<group>"; };
+		BFA6E1EFD5B8250EFCB12530 /* OAuthCredentials.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OAuthCredentials.swift; sourceTree = "<group>"; };
 		C13D6D3BD67DEADECF4C615B /* ScreenMasterWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenMasterWriter.swift; sourceTree = "<group>"; };
 		C32BF343BFB4AEC87E86BCA1 /* EditorRegion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorRegion.swift; sourceTree = "<group>"; };
 		C6840E3AAEFC0329B397E930 /* CameraSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraSetupView.swift; sourceTree = "<group>"; };
@@ -240,6 +242,7 @@
 				D36B84B4B1F8D344D22C3892 /* Models.swift */,
 				BE950809DC1CB6BFA752F80D /* NewRecordingTitleEditor.swift */,
 				36ACB61C84F04DE05285C1AA /* OAuth.swift */,
+				BFA6E1EFD5B8250EFCB12530 /* OAuthCredentials.swift */,
 				195ED7EEA588C1534E5375CA /* PIPGeometryViews.swift */,
 				B24ECC967558913130770853 /* PIPVideoCompositor.swift */,
 				EDCA470BF5B6AAE4C6F8DF07 /* PresentationControls.swift */,
@@ -303,6 +306,7 @@
 			buildPhases = (
 				4D108048C726FE4DB3C91694 /* Sources */,
 				86F9E23CB04346D55DA70545 /* Resources */,
+				6CA480676BFE0EAAAB6ECAAA /* Bundle local OAuth configuration */,
 				E870E86AA152BD494C936DAE /* Bundle local Metal speech runtime */,
 			);
 			buildRules = (
@@ -366,6 +370,27 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		6CA480676BFE0EAAAB6ECAAA /* Bundle local OAuth configuration */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../Tools/embed-oauth-config.py",
+			);
+			name = "Bundle local OAuth configuration";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/OAuthConfig.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "python3 \"$SRCROOT/../Tools/embed-oauth-config.py\" --env \"$SRCROOT/../.env\" --output \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/OAuthConfig.plist\"";
+		};
 		E870E86AA152BD494C936DAE /* Bundle local Metal speech runtime */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -446,6 +471,7 @@
 				485B2C647E5B8415DED8C557 /* Models.swift in Sources */,
 				A464395CCA3C53791F36D320 /* NewRecordingTitleEditor.swift in Sources */,
 				2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */,
+				84320D37C1B495CFDE2CF9D8 /* OAuthCredentials.swift in Sources */,
 				4D3C86393CA8F435ED45793C /* PIPGeometryViews.swift in Sources */,
 				7913190FB76B6D3FFA575483 /* PIPVideoCompositor.swift in Sources */,
 				1D54F3E6CF3DCF45CF990EFC /* PresentationControls.swift in Sources */,

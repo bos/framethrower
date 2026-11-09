@@ -33,19 +33,11 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>8</string>
-	<key>GDriveClientID</key>
-	<string></string>
-	<key>GDriveClientSecret</key>
-	<string></string>
 	<key>NSCameraUsageDescription</key>
 	<string>FrameThrower records your selected camera as an editable picture-in-picture track.</string>
 	<key>NSCameraUseContinuityCameraType</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>FrameThrower uses your microphone for recording audio and on-device editing instructions.</string>
-	<key>SlackClientID</key>
-	<string></string>
-	<key>SlackClientSecret</key>
-	<string></string>
 </dict>
 </plist>

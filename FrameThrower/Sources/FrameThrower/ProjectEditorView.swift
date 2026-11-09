@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 private enum EditorInspector: String, CaseIterable {
-    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas", audio = "Audio"
+    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", canvas = "Canvas", audio = "Audio", layers = "Layers"
 }
 
 private enum PreviewTool: String, CaseIterable {
@@ -18,6 +18,7 @@ struct ProjectEditorView: View {
     @StateObject private var automation: EditorAutomationHost
     @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
+    @State private var selectedContentLayerID: UUID?
     @State private var selectedEditID: UUID?
     @State private var presentationDraft: CanvasPresentation?
     @State private var audioGestureTime: Double?
@@ -236,6 +237,7 @@ struct ProjectEditorView: View {
         .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame(); automation.recordEvent("preview_seek") } }
         .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: editor.project.state) { old, next in
+            if let selectedContentLayerID, !next.contentLayers.contains(where: { $0.id == selectedContentLayerID }) { self.selectedContentLayerID = nil }
             animationGesture = nil
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
             if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
@@ -289,7 +291,10 @@ struct ProjectEditorView: View {
             cutSelection = nil
             if let selectedCutID, !state.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
         }
-        .onChange(of: selectedInspector) { _, _ in if animationGesture == nil { synchronizeAnimationSelection() } }
+        .onChange(of: selectedInspector) { _, next in
+            if next == .layers { selectedEditID = nil; selectedAnimationID = nil }
+            else if animationGesture == nil { synchronizeAnimationSelection() }
+        }
         .onAppear {
             assistant.attach(to: editor)
             configureAutomation()
@@ -488,6 +493,22 @@ struct ProjectEditorView: View {
             onDeleteRegion: { removeRegion($0) },
             conflictOutlines: conflictReview?.outlines(at: playback.time), outputSamples: canvasOutputSamples)
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
+            .overlay {
+                ContentLayersOverlay(layers: state.contentLayers, sourceSize: playback.sourceSize,
+                    presentation: canvasPresentation, time: playback.time, samples: canvasOutputSamples,
+                    selection: selectedContentLayerID,
+                    isEditing: selectedInspector == .layers && conflictReview == nil && !isBlendedCanvas && !playback.isPlaying,
+                    select: { selectedContentLayerID = $0 }, begin: {
+                        assistant.cancel(); leaveConflictForManualEdit(); playback.pause()
+                        return editor.finishDraft()
+                    }, preview: { layer in
+                        var next = state
+                        guard let index = next.contentLayers.firstIndex(where: { $0.id == layer.id }) else { return }
+                        next.contentLayers[index] = layer
+                        _ = editor.updateDraft(next, at: playback.editingTime)
+                    }, commit: { name in _ = editor.finishDraft(name: name) }, cancel: { _ = editor.cancelDraft() })
+                .allowsHitTesting(selectedInspector == .layers && conflictReview == nil && !isBlendedCanvas && !playback.isPlaying)
+            }
             .overlay(alignment: .topTrailing) { previewTools.padding(10) }
             .overlay(alignment: .bottomLeading) {
                 if MediaProcessing.isSuspended {
@@ -609,6 +630,7 @@ struct ProjectEditorView: View {
         if animationGesture != nil { cancelAnimationGesture() }
         else if movingEditState != nil { cancelMove() }
         else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
+        else if selectedContentLayerID != nil { selectedContentLayerID = nil }
         else if selectedRegionID != nil { selectedRegionID = nil }
         else if directorMode { directorMode = false }
         else { cancelDraft() }
@@ -632,8 +654,14 @@ struct ProjectEditorView: View {
     }
 
     private func deleteSelectedBox() {
-        guard directorMode, let selectedRegionID, state.regions.contains(where: { $0.id == selectedRegionID }) else { return }
         if let text = NSApplication.shared.keyWindow?.firstResponder as? NSTextView, text.isEditable { return }
+        if selectedInspector == .layers, let selectedContentLayerID,
+           state.contentLayers.contains(where: { $0.id == selectedContentLayerID }) {
+            var next = state; next.contentLayers.removeAll { $0.id == selectedContentLayerID }
+            if editor.commit(next, name: "Remove layer") { self.selectedContentLayerID = nil }
+            return
+        }
+        guard directorMode, let selectedRegionID, state.regions.contains(where: { $0.id == selectedRegionID }) else { return }
         removeRegion(selectedRegionID)
     }
 
@@ -844,6 +872,9 @@ struct ProjectEditorView: View {
                     cameraControls.disabled(hasAmbiguousFramingTarget)
                         .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Adjust the camera overlay.")
                 case .audio: audioControls
+                case .layers:
+                    ContentLayersInspector(editor: editor, sourceTime: playback.time, selection: $selectedContentLayerID,
+                        prepare: { assistant.cancel(); leaveConflictForManualEdit(); playback.pause() }, seek: { playback.seek($0) })
                 case .canvas:
                     PresentationControls(presentation: canvasPresentation,
                         onBegin: {

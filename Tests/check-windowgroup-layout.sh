@@ -25,7 +25,7 @@ swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   "$repo_dir/FrameThrower/Sources/FrameThrower/VideoExportUI.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommands.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/MissingMediaRecovery.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAnimationEditing.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/ProjectEditorView.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/ContentLayersView.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAnimationEditing.swift" \
   "$repo_dir/Tests/EditorMovieFixtures.swift" \
   "$repo_dir/Tests/WindowGroupLayoutChecks.swift" \
   -o "$check_dir/check-windowgroup-layout"

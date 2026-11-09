@@ -47,7 +47,10 @@ struct EditorMutationChecks {
             .cameraSource(.init(crop: PIPCrop(x: 0.2, y: 0.5), sourceZoom: 2), timing: interval),
             .alignCameraOverlay(regionID: regionID, subjectAnchor: .center, targetAnchor: .center, axes: .both, timing: interval),
             .pointer(.init(size: 2)), .audio(.init(volume: 0.5)), .canvas(.init(padding: 0.1)), .trim(start: 1, end: 9),
-            .cutSection(start: 2, end: 3, timeBase: .source), .restoreCut(cutID: regionID), .cutTransition(cutID: regionID, duration: 0.5)]
+            .cutSection(start: 2, end: 3, timeBase: .source), .restoreCut(cutID: regionID), .cutTransition(cutID: regionID, duration: 0.5),
+            .addContentLayer(ContentLayer(id: regionID, kind: .text, start: 2, end: 5)),
+            .updateContentLayer(ContentLayer(id: regionID, kind: .arrow, start: 2, end: 5)),
+            .removeContentLayer(layerID: regionID), .reorderContentLayer(layerID: regionID, index: 0)]
         for value in samples {
             let data = try JSONEncoder().encode(EditorCommand.mutate(value))
             try require(try JSONDecoder().decode(EditorCommand.self, from: data) == .mutate(value), "every mutation roundtrips through existing command decoder")

@@ -196,7 +196,7 @@ struct EditorMutationGeometry: Equatable, Sendable {
 }
 
 enum EditorCutTimeBase: String, Codable, Sendable { case source, output }
-enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing }
+enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing, content }
 enum EditorMutationSubject: String, Codable, Sendable { case screenViewport, cameraOverlay, cameraSource }
 
 struct EditorMutationEffect: Equatable, Sendable {
@@ -246,10 +246,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
     case cutSection(start: Double, end: Double, timeBase: EditorCutTimeBase, crossfade: Double? = nil)
     case restoreCut(cutID: UUID)
     case cutTransition(cutID: UUID, duration: Double)
+    case addContentLayer(ContentLayer)
+    case updateContentLayer(ContentLayer)
+    case removeContentLayer(layerID: UUID)
+    case reorderContentLayer(layerID: UUID, index: Int)
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end,
-             timeBase, crossfade, cutID, duration
+             timeBase, crossfade, cutID, duration, layer, layerID, index
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
@@ -284,6 +288,15 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case "cutTransition":
             try c.only([.operation, .cutID, .duration])
             self = .cutTransition(cutID: try c.decode(UUID.self, forKey: .cutID), duration: try c.decode(Double.self, forKey: .duration))
+        case "addContentLayer":
+            try c.only([.operation, .layer]); self = .addContentLayer(try c.decode(ContentLayer.self, forKey: .layer))
+        case "updateContentLayer":
+            try c.only([.operation, .layer]); self = .updateContentLayer(try c.decode(ContentLayer.self, forKey: .layer))
+        case "removeContentLayer":
+            try c.only([.operation, .layerID]); self = .removeContentLayer(layerID: try c.decode(UUID.self, forKey: .layerID))
+        case "reorderContentLayer":
+            try c.only([.operation, .layerID, .index])
+            self = .reorderContentLayer(layerID: try c.decode(UUID.self, forKey: .layerID), index: try c.decode(Int.self, forKey: .index))
         default: throw EditorMutationError.invalid("The requested mutation operation is not supported.")
         }
     }
@@ -314,6 +327,11 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .restoreCut(id): try c.encode("restoreCut", forKey: .operation); try c.encode(id, forKey: .cutID)
         case let .cutTransition(id, duration):
             try c.encode("cutTransition", forKey: .operation); try c.encode(id, forKey: .cutID); try c.encode(duration, forKey: .duration)
+        case let .addContentLayer(layer): try c.encode("addContentLayer", forKey: .operation); try c.encode(layer, forKey: .layer)
+        case let .updateContentLayer(layer): try c.encode("updateContentLayer", forKey: .operation); try c.encode(layer, forKey: .layer)
+        case let .removeContentLayer(id): try c.encode("removeContentLayer", forKey: .operation); try c.encode(id, forKey: .layerID)
+        case let .reorderContentLayer(id, index):
+            try c.encode("reorderContentLayer", forKey: .operation); try c.encode(id, forKey: .layerID); try c.encode(index, forKey: .index)
         }
     }
 
@@ -333,6 +351,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case .canvas: .canvas
         case .trim: .trim
         case .cutSection, .restoreCut, .cutTransition: .timing
+        case .addContentLayer, .updateContentLayer, .removeContentLayer, .reorderContentLayer: .content
         }
     }
     func effects(duration: Double) -> [EditorMutationEffect] {
@@ -485,6 +504,21 @@ enum EditorMutation: Codable, Equatable, Sendable {
             guard duration.isFinite, duration >= 0 else { throw EditorMutationError.invalid("Crossfade duration must be a finite, nonnegative number of output seconds.") }
             guard let index = state.cuts.firstIndex(where: { $0.id == id }) else { throw EditorMutationError.invalid("That cut no longer exists.") }
             state.cuts[index].crossfade = duration
+        case let .addContentLayer(layer):
+            guard !state.contentLayers.contains(where: { $0.id == layer.id }) else { throw EditorMutationError.invalid("That content layer identity is already in use.") }
+            state.contentLayers.append(layer)
+        case let .updateContentLayer(layer):
+            guard let index = state.contentLayers.firstIndex(where: { $0.id == layer.id }) else { throw EditorMutationError.invalid("That content layer no longer exists.") }
+            state.contentLayers[index] = layer
+        case let .removeContentLayer(id):
+            guard state.contentLayers.contains(where: { $0.id == id }) else { throw EditorMutationError.invalid("That content layer no longer exists.") }
+            state.contentLayers.removeAll { $0.id == id }
+        case let .reorderContentLayer(id, index):
+            guard state.contentLayers.indices.contains(index), let current = state.contentLayers.firstIndex(where: { $0.id == id }) else {
+                throw EditorMutationError.invalid("Choose an existing layer and an index inside the layer stack.")
+            }
+            let layer = state.contentLayers.remove(at: current)
+            state.contentLayers.insert(layer, at: index)
         }
     }
 
@@ -563,7 +597,24 @@ enum EditorMutation: Codable, Equatable, Sendable {
         let audio = object(["isMuted": ["type": "boolean"], "volume": number(0, 1), "fadeIn": number(0, 5), "fadeOut": number(0, 5)], optional: ["isMuted", "volume", "fadeIn", "fadeOut"])
         let canvas = object(["aspect": enumeration(["source", "wide", "portrait", "square"]), "padding": number(0, 0.2), "cornerRadius": number(0, 0.2),
             "background": object(["red": number(0, 1), "green": number(0, 1), "blue": number(0, 1)])], optional: ["aspect", "padding", "cornerRadius", "background"])
+        let rectangle = object(["x": number(0, 1), "y": number(0, 1), "width": number(0.001, 1), "height": number(0.001, 1)])
+        let layerFields: [String: Any] = ["id": ["type": "string", "format": "uuid"],
+            "kind": enumeration(ContentLayerKind.allCases.map(\.rawValue)), "start": ["type": "number", "minimum": 0],
+            "end": ["type": "number", "minimum": 0], "rect": rectangle, "endRect": rectangle,
+            "text": ["type": "string", "maxLength": 4096], "assetID": ["type": "string", "format": "uuid"],
+            "color": object(["red": number(0, 1), "green": number(0, 1), "blue": number(0, 1)]),
+            "opacity": number(0, 1), "fontSize": number(0.005, 0.5), "bold": ["type": "boolean"],
+            "strokeWidth": number(0.0005, 0.05), "filled": ["type": "boolean"], "rotation": number(-180, 180),
+            "fadeIn": number(0, 60), "fadeOut": number(0, 60)]
+        let layerOptional = Set(layerFields.keys).subtracting(["kind", "start", "end", "rect"])
         return [
+            operation("addContentLayer", "Add visible text, arrow, rectangle, circle or image above screen and camera. Times are half-open original-source seconds; rect is final-canvas normalized top-left bounds. Omitted id is allocated by the host. Default white, opacity1, fontSize0.045 of canvas height, bold, strokeWidth0.004 of short edge, outline shapes, fades0.2s. Arrow points right; rotation degrees is clockwise. Optional endRect animates smoothly across the entire layer interval. Image requires an existing assetID from inspect_editor section=layers; no paths or image bytes are accepted.",
+                ["layer": object(layerFields, optional: layerOptional)]),
+            operation("updateContentLayer", "Replace one existing content layer by its actual id, preserving stack position. Inspect section=layers first and include all fields to retain; omitted optional fields revert to documented defaults. Omitting endRect removes movement. Validation is atomic.",
+                ["layer": object(layerFields, optional: layerOptional.subtracting(["id"]))]),
+            operation("removeContentLayer", "Remove a visible content layer by id. Source media, images used by history, and reference boxes stay intact.", ["layerID": ["type": "string", "format": "uuid"]]),
+            operation("reorderContentLayer", "Move a layer to a zero-based stack index; index0 is backmost, final index is frontmost. All content remains above screen and camera.",
+                ["layerID": ["type": "string", "format": "uuid"], "index": ["type": "integer", "minimum": 0]]),
             operation("panScreen", "Move the original-source viewport center while preserving its zoom. Exact normalized focal coordinates; impossible bounds reject. Timing uses absolute source seconds.", ["center": point, "timing": timing]),
             operation("zoomScreen", "Set screen magnification1...3. Optional center is exact source-normalized focal point; omission retains current focus with normal bounds clamping.", ["scale": number(1, 3), "center": point, "timing": timing], optional: ["center"]),
             operation("alignScreen", "Align an exact viewport anchor to a raw Box anchor. Preserve scale for pan; explicit absolute/fitRegion permits zoom. No implicit10% padding. Unreachable alignment rejects.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "scalePolicy": policy, "timing": timing]),
@@ -588,6 +639,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         ["mutation_schema": ["oneOf": schemaDescriptors],
          "legacy_command_schema": ["oneOf": legacySchemas],
          "units": ["screen": "Original source-normalized focal center; top-left origin. Zoom1...3.",
+                   "content": "Visible content layers use original-source start/end seconds and final-canvas normalized rect bounds. They are independent of reference boxes and screen zoom. Inspect section=layers for IDs, z-order and registered image metadata; image bytes are never returned.",
                    "cameraOverlay": "Position fractions of available output-canvas travel; normal scale fraction of output width0.12...0.5. fullscreen0...1 blends normal outline to exact canvas fill without erasing normal shape/placement.",
                    "cameraSource": "Oriented camera crop travel fractions0...1; sourceZoom1...3.",
                    "timing": "Absolute original-source seconds. Smooth start<end; jump start=end. End precedes recording end.",

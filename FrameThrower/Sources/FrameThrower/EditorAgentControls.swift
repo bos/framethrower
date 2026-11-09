@@ -72,6 +72,7 @@ enum EditorHistoryInspector {
             ("pointer", a.cursorStyle != b.cursorStyle), ("audio", a.audio != b.audio),
             ("trim", a.trimStart != b.trimStart || a.trimEnd != b.trimEnd),
             ("canvas", a.presentation != b.presentation), ("boxes", a.regions != b.regions),
+            ("content_layers", a.contentLayers != b.contentLayers),
             ("reference_marks", a.editAnchors != b.editAnchors)].compactMap { $0.1 ? $0.0 : nil }
     }
 
@@ -106,6 +107,10 @@ enum EditorHistoryInspector {
             case "audio":
                 details.append("Audio: \(state.audio.isMuted ? "muted" : "unmuted"), volume \(seconds(state.audio.volume)), fades \(seconds(state.audio.fadeIn))/\(seconds(state.audio.fadeOut))s.")
             case "trim": details.append("Trim: \(seconds(state.trimStart))–\(seconds(state.trimEnd))s.")
+            case "content_layers":
+                let changed = state.contentLayers.filter { !other.state.contentLayers.contains($0) }
+                let samples = changed.prefix(2).map { "\($0.label): \(seconds($0.start))–\(seconds($0.end))s" }.joined(separator: "; ")
+                details.append("Content: \(state.contentLayers.count) layers\(samples.isEmpty ? "." : " (" + samples + ").")")
             case "canvas":
                 let canvas = state.presentation
                 details.append("Canvas: \(canvas.aspect.rawValue), padding \(seconds(canvas.padding)), corners \(seconds(canvas.cornerRadius)), RGB \(seconds(canvas.background.red))/\(seconds(canvas.background.green))/\(seconds(canvas.background.blue)).")

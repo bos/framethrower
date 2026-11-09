@@ -171,6 +171,41 @@ recording and editing do not require connecting Google Drive or Slack.
 
 ## Editing
 
+### Content layers
+
+Choose **Layers** in the editor, then **Add** to insert text, an arrow, a rectangle,
+a circle, or an image. These objects appear above the screen and camera in the
+finished video. Director's reference boxes remain separate editing guides.
+
+Select a layer in the picker or click it on the canvas while Layers is selected.
+Drag its body to move it, or its lower-right handle to resize it. Each gesture is
+one Undo step; Escape cancels it. **Edit…** changes text, source start/end times,
+position, size, rotation, color, opacity, fill, font and stroke size, and fades.
+Enable **Move and resize over this interval** to set a smooth destination frame.
+The stack buttons change which content appears in front. **Show** seeks to the
+layer; selecting it alone leaves the playhead unchanged.
+
+Layer positions use the final output canvas, independent of screen zoom. Their
+times stay attached to the original footage through trims and cuts; crossfades
+evaluate the layers on each source branch before blending the pictures.
+
+Images are stored once inside the project and shared by layers and history using
+asset IDs. Import reads image headers and copies bytes without changing the
+original. Limits are 8 MiB and 32 megapixels per image, 32 MiB of total image data,
+32 images, and 256 content layers. Unused assets are removed when no current or
+saved history state refers to them, including when making a fresh-history copy.
+
+Director can discover `addContentLayer`, `updateContentLayer`,
+`removeContentLayer`, and `reorderContentLayer` through the editing catalog.
+`inspect_editor` with `section=layers` lists layer order and image asset metadata;
+`section=state, component=layers` evaluates active frames and opacity at a source
+or output time. The tools never return image bytes or accept arbitrary image paths.
+
+During media suspension, the editor draws text and shapes as vectors and shows
+image placeholders. Pixel compositing and image decoding remain behind the media
+interlock. Run `Tests/check-content-layers.sh` for model/file/command checks and
+`Tests/check-content-layer-interface.sh` for an offscreen vector/text UI fixture.
+
 Use the single timeline to scrub and drag its blue handles to trim. Arrow keys
 seek by 0.1 seconds; Shift-arrow seeks by one second. Trimming keeps every original
 frame available. Right-click the timeline for **Reset trim**. Space starts or

@@ -1,6 +1,8 @@
 @preconcurrency import AVFoundation
 import CoreImage
+import CoreText
 import Foundation
+import ImageIO
 
 /// An immutable edit snapshot shared by AVPlayer, still previews, and export.
 final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
@@ -20,10 +22,12 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
     let focusedCapture: FocusedFrameCapture?
     let cursorRecording: CursorRecording?
     let previewFrames: PreviewSourceFrames?
+    let contentAssets: [ContentImageAsset]
 
     init(timeRange: CMTimeRange, screenTrackID: CMPersistentTrackID, cameraTrackID: CMPersistentTrackID?,
          screenGeometry: PIPSourceGeometry, cameraGeometry: PIPSourceGeometry?, renderSize: CGSize,
-         cameraStart: Double, cameraEnd: Double, state: EditState, focusedCapture: FocusedFrameCapture? = nil, cursorRecording: CursorRecording? = nil, previewFrames: PreviewSourceFrames? = nil) {
+         cameraStart: Double, cameraEnd: Double, state: EditState, focusedCapture: FocusedFrameCapture? = nil, cursorRecording: CursorRecording? = nil, previewFrames: PreviewSourceFrames? = nil,
+         contentAssets: [ContentImageAsset] = []) {
         self.timeRange = timeRange
         self.screenTrackID = screenTrackID
         self.cameraTrackID = cameraTrackID
@@ -36,6 +40,7 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
         self.focusedCapture = focusedCapture
         self.cursorRecording = cursorRecording
         self.previewFrames = previewFrames
+        self.contentAssets = contentAssets
         requiredSourceTrackIDs = ([screenTrackID] + [cameraTrackID].compactMap { $0 }).map { NSNumber(value: $0) }
         super.init()
     }
@@ -47,7 +52,8 @@ final class PIPCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
                                                                                 presentation: state.presentation).outputSize,
                                   cameraStart: cameraStart, cameraEnd: cameraEnd, state: state, focusedCapture: focusedCapture,
                                   cursorRecording: cursorRecording,
-                                  previewFrames: preservePreviewFrames && focusedCapture == nil ? previewFrames : nil)
+                                  previewFrames: preservePreviewFrames && focusedCapture == nil ? previewFrames : nil,
+                                  contentAssets: contentAssets)
     }
 
 }
@@ -179,7 +185,7 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
             var blended: CIImage?
             for sample in cut.timingMap.samples(at: request.compositionTime.seconds) {
                 let branch = cut.branches[sample.clipIndex]
-                let image = composer.image(screen: request.sourceFrame(byTrackID: branch.screenTrackID),
+                let image = try composer.image(screen: request.sourceFrame(byTrackID: branch.screenTrackID),
                     camera: branch.cameraTrackID.flatMap { request.sourceFrame(byTrackID: $0) },
                     instruction: cut.template, state: cut.template.state, at: sample.sourceTime,
                     renderSize: cut.template.renderSize)
@@ -203,7 +209,7 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
                                              at: request.compositionTime, instruction: instruction)
         instruction.previewFrames?.capture(screen: screenBuffer, camera: cameraBuffer,
                                             at: request.compositionTime, instruction: instruction)
-        let image = composer.image(screen: screenBuffer, camera: cameraBuffer,
+        let image = try composer.image(screen: screenBuffer, camera: cameraBuffer,
                                    instruction: instruction, state: instruction.state,
                                    at: request.compositionTime.seconds, renderSize: instruction.renderSize)
         composer.context.render(image, to: output, bounds: CGRect(origin: .zero, size: instruction.renderSize),
@@ -212,15 +218,143 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
     }
 }
 
+/// Vector/text drawing shared by the suspended canvas and media renderer.
+/// The caller supplies a top-left coordinate system. This helper never loads
+/// image files, creates video frames, or allocates a bitmap.
+enum ContentLayerDrawing {
+    static func draw(_ layer: ContentLayer, in context: CGContext, rect: CGRect,
+                     canvasSize: CGSize, image: CGImage? = nil, imagePlaceholder: Bool = false) {
+        context.saveGState()
+        defer { context.restoreGState() }
+        let color = CGColor(red: layer.color.red, green: layer.color.green, blue: layer.color.blue, alpha: 1)
+        context.setStrokeColor(color); context.setFillColor(color)
+        let line = layer.strokeWidth * min(canvasSize.width, canvasSize.height)
+        context.setLineWidth(line); context.setLineCap(.round); context.setLineJoin(.round)
+        switch layer.kind {
+        case .text:
+            drawText(layer.text, in: context, rect: rect, size: layer.fontSize * canvasSize.height,
+                     bold: layer.bold, color: color)
+        case .rectangle, .circle:
+            let inset = min(line / 2, min(rect.width, rect.height) / 4)
+            let shape = rect.insetBy(dx: inset, dy: inset)
+            if layer.kind == .circle { context.addEllipse(in: shape) } else { context.addRect(shape) }
+            context.drawPath(using: layer.filled ? .fill : .stroke)
+        case .arrow:
+            let inset = min(line / 2, rect.width / 8)
+            let head = min(rect.height / 2, rect.width / 3)
+            context.move(to: CGPoint(x: rect.minX + inset, y: rect.midY))
+            context.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.midY))
+            context.strokePath()
+            context.move(to: CGPoint(x: rect.maxX - inset - head, y: rect.midY - head))
+            context.addLine(to: CGPoint(x: rect.maxX - inset, y: rect.midY))
+            context.addLine(to: CGPoint(x: rect.maxX - inset - head, y: rect.midY + head))
+            context.strokePath()
+        case .image:
+            if let image {
+                let fitted = fittedRect(source: CGSize(width: Double(image.width), height: Double(image.height)), in: rect)
+                // CGImage draws in a bottom-left coordinate system.
+                context.translateBy(x: fitted.minX, y: fitted.maxY); context.scaleBy(x: 1, y: -1)
+                context.draw(image, in: CGRect(origin: .zero, size: fitted.size))
+            } else if imagePlaceholder {
+                context.setLineDash(phase: 0, lengths: [5, 4]); context.stroke(rect.insetBy(dx: 1, dy: 1))
+                drawText("Image", in: context, rect: rect,
+                    size: min(canvasSize.height * 0.035, rect.height * 0.4), bold: false, color: color)
+            }
+        }
+    }
+
+    static func fittedRect(source: CGSize, in bounds: CGRect) -> CGRect {
+        guard source.width > 0, source.height > 0 else { return bounds }
+        let scale = min(bounds.width / source.width, bounds.height / source.height)
+        let size = CGSize(width: source.width * scale, height: source.height * scale)
+        return CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height)
+    }
+
+    private static func drawText(_ text: String, in context: CGContext, rect: CGRect,
+                                 size: Double, bold: Bool, color: CGColor) {
+        let font = CTFontCreateWithName((bold ? "HelveticaNeue-Bold" : "HelveticaNeue") as CFString, max(1, size), nil)
+        var alignment = CTTextAlignment.center
+        let paragraph = withUnsafePointer(to: &alignment) {
+            CTParagraphStyleCreate([CTParagraphStyleSetting(spec: .alignment, valueSize: MemoryLayout<CTTextAlignment>.size, value: $0)], 1)
+        }
+        let attributed = NSAttributedString(string: text, attributes: [
+            NSAttributedString.Key(kCTFontAttributeName as String): font,
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): color,
+            NSAttributedString.Key(kCTParagraphStyleAttributeName as String): paragraph])
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed)
+        context.saveGState()
+        context.clip(to: rect)
+        context.translateBy(x: rect.minX, y: rect.maxY); context.scaleBy(x: 1, y: -1)
+        context.textMatrix = .identity
+        let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: 0, length: 0),
+            CGPath(rect: CGRect(origin: .zero, size: rect.size), transform: nil), nil)
+        CTFrameDraw(frame, context)
+        context.restoreGState()
+    }
+}
+
+/// Only the guarded media pipeline calls this raster cache. Static artwork is
+/// cached separately from per-frame movement, rotation and fades, with a 64 MiB
+/// cap. Image data is decoded lazily; the suspended editor uses vectors only.
+private final class ContentLayerRasterCache {
+    private struct Entry {
+        let layer: ContentLayer
+        let asset: ContentImageAsset?
+        let canvas: CGSize
+        let image: CIImage
+        let cost: Int
+    }
+    private var entries: [UUID: Entry] = [:]
+    private var cost = 0
+
+    func image(for layer: ContentLayer, assets: [ContentImageAsset], canvas: CGSize) throws -> CIImage {
+        try MediaProcessing.requireEnabled()
+        let asset = layer.assetID.flatMap { id in assets.first { $0.id == id } }
+        if let entry = entries[layer.id], entry.layer == layer, entry.asset == asset, entry.canvas == canvas { return entry.image }
+        let native = CGSize(width: canvas.width * layer.rect.width, height: canvas.height * layer.rect.height)
+        let scale = min(1, 4096 / max(native.width, native.height))
+        let width = max(1, Int(ceil(native.width * scale))), height = max(1, Int(ceil(native.height * scale)))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                  bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw ProjectError.invalid("The content layer could not be rendered.")
+        }
+        var decoded: CGImage?
+        if layer.kind == .image {
+            guard let asset, let source = CGImageSourceCreateWithData(asset.data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+                  let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 4096, kCGImageSourceShouldCache: false] as CFDictionary) else {
+                throw ProjectError.invalid("A content image cannot be decoded. Replace it in Layers.")
+            }
+            decoded = image
+        }
+        context.translateBy(x: 0, y: Double(height)); context.scaleBy(x: 1, y: -1)
+        ContentLayerDrawing.draw(layer, in: context, rect: CGRect(x: 0, y: 0, width: Double(width), height: Double(height)),
+            canvasSize: CGSize(width: canvas.width * scale, height: canvas.height * scale), image: decoded)
+        guard let pixels = context.makeImage() else { throw ProjectError.invalid("The content layer could not be rendered.") }
+        let image = CIImage(cgImage: pixels)
+        if let old = entries.removeValue(forKey: layer.id) { cost -= old.cost }
+        let bytes = pixels.bytesPerRow * pixels.height
+        if cost + bytes > 64 * 1024 * 1024 { entries.removeAll(); cost = 0 }
+        if bytes <= 64 * 1024 * 1024 {
+            entries[layer.id] = Entry(layer: layer, asset: asset, canvas: canvas, image: image, cost: bytes)
+            cost += bytes
+        }
+        return image
+    }
+}
+
 /// The single image graph for decoded playback frames, export, and interactive
 /// drafts. Live editing supplies the same unmodified screen/camera buffers.
 private final class PIPFrameComposer: @unchecked Sendable {
     let context = CIContext(options: [.cacheIntermediates: false])
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    private let layerArtwork = ContentLayerRasterCache()
 
     func image(screen screenBuffer: CVPixelBuffer?, camera cameraBuffer: CVPixelBuffer?,
                instruction: PIPCompositionInstruction, state: EditState, at seconds: Double,
-               renderSize: CGSize) -> CIImage {
+               renderSize: CGSize) throws -> CIImage {
         let canvas = CGRect(origin: .zero, size: renderSize)
         let presentation = PresentationGeometry(sourceSize: instruction.screenGeometry.size,
                                                 presentation: state.presentation)
@@ -299,6 +433,23 @@ private final class PIPFrameComposer: @unchecked Sendable {
                 ])
             }
             image = camera.composited(over: image)
+        }
+        for layer in state.contentLayers {
+            let alpha = layer.alpha(at: seconds)
+            guard alpha > 0 else { continue }
+            let artwork = try layerArtwork.image(for: layer, assets: instruction.contentAssets, canvas: renderSize)
+            let rect = layer.frame(at: seconds)
+            let frame = CGRect(x: rect.x * canvas.width, y: rect.y * canvas.height,
+                               width: rect.width * canvas.width, height: rect.height * canvas.height)
+            var overlay = artwork.transformed(by: CGAffineTransform(scaleX: frame.width / artwork.extent.width,
+                                                                    y: frame.height / artwork.extent.height))
+                .transformed(by: CGAffineTransform(translationX: -frame.width / 2, y: -frame.height / 2))
+                .transformed(by: CGAffineTransform(rotationAngle: -layer.rotation * .pi / 180))
+                .transformed(by: CGAffineTransform(translationX: frame.midX, y: canvas.height - frame.midY))
+            if alpha < 1 {
+                overlay = overlay.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha)])
+            }
+            image = overlay.composited(over: image)
         }
         return image.cropped(to: canvas)
     }
@@ -459,8 +610,11 @@ final class LivePreviewSources: @unchecked Sendable {
                     let scale = min(1, limit.width / native.width, limit.height / native.height)
                     let size = CGSize(width: max(1, (native.width * scale).rounded(.down)),
                                       height: max(1, (native.height * scale).rounded(.down)))
-                    let image = composer.image(screen: screen, camera: camera, instruction: instruction,
-                                               state: state, at: sourceTime.seconds, renderSize: size)
+                    let image: CIImage
+                    do {
+                        image = try composer.image(screen: screen, camera: camera, instruction: instruction,
+                                                   state: state, at: sourceTime.seconds, renderSize: size)
+                    } catch { continuation.resume(throwing: error); return }
                     if let result = composer.context.createCGImage(image, from: CGRect(origin: .zero, size: size),
                                                                    format: .RGBA8, colorSpace: composer.colorSpace) {
                         continuation.resume(returning: result)

@@ -215,7 +215,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             case "select_box", "go_to_box":
                 guard let id, editor.editingState.regions.contains(where: { $0.id == id }) else { throw EditorAutomationError.invalid("That box is no longer present.") }
             case "show_inspector":
-                guard let inspector = args["inspector"] as? String, ["Zoom", "Camera", "Pointer", "Canvas", "Audio"].contains(inspector) else { throw EditorAutomationError.invalid("Choose an available inspector.") }
+                guard let inspector = args["inspector"] as? String, ["Zoom", "Camera", "Pointer", "Canvas", "Audio", "Layers"].contains(inspector) else { throw EditorAutomationError.invalid("Choose an available inspector.") }
             default: break
             }
             try Task.checkCancellation()
@@ -588,7 +588,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             return ["context": try EditorAutomationAPI.object(automationContext), "duration": editor.project.duration,
                 "source_duration": editor.project.duration, "output_duration": map.outputDuration, "cut_count": state.cuts.count,
                 "trim": ["start": state.trimStart, "end": state.trimEnd], "edit_count": state.timedEdits(includeCamera: editor.project.cameraFilename != nil).count,
-                "box_count": state.regions.count, "undo_count": editor.historyState.undo.count,
+                "box_count": state.regions.count, "content_layer_count": state.contentLayers.count, "undo_count": editor.historyState.undo.count,
                 "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
         case "pending":
             invalidateFramingProposal(for: editor.project)
@@ -601,6 +601,13 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             if args["component"] != nil { return try inspectComponent(args, editor: editor) }
             guard args["time"] == nil && args["time_base"] == nil else { throw EditorAutomationError.invalid("Choose a state component when specifying time coordinates.") }
             return try EditorAutomationAPI.object(state)
+        case "layers":
+            return ["layers": page(try state.contentLayers.enumerated().map { index, layer in
+                ["index": index, "layer": try EditorAutomationAPI.object(layer)] as [String: Any]
+            }), "assets": page(editor.project.contentAssets.map { asset in
+                ["id": asset.id.uuidString, "name": asset.name, "pixel_width": asset.pixelWidth,
+                 "pixel_height": asset.pixelHeight] as [String: Any]
+            }), "coordinates": "Final-canvas normalized bounds, top-left origin; original-source seconds. Stack order is back to front above screen and camera."]
         case "boxes": return page(try state.regions.map { region -> Any in
             ["id": region.id.uuidString, "label": editor.references.boxLabel(for: region.id) ?? "Box",
              "box": try EditorAutomationAPI.object(region)]
@@ -621,7 +628,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                             "redo": try historyDetails(.redo, offset: offset, limit: limit, editor: editor)]]
         case "events": return ["page": page(recentEvents), "first_retained_sequence": recentEvents.first?["sequence"] ?? eventSequence,
                                 "last_sequence": eventSequence, "retained_limit": 128]
-        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, history, state, timing or events.")
+        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, layers, history, state, timing or events.")
         }
     }
 
@@ -629,8 +636,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     /// never seeks, finishes a gesture, creates history or opens source media.
     private func inspectComponent(_ args: [String: Any], editor: ProjectEditor) throws -> [String: Any] {
         guard let component = args["component"] as? String,
-              ["screen", "camera", "pointer", "audio", "canvas", "trim"].contains(component) else {
-            throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas or trim.")
+              ["screen", "camera", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
+            throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas, trim or layers.")
         }
         let context = try automationContext
         let state = editor.editingState
@@ -643,6 +650,10 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             case "pointer": return try EditorAutomationAPI.object(state.cursorStyle)
             case "audio": return try EditorAutomationAPI.object(state.audio)
             case "canvas": return try EditorAutomationAPI.object(state.presentation)
+            case "layers": return try state.contentLayers.filter { $0.isActive(at: sourceTime) }.map { layer in
+                ["layer": try EditorAutomationAPI.object(layer), "rect": try EditorAutomationAPI.object(layer.frame(at: sourceTime)),
+                 "opacity": layer.alpha(at: sourceTime)] as [String: Any]
+            }
             default: return ["start": state.trimStart, "end": state.trimEnd]
             }
         }
@@ -660,7 +671,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
         guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
         var result: [String: Any] = ["component": component, "source_time": time, "value": try value(at: time),
-            "scope": ["screen", "camera"].contains(component) ? "source_time" : "recording",
+            "scope": ["screen", "camera", "layers"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
         return result
@@ -719,7 +730,7 @@ final class EditorAutomationRegistry {
     }
     func resourceList() throws -> Data {
         let resources = openHosts.prefix(64).flatMap { host in
-            ["view", "edits", "boxes", "history", "events"].map { section in
+            ["view", "edits", "boxes", "layers", "history", "events"].map { section in
                 ["uri": "framethrower://recordings/\(host.documentID)/\(section)",
                  "name": "\((try? host.automationContext.name) ?? "Recording") · \(section)", "mimeType": "application/json"]
             }
@@ -730,7 +741,7 @@ final class EditorAutomationRegistry {
         guard let url = URL(string: uri), url.scheme == "framethrower", url.host == "recordings",
               url.query == nil, url.fragment == nil else { throw EditorAutomationError.invalid("Unknown recording resource.") }
         let parts = url.pathComponents.filter { $0 != "/" }
-        guard parts.count == 2, ["view", "edits", "boxes", "history", "events"].contains(parts[1]) else { throw EditorAutomationError.invalid("Unknown recording resource.") }
+        guard parts.count == 2, ["view", "edits", "boxes", "layers", "history", "events"].contains(parts[1]) else { throw EditorAutomationError.invalid("Unknown recording resource.") }
         return try await call("inspect_editor", arguments: JSONSerialization.data(withJSONObject: ["document_id": parts[0], "section": parts[1]]))
     }
     func startServer() async {

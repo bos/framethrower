@@ -169,7 +169,8 @@ enum ProjectRenderer {
         let instruction = PIPCompositionInstruction(
             timeRange: wholeRange, screenTrackID: screenTrack.trackID, cameraTrackID: cameraTrackID,
             screenGeometry: sourceGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
-            cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state, cursorRecording: cursorRecording, previewFrames: previewFrames
+            cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state, cursorRecording: cursorRecording, previewFrames: previewFrames,
+            contentAssets: project.contentAssets
         )
         let videoComposition = AVMutableVideoComposition()
         videoComposition.customVideoCompositorClass = PIPVideoCompositor.self
@@ -262,7 +263,8 @@ enum ProjectRenderer {
             screenTrackID: screenTracks[0].trackID, cameraTrackID: cameraTracks.first?.trackID,
             screenGeometry: screenGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
             cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state,
-            cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) })
+            cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) },
+            contentAssets: project.contentAssets)
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = PIPVideoCompositor.self
         video.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2

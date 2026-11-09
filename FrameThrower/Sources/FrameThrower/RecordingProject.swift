@@ -719,6 +719,144 @@ struct RecordingTimeMap: Equatable, Sendable {
     }
 }
 
+enum ContentLayerKind: String, Codable, CaseIterable, Sendable {
+    case text, arrow, rectangle, circle, image
+    var title: String { rawValue.capitalized }
+}
+
+/// Immutable image bytes are stored once per project, outside undo snapshots.
+/// Model commands can refer to these IDs but cannot supply files or image data.
+struct ContentImageAsset: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    let name: String
+    let data: Data
+    let pixelWidth: Int
+    let pixelHeight: Int
+    static let maximumBytes = 8 * 1024 * 1024
+
+    func validate() throws {
+        guard !name.isEmpty, name.count <= 256, !name.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }),
+              !data.isEmpty, data.count <= Self.maximumBytes,
+              (1...16_384).contains(pixelWidth), (1...16_384).contains(pixelHeight),
+              Int64(pixelWidth) * Int64(pixelHeight) <= 32_000_000 else {
+            throw ProjectError.invalid("Use an image of at most 8 MiB and 32 megapixels, with a name of 1–256 characters.")
+        }
+    }
+}
+
+/// Visible content uses final-canvas normalized coordinates with a top-left
+/// origin. Array order is back to front, above screen and camera. Times refer
+/// to the original source; trims/cuts never rewrite or destroy these objects.
+struct ContentLayer: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var kind: ContentLayerKind
+    var start: Double
+    var end: Double
+    var rect = EditorRegionRect(x: 0.25, y: 0.1, width: 0.5, height: 0.15)
+    var endRect: EditorRegionRect? = nil
+    var text = "Text"
+    var assetID: UUID? = nil
+    var color = CanvasColor(red: 1, green: 1, blue: 1)
+    var opacity = 1.0
+    /// Font size is a fraction of canvas height; line width uses its short edge.
+    var fontSize = 0.045
+    var bold = true
+    var strokeWidth = 0.004
+    var filled = false
+    var rotation = 0.0
+    var fadeIn = 0.2
+    var fadeOut = 0.2
+
+    init(id: UUID = UUID(), kind: ContentLayerKind, start: Double, end: Double) {
+        self.id = id; self.kind = kind; self.start = start; self.end = end
+    }
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case id, kind, start, end, rect, endRect, text, assetID, color, opacity, fontSize, bold, strokeWidth, filled, rotation, fadeIn, fadeOut
+    }
+    private struct AnyKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    init(from decoder: any Decoder) throws {
+        let keys = try decoder.container(keyedBy: AnyKey.self).allKeys.map(\.stringValue)
+        guard Set(keys).isSubset(of: Set(CodingKeys.allCases.map(\.rawValue))) else {
+            throw ProjectError.invalid("The content layer contains unsupported fields.")
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            kind: try values.decode(ContentLayerKind.self, forKey: .kind),
+            start: try values.decode(Double.self, forKey: .start), end: try values.decode(Double.self, forKey: .end))
+        rect = try values.decodeIfPresent(EditorRegionRect.self, forKey: .rect) ?? rect
+        endRect = try values.decodeIfPresent(EditorRegionRect.self, forKey: .endRect)
+        text = try values.decodeIfPresent(String.self, forKey: .text) ?? text
+        assetID = try values.decodeIfPresent(UUID.self, forKey: .assetID)
+        color = try values.decodeIfPresent(CanvasColor.self, forKey: .color) ?? color
+        opacity = try values.decodeIfPresent(Double.self, forKey: .opacity) ?? opacity
+        fontSize = try values.decodeIfPresent(Double.self, forKey: .fontSize) ?? fontSize
+        bold = try values.decodeIfPresent(Bool.self, forKey: .bold) ?? bold
+        strokeWidth = try values.decodeIfPresent(Double.self, forKey: .strokeWidth) ?? strokeWidth
+        filled = try values.decodeIfPresent(Bool.self, forKey: .filled) ?? filled
+        rotation = try values.decodeIfPresent(Double.self, forKey: .rotation) ?? rotation
+        fadeIn = try values.decodeIfPresent(Double.self, forKey: .fadeIn) ?? fadeIn
+        fadeOut = try values.decodeIfPresent(Double.self, forKey: .fadeOut) ?? fadeOut
+    }
+
+    var label: String { kind == .text ? String(text.prefix(48)) : kind.title }
+    func isActive(at time: Double) -> Bool { time.isFinite && time >= start && time < end }
+    func frame(at time: Double) -> EditorRegionRect {
+        guard let endRect else { return rect }
+        let progress = MotionInterpolation.progress(at: time, from: start, to: end,
+            duration: end - start, transition: .smooth)
+        func value(_ a: Double, _ b: Double) -> Double { a + (b - a) * progress }
+        return EditorRegionRect(x: value(rect.x, endRect.x), y: value(rect.y, endRect.y),
+            width: value(rect.width, endRect.width), height: value(rect.height, endRect.height))
+    }
+    func alpha(at time: Double) -> Double {
+        guard isActive(at: time) else { return 0 }
+        let fades = MotionInterpolation.rampDurations(duration: end - start, easeIn: fadeIn, easeOut: fadeOut)
+        let incoming = fades.easeIn > 0 ? min(1, (time - start) / fades.easeIn) : 1
+        let outgoing = fades.easeOut > 0 ? min(1, (end - time) / fades.easeOut) : 1
+        return opacity * max(0, min(incoming, outgoing))
+    }
+    func translated(x: Double, y: Double) -> Self {
+        guard x.isFinite, y.isFinite else { return self }
+        let frames = [rect] + (endRect.map { [$0] } ?? [])
+        let dx = min(frames.map { 1 - $0.x - $0.width }.min()!, max(-frames.map(\.x).min()!, x))
+        let dy = min(frames.map { 1 - $0.y - $0.height }.min()!, max(-frames.map(\.y).min()!, y))
+        var next = self
+        next.rect.x = min(1 - rect.width, max(0, rect.x + dx)); next.rect.y = min(1 - rect.height, max(0, rect.y + dy))
+        if var end = endRect { end.x = min(1 - end.width, max(0, end.x + dx)); end.y = min(1 - end.height, max(0, end.y + dy)); next.endRect = end }
+        return next
+    }
+    func resized(width: Double, height: Double) -> Self {
+        guard width.isFinite, height.isFinite else { return self }
+        let frames = [rect] + (endRect.map { [$0] } ?? [])
+        let dw = min(frames.map { 1 - $0.x - $0.width }.min()!, max(frames.map { 0.001 - $0.width }.max()!, width))
+        let dh = min(frames.map { 1 - $0.y - $0.height }.min()!, max(frames.map { 0.001 - $0.height }.max()!, height))
+        var next = self
+        next.rect.width = min(1 - rect.x, max(0.001, rect.width + dw)); next.rect.height = min(1 - rect.y, max(0.001, rect.height + dh))
+        if var end = endRect { end.width = min(1 - end.x, max(0.001, end.width + dw)); end.height = min(1 - end.y, max(0.001, end.height + dh)); next.endRect = end }
+        return next
+    }
+    func validate(duration: Double, assets: Set<UUID>) throws {
+        guard start.isFinite, end.isFinite, start >= 0, start < end, end <= duration,
+              rect.isValid, rect.width >= 0.001, rect.height >= 0.001,
+              endRect.map({ $0.isValid && $0.width >= 0.001 && $0.height >= 0.001 }) ?? true,
+              [color.red, color.green, color.blue, opacity].allSatisfy({ $0.isFinite && (0...1).contains($0) }),
+              fontSize.isFinite, (0.005...0.5).contains(fontSize), strokeWidth.isFinite, (0.0005...0.05).contains(strokeWidth),
+              rotation.isFinite, (-180...180).contains(rotation),
+              [fadeIn, fadeOut].allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 60 }),
+              text.count <= 4_096, !text.unicodeScalars.contains(where: {
+                  $0.properties.generalCategory == .control && $0 != "\n" && $0 != "\t"
+              }), kind != .text || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              kind == .image ? assetID.map(assets.contains) == true : assetID == nil else {
+            throw ProjectError.invalid("A content layer needs a valid source-time range, canvas bounds, style, and registered image when applicable.")
+        }
+    }
+}
+
 struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
@@ -730,6 +868,7 @@ struct EditState: Codable, Equatable, Sendable {
     var editAnchors: [EditAnchor] = []
     var audio = RecordingAudio()
     var cuts: [RecordingCut] = []
+    var contentLayers: [ContentLayer] = []
     /// Missing only in legacy states. A persisted version prevents a manually
     /// detached target from being inferred again after a later save/reopen.
     var boxConnectionsVersion = 1
@@ -737,7 +876,8 @@ struct EditState: Codable, Equatable, Sendable {
     init(trimStart: Double, trimEnd: Double, pipKeyframes: [PIPKeyframe],
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
-         editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = []) {
+         editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = [],
+         contentLayers: [ContentLayer] = []) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -748,10 +888,11 @@ struct EditState: Codable, Equatable, Sendable {
         self.editAnchors = editAnchors
         self.audio = audio
         self.cuts = cuts
+        self.contentLayers = contentLayers
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, boxConnectionsVersion
+        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -768,6 +909,7 @@ struct EditState: Codable, Equatable, Sendable {
         editAnchors = try values.decodeIfPresent([EditAnchor].self, forKey: .editAnchors) ?? []
         audio = try values.decodeIfPresent(RecordingAudio.self, forKey: .audio) ?? RecordingAudio()
         cuts = try values.decodeIfPresent([RecordingCut].self, forKey: .cuts) ?? []
+        contentLayers = try values.decodeIfPresent([ContentLayer].self, forKey: .contentLayers) ?? []
         if values.contains(.boxConnectionsVersion) {
             boxConnectionsVersion = try values.decode(Int.self, forKey: .boxConnectionsVersion)
             guard boxConnectionsVersion == 1 else {
@@ -1058,6 +1200,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var undoHistory: [NamedEditSnapshot] = []
     var redoHistory: [NamedEditSnapshot] = []
     var references = EditorReferences()
+    var contentAssets: [ContentImageAsset] = []
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          sceneFilename: String? = nil,
@@ -1085,7 +1228,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, automationID, cameraOffset,
-             captureFrameDuration, duration, state, undoHistory, redoHistory, references
+             captureFrameDuration, duration, state, undoHistory, redoHistory, references, contentAssets
     }
 
     init(from decoder: any Decoder) throws {
@@ -1104,6 +1247,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         undoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .undoHistory) ?? []
         redoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .redoHistory) ?? []
         references = try values.decodeIfPresent(EditorReferences.self, forKey: .references) ?? EditorReferences()
+        contentAssets = try values.decodeIfPresent([ContentImageAsset].self, forKey: .contentAssets) ?? []
         try references.validate()
         ensureReferences()
     }
@@ -1114,6 +1258,9 @@ struct RecordingProject: Codable, Equatable, Sendable {
         for snapshot in undoHistory + redoHistory {
             references.register(state: snapshot.state, includeCamera: cameraFilename != nil)
         }
+        let states = [state] + (extraState.map { [$0] } ?? []) + (undoHistory + redoHistory).map(\.state)
+        let usedAssets = Set(states.flatMap { $0.contentLayers.compactMap(\.assetID) })
+        contentAssets.removeAll { !usedAssets.contains($0.id) }
     }
 
     func displayName(projectURL: URL) -> String {
@@ -1155,6 +1302,11 @@ struct RecordingProject: Codable, Equatable, Sendable {
 
     func validate() throws {
         try references.validate()
+        guard contentAssets.count <= 32, Set(contentAssets.map(\.id)).count == contentAssets.count,
+              contentAssets.reduce(0, { $0 + $1.data.count }) <= 32 * 1024 * 1024 else {
+            throw ProjectError.invalid("Keep at most 32 content images and 32 MiB of image data in a project.")
+        }
+        for asset in contentAssets { try asset.validate() }
         guard version == 1 else { throw ProjectError.invalid("Unsupported project version: \(version).") }
         guard duration.isFinite, duration > 0, cameraOffset.isFinite else {
             throw ProjectError.invalid("The recording has an invalid duration or camera offset.")
@@ -1198,6 +1350,11 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState) throws {
+        guard state.contentLayers.count <= 256, Set(state.contentLayers.map(\.id)).count == state.contentLayers.count else {
+            throw ProjectError.invalid("Keep at most 256 content layers with unique identities.")
+        }
+        let assets = Set(contentAssets.map(\.id))
+        for layer in state.contentLayers { try layer.validate(duration: duration, assets: assets) }
         guard state.boxConnectionsVersion == 1 else {
             throw ProjectError.invalid("This recording uses an unsupported box connection version.")
         }
@@ -1451,6 +1608,25 @@ final class ProjectEditor: ObservableObject {
     @discardableResult
     func commit(_ state: EditState, name: String) -> Bool {
         commitDocument(state: state, title: nil, name: name)
+    }
+
+    /// Adding an image and its layer is one saved edit. Immutable assets remain
+    /// available to every undo/redo state; no source image is written or linked.
+    @discardableResult
+    func addContentLayer(_ layer: ContentLayer, image: ContentImageAsset? = nil) -> Bool {
+        var candidate = project
+        candidate.state = editingState
+        if let image { candidate.contentAssets.append(image) }
+        candidate.state.contentLayers.append(layer)
+        do { try candidate.validate() }
+        catch { errorMessage = error.localizedDescription; return false }
+        guard finishDraft() else { return false }
+        var next = project
+        if let image { next.contentAssets.append(image) }
+        next.undoHistory.append(NamedEditSnapshot(name: "Add " + layer.kind.rawValue, state: project.state, title: project.title))
+        next.redoHistory.removeAll()
+        next.state.contentLayers.append(layer)
+        return persist(next, operation: ProjectHistoryOperation(kind: .edit, names: ["Add " + layer.kind.rawValue]))
     }
 
     /// One document transaction, including an optional title, on the normal
@@ -1745,6 +1921,11 @@ final class ProjectEditor: ObservableObject {
         for id in Set(oldAnchors.keys).union(newAnchors.keys) where oldAnchors[id] != newAnchors[id] {
             if let old = oldAnchors[id] { times.append(old.time) }
             if let new = newAnchors[id] { times.append(new.time) }
+        }
+        let oldLayers = Dictionary(uniqueKeysWithValues: previous.contentLayers.map { ($0.id, $0) })
+        let newLayers = Dictionary(uniqueKeysWithValues: next.contentLayers.map { ($0.id, $0) })
+        for id in Set(oldLayers.keys).union(newLayers.keys) where oldLayers[id] != newLayers[id] {
+            if let layer = newLayers[id] ?? oldLayers[id] { times.append(layer.start) }
         }
         historyNavigationTime = preferredTime ?? times.min()
         if historyNavigationTime != nil { historyNavigationToken = UUID() }

@@ -447,11 +447,100 @@ struct PresentationGeometry: Equatable, Sendable {
 
 /// Master controls apply to every original audio track, retaining their source
 /// offsets and relative levels. Requested fades survive later trim changes.
+enum RecordingAudioRole: String, Codable, CaseIterable, Hashable, Sendable {
+    case microphone, systemAudio
+    var title: String { self == .microphone ? "Microphone" : "System audio" }
+    var metadataIdentifier: String { "mdta/com.framethrower.audio.role" }
+}
+
+/// Explicit capture-written identity; track order never establishes a role.
+struct RecordingAudioSource: Codable, Equatable, Sendable {
+    var role: RecordingAudioRole
+    var identifier: String
+    init(role: RecordingAudioRole) { self.role = role; identifier = role.metadataIdentifier }
+    static func resolve(identifier: String?, value: String?, bindings: [RecordingAudioSource]) -> RecordingAudioRole? {
+        let matches = bindings.filter { $0.identifier == identifier && $0.role.rawValue == value }
+        return matches.count == 1 ? matches[0].role : nil
+    }
+}
+struct RecordingAudioGainPoint: Codable, Equatable, Sendable, Identifiable {
+    var id = UUID()
+    var time: Double
+    var gain: Double
+    var transition: PIPTransition = .smooth
+    var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
+}
+struct RecordingAudioChannel: Codable, Equatable, Sendable {
+    var role: RecordingAudioRole
+    var isMuted = false
+    var volume = 1.0
+    var points: [RecordingAudioGainPoint] = []
+
+    func envelopeGain(at time: Double) -> Double {
+        var gain = 1.0, previous = 0.0
+        for point in points {
+            if time >= point.time { gain = point.gain; previous = point.time; continue }
+            if point.transition == .smooth {
+                let progress = MotionInterpolation.progress(at: time, from: previous, to: point.time,
+                    duration: point.duration, transition: .smooth, easeIn: point.easeIn, easeOut: point.easeOut)
+                return gain + (point.gain - gain) * progress
+            }
+            return gain
+        }
+        return gain
+    }
+    func gain(at time: Double) -> Double { isMuted ? 0 : volume * envelopeGain(at: time) }
+    func validate(duration: Double) throws {
+        guard volume.isFinite, (0...1).contains(volume), points.count <= 4096,
+              Set(points.map(\.id)).count == points.count else { throw ProjectError.invalid("Audio levels must be 0–100%, with unique volume-change identities.") }
+        var previous = -Double.infinity
+        for point in points {
+            guard point.time.isFinite, point.time >= 0, point.time <= duration, point.time > previous,
+                  point.gain.isFinite, (0...1).contains(point.gain), point.duration.isFinite, point.duration > 0,
+                  [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                throw ProjectError.invalid("Volume changes need ordered source times, finite ramps and gains of 0–100%.")
+            }
+            previous = point.time
+        }
+    }
+}
+
 struct RecordingAudio: Codable, Equatable, Sendable {
     var isMuted = false
     var volume = 1.0
     var fadeIn = 0.0
     var fadeOut = 0.0
+    var channels: [RecordingAudioChannel] = []
+    private enum CodingKeys: String, CodingKey { case isMuted, volume, fadeIn, fadeOut, channels }
+    init(isMuted: Bool = false, volume: Double = 1, fadeIn: Double = 0, fadeOut: Double = 0,
+         channels: [RecordingAudioChannel] = []) {
+        self.isMuted = isMuted; self.volume = volume; self.fadeIn = fadeIn; self.fadeOut = fadeOut; self.channels = channels
+    }
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        isMuted = try c.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false
+        volume = try c.decodeIfPresent(Double.self, forKey: .volume) ?? 1
+        fadeIn = try c.decodeIfPresent(Double.self, forKey: .fadeIn) ?? 0
+        fadeOut = try c.decodeIfPresent(Double.self, forKey: .fadeOut) ?? 0
+        channels = try c.decodeIfPresent([RecordingAudioChannel].self, forKey: .channels) ?? []
+    }
+    func gain(role: RecordingAudioRole?, sourceTime: Double, outputTime: Double, outputDuration: Double) -> Double {
+        guard outputDuration > 0, outputTime >= 0, outputTime <= outputDuration else { return 0 }
+        let fades = effectiveFades(duration: outputDuration)
+        var gain = isMuted ? 0 : volume
+        if fades.fadeIn > 0 { gain *= min(1, max(0, outputTime / fades.fadeIn)) }
+        if fades.fadeOut > 0 { gain *= min(1, max(0, (outputDuration - outputTime) / fades.fadeOut)) }
+        if let role { gain *= channel(role).gain(at: sourceTime) }
+        return gain
+    }
+    func channel(_ role: RecordingAudioRole) -> RecordingAudioChannel { channels.first { $0.role == role } ?? .init(role: role) }
+    mutating func updateChannel(_ role: RecordingAudioRole, _ change: (inout RecordingAudioChannel) -> Void) {
+        var value = channel(role); change(&value)
+        channels.removeAll { $0.role == role }; channels.append(value)
+        channels.sort { $0.role.rawValue < $1.role.rawValue }
+    }
 
     static let maximumFade = 5.0
 
@@ -475,6 +564,42 @@ struct RecordingAudio: Codable, Equatable, Sendable {
         var volume: Double
     }
 
+    /// Adaptive linear projection for AV gain ramps. Quarter samples avoid
+    /// missing symmetric S-curves; duplicate-time points retain exact jumps.
+    static func sampledEnvelope(knots: [Double], gain: (Double) -> Double) -> [Point] {
+        let times = Set(knots.filter(\.isFinite)).sorted()
+        guard let first = times.first else { return [] }
+        var result = [Point(time: first, volume: gain(first))]
+        func append(_ a: Double, _ b: Double, _ ga: Double, _ gb: Double, depth: Int) {
+            let middle = a + (b - a) / 2, gm = gain(middle)
+            var error = 0.0
+            for fraction: Double in [0.25, 0.5, 0.75] {
+                let time = a + (b - a) * fraction
+                let linear = ga + (gb - ga) * fraction
+                error = max(error, abs(gain(time) - linear))
+            }
+            if error > 0.00005 && depth < 18 && middle > a && middle < b {
+                append(a, middle, ga, gm, depth: depth + 1); append(middle, b, gm, gb, depth: depth + 1)
+            } else { result.append(Point(time: b, volume: gb)) }
+        }
+        for (a, b) in zip(times, times.dropFirst()) {
+            append(a, b, gain(a), gain(max(a, b.nextDown)), depth: 0)
+            let actual = gain(b)
+            if actual != result.last!.volume { result.append(Point(time: b, volume: actual)) }
+        }
+        return result
+    }
+    func sourceKnots(role: RecordingAudioRole?) -> [Double] {
+        guard let role else { return [] }
+        var previous = 0.0, result: [Double] = []
+        for point in channel(role).points {
+            let start = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
+            let ramps = MotionInterpolation.rampDurations(duration: point.time - start, easeIn: point.easeIn, easeOut: point.easeOut)
+            result += [start, start + ramps.easeIn, point.time - ramps.easeOut, point.time]
+            previous = point.time
+        }
+        return result
+    }
     /// Linear gain points in source seconds, shared by playback and export.
     func envelope(trimStart: Double, trimEnd: Double) -> [Point] {
         guard trimStart.isFinite, trimEnd.isFinite, trimStart >= 0, trimEnd > trimStart else { return [] }
@@ -1377,13 +1502,14 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var redoHistory: [NamedEditSnapshot] = []
     var references = EditorReferences()
     var contentAssets: [ContentImageAsset] = []
+    var audioSources: [RecordingAudioSource] = []
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          sceneFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
          captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences(),
-         automationID: UUID? = UUID()) {
+         automationID: UUID? = UUID(), audioSources: [RecordingAudioSource] = []) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
@@ -1399,12 +1525,16 @@ struct RecordingProject: Codable, Equatable, Sendable {
         self.undoHistory = undoHistory
         self.redoHistory = redoHistory
         self.references = references
+        self.audioSources = audioSources
+        for source in audioSources where !self.state.audio.channels.contains(where: { $0.role == source.role }) {
+            self.state.audio.channels.append(.init(role: source.role))
+        }
         ensureReferences()
     }
 
     private enum CodingKeys: String, CodingKey {
         case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, automationID, cameraOffset,
-             captureFrameDuration, duration, state, undoHistory, redoHistory, references, contentAssets
+             captureFrameDuration, duration, state, undoHistory, redoHistory, references, contentAssets, audioSources
     }
 
     init(from decoder: any Decoder) throws {
@@ -1424,6 +1554,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         redoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .redoHistory) ?? []
         references = try values.decodeIfPresent(EditorReferences.self, forKey: .references) ?? EditorReferences()
         contentAssets = try values.decodeIfPresent([ContentImageAsset].self, forKey: .contentAssets) ?? []
+        audioSources = try values.decodeIfPresent([RecordingAudioSource].self, forKey: .audioSources) ?? []
         try references.validate()
         ensureReferences()
     }
@@ -1508,6 +1639,10 @@ struct RecordingProject: Codable, Equatable, Sendable {
         if let sceneFilename, [screenFilename, cameraFilename, cursorFilename].compactMap({ $0 }).contains(sceneFilename) {
             throw ProjectError.invalid("Scene metadata must use a separate source file.")
         }
+        guard Set(audioSources.map(\.role)).count == audioSources.count,
+              audioSources.allSatisfy({ $0.identifier == $0.role.metadataIdentifier }) else {
+            throw ProjectError.invalid("Audio source roles require unique explicit capture metadata bindings.")
+        }
         // Visual-only history commonly repeats the same timing. Compile each
         // distinct plan once per validation, without retaining global state or
         // skipping validation of any other snapshot properties.
@@ -1546,6 +1681,11 @@ struct RecordingProject: Codable, Equatable, Sendable {
             throw ProjectError.invalid("This recording uses an unsupported box connection version.")
         }
         try state.audio.validate()
+        guard Set(state.audio.channels.map(\.role)).count == state.audio.channels.count else { throw ProjectError.invalid("Audio roles must be unique.") }
+        for channel in state.audio.channels {
+            guard audioSources.contains(where: { $0.role == channel.role }) else { throw ProjectError.invalid("This recording has no identified \(channel.role.title.lowercased()) track.") }
+            try channel.validate(duration: duration)
+        }
         let timing = TimingSignature(trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts, speed: state.speedKeyframes)
         if !timingPlans.contains(timing) {
             _ = try RecordingTimeMap(duration: duration, trimStart: state.trimStart, trimEnd: state.trimEnd, cuts: state.cuts,

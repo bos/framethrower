@@ -673,6 +673,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             "scope": ["screen", "camera", "speed", "layers"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
+        if component == "audio" { result["audio_sources"] = try editor.project.audioSources.map { try EditorAutomationAPI.object($0) } }
         return result
     }
 

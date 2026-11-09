@@ -96,6 +96,12 @@ final class ScreenMasterWriter: @unchecked Sendable {
         for track in [Track.systemAudio, .microphone] where audioTracks.contains(track) {
             let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: RecordingQuality.masterAudioSettings)
             audio.expectsMediaDataInRealTime = true
+            let role: RecordingAudioRole = track == .microphone ? .microphone : .systemAudio
+            let metadata = AVMutableMetadataItem()
+            metadata.identifier = AVMetadataIdentifier(rawValue: role.metadataIdentifier)
+            metadata.value = role.rawValue as NSString
+            metadata.dataType = kCMMetadataBaseDataType_UTF8 as String
+            audio.metadata = [metadata]
             guard writer.canAdd(audio) else { throw MasterRecordingError.unsupportedFormat }
             writer.add(audio)
             configured[track] = audio

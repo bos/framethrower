@@ -108,6 +108,9 @@ enum EditorHistoryInspector {
                 details.append("Pointer: \(state.cursorStyle.visible ? "visible" : "hidden"), size \(seconds(state.cursorStyle.size)), smoothing \(seconds(state.cursorStyle.smoothing)), clicks \(state.cursorStyle.clickHighlight ? "on" : "off").")
             case "audio":
                 details.append("Audio: \(state.audio.isMuted ? "muted" : "unmuted"), volume \(seconds(state.audio.volume)), fades \(seconds(state.audio.fadeIn))/\(seconds(state.audio.fadeOut))s.")
+                for channel in state.audio.channels where channel != other.state.audio.channel(channel.role) {
+                    details.append("\(channel.role.title): \(channel.isMuted ? "muted" : "unmuted"), level \(seconds(channel.volume)), \(channel.points.count) volume changes.")
+                }
             case "trim": details.append("Trim: \(seconds(state.trimStart))–\(seconds(state.trimEnd))s.")
             case "speed":
                 let changed = state.speedKeyframes.filter { !other.state.speedKeyframes.contains($0) }

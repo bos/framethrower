@@ -1150,7 +1150,7 @@ final class CaptureViewModel: ObservableObject {
             var project = RecordingProject(screenFilename: outputURL.lastPathComponent,
                 cameraFilename: cameraFilename, cursorFilename: cursorFilename, sceneFilename: sceneURL?.lastPathComponent,
                 cameraOffset: cameraFilename == nil ? 0 : activeCameraOffset + firstFrameTime, duration: duration,
-                title: activeRecordingTitle, captureFrameDuration: 1.0 / 60)
+                title: activeRecordingTitle, captureFrameDuration: 1.0 / 60, audioSources: recorder.recordedAudioSources)
             project.state.pipKeyframes[0].placement = initialCameraPlacement
             let url = outputURL.deletingPathExtension().appendingPathExtension("framethrower")
             let editor = ProjectEditor(project: project, url: url)

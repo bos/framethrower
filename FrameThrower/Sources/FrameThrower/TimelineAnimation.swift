@@ -1,7 +1,7 @@
 import Foundation
 
 enum TimelineAnimationLane: String, CaseIterable, Hashable, Sendable {
-    case screen, camera, speed, pointer
+    case screen, camera, speed, pointer, audioMicrophone, audioSystem
 }
 
 struct TimelineAnimationID: Hashable, Sendable {
@@ -20,6 +20,8 @@ struct TimelineAnimation: Identifiable, Equatable, Sendable {
     var help: String
     var editable: Bool
     var isReference: Bool = false
+    var gainStart: Double? = nil
+    var gainEnd: Double? = nil
 
     var lane: TimelineAnimationLane { id.lane }
     var componentID: UUID { id.componentID }

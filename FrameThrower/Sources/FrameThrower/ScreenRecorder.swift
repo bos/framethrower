@@ -12,6 +12,8 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     private var stream: SCStream?
     private var recordingOutput: SCRecordingOutput?
     private var masterWriter: ScreenMasterWriter?
+    private var capturedAudioSources: [RecordingAudioSource] = []
+    var recordedAudioSources: [RecordingAudioSource] { callbackQueue.sync { capturedAudioSources } }
     private var isMasterStopping = false
     private var lifecycle = ScreenRecordingState()
     private var startContinuation: CheckedContinuation<Double, any Error>?
@@ -57,6 +59,11 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
         try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: callbackQueue)
         let output: SCRecordingOutput?
         let master: ScreenMasterWriter?
+        callbackQueue.sync {
+            capturedAudioSources = quality == .highQuality
+                ? [configuration.captureMicrophone ? RecordingAudioSource(role: .microphone) : nil,
+                   configuration.capturesAudio ? RecordingAudioSource(role: .systemAudio) : nil].compactMap { $0 } : []
+        }
         if quality == .highQuality {
             var audioTracks = Set<ScreenMasterWriter.Track>()
             if configuration.capturesAudio { audioTracks.insert(.systemAudio) }

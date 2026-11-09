@@ -269,6 +269,25 @@ profile as the screen and camera playback, including clipped transitions.
 with steady holds and returns to the wider context. Suggestions are ordinary
 editable changes and applying them is one undo step.
 
+The **Audio** inspector keeps master mute, volume and opening/closing fades.
+New high-quality PCM recordings identify microphone and system audio separately;
+each has an independent mute, overall level and source-timed volume envelope.
+Choose **Track** and adjust **Volume at playhead** to create or update a change
+at the source playhead. Selecting an audio mark changes that mark without seeking.
+**Track level** applies throughout the recording; timed volume is applied afterward.
+Choose **Jump** or **Smooth**, with the same duration and timeline easing controls
+as other animations. The track's timeline span uses the same
+move, resize and easing handles as other animations; Escape cancels the gesture
+and each completed gesture is one Undo step. Envelope values multiply the overall
+track level. Cuts and crossfades evaluate each branch at its original source time,
+while master fades follow kept output time. Restoring trim restores hidden changes.
+
+Older or compact recordings without explicit track identity remain labelled
+combined/unidentified and retain master controls. Track order is never used to guess
+which audio is the microphone. Director/MCP exposes `audioTrack`, `audioGain` and
+`removeAudioGain` through the ordinary typed edit batch; unavailable roles reject.
+The audio rendering changes are compile-checked only while the media interlock is on.
+
 For new recordings, **Pointer** changes pointer size, smoothing, visibility, and
 click highlights after capture. Smoothing keeps click targets exact and preserves
 held-button paths when dragging or drawing. Older recordings retain their baked-in

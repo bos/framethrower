@@ -1,5 +1,14 @@
 import Foundation
 
+extension RecordingAudioRole {
+    var lane: TimelineAnimationLane { self == .microphone ? .audioMicrophone : .audioSystem }
+}
+extension TimelineAnimationLane {
+    var audioRole: RecordingAudioRole? {
+        switch self { case .audioMicrophone: .microphone; case .audioSystem: .systemAudio; default: nil }
+    }
+}
+
 struct EditorAnimationIdentityAlias: Equatable, Sendable {
     var originalID: UUID
     var replacementID: UUID
@@ -67,6 +76,24 @@ enum EditorAnimationEditing {
                 label: description.shortLabel + String(format: " · %.2g×", point.rate), help: help, editable: true))
             previous = point.time
         }
+        for channel in state.audio.channels {
+            var previous = 0.0, gain = 1.0
+            if channel.points.isEmpty {
+                let id = UUID(uuidString: channel.role == .microphone ? "9F0A4A52-9702-468A-94CE-000000000004" : "9F0A4A52-9702-468A-94CE-000000000005")!
+                result.append(TimelineAnimation(id: .init(lane: channel.role.lane, componentID: id), editID: id,
+                    start: 0, end: duration, easeIn: 0, easeOut: 0, label: channel.role.title,
+                    help: "Select to change \(channel.role.title.lowercased()) level or add a source-timed volume change.", editable: false,
+                    gainStart: 1, gainEnd: 1))
+            }
+            for point in channel.points {
+                var span = animation(id: point.id, editID: point.id, lane: channel.role.lane, end: point.time,
+                    previous: previous, transition: point.transition, duration: point.duration,
+                    easeIn: point.easeIn, easeOut: point.easeOut, label: String(format: "%.0f%%", point.gain * 100),
+                    help: String(format: "\(channel.role.title) envelope to %.0f%% at %.3f s. Source time; multiplied by the track level.", point.gain * 100, point.time), editable: true)
+                span.gainStart = gain; span.gainEnd = point.gain
+                result.append(span); previous = point.time; gain = point.gain
+            }
+        }
         for anchor in state.editAnchors {
             let attachedScreen = state.zoomKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
             let attachedCamera = state.pipKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
@@ -109,6 +136,17 @@ enum EditorAnimationEditing {
                 guard change.isInstant, change.easeIn == 0, change.easeOut == 0,
                       let index = result.editAnchors.firstIndex(where: { $0.id == change.componentID }) else { return nil }
                 result.editAnchors[index].time = change.end
+                continue
+            }
+            if let role = change.lane.audioRole {
+                var channel = result.audio.channel(role)
+                guard let index = channel.points.firstIndex(where: { $0.id == change.componentID }) else { return nil }
+                channel.points[index].time = change.end
+                if !change.isInstant { channel.points[index].duration = change.duration }
+                channel.points[index].transition = change.isInstant ? .jump : .smooth
+                channel.points[index].easeIn = change.easeIn; channel.points[index].easeOut = change.easeOut
+                channel.points.sort { $0.time < $1.time }
+                result.audio.updateChannel(role) { $0 = channel }
                 continue
             }
             var newID = change.componentID
@@ -164,7 +202,7 @@ enum EditorAnimationEditing {
                     if change.easeIn != original.easeIn { result.speedKeyframes[index].easeIn = change.easeIn }
                     if change.easeOut != original.easeOut { result.speedKeyframes[index].easeOut = change.easeOut }
                 }
-            case .pointer: return nil
+            case .pointer, .audioMicrophone, .audioSystem: return nil
             }
         }
         result.zoomKeyframes.sort { $0.time < $1.time }
@@ -201,6 +239,15 @@ enum EditorAnimationEditing {
                     result.speedKeyframes[index].transition = original.isInstant ? .jump : .smooth
                     result.speedKeyframes[index].easeIn = original.easeIn
                     result.speedKeyframes[index].easeOut = original.easeOut
+                case .audioMicrophone, .audioSystem:
+                    guard let role = original.lane.audioRole else { return nil }
+                    result.audio.updateChannel(role) { channel in
+                        if let index = channel.points.firstIndex(where: { $0.id == original.componentID }) {
+                            if !original.isInstant { channel.points[index].duration = original.duration }
+                            channel.points[index].transition = original.isInstant ? .jump : .smooth
+                            channel.points[index].easeIn = original.easeIn; channel.points[index].easeOut = original.easeOut
+                        }
+                    }
                 case .pointer: break
                 }
             }

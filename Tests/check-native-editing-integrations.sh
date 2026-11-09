@@ -17,7 +17,7 @@ production = list(dict.fromkeys(values['production'] + [
 suites = values['suites'] + ['EditorAutomationChecks','NativeAutomationConflictChecks','EditorComponentInspectionChecks',
     'RecordingTimeMapChecks','EditorMutationChecks','EditorCutMutationChecks','EditorCutPlaybackChecks',
     'EditorPreviewCommandChecks','EditorSimulationChecks','CutTimelineChecks',
-    'RecordingSpeedTimeMapChecks','EditorSpeedPlaybackChecks','EditorSpeedEditingChecks','RecordingAudioMixChecks']
+    'RecordingSpeedTimeMapChecks','EditorSpeedPlaybackChecks','EditorSpeedEditingChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks']
 live = 'NativeDirectorLiveChecks'
 paths = [source/(name+'.swift') for name in production] + [root/'Tests'/(name+'.swift') for name in suites+[live]]
 override = os.environ.get('FRAMETHROWER_TEST_SOURCE_SNAPSHOT')
@@ -40,7 +40,7 @@ if not binary.exists():
         text=data.decode(); assert text.count('@main')==1,name
         path=folder/(name+'.swift'); path.write_text(text.replace('@main','',1)); tests.append(path)
     calls='\n'.join('if selected.isEmpty || selected.contains("'+name+'") { try '+
-        ('' if name in ('EditorAutomationPlannerChecks','EditorMutationChecks','RecordingTimeMapChecks','EditorCutMutationChecks','CutTimelineChecks','RecordingSpeedTimeMapChecks','RecordingAudioMixChecks') else 'await ')+name+
+        ('' if name in ('EditorAutomationPlannerChecks','EditorMutationChecks','RecordingTimeMapChecks','EditorCutMutationChecks','CutTimelineChecks','RecordingSpeedTimeMapChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks') else 'await ')+name+
         ('.run()' if name=='DirectorInspectionSessionChecks' else '.main()')+' }' for name in suites)
     entry=folder/'IntegrationMain.swift'
     entry.write_text('import Foundation\nimport Darwin\n@main @MainActor struct NativeEditingMain { static func main() async { let selected=Set(CommandLine.arguments.dropFirst()); do {\n'+

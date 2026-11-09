@@ -30,6 +30,10 @@ struct ProjectEditorView: View {
     @State private var selectedEditID: UUID?
     @State private var presentationDraft: CanvasPresentation?
     @State private var audioGestureTime: Double?
+    @State private var audioRole: RecordingAudioRole = .microphone
+    @State private var audioVolumeGesture: AudioVolumeGesture?
+    @State private var audioTransition: PIPTransition = .smooth
+    @State private var audioDuration = 0.4
     @State private var timelineFitRequest: UUID?
     @State private var timelineTimeBase: EditorCutTimeBase = .output
     @State private var cutSelection: ClosedRange<Double>?
@@ -86,6 +90,7 @@ struct ProjectEditorView: View {
         case .camera: return state.pipKeyframes.first { $0.id == id }?.time
         case .speed: return state.speedKeyframes.first { $0.id == id }?.time
         case .pointer: return nil
+        case .audioMicrophone, .audioSystem: return selectedAnimationID.lane.audioRole.flatMap { role in state.audio.channel(role).points.first { $0.id == id }?.time }
         }
     }
     private var point: PIPKeyframe? { state.pipKeyframes.first { abs($0.time - editTime) < 0.000001 } }
@@ -94,6 +99,11 @@ struct ProjectEditorView: View {
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
     private var speedPoint: RecordingSpeedKeyframe? { state.speedKeyframes.first { abs($0.time - editTime) < 0.000001 } }
     private var frameDuration: Double { playback.frameDuration }
+    private struct AudioVolumeGesture {
+        let state: EditState
+        let role: RecordingAudioRole
+        let point: RecordingAudioGainPoint
+    }
     private struct AnimationGestureSnapshot {
         let id: TimelineAnimationID
         let state: EditState
@@ -771,7 +781,7 @@ struct ProjectEditorView: View {
                 }, onCutRange: { cutSelectedSection() },
                 onRestoreCut: { applyCutMutation(.restoreCut(cutID: $0), name: "Restore section") },
                 onCutAnchor: { cutPopoverAnchor = $0 }, sourceEnvelopes: outputProjection?.envelopes ?? [:], speedCurves: speedCurves)
-                .frame(height: RecordingTimeline.clipLaneHeight)
+                .frame(height: RecordingTimeline.clipLaneHeight + CGFloat(editor.project.audioSources.count * 30))
                 .popover(isPresented: Binding(get: { selectedCutID != nil }, set: { if !$0 { selectedCutID = nil } }),
                     attachmentAnchor: .point(cutPopoverAnchor)) { cutControls }
                 .contextMenu {
@@ -918,7 +928,7 @@ struct ProjectEditorView: View {
             }
             // Tool tabs, playback values, and edit selection share one allocation.
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .frame(height: 100, alignment: .top)
+            .frame(height: editor.project.audioSources.isEmpty ? 100 : 190, alignment: .top)
         }
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)
@@ -1007,24 +1017,24 @@ struct ProjectEditorView: View {
     }
 
     private var audioControls: some View {
-        let fades = state.audio.effectiveFades(duration: state.trimEnd - state.trimStart)
-        return VStack(alignment: .leading, spacing: 12) {
+        let fades = state.audio.effectiveFades(duration: timelineMap?.outputDuration ?? (state.trimEnd - state.trimStart))
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 Toggle("Mute", isOn: Binding(get: { state.audio.isMuted }, set: { muted in
                     commitAudio(name: muted ? "Mute recording" : "Unmute recording") { $0.isMuted = muted }
                 }))
                     .toggleStyle(.checkbox)
                     .help("Mute all recorded audio. The original tracks and volume setting are preserved.")
-                CommitSlider(title: "Volume", value: state.audio.volume * 100, range: 0...100, valueSuffix: "%", valueFormat: "%.0f",
+                CommitSlider(title: "Master volume", value: state.audio.volume * 100, range: 0...100, valueSuffix: "%", valueFormat: "%.0f",
                     begin: beginAudioGesture,
                     preview: { value in previewAudio { $0.volume = value / 100 } }) { value in
                         finishAudioGesture(name: "Change recording volume") { $0.volume = value / 100 }
                     }
                     .frame(width: 285)
                     .help("Adjust every recorded audio track together, keeping their relative levels.")
-                Button("Reset audio") { commitAudio(name: "Reset recording audio") { $0 = RecordingAudio() } }
-                    .disabled(state.audio == RecordingAudio())
-                    .help("Restore full volume, unmute, and remove both fades.")
+                Button("Reset audio") { commitAudio(name: "Reset recording audio") { $0 = RecordingAudio(channels: editor.project.audioSources.map { .init(role: $0.role) }) } }
+                    .disabled(state.audio == RecordingAudio(channels: editor.project.audioSources.map { .init(role: $0.role) }))
+                    .help("Restore master and track levels, unmute, and remove fades and timed volume changes.")
                 Spacer(minLength: 0)
             }.frame(height: 24)
             HStack(spacing: 16) {
@@ -1044,11 +1054,108 @@ struct ProjectEditorView: View {
                     .help("Fade to silence at the kept trim end. Restoring a longer trim restores the requested fade lengths.")
                 Spacer(minLength: 0)
             }.frame(height: 24)
+            if !editor.project.audioSources.isEmpty { audioTrackControls; audioEnvelopeControls }
+            else if abs(fades.fadeIn - state.audio.fadeIn) < 0.000001 && abs(fades.fadeOut - state.audio.fadeOut) < 0.000001 { Text("Combined or unidentified audio").font(.caption).foregroundStyle(.secondary)
+                .help("The recording has no explicit microphone/system track identities. Master controls apply to all original tracks.") }
             if abs(fades.fadeIn - state.audio.fadeIn) > 0.000001 || abs(fades.fadeOut - state.audio.fadeOut) > 0.000001 {
-                Text("Fades in kept trim: \(fades.fadeIn, specifier: "%.2f") s in, \(fades.fadeOut, specifier: "%.2f") s out")
+                Text("Fades in kept output: \(fades.fadeIn, specifier: "%.2f") s in, \(fades.fadeOut, specifier: "%.2f") s out")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var activeAudioRole: RecordingAudioRole {
+        editor.project.audioSources.contains(where: { $0.role == audioRole }) ? audioRole : editor.project.audioSources.first?.role ?? .microphone
+    }
+    private var selectedAudioPoint: RecordingAudioGainPoint? {
+        guard let id = selectedAnimationID, id.lane.audioRole == activeAudioRole else { return nil }
+        return state.audio.channel(activeAudioRole).points.first { $0.id == id.componentID }
+    }
+    private var audioTrackControls: some View {
+        let role = activeAudioRole
+        return HStack(spacing: 12) {
+            Picker("Track", selection: Binding(get: { role }, set: { value in
+                guard editor.finishDraft() else { return }
+                audioVolumeGesture = nil; audioRole = value; selectedAnimationID = nil; selectedEditID = nil
+            })) {
+                ForEach(editor.project.audioSources, id: \.role) { source in Text(source.role.title).tag(source.role) }
+            }.frame(width: 190).help("Choose the recorded audio track to change. Other tracks are preserved.")
+            Toggle("Mute track", isOn: Binding(get: { state.audio.channel(role).isMuted }, set: { muted in
+                commitAudio(name: muted ? "Mute \(role.title)" : "Unmute \(role.title)") { audio in audio.updateChannel(role) { $0.isMuted = muted } }
+            })).toggleStyle(.checkbox)
+            CommitSlider(title: "Track level", value: state.audio.channel(role).volume * 100, range: 0...100,
+                valueSuffix: "%", valueFormat: "%.0f", begin: beginAudioGesture,
+                preview: { value in previewAudio { audio in audio.updateChannel(role) { $0.volume = value / 100 } } }) { value in
+                    finishAudioGesture(name: "Change \(role.title) level") { audio in audio.updateChannel(role) { $0.volume = value / 100 } }
+                }.frame(width: 250).help("Overall level for this track throughout the recording. Timed volume changes are applied after this level.")
+            Spacer(minLength: 0)
+        }.frame(height: 24)
+    }
+    private var audioEnvelopeControls: some View {
+        let role = activeAudioRole, point = selectedAudioPoint
+        let mode = point?.transition ?? audioTransition
+        let value = point?.gain ?? state.audio.channel(role).envelopeGain(at: playback.editingTime)
+        return HStack(spacing: 12) {
+            CommitSlider(title: point == nil ? "Volume at playhead" : "Volume at selection", value: value * 100, range: 0...100,
+                valueSuffix: "%", valueFormat: "%.0f", begin: beginAudioVolumeGesture,
+                preview: { value in setAudioVolume(value / 100, final: false) }) { value in
+                    setAudioVolume(value / 100, final: true)
+                }.frame(width: 310)
+                .help(point == nil ? "Changing this value creates or updates a volume change arriving at the source playhead. 100% leaves Track level unchanged."
+                    : "Changes the selected volume mark without moving the playhead. 100% leaves Track level unchanged.")
+                .disabled(isBlendedCanvas && point == nil)
+            Picker("Movement", selection: Binding(get: { mode }, set: { value in
+                audioTransition = value
+                updateAudioTiming { $0.transition = value }
+            })) { Text("Jump").tag(PIPTransition.jump); Text("Smooth").tag(PIPTransition.smooth) }
+                .frame(width: 160).help("Jump changes volume at arrival. Smooth uses the duration and timeline ramps.")
+            if mode == .smooth {
+                Text("Duration").font(.caption)
+                MotionDurationField(value: point?.duration ?? audioDuration, maximum: max(editor.project.duration, point?.duration ?? audioDuration), change: { value in
+                    audioDuration = value; updateAudioTiming { $0.duration = value }
+                }, cancel: { cancelDraft() }).frame(width: 64, height: 24)
+                Text("s").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }.frame(height: 24)
+    }
+    private func beginAudioVolumeGesture() {
+        leaveConflictForManualEdit(); assistant.cancel(); playback.pause()
+        guard editor.finishDraft() else { audioVolumeGesture = nil; return }
+        let role = activeAudioRole, channel = editor.project.state.audio.channel(activeAudioRole)
+        let selected = selectedAudioPoint
+        let time = selected?.time ?? playback.editingTime
+        let existing = selected ?? channel.points.first { abs($0.time - time) < 0.000001 }
+        let point = existing ?? RecordingAudioGainPoint(time: time, gain: channel.envelopeGain(at: time),
+            transition: time == 0 ? .jump : audioTransition, duration: audioDuration)
+        audioVolumeGesture = AudioVolumeGesture(state: editor.project.state, role: role, point: point)
+    }
+    private func setAudioVolume(_ gain: Double, final: Bool) {
+        guard let gesture = audioVolumeGesture else { return }
+        if abs(gain - gesture.point.gain) < 0.000000001 {
+            if editor.draftState != nil { _ = editor.cancelDraft() }
+            if final { audioVolumeGesture = nil }
+            return
+        }
+        var next = gesture.state, point = gesture.point
+        point.gain = gain
+        next.audio.updateChannel(gesture.role) { channel in
+            channel.points.removeAll { $0.id == point.id }; channel.points.append(point); channel.points.sort { $0.time < $1.time }
+        }
+        guard editor.updateDraft(next, at: point.time) else { return }
+        if final, editor.finishDraft(name: "Change \(gesture.role.title) timed volume") {
+            selectedAnimationID = .init(lane: gesture.role.lane, componentID: point.id)
+            audioVolumeGesture = nil
+        }
+    }
+    private func updateAudioTiming(_ change: (inout RecordingAudioGainPoint) -> Void) {
+        guard let selected = selectedAudioPoint else { return }
+        assistant.cancel(); playback.pause()
+        var next = state
+        next.audio.updateChannel(activeAudioRole) { channel in
+            if let index = channel.points.firstIndex(where: { $0.id == selected.id }) { change(&channel.points[index]) }
+        }
+        _ = editor.updateDraft(next, at: selected.time)
     }
 
     private func beginAudioGesture() {
@@ -1169,6 +1276,14 @@ struct ProjectEditorView: View {
     }
 
     private func synchronizeAnimationSelection() {
+        if selectedInspector == .audio {
+            if let id = selectedAnimationID, let role = id.lane.audioRole,
+               timelineAnimations.contains(where: { $0.id == id }) {
+                audioRole = role
+            } else { selectedAnimationID = nil }
+            selectedEditID = nil
+            return
+        }
         if selectedInspector == .pointer {
             selectedAnimationID = timelineAnimations.first(where: { $0.lane == .pointer })?.id
         } else if let edit = selectedEdit {
@@ -1195,6 +1310,7 @@ struct ProjectEditorView: View {
         guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id }) else { return }
         selectedAnimationID = id
         if id.lane == .pointer { selectedInspector = .pointer; selectedEditID = nil; return }
+        if let role = id.lane.audioRole { selectedInspector = .audio; audioRole = role; selectedEditID = nil; return }
         selectedEditID = edits.first(where: { edit in
             span.isReference ? edit.anchorID == id.componentID : id.lane == .screen ? edit.zoomID == id.componentID :
                 id.lane == .speed ? edit.speedID == id.componentID : edit.cameraID == id.componentID
@@ -1228,7 +1344,8 @@ struct ProjectEditorView: View {
             original.isReference ? value.anchorID == component : request.id.lane == .screen ? value.zoomID == component :
                 request.id.lane == .speed ? value.speedID == component : value.cameraID == component
         })?.id
-        selectedInspector = request.id.lane == .camera ? .camera : request.id.lane == .speed ? .speed : .zoom
+        selectedInspector = request.id.lane.audioRole != nil ? .audio : request.id.lane == .camera ? .camera : request.id.lane == .speed ? .speed : .zoom
+        if let role = request.id.lane.audioRole { audioRole = role; selectedEditID = nil }
         selectedAnimationID = request.id
         let current = changes.first(where: { $0.id == request.id }) ?? original
         let position = request.handle == .start ? current.start : current.end
@@ -1257,6 +1374,7 @@ struct ProjectEditorView: View {
         guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id && $0.editable }) else { return }
         var next = state
         if span.isReference { next.editAnchors.removeAll { $0.id == id.componentID } }
+        else if let role = id.lane.audioRole { next.audio.updateChannel(role) { $0.points.removeAll { $0.id == id.componentID } } }
         else {
             do { try EditorMutation.removeAnimation(animationID: "\(id.lane.rawValue):\(id.componentID.uuidString)").apply(to: &next, project: editor.project) }
             catch { timelineError = error.localizedDescription; return }
@@ -1310,6 +1428,7 @@ struct ProjectEditorView: View {
     private func cancelDraft() {
         presentationDraft = nil
         audioGestureTime = nil
+        audioVolumeGesture = nil
         _ = editor.cancelDraft()
         selectedEditID = nil
         playback.cancelPreview()

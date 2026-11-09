@@ -168,6 +168,17 @@ struct EditorAudioPatch: Codable, Equatable, Sendable {
     var isEmpty: Bool { isMuted == nil && volume == nil && fadeIn == nil && fadeOut == nil }
 }
 
+struct EditorAudioTrackPatch: Codable, Equatable, Sendable {
+    var isMuted: Bool? = nil
+    var volume: Double? = nil
+    init(isMuted: Bool? = nil, volume: Double? = nil) { self.isMuted = isMuted; self.volume = volume }
+    private enum CodingKeys: String, CodingKey, CaseIterable { case isMuted, volume }
+    init(from decoder: any Decoder) throws {
+        let c = try mutationContainer(CodingKeys.self, decoder)
+        isMuted = try c.optional(Bool.self, .isMuted); volume = try c.optional(Double.self, .volume)
+    }
+}
+
 struct EditorCanvasPatch: Codable, Equatable, Sendable {
     var aspect: CanvasAspect? = nil
     var padding: Double? = nil
@@ -241,6 +252,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
     case cameraSource(EditorCameraSourcePatch, timing: EditorMutationTiming)
     case pointer(EditorPointerPatch)
     case audio(EditorAudioPatch)
+    case audioTrack(role: RecordingAudioRole, patch: EditorAudioTrackPatch)
+    case audioGain(role: RecordingAudioRole, gain: Double, timing: EditorMutationTiming, id: UUID? = nil)
+    case removeAudioGain(role: RecordingAudioRole, pointID: UUID)
     case canvas(EditorCanvasPatch)
     case trim(start: Double, end: Double)
     case cutSection(start: Double, end: Double, timeBase: EditorCutTimeBase, crossfade: Double? = nil)
@@ -255,7 +269,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end,
-             timeBase, crossfade, cutID, duration, layer, layerID, index, rate, preservesPitch, animationID
+             timeBase, crossfade, cutID, duration, layer, layerID, index, rate, preservesPitch, animationID, role, gain, id, pointID
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
@@ -279,6 +293,12 @@ enum EditorMutation: Codable, Equatable, Sendable {
             try c.only([.operation, .patch, .timing]); self = .cameraSource(try c.decode(EditorCameraSourcePatch.self, forKey: .patch), timing: try c.decode(EditorMutationTiming.self, forKey: .timing))
         case "pointer": try c.only([.operation, .patch]); self = .pointer(try c.decode(EditorPointerPatch.self, forKey: .patch))
         case "audio": try c.only([.operation, .patch]); self = .audio(try c.decode(EditorAudioPatch.self, forKey: .patch))
+        case "audioTrack":
+            try c.only([.operation, .role, .patch]); self = .audioTrack(role: try c.decode(RecordingAudioRole.self, forKey: .role), patch: try c.decode(EditorAudioTrackPatch.self, forKey: .patch))
+        case "audioGain":
+            try c.only([.operation, .role, .gain, .timing, .id]); self = .audioGain(role: try c.decode(RecordingAudioRole.self, forKey: .role), gain: try c.decode(Double.self, forKey: .gain), timing: try c.decode(EditorMutationTiming.self, forKey: .timing), id: try c.optional(UUID.self, .id))
+        case "removeAudioGain":
+            try c.only([.operation, .role, .pointID]); self = .removeAudioGain(role: try c.decode(RecordingAudioRole.self, forKey: .role), pointID: try c.decode(UUID.self, forKey: .pointID))
         case "canvas": try c.only([.operation, .patch]); self = .canvas(try c.decode(EditorCanvasPatch.self, forKey: .patch))
         case "trim": try c.only([.operation, .start, .end]); self = .trim(start: try c.decode(Double.self, forKey: .start), end: try c.decode(Double.self, forKey: .end))
         case "cutSection":
@@ -328,6 +348,12 @@ enum EditorMutation: Codable, Equatable, Sendable {
             try c.encode("cameraSource", forKey: .operation); try c.encode(patch, forKey: .patch); try c.encode(timing, forKey: .timing)
         case let .pointer(patch): try c.encode("pointer", forKey: .operation); try c.encode(patch, forKey: .patch)
         case let .audio(patch): try c.encode("audio", forKey: .operation); try c.encode(patch, forKey: .patch)
+        case let .audioTrack(role, patch):
+            try c.encode("audioTrack", forKey: .operation); try c.encode(role, forKey: .role); try c.encode(patch, forKey: .patch)
+        case let .audioGain(role, gain, timing, id):
+            try c.encode("audioGain", forKey: .operation); try c.encode(role, forKey: .role); try c.encode(gain, forKey: .gain); try c.encode(timing, forKey: .timing); try c.encodeIfPresent(id, forKey: .id)
+        case let .removeAudioGain(role, id):
+            try c.encode("removeAudioGain", forKey: .operation); try c.encode(role, forKey: .role); try c.encode(id, forKey: .pointID)
         case let .canvas(patch): try c.encode("canvas", forKey: .operation); try c.encode(patch, forKey: .patch)
         case let .trim(start, end): try c.encode("trim", forKey: .operation); try c.encode(start, forKey: .start); try c.encode(end, forKey: .end)
         case let .cutSection(start, end, timeBase, crossfade):
@@ -352,7 +378,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
     var timing: EditorMutationTiming? {
         switch self {
         case let .panScreen(_, value), let .zoomScreen(_, _, value), let .alignScreen(_, _, _, _, _, value),
-             let .cameraOverlay(_, value), let .alignCameraOverlay(_, _, _, _, value), let .cameraSource(_, value): value
+             let .cameraOverlay(_, value), let .alignCameraOverlay(_, _, _, _, value), let .cameraSource(_, value), let .audioGain(_, _, value, _): value
         case let .speed(_, value, base, _): base == .source ? value : nil
         default: nil
         }
@@ -362,12 +388,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case .panScreen, .zoomScreen, .alignScreen: .screen
         case .cameraOverlay, .alignCameraOverlay, .cameraSource: .camera
         case .pointer: .pointer
-        case .audio: .audio
+        case .audio, .audioTrack, .audioGain, .removeAudioGain: .audio
         case .canvas: .canvas
         case .trim: .trim
         case .cutSection, .restoreCut, .cutTransition: .timing
         case .speed: .speed
-        case let .removeAnimation(id): EditorMutationLane(rawValue: String(id.split(separator: ":").first ?? "")) ?? .timing
+        case let .removeAnimation(id):
+            id.hasPrefix("audioMicrophone:") || id.hasPrefix("audioSystem:") ? .audio :
+                EditorMutationLane(rawValue: String(id.split(separator: ":").first ?? "")) ?? .timing
         case .addContentLayer, .updateContentLayer, .removeContentLayer, .reorderContentLayer: .content
         }
     }
@@ -502,6 +530,34 @@ enum EditorMutation: Codable, Equatable, Sendable {
             if let value = patch.size { state.cursorStyle.size = value }
             if let value = patch.smoothing { state.cursorStyle.smoothing = value }
             if let value = patch.clickHighlight { state.cursorStyle.clickHighlight = value }
+        case let .audioTrack(role, patch):
+            guard project.audioSources.contains(where: { $0.role == role }) else { throw EditorMutationError.invalid("This recording has no identified \(role.title.lowercased()) track.") }
+            guard patch.isMuted != nil || patch.volume != nil else { throw EditorMutationError.invalid("Supply a track mute or volume value.") }
+            state.audio.updateChannel(role) { channel in
+                if let value = patch.isMuted { channel.isMuted = value }
+                if let value = patch.volume { channel.volume = value }
+            }
+        case let .audioGain(role, gain, timing, id):
+            guard project.audioSources.contains(where: { $0.role == role }) else { throw EditorMutationError.invalid("This recording has no identified \(role.title.lowercased()) track.") }
+            var channel = state.audio.channel(role)
+            if let id, !channel.points.contains(where: { $0.id == id }) { throw EditorMutationError.invalid("The volume change no longer exists.") }
+            var previous = 0.0
+            for point in channel.points {
+                let beginning = point.transition == .smooth ? max(previous, point.time - point.duration) : point.time
+                if point.id != id && point.time > timing.start && beginning < timing.end {
+                    throw EditorMutationError.invalid("This volume change overlaps another change on the same audio track.")
+                }
+                if point.id != id && abs(point.time - timing.end) < 0.000001 { throw EditorMutationError.invalid("Another volume change already arrives at that source time.") }
+                previous = point.time
+            }
+            let point = RecordingAudioGainPoint(id: id ?? UUID(), time: timing.end, gain: gain,
+                transition: timing.start == timing.end ? .jump : .smooth, duration: max(0.000001, timing.end - timing.start),
+                easeIn: timing.easeIn, easeOut: timing.easeOut)
+            channel.points.removeAll { $0.id == point.id }; channel.points.append(point); channel.points.sort { $0.time < $1.time }
+            state.audio.updateChannel(role) { $0 = channel }
+        case let .removeAudioGain(role, id):
+            guard state.audio.channel(role).points.contains(where: { $0.id == id }) else { throw EditorMutationError.invalid("The volume change no longer exists.") }
+            state.audio.updateChannel(role) { $0.points.removeAll { $0.id == id } }
         case let .audio(patch):
             guard !patch.isEmpty else { throw EditorMutationError.invalid("Supply at least one audio property.") }
             if let value = patch.isMuted { state.audio.isMuted = value }
@@ -581,7 +637,11 @@ enum EditorMutation: Codable, Equatable, Sendable {
             case "speed":
                 guard state.speedKeyframes.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That speed animation no longer exists.") }
                 state.speedKeyframes.removeAll { $0.id == component }
-            default: throw EditorMutationError.invalid("Choose a screen, camera or speed animation; pointer styling is not a removable animation.")
+            case "audioMicrophone", "audioSystem":
+                let role: RecordingAudioRole = pieces[0] == "audioMicrophone" ? .microphone : .systemAudio
+                guard state.audio.channel(role).points.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That volume change no longer exists.") }
+                state.audio.updateChannel(role) { $0.points.removeAll { $0.id == component } }
+            default: throw EditorMutationError.invalid("Choose a screen, camera, speed or audio animation; pointer styling is not a removable animation.")
             }
         case let .addContentLayer(layer):
             guard !state.contentLayers.contains(where: { $0.id == layer.id }) else { throw EditorMutationError.invalid("That content layer identity is already in use.") }
@@ -707,8 +767,11 @@ enum EditorMutation: Codable, Equatable, Sendable {
             operation("speed", "Change exported recording speed, not transient preview speed. rate0.1...8 is source-seconds per output-second. timeBase defaults to source; output endpoints and ramps resolve through the PRE-EDIT timing map (ambiguous crossfades reject). timing arrives at end; smooth inserts the evaluated baseline at start and ramps to the target, which persists afterward. Jump has start=end. Keep source anchors unchanged. Optional preservesPitch changes the whole recording's audio-pitch policy (defaulttrue); an unchanged rate changes only that policy without creating a point. For a constant-speed section use jumps to the requested rate at its source start and back to the prior rate at its source end. Translate output references using the PRE-EDIT timing map before this batch; never recompute later command times midway through the same requested range.",
                 ["rate": number(0.1, 8), "timing": speedTiming, "timeBase": enumeration(["source", "output"]),
                  "preservesPitch": ["type": "boolean"]], optional: ["timeBase", "preservesPitch"]),
-            operation("removeAnimation", "Remove one lane-qualified screen, camera or speed component from inspect_editor edits (animationID=lane:UUID). Independent components at the same time remain. Initial camera and whole-recording pointer style cannot be removed this way.",
+            operation("removeAnimation", "Remove one lane-qualified screen, camera, speed, audioMicrophone or audioSystem component from inspect_editor edits (animationID=lane:UUID). Independent components at the same time remain. Initial camera and whole-recording pointer style cannot be removed this way.",
                 ["animationID": ["type": "string"]]),
+            operation("audioTrack", "Patch one explicitly identified source role only. volume0...1 is its overall level; isMuted preserves its envelope. Unknown/mixed legacy tracks use master audio.", ["role": enumeration(RecordingAudioRole.allCases.map(\.rawValue)), "patch": object(["isMuted": ["type": "boolean"], "volume": number(0, 1)], optional: ["isMuted", "volume"])]),
+            operation("audioGain", "Source-anchored volume envelope multiplier0...1 on one role, using shared timing/easing. Separate role changes may overlap. Optional id updates an existing change.", ["role": enumeration(RecordingAudioRole.allCases.map(\.rawValue)), "gain": number(0, 1), "timing": timing, "id": ["type": "string", "format": "uuid"]], optional: ["id"]),
+            operation("removeAudioGain", "Remove one role volume change by its actual UUID.", ["role": enumeration(RecordingAudioRole.allCases.map(\.rawValue)), "pointID": ["type": "string", "format": "uuid"]]),
             operation("audio", "Patch master recorded audio: volume0...1, mute, fade seconds0...5 relative to kept trim. Preserves source offsets and relative levels. Supply at least one field.", ["patch": audio]),
             operation("canvas", "Patch whole-recording output presentation. Padding/corner radius are fractions0...0.2; background RGB0...1. Source coordinates and PIP travel remain unchanged.", ["patch": canvas]),
             operation("trim", "Keep a nonempty original-source interval. Does not retime keyframes or overwrite requested audio fades.", ["start": ["type": "number", "minimum": 0], "end": ["type": "number", "minimum": 0]]),
@@ -749,7 +812,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             return ["operations": [
                 "screen": ["panScreen", "zoomScreen", "alignScreen", "frameRegion", "fullFrame", "holdFraming", "reviseFraming", "moveBetweenEdits", "moveForDuration"],
                 "camera": ["cameraOverlay", "alignCameraOverlay", "cameraSource"],
-                "global": ["pointer", "audio", "canvas", "trim"],
+                "global": ["pointer", "audio", "audioTrack", "audioGain", "removeAudioGain", "canvas", "trim"],
                 "timing": ["cutSection", "restoreCut", "cutTransition", "speed"],
                 "boxes": ["addRegion", "labelRegion", "removeRegion"],
                 "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming", "removeAnimation"]],

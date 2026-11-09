@@ -44,6 +44,7 @@ struct RenderedProject {
     let previewFrames: PreviewSourceFrames
     let audioMix: AVAudioMix?
     let audioTrackIDs: [CMPersistentTrackID]
+    let audioRoles: [CMPersistentTrackID: RecordingAudioRole]
     let timingMap: RecordingTimeMap?
     let cutAudioSegments: [CutAudioSegment]
     var supportsDirectSourcePreview: Bool { timingMap == nil }
@@ -53,13 +54,14 @@ struct RenderedProject {
         let clipIndex: Int
         let outputStart: Double
         let outputEnd: Double
+        var role: RecordingAudioRole? = nil
     }
 
     init(asset: AVComposition, videoComposition: AVVideoComposition, screenSize: CGSize,
          cameraAspect: Double, sourceSize: CGSize? = nil,
          previewFrames: PreviewSourceFrames = PreviewSourceFrames(),
          audioMix: AVAudioMix? = nil, audioTrackIDs: [CMPersistentTrackID] = [],
-         timingMap: RecordingTimeMap? = nil, cutAudioSegments: [CutAudioSegment] = []) {
+         audioRoles: [CMPersistentTrackID: RecordingAudioRole] = [:], timingMap: RecordingTimeMap? = nil, cutAudioSegments: [CutAudioSegment] = []) {
         self.asset = asset
         self.videoComposition = videoComposition
         self.screenSize = screenSize
@@ -68,6 +70,7 @@ struct RenderedProject {
         self.previewFrames = previewFrames
         self.audioMix = audioMix
         self.audioTrackIDs = audioTrackIDs
+        self.audioRoles = audioRoles
         self.timingMap = timingMap
         self.cutAudioSegments = cutAudioSegments
     }
@@ -80,6 +83,7 @@ enum ProjectRenderer {
         case invalidTrim
         case destinationExists
         case cannotExport
+        case unidentifiedAudio(String)
 
         var errorDescription: String? {
             switch self {
@@ -87,6 +91,7 @@ enum ProjectRenderer {
             case .invalidTrim: return "Choose a trim range inside the recording."
             case .destinationExists: return "Choose a different destination. An original recording or a file changed during export cannot be replaced."
             case .cannotExport: return "This recording could not be prepared for export."
+            case let .unidentifiedAudio(role): return "The source has no verified \(role) track. Restore the original audio metadata or reset that track’s controls before exporting."
             }
         }
     }
@@ -120,6 +125,7 @@ enum ProjectRenderer {
         // ScreenCaptureKit may produce independent system and microphone tracks.
         // Preserve all of them, including any source-track leading offset.
         var audioTrackIDs: [CMPersistentTrackID] = []
+        var audioRoles: [CMPersistentTrackID: RecordingAudioRole] = [:]
         for audioSource in try await screenAsset.loadTracks(withMediaType: .audio) {
             let available = try await audioSource.load(.timeRange)
             let range = CMTimeRangeGetIntersection(wholeRange, otherRange: available)
@@ -129,8 +135,10 @@ enum ProjectRenderer {
             ) else { throw RenderError.cannotExport }
             try audioTrack.insertTimeRange(range, of: audioSource, at: range.start)
             audioTrackIDs.append(audioTrack.trackID)
+            audioRoles[audioTrack.trackID] = try await audioRole(of: audioSource, bindings: project.audioSources)
         }
 
+        try requireControlledAudioRoles(project.state.audio, found: Array(audioRoles.values))
         var cameraAspect = 16.0 / 9.0
         var cameraTrackID: CMPersistentTrackID?
         var cameraGeometry: PIPSourceGeometry?
@@ -186,8 +194,8 @@ enum ProjectRenderer {
             asset: composition, videoComposition: videoComposition,
             screenSize: renderSize, cameraAspect: cameraAspect, sourceSize: sourceGeometry.size,
             previewFrames: previewFrames,
-            audioMix: audioMix(for: project.state, trackIDs: audioTrackIDs, duration: duration),
-            audioTrackIDs: audioTrackIDs
+            audioMix: audioMix(for: project.state, trackIDs: audioTrackIDs, duration: duration, roles: audioRoles),
+            audioTrackIDs: audioTrackIDs, audioRoles: audioRoles
         )
     }
 
@@ -229,10 +237,13 @@ enum ProjectRenderer {
         let audioSources = try await screenAsset.loadTracks(withMediaType: .audio)
         var audioTracks: [[AVMutableCompositionTrack]] = []
         var audioRanges: [CMTimeRange] = []
+        var sourceRoles: [RecordingAudioRole?] = []
         for source in audioSources {
             audioTracks.append(try tracks(.audio))
             audioRanges.append(try await source.load(.timeRange))
+            sourceRoles.append(try await audioRole(of: source, bindings: project.audioSources))
         }
+        try requireControlledAudioRoles(project.state.audio, found: sourceRoles.compactMap { $0 })
         var branches: [CutCompositionInstruction.Branch] = []
         var audioSegments: [RenderedProject.CutAudioSegment] = []
         for (index, clip) in map.clips.enumerated() {
@@ -268,7 +279,7 @@ enum ProjectRenderer {
                 let track = audioTracks[sourceIndex][lane]
                 try insert(audioSources[sourceIndex], into: track, sourceStart: range.start.seconds, sourceEnd: range.end.seconds)
                 audioSegments.append(.init(trackID: track.trackID, clipIndex: index,
-                    outputStart: outputStart, outputEnd: clip.outputTime(for: range.end.seconds)))
+                    outputStart: outputStart, outputEnd: clip.outputTime(for: range.end.seconds), role: sourceRoles[sourceIndex]))
             }
             branches.append(.init(screenTrackID: screenTracks[lane].trackID,
                 cameraTrackID: cameraTracks.isEmpty ? nil : cameraTracks[lane].trackID))
@@ -300,16 +311,7 @@ enum ProjectRenderer {
                                     segments: [RenderedProject.CutAudioSegment]) -> AVAudioMix? {
         guard !segments.isEmpty else { return nil }
         let master = state.audio.envelope(trimStart: 0, trimEnd: timingMap.outputDuration)
-        func masterGain(_ at: Double) -> Double {
-            guard let first = master.first, let last = master.last else { return 0 }
-            if at <= first.time { return first.volume }
-            if at >= last.time { return last.volume }
-            for (a, b) in zip(master, master.dropFirst()) where at <= b.time {
-                return a.volume + (b.volume - a.volume) * (at - a.time) / (b.time - a.time)
-            }
-            return last.volume
-        }
-        func gain(_ at: Double, clip: Int) -> Double {
+        func gain(_ at: Double, clip: Int, role: RecordingAudioRole?) -> Double {
             var weight = 1.0
             if clip > 0 {
                 let join = timingMap.joins[clip - 1]
@@ -319,7 +321,8 @@ enum ProjectRenderer {
                 let join = timingMap.joins[clip]
                 if join.duration > 0 { weight = min(weight, max(0, min(1, (join.outputEnd - at) / join.duration))) }
             }
-            return masterGain(at) * weight
+            let source = timingMap.clips[clip].sourceTime(at: at)
+            return state.audio.gain(role: role, sourceTime: source, outputTime: at, outputDuration: timingMap.outputDuration) * weight
         }
         let mix = AVMutableAudioMix()
         mix.inputParameters = Set(segments.map(\.trackID)).sorted().map { trackID in
@@ -333,20 +336,12 @@ enum ProjectRenderer {
                     knots += [join.outputStart, join.outputEnd]
                 }
                 knots = Set(knots.filter { $0 >= segment.outputStart && $0 <= segment.outputEnd }).sorted()
-                parameters.setVolume(Float(gain(segment.outputStart, clip: segment.clipIndex)), at: time(segment.outputStart))
-                for (a, b) in zip(knots, knots.dropFirst()) {
-                    let error = abs((gain(a, clip: segment.clipIndex) + gain(b, clip: segment.clipIndex)) / 2 - gain((a + b) / 2, clip: segment.clipIndex))
-                    let count = max(1, Int(ceil(sqrt(error / 0.0001))))
-                    for part in 0..<count {
-                        let start = a + (b - a) * Double(part) / Double(count)
-                        let end = a + (b - a) * Double(part + 1) / Double(count)
-                        let range = CMTimeRange(start: time(start), end: time(end))
-                        if range.duration > .zero {
-                            parameters.setVolumeRamp(fromStartVolume: Float(gain(start, clip: segment.clipIndex)),
-                                toEndVolume: Float(gain(end, clip: segment.clipIndex)), timeRange: range)
-                        }
-                    }
-                }
+                let clip = timingMap.clips[segment.clipIndex]
+                knots += state.audio.sourceKnots(role: segment.role).map { clip.outputTime(for: $0) }
+                knots += clip.segments.flatMap { [$0.outputStart, $0.outputEnd] }
+                knots = knots.filter { $0 >= segment.outputStart && $0 <= segment.outputEnd }
+                let points = RecordingAudio.sampledEnvelope(knots: knots) { gain($0, clip: segment.clipIndex, role: segment.role) }
+                applyGainPoints(points, to: parameters)
                 parameters.setVolume(0, at: time(segment.outputEnd))
             }
             return parameters
@@ -372,34 +367,57 @@ enum ProjectRenderer {
                                screenSize: outputSize, cameraAspect: rendered.cameraAspect, sourceSize: rendered.sourceSize,
                                previewFrames: rendered.previewFrames,
                                audioMix: rendered.timingMap.map { cutAudioMix(for: state, timingMap: $0, segments: rendered.cutAudioSegments) }
-                                   ?? audioMix(for: state, trackIDs: rendered.audioTrackIDs, duration: rendered.asset.duration.seconds),
-                               audioTrackIDs: rendered.audioTrackIDs, timingMap: rendered.timingMap,
+                                   ?? audioMix(for: state, trackIDs: rendered.audioTrackIDs, duration: rendered.asset.duration.seconds, roles: rendered.audioRoles),
+                               audioTrackIDs: rendered.audioTrackIDs, audioRoles: rendered.audioRoles, timingMap: rendered.timingMap,
                                cutAudioSegments: rendered.cutAudioSegments)
     }
 
     /// Source-time ramps preserve independent tracks and any leading gaps.
     /// Identity settings deliberately leave the original audio pipeline alone.
     static func audioMix(for state: EditState, trackIDs: [CMPersistentTrackID],
-                         duration: Double) -> AVAudioMix? {
+                         duration: Double, roles: [CMPersistentTrackID: RecordingAudioRole] = [:]) -> AVAudioMix? {
         guard state.audio != RecordingAudio(), !trackIDs.isEmpty else { return nil }
-        let points = state.audio.envelope(trimStart: state.trimStart, trimEnd: min(state.trimEnd, duration))
-        guard let first = points.first else { return nil }
+        let start = state.trimStart, end = min(state.trimEnd, duration)
         let mix = AVMutableAudioMix()
         mix.inputParameters = trackIDs.map { trackID in
             let parameters = AVMutableAudioMixInputParameters()
             parameters.trackID = trackID
-            parameters.setVolume(Float(state.audio.isMuted ? 0 : state.audio.volume), at: .zero)
-            parameters.setVolume(Float(first.volume), at: time(first.time))
-            for (start, end) in zip(points, points.dropFirst()) {
-                let range = CMTimeRange(start: time(start.time), end: time(end.time))
-                if range.duration > .zero {
-                    parameters.setVolumeRamp(fromStartVolume: Float(start.volume), toEndVolume: Float(end.volume),
-                                             timeRange: range)
-                }
+            parameters.setVolume(0, at: .zero)
+            let role = roles[trackID]
+            let knots = [start, end] + state.audio.envelope(trimStart: start, trimEnd: end).map(\.time)
+                + state.audio.sourceKnots(role: role).filter { $0 >= start && $0 <= end }
+            let points = RecordingAudio.sampledEnvelope(knots: knots) {
+                state.audio.gain(role: role, sourceTime: $0, outputTime: $0 - start, outputDuration: end - start)
             }
+            applyGainPoints(points, to: parameters)
             return parameters
         }
         return mix
+    }
+
+    private static func applyGainPoints(_ points: [RecordingAudio.Point], to parameters: AVMutableAudioMixInputParameters) {
+        guard let first = points.first else { return }
+        parameters.setVolume(Float(first.volume), at: time(first.time))
+        for (a, b) in zip(points, points.dropFirst()) {
+            let range = CMTimeRange(start: time(a.time), end: time(b.time))
+            if range.duration > .zero { parameters.setVolumeRamp(fromStartVolume: Float(a.volume), toEndVolume: Float(b.volume), timeRange: range) }
+            else { parameters.setVolume(Float(b.volume), at: time(b.time)) }
+        }
+    }
+    private static func requireControlledAudioRoles(_ audio: RecordingAudio, found: [RecordingAudioRole]) throws {
+        guard Set(found).count == found.count else { throw RenderError.unidentifiedAudio("uniquely identified microphone/system audio") }
+        for channel in audio.channels where channel != RecordingAudioChannel(role: channel.role) && !found.contains(channel.role) {
+            throw RenderError.unidentifiedAudio(channel.role.title.lowercased())
+        }
+    }
+    private static func audioRole(of track: AVAssetTrack, bindings: [RecordingAudioSource]) async throws -> RecordingAudioRole? {
+        guard !bindings.isEmpty, let metadata = try? await track.load(.metadata) else { return nil }
+        var roles = Set<RecordingAudioRole>()
+        for item in metadata {
+            let value = try? await item.load(.stringValue)
+            if let role = RecordingAudioSource.resolve(identifier: item.identifier?.rawValue, value: value, bindings: bindings) { roles.insert(role) }
+        }
+        return roles.count == 1 ? roles.first : nil
     }
 
     /// Decode the current screen/camera source pair once for a frozen playhead.

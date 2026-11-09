@@ -474,7 +474,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? (showsClipLane ? RecordingTimeline.clipLaneHeight : RecordingTimeline.animationLaneHeight) : 72) }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? (showsClipLane ? RecordingTimeline.clipLaneHeight : RecordingTimeline.animationLaneHeight) + CGFloat(max(0, animationLanes().count - 4) * 30) : 72) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -644,9 +644,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     func animationLanes() -> [AnimationLaneGeometry] {
-        TimelineAnimationLane.allCases.enumerated().map { index, lane in
+        TimelineAnimationLane.allCases.filter { lane in lane == .screen || lane == .camera || lane == .speed || lane == .pointer || animationSpans.contains(where: { $0.lane == lane }) }.enumerated().map { index, lane in
             let y = CGFloat(40 + index * 30) + laneOffset
-            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .speed: "Speed"; case .pointer: "Pointer" }
+            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .speed: "Speed"; case .pointer: "Pointer"; case .audioMicrophone: "Mic"; case .audioSystem: "System" }
             return AnimationLaneGeometry(lane: lane, title: title,
                 frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
                 labelFrame: CGRect(x: 8, y: y + 5, width: 52, height: 16))
@@ -654,8 +654,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     func pointerClickGeometry() -> [PointerClickGeometry] {
-        pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
-            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: 153 + laneOffset, width: 2, height: 3))
+        let y = (animationLanes().first { $0.lane == .pointer }?.frame.maxY ?? 156 + laneOffset) - 3
+        return pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
+            PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: y, width: 2, height: 3))
         }
     }
 
@@ -733,7 +734,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
-        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .speed: .systemOrange; case .pointer: .secondaryLabelColor }
+        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .speed: .systemOrange; case .pointer: .secondaryLabelColor; case .audioMicrophone: .systemGreen; case .audioSystem: .systemBlue }
     }
 
     func playheadLine() -> NSBezierPath {
@@ -772,8 +773,15 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let upper = (profile?.sourceTime(at: animation.end) ?? animation.end + sourceOffset) - source.start
         samples += [lower, upper]
         for elapsed in Set(samples).sorted() where elapsed >= lower && elapsed <= upper {
-            let speed = MotionInterpolation.normalizedSpeed(at: elapsed, duration: span,
-                easeIn: source.easeIn, easeOut: source.easeOut)
+            let speed: Double
+            if let startGain = source.gainStart, let endGain = source.gainEnd {
+                let progress = MotionInterpolation.progress(at: elapsed, from: 0, to: span, duration: span, transition: .smooth,
+                    easeIn: source.easeIn, easeOut: source.easeOut)
+                speed = startGain + (endGain - startGain) * progress
+            } else {
+                speed = MotionInterpolation.normalizedSpeed(at: elapsed, duration: span,
+                    easeIn: source.easeIn, easeOut: source.easeOut)
+            }
             envelope.line(to: CGPoint(x: x(for: profile?.outputTime(for: source.start + elapsed) ?? source.start + elapsed - sourceOffset),
                 y: item.body.maxY - CGFloat(speed) * (item.body.height - 3)))
         }
@@ -795,7 +803,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
         drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
         NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: CGRect(x: railOrigin, y: 38 + laneOffset, width: railWidth, height: 120)).addClip()
+        let top = 38 + laneOffset
+        let bottom = animationLanes().map(\.frame.maxY).max() ?? top
+        NSBezierPath(rect: CGRect(x: railOrigin, y: top, width: railWidth, height: max(0, bottom - top))).addClip()
         if let lane = animationLanes().first(where: { $0.lane == .speed }) {
             NSColor.systemOrange.withAlphaComponent(0.8).setStroke()
             for curve in speedCurves {

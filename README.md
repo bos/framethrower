@@ -316,12 +316,26 @@ The speed selector beside Play reviews at 0.5×, 1×, 2×, or 5×. Speed can cha
 while playing or paused, and remains selected while editing and replaying.
 This is a preview preference; project timing, Undo history, and exports are unchanged.
 
+The **Speed** inspector changes the finished recording from 0.1× to 8×, with
+instant changes or smooth ramps. A target rate continues until the next speed
+change. Duration and easing are anchored to original-source seconds; all screen,
+camera, pointer and audio data use one shared source/finished timing map. Other
+edits retain their original-source anchors. **Preserve audio pitch** keeps voices
+at their original pitch. Finished duration updates after each saved timing edit.
+Complete, unblended animation spans can be moved and resized directly in
+**Finished**; split, trimmed or blended fragments use **Source** for timing edits.
+Each gesture is one Undo step, and cancellation discards its preview.
+
+Camera **Opacity** changes from 0% to 100% on its own lane, independently of camera
+position, size and crop. It uses the same duration and easing controls as camera
+movement; a fade can overlap a move without changing that move's path.
+
 **Canvas** sets the output shape (Source, 16:9, 9:16, or Square), padding, screen
 corner radius, and background color for the whole recording. The full screen image
 fits inside the canvas; camera placement uses the entire output, including margins.
 Preview and export use the same composition.
 
-**Audio** controls mute and volume for all original audio tracks together. Fade
+**Audio’s master controls** change all original tracks together. Fade
 in and fade out run from the kept trim boundaries and can last up to five seconds
 each. If a short trim leaves too little room, both fades shorten proportionally;
 restoring a longer trim restores their requested lengths. Each slider gesture,
@@ -809,7 +823,9 @@ label and does not rename the recording. Set `recording_title` only when the use
 requested an actual recording rename; it joins the same transaction. The former
 `title` argument is rejected. Read
 `describe_editor_actions` for precise schemas and coordinate units before editing.
-Playback speed affects preview only.
+`control_preview.set_rate` changes review speed only. The typed `speed` mutation
+changes finished-recording timing; `cameraOverlay`’s `patch.opacity` changes independent
+camera transparency. Use `audioTrack` and `audioGain` for identified audio roles.
 
 The domain API is shared with Director and can support richer operations than a
 future Siri/App Intents adapter exposes. Siri integration is not implemented.

@@ -104,17 +104,23 @@ struct EditorCameraOverlayPatch: Codable, Equatable, Sendable {
     var visible: Bool? = nil
     /// 0 restores normal geometry; 1 fills the output with an aspect-fill crop.
     var fullscreen: Double? = nil
-    private enum CodingKeys: String, CodingKey, CaseIterable { case position, scale, shape, aspectRatio, visible, fullscreen }
-    init(position: EditorUnitPoint? = nil, scale: Double? = nil, shape: PIPShape? = nil, aspectRatio: Double? = nil, visible: Bool? = nil, fullscreen: Double? = nil) {
-        self.position = position; self.scale = scale; self.shape = shape; self.aspectRatio = aspectRatio; self.visible = visible; self.fullscreen = fullscreen
+    /// Independent camera alpha; visible is compatibility shorthand for 0/1.
+    var opacity: Double? = nil
+    private enum CodingKeys: String, CodingKey, CaseIterable { case position, scale, shape, aspectRatio, visible, fullscreen, opacity }
+    init(position: EditorUnitPoint? = nil, scale: Double? = nil, shape: PIPShape? = nil, aspectRatio: Double? = nil, visible: Bool? = nil, fullscreen: Double? = nil, opacity: Double? = nil) {
+        self.position = position; self.scale = scale; self.shape = shape; self.aspectRatio = aspectRatio; self.visible = visible; self.fullscreen = fullscreen; self.opacity = opacity
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
         position = try c.optional(EditorUnitPoint.self, .position); scale = try c.optional(Double.self, .scale)
         shape = try c.optional(PIPShape.self, .shape); aspectRatio = try c.optional(Double.self, .aspectRatio); visible = try c.optional(Bool.self, .visible)
         fullscreen = try c.optional(Double.self, .fullscreen)
+        opacity = try c.optional(Double.self, .opacity)
     }
-    var isEmpty: Bool { position == nil && scale == nil && shape == nil && aspectRatio == nil && visible == nil && fullscreen == nil }
+    var hasGeometry: Bool { position != nil || scale != nil || shape != nil || aspectRatio != nil || fullscreen != nil }
+    var hasOpacity: Bool { opacity != nil || visible != nil }
+    var opacityTarget: Double? { opacity ?? visible.map { $0 ? 1 : 0 } }
+    var isEmpty: Bool { !hasGeometry && !hasOpacity }
 }
 
 struct EditorCameraSourcePatch: Codable, Equatable, Sendable {
@@ -207,7 +213,7 @@ struct EditorMutationGeometry: Equatable, Sendable {
 }
 
 enum EditorCutTimeBase: String, Codable, Sendable { case source, output }
-enum EditorMutationLane: String, Codable, Sendable { case screen, camera, pointer, audio, canvas, trim, timing, content, speed }
+enum EditorMutationLane: String, Codable, Sendable { case screen, camera, cameraOpacity, pointer, audio, canvas, trim, timing, content, speed }
 enum EditorMutationSubject: String, Codable, Sendable { case screenViewport, cameraOverlay, cameraSource }
 
 struct EditorMutationEffect: Equatable, Sendable {
@@ -386,7 +392,8 @@ enum EditorMutation: Codable, Equatable, Sendable {
     var lane: EditorMutationLane {
         switch self {
         case .panScreen, .zoomScreen, .alignScreen: .screen
-        case .cameraOverlay, .alignCameraOverlay, .cameraSource: .camera
+        case let .cameraOverlay(patch, _): patch.hasGeometry ? .camera : .cameraOpacity
+        case .alignCameraOverlay, .cameraSource: .camera
         case .pointer: .pointer
         case .audio, .audioTrack, .audioGain, .removeAudioGain: .audio
         case .canvas: .canvas
@@ -407,6 +414,10 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case .cameraSource: subject = .cameraSource
         default: subject = nil
         }
+        if case let .cameraOverlay(patch, _) = self, patch.hasGeometry, patch.hasOpacity {
+            return [.init(lane: .camera, start: timing?.start ?? 0, end: timing?.end ?? duration, subject: subject),
+                    .init(lane: .cameraOpacity, start: timing?.start ?? 0, end: timing?.end ?? duration, subject: subject)]
+        }
         return [EditorMutationEffect(lane: lane, start: timing?.start ?? 0, end: timing?.end ?? duration, subject: subject)]
     }
 
@@ -416,6 +427,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
         guard let timing else { return [] }
         var result: [EditorMutationConflict] = []
         var previous = 0.0
+        var checkingLane = lane
         func check(id: UUID, time: Double, transition: PIPTransition, duration: Double) {
             defer { previous = time }
             guard time > 0 else { return }
@@ -423,14 +435,24 @@ enum EditorMutation: Codable, Equatable, Sendable {
             let intersects = timing.start == timing.end
                 ? (begins < timing.end && time >= timing.end) || abs(time - timing.end) < 0.000_001
                 : time > timing.start + 0.000_001 && (begins < timing.end - 0.000_001 || abs(time - timing.end) < 0.000_001)
-            if intersects { result.append(EditorMutationConflict(lane: lane, componentID: id, start: begins, end: time)) }
+            if intersects { result.append(EditorMutationConflict(lane: checkingLane, componentID: id, start: begins, end: time)) }
         }
         if lane == .screen {
             for point in state.zoomKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
-        } else if lane == .camera {
-            for point in state.pipKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
         } else if lane == .speed {
             for point in state.speedKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
+        } else {
+            let geometry: Bool, opacity: Bool
+            if case let .cameraOverlay(patch, _) = self { geometry = patch.hasGeometry; opacity = patch.hasOpacity }
+            else { geometry = lane == .camera; opacity = lane == .cameraOpacity }
+            if geometry {
+                checkingLane = .camera
+                for point in state.pipKeyframes { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
+            }
+            if opacity {
+                previous = 0; checkingLane = .cameraOpacity
+                for point in state.cameraOpacityEvents { check(id: point.id, time: point.time, transition: point.transition, duration: point.duration) }
+            }
         }
         return result
     }
@@ -481,18 +503,29 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .cameraOverlay(patch, timing):
             try requireCamera(project)
             guard !patch.isEmpty, patch.position?.isValid ?? true else { throw EditorMutationError.invalid("Supply at least one valid camera overlay property.") }
-            var target = state.placement(at: timing.start)
+            var target = state.cameraGeometry(at: timing.start)
             if let position = patch.position { target.x = position.x; target.y = position.y }
             if let value = patch.scale { target.scale = value }
             if let value = patch.shape { target.shape = value }
             if let value = patch.aspectRatio { target.aspectRatio = value }
-            if let value = patch.visible { target.visible = value }
             if let value = patch.fullscreen { target.fullscreen = value == 0 ? nil : value }
-            try camera(target, timing: timing, state: &state)
+            if let value = patch.opacity, !value.isFinite || !(0...1).contains(value) {
+                throw EditorMutationError.invalid("Camera opacity must be a finite value between 0 and 1.")
+            }
+            if patch.visible == false, let opacity = patch.opacity, opacity > 0 {
+                throw EditorMutationError.invalid("A hidden camera cannot have nonzero opacity. Omit visible and use opacity for fades.")
+            }
+            let overlaps = conflicts(in: state).filter { conflict in
+                conflict.lane == .camera ? patch.hasGeometry && target != state.cameraGeometry(at: timing.start)
+                    : patch.opacityTarget.map { $0 != state.cameraOpacity(at: timing.start) } ?? false
+            }
+            guard overlaps.isEmpty else { throw EditorMutationError.conflicts(overlaps) }
+            if patch.hasGeometry { try camera(target, timing: timing, state: &state, checkConflicts: false) }
+            if let opacity = patch.opacityTarget { cameraOpacity(opacity, timing: timing, state: &state) }
         case let .cameraSource(patch, timing):
             try requireCamera(project)
             guard !patch.isEmpty else { throw EditorMutationError.invalid("Supply a camera crop or source zoom.") }
-            var target = state.placement(at: timing.start)
+            var target = state.cameraGeometry(at: timing.start)
             if let value = patch.crop { target.crop = value }
             if let value = patch.sourceZoom { target.sourceZoom = value }
             try camera(target, timing: timing, state: &state)
@@ -501,7 +534,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             guard let geometry, geometry.sourceSize.width.isFinite, geometry.sourceSize.height.isFinite,
                   geometry.sourceSize.width > 0, geometry.sourceSize.height > 0,
                   geometry.sourceSize.width <= 32768, geometry.sourceSize.height <= 32768 else { throw EditorMutationError.geometryUnavailable }
-            var target = state.placement(at: timing.start)
+            var target = state.cameraGeometry(at: timing.start)
             let aspect: Double
             if target.shape == .original {
                 guard let value = geometry.cameraAspect, value.isFinite, value > 0 else { throw EditorMutationError.geometryUnavailable }
@@ -637,11 +670,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
             case "speed":
                 guard state.speedKeyframes.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That speed animation no longer exists.") }
                 state.speedKeyframes.removeAll { $0.id == component }
+            case "cameraOpacity":
+                guard state.cameraOpacityKeyframes.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That independent opacity change no longer exists.") }
+                state.cameraOpacityKeyframes.removeAll { $0.id == component }
             case "audioMicrophone", "audioSystem":
                 let role: RecordingAudioRole = pieces[0] == "audioMicrophone" ? .microphone : .systemAudio
                 guard state.audio.channel(role).points.contains(where: { $0.id == component }) else { throw EditorMutationError.invalid("That volume change no longer exists.") }
                 state.audio.updateChannel(role) { $0.points.removeAll { $0.id == component } }
-            default: throw EditorMutationError.invalid("Choose a screen, camera, speed or audio animation; pointer styling is not a removable animation.")
+            default: throw EditorMutationError.invalid("Choose a screen, camera, opacity, speed or audio animation; pointer styling is not a removable animation.")
             }
         case let .addContentLayer(layer):
             guard !state.contentLayers.contains(where: { $0.id == layer.id }) else { throw EditorMutationError.invalid("That content layer identity is already in use.") }
@@ -693,21 +729,36 @@ enum EditorMutation: Codable, Equatable, Sendable {
             easeIn: motion.easeIn, easeOut: motion.easeOut, sourceRegionID: regionID))
         state.zoomKeyframes.sort { $0.time < $1.time }
     }
-    private func camera(_ requested: PIPPlacement, timing: EditorMutationTiming, state: inout EditState) throws {
+    private func camera(_ requested: PIPPlacement, timing: EditorMutationTiming, state: inout EditState, checkConflicts: Bool = true) throws {
         var target = requested
-        var baseline = state.placement(at: timing.start)
+        var baseline = state.cameraGeometry(at: timing.start)
         // Explicit zero and absent legacy metadata describe the same geometry.
         if target.fullscreen == 0 { target.fullscreen = nil }
         if baseline.fullscreen == 0 { baseline.fullscreen = nil }
         guard target != baseline else { return }
-        let overlaps = conflicts(in: state)
-        guard overlaps.isEmpty else { throw EditorMutationError.conflicts(overlaps) }
+        if checkConflicts {
+            let overlaps = conflicts(in: state).filter { $0.lane == .camera }
+            guard overlaps.isEmpty else { throw EditorMutationError.conflicts(overlaps) }
+        }
         if timing.transition == .smooth, !state.pipKeyframes.contains(where: { abs($0.time - timing.start) < 0.000_001 }) {
             state.upsert(PIPKeyframe(time: timing.start, placement: baseline, transition: .jump))
         }
         let motion = timing.motion
         state.upsert(PIPKeyframe(time: timing.end, placement: target, transition: motion.transition,
             duration: motion.duration, easeIn: motion.easeIn, easeOut: motion.easeOut))
+    }
+
+    private func cameraOpacity(_ opacity: Double, timing: EditorMutationTiming, state: inout EditState) {
+        let baseline = state.cameraOpacity(at: timing.start)
+        guard opacity != baseline else { return }
+        if timing.transition == .smooth, !state.cameraOpacityKeyframes.contains(where: { abs($0.time - timing.start) < 0.000001 }) {
+            state.cameraOpacityKeyframes.append(CameraOpacityKeyframe(time: timing.start, opacity: baseline))
+        }
+        let existing = state.cameraOpacityKeyframes.first { abs($0.time - timing.end) < 0.000001 }
+        state.cameraOpacityKeyframes.removeAll { abs($0.time - timing.end) < 0.000001 }
+        state.cameraOpacityKeyframes.append(CameraOpacityKeyframe(id: existing?.id ?? UUID(), time: timing.end, opacity: opacity,
+            transition: timing.transition, duration: timing.motion.duration, easeIn: timing.easeIn, easeOut: timing.easeOut))
+        state.cameraOpacityKeyframes.sort { $0.time < $1.time }
     }
 
     /// Lazy catalog schema: callers need not put this in every model request.
@@ -732,7 +783,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
             return value
         }
         let overlay = object(["position": point, "scale": number(0.12, 0.5), "shape": enumeration(["original", "rectangle", "square", "circle"]),
-            "aspectRatio": number(0.2, 5), "visible": ["type": "boolean"], "fullscreen": number(0, 1)], optional: ["position", "scale", "shape", "aspectRatio", "visible", "fullscreen"])
+            "aspectRatio": number(0.2, 5), "visible": ["type": "boolean"], "fullscreen": number(0, 1), "opacity": number(0, 1)], optional: ["position", "scale", "shape", "aspectRatio", "visible", "fullscreen", "opacity"])
         let source = object(["crop": point, "sourceZoom": number(1, 3)], optional: ["crop", "sourceZoom"])
         let pointer = object(["visible": ["type": "boolean"], "size": number(1, 4), "smoothing": number(0, 1), "clickHighlight": ["type": "boolean"]],
             optional: ["visible", "size", "smoothing", "clickHighlight"])
@@ -760,14 +811,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
             operation("panScreen", "Move the original-source viewport center while preserving its zoom. Exact normalized focal coordinates; impossible bounds reject. Timing uses absolute source seconds.", ["center": point, "timing": timing]),
             operation("zoomScreen", "Set screen magnification1...3. Optional center is exact source-normalized focal point; omission retains current focus with normal bounds clamping.", ["scale": number(1, 3), "center": point, "timing": timing], optional: ["center"]),
             operation("alignScreen", "Align an exact viewport anchor to a raw Box anchor. Preserve scale for pan; explicit absolute/fitRegion permits zoom. No implicit10% padding. Unreachable alignment rejects.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "scalePolicy": policy, "timing": timing]),
-            operation("cameraOverlay", "Patch only output-camera overlay fields. Position is fraction of AVAILABLE travel, scale is fraction of output width0.12...0.5. fullscreen0...1 animates preserved normal placement to exact output fill, with aspect-fill cropping;0restores normal shape/size. Shape/visibility switch at arrival; this is not opacity.", ["patch": overlay, "timing": timing]),
+            operation("cameraOverlay", "Patch only output-camera overlay fields. Position is fraction of AVAILABLE travel, scale is fraction of output width0.12...0.5. fullscreen0...1 animates preserved normal placement to exact output fill, with aspect-fill cropping;0restores normal shape/size. opacity0...1 fades only the camera using the same source-time motion/easing;0is transparent,1opaque. Opacity is an independent source-anchored track: it can overlap geometry animation and does not insert camera placement points. It overrides same-time saved legacy visibility events; unchanged geometry targets never bound fades. visible maps to independent opacity0/1 when opacity is omitted; visible=true permits explicit opacity, but visible=false with nonzero opacity rejects. Saved legacy visible-only events and Shape still switch at arrival.", ["patch": overlay, "timing": timing]),
             operation("alignCameraOverlay", "Move the camera outline without resizing or changing its source crop. Align to displayed Box using verified host geometry; unavailable geometry rejects. Source boxes project through arrival screen framing into final canvas.", ["regionID": ["type": "string"], "subjectAnchor": anchors, "targetAnchor": anchors, "axes": axes, "timing": timing]),
             operation("cameraSource", "Patch the camera image INSIDE its unchanged outline. Crop x/y are fractions of available oriented camera-source travel; sourceZoom1...3 is not overlay size.", ["patch": source, "timing": timing]),
             operation("pointer", "Patch whole-recording pointer style only; does not invent or retime captured pointer motion. Supply at least one field.", ["patch": pointer]),
             operation("speed", "Change exported recording speed, not transient preview speed. rate0.1...8 is source-seconds per output-second. timeBase defaults to source; output endpoints and ramps resolve through the PRE-EDIT timing map (ambiguous crossfades reject). timing arrives at end; smooth inserts the evaluated baseline at start and ramps to the target, which persists afterward. Jump has start=end. Keep source anchors unchanged. Optional preservesPitch changes the whole recording's audio-pitch policy (defaulttrue); an unchanged rate changes only that policy without creating a point. For a constant-speed section use jumps to the requested rate at its source start and back to the prior rate at its source end. Translate output references using the PRE-EDIT timing map before this batch; never recompute later command times midway through the same requested range.",
                 ["rate": number(0.1, 8), "timing": speedTiming, "timeBase": enumeration(["source", "output"]),
                  "preservesPitch": ["type": "boolean"]], optional: ["timeBase", "preservesPitch"]),
-            operation("removeAnimation", "Remove one lane-qualified screen, camera, speed, audioMicrophone or audioSystem component from inspect_editor edits (animationID=lane:UUID). Independent components at the same time remain. Initial camera and whole-recording pointer style cannot be removed this way.",
+            operation("removeAnimation", "Remove one lane-qualified screen, camera, cameraOpacity, speed, audioMicrophone or audioSystem component from inspect_editor edits (animationID=lane:UUID). Independent components at the same time remain. Initial camera, inherited opacity and whole-recording pointer style cannot be removed this way.",
                 ["animationID": ["type": "string"]]),
             operation("audioTrack", "Patch one explicitly identified source role only. volume0...1 is its overall level; isMuted preserves its envelope. Unknown/mixed legacy tracks use master audio.", ["role": enumeration(RecordingAudioRole.allCases.map(\.rawValue)), "patch": object(["isMuted": ["type": "boolean"], "volume": number(0, 1)], optional: ["isMuted", "volume"])]),
             operation("audioGain", "Source-anchored volume envelope multiplier0...1 on one role, using shared timing/easing. Separate role changes may overlap. Optional id updates an existing change.", ["role": enumeration(RecordingAudioRole.allCases.map(\.rawValue)), "gain": number(0, 1), "timing": timing, "id": ["type": "string", "format": "uuid"]], optional: ["id"]),
@@ -790,13 +841,13 @@ enum EditorMutation: Codable, Equatable, Sendable {
          "legacy_command_schema": ["oneOf": legacySchemas],
          "units": ["screen": "Original source-normalized focal center; top-left origin. Zoom1...3.",
                    "content": "Visible content layers use original-source start/end seconds and final-canvas normalized rect bounds. They are independent of reference boxes and screen zoom. Inspect section=layers for IDs, z-order and registered image metadata; image bytes are never returned.",
-                   "cameraOverlay": "Position fractions of available output-canvas travel; normal scale fraction of output width0.12...0.5. fullscreen0...1 blends normal outline to exact canvas fill without erasing normal shape/placement.",
+                   "cameraOverlay": "Position fractions of available output-canvas travel; normal scale fraction of output width0.12...0.5. fullscreen0...1 blends normal outline to exact canvas fill without erasing normal shape/placement. opacity0...1 continuously fades only the camera; legacy absence defaults to1.",
                    "cameraSource": "Oriented camera crop travel fractions0...1; sourceZoom1...3.",
                    "timing": "Absolute original-source seconds. Smooth start<end; jump start=end. End precedes recording end.",
                    "cuts": "cutSection requires timeBase source or output, with a half-open start<end range. Crossfade duration is output seconds; inspect requested/effective duration. Cuts preserve every source-time edit.",
                    "alignment": "Exact raw Box anchors; no implicit padding or silent clamp. PIP-to-Box needs verified host geometry.",
-                   "partial_updates": "Unspecified patch fields remain unchanged. Shape and visible are discrete arrival changes, not opacity.",
-                   "conflicts": "Existing same-lane movements must be resolved explicitly. Screen and camera are independent lanes."],
+                   "partial_updates": "Unspecified patch fields remain unchanged. Shape and saved legacy visibility events are discrete arrival changes. New visible patches map to independent camera opacity0/1. Opacity is continuous0...1 and uses its own source timing/easing, independent of geometry.",
+                   "conflicts": "Existing same-lane movements must be resolved explicitly. Screen, camera geometry and camera opacity are independent lanes."],
          "examples": [
             ["action": "mutate", "mutation": ["operation": "zoomScreen", "scale": 2,
                 "timing": ["start": 2, "end": 5, "transition": "smooth"]]],
@@ -818,7 +869,7 @@ enum EditorMutation: Codable, Equatable, Sendable {
                 "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming", "removeAnimation"]],
                 "subjects": [
                     "screen": "Main recorded screen viewport. panScreen preserves zoom; zoomScreen changes screen magnification; alignScreen matches Box anchors. These do not resize the PIP camera.",
-                    "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or hides it; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
+                    "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or fades it with opacity0...1; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
                     "cameraSource": "Camera image inside the unchanged PIP outline. cameraSource changes sourceZoom or crop, preserving the overlay size/position and main screen framing."],
                 "units": "Animation seconds are original source time. cutSection requires explicit timeBase source/output; crossfade duration is output seconds. Screen points are normalized source focal centers; camera positions are fractions of available OUTPUT travel. Pan preserves size. Exact alignment rejects unreachable bounds. Get one operation's schema before apply_edits; unknown camera/screen intent requires clarification.",
                 "query": "Specify operation by exact name; '*' returns all schemas explicitly."]

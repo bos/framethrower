@@ -69,6 +69,7 @@ enum EditorHistoryInspector {
         return [("title", before.title != after.title),
             ("screen_framing", a.zoomKeyframes != b.zoomKeyframes),
             ("camera", a.pipKeyframes != b.pipKeyframes),
+            ("camera_opacity", a.cameraOpacityKeyframes != b.cameraOpacityKeyframes),
             ("pointer", a.cursorStyle != b.cursorStyle), ("audio", a.audio != b.audio),
             ("speed", a.speedKeyframes != b.speedKeyframes || a.preservesAudioPitch != b.preservesAudioPitch),
             ("cuts", a.cuts != b.cuts),
@@ -104,6 +105,16 @@ enum EditorHistoryInspector {
                     return "\(seconds(point.time))s: \(changedPointFields(point, comparedWith: prior))"
                 }.joined(separator: "; ")
                 details.append("Camera: \(state.pipKeyframes.count) points, \(changed.count) differing (\(samples)).")
+            case "camera_opacity":
+                let changed = state.cameraOpacityKeyframes.filter { !other.state.cameraOpacityKeyframes.contains($0) }.sorted {
+                    if $0.transition != $1.transition { return $0.transition == .smooth }
+                    return $0.time > $1.time
+                }
+                let samples = changed.prefix(2).map { point in
+                    let prior = other.state.cameraOpacityKeyframes.first { $0.id == point.id }
+                    return "\(seconds(point.time))s: \(changedPointFields(point, comparedWith: prior))"
+                }.joined(separator: "; ")
+                details.append("Camera opacity: \(state.cameraOpacityKeyframes.count) points, \(changed.count) differing (\(samples)).")
             case "pointer":
                 details.append("Pointer: \(state.cursorStyle.visible ? "visible" : "hidden"), size \(seconds(state.cursorStyle.size)), smoothing \(seconds(state.cursorStyle.smoothing)), clicks \(state.cursorStyle.clickHighlight ? "on" : "off").")
             case "audio":

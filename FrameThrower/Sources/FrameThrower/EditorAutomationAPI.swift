@@ -68,7 +68,7 @@ enum EditorAutomationAPI {
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
             tool("inspect_editor", "Read current editor metadata. section=timing returns kept sections, cut joins and both source/output durations. For section=state, component returns one source value by default; time_base=output returns weighted samples of both crossfade branches. section=timing accepts output time for a read-only mapping query. Existing time/frameTime fields remain source time; preview.outputTime is finished-video time. Omit component for the full state. Component is valid only with section=state; state time requires component. Selection and playhead are separate.", object(doc.merging([
                 "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending", "timing", "layers"]],
-                "component": ["type": "string", "enum": ["screen", "camera", "speed", "pointer", "audio", "canvas", "trim", "layers"]],
+                "component": ["type": "string", "enum": ["screen", "camera", "camera_opacity", "speed", "pointer", "audio", "canvas", "trim", "layers"]],
                 "time": ["type": "number", "minimum": 0],
                 "time_base": ["type": "string", "enum": ["source", "output"]],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]

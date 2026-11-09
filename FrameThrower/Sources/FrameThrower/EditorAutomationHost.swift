@@ -634,8 +634,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     /// never seeks, finishes a gesture, creates history or opens source media.
     private func inspectComponent(_ args: [String: Any], editor: ProjectEditor) throws -> [String: Any] {
         guard let component = args["component"] as? String,
-              ["screen", "camera", "speed", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
-            throw EditorAutomationError.invalid("Choose screen, camera, pointer, audio, canvas, trim or layers.")
+              ["screen", "camera", "camera_opacity", "speed", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
+            throw EditorAutomationError.invalid("Choose screen, camera, camera_opacity, speed, pointer, audio, canvas, trim or layers.")
         }
         let context = try automationContext
         let state = editor.editingState
@@ -646,6 +646,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             case "screen": return try EditorAutomationAPI.object(state.zoom(at: sourceTime))
             case "camera": return try EditorAutomationAPI.object(state.placement(at: sourceTime))
             case "speed": return ["rate": state.speed(at: sourceTime), "preservesPitch": state.preservesAudioPitch] as [String: Any]
+            case "camera_opacity": return ["opacity": state.cameraOpacity(at: sourceTime)]
             case "pointer": return try EditorAutomationAPI.object(state.cursorStyle)
             case "audio": return try EditorAutomationAPI.object(state.audio)
             case "canvas": return try EditorAutomationAPI.object(state.presentation)
@@ -670,7 +671,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
         guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
         var result: [String: Any] = ["component": component, "source_time": time, "value": try value(at: time),
-            "scope": ["screen", "camera", "speed", "layers"].contains(component) ? "source_time" : "recording",
+            "scope": ["screen", "camera", "camera_opacity", "speed", "layers"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
         if component == "audio" { result["audio_sources"] = try editor.project.audioSources.map { try EditorAutomationAPI.object($0) } }

@@ -89,11 +89,20 @@ struct ProjectEditorView: View {
         case .screen: return state.zoomKeyframes.first { $0.id == id }?.time ?? state.editAnchors.first { $0.id == id }?.time
         case .camera: return state.pipKeyframes.first { $0.id == id }?.time
         case .speed: return state.speedKeyframes.first { $0.id == id }?.time
+        case .cameraOpacity: return state.cameraOpacityEvents.first { $0.id == id }?.time
         case .pointer: return nil
         case .audioMicrophone, .audioSystem: return selectedAnimationID.lane.audioRole.flatMap { role in state.audio.channel(role).points.first { $0.id == id }?.time }
         }
     }
     private var point: PIPKeyframe? { state.pipKeyframes.first { abs($0.time - editTime) < 0.000001 } }
+    private var usesCameraOpacityTiming: Bool { selectedAnimationID?.lane == .cameraOpacity }
+    private var opacityPoint: CameraOpacityKeyframe? { state.cameraOpacityKeyframes.first { abs($0.time - editTime) < 0.000001 } }
+    private var cameraTimingPoint: PIPKeyframe? {
+        guard usesCameraOpacityTiming else { return point }
+        guard let value = opacityPoint else { return nil }
+        return PIPKeyframe(id: value.id, time: value.time, placement: PIPPlacement(), transition: value.transition,
+            duration: value.duration, easeIn: value.easeIn, easeOut: value.easeOut)
+    }
     private var placement: PIPPlacement { state.placement(at: editTime) }
     private var zoom: ZoomPlacement { state.zoom(at: editTime) }
     private var zoomPoint: ZoomKeyframe? { state.zoomKeyframes.first { abs($0.time - editTime) < 0.000001 } }
@@ -433,10 +442,12 @@ struct ProjectEditorView: View {
                 playback.pause()
                 if sameEdit { return }
                 edit.wrappedValue = target.id; animation.wrappedValue = nil
-                if (target.speedID == id && target.zoomID != id && target.cameraID != id) || (target.speedID != nil && target.cameraID == nil && target.zoomID == nil) { inspector.wrappedValue = .speed }
-                else if target.cameraID != nil && target.zoomID == nil { inspector.wrappedValue = .camera }
+                if (target.speedID == id && target.zoomID != id && target.cameraID != id && target.cameraOpacityID != id) || (target.speedID != nil && target.cameraID == nil && target.zoomID == nil && target.cameraOpacityID == nil) { inspector.wrappedValue = .speed }
+                else if (target.cameraID != nil || target.cameraOpacityID != nil) && target.zoomID == nil { inspector.wrappedValue = .camera }
                 else if target.zoomID != nil && target.cameraID == nil { inspector.wrappedValue = .zoom }
-                let lane: TimelineAnimationLane = inspector.wrappedValue == .camera ? .camera : inspector.wrappedValue == .speed ? .speed : inspector.wrappedValue == .pointer ? .pointer : .screen
+                let lane: TimelineAnimationLane = inspector.wrappedValue == .camera
+                    ? ((target.cameraOpacityID == id && target.cameraID != id) || (target.cameraID == nil && target.cameraOpacityID != nil) ? .cameraOpacity : .camera)
+                    : inspector.wrappedValue == .speed ? .speed : inspector.wrappedValue == .pointer ? .pointer : .screen
                 animation.wrappedValue = EditorAnimationEditing.animations(in: editor.editingState, references: editor.references,
                     duration: editor.project.duration, includeCamera: editor.project.cameraFilename != nil)
                     .first { $0.lane == lane && (lane == .pointer || $0.editID == target.id) }?.id
@@ -765,7 +776,7 @@ struct ProjectEditorView: View {
                 onAnimationEdit: { editAnimation($0, final: $1) },
                 onAnimationCancel: { cancelAnimationGesture() },
                 onDeleteAnimation: { if isSourceTimeline || timelineIsIdentity { deleteAnimation($0) } },
-                showsClipLane: true, showsTrimHandles: isSourceTimeline,
+                showsClipLane: true, showsCameraOpacityLane: editor.project.cameraFilename != nil, showsTrimHandles: isSourceTimeline,
                 allowsSeekingOutsideTrim: isSourceTimeline, clockID: timelineTimeBase.rawValue,
                 clipBands: timelineClipBands, cutMarkers: timelineCutMarkers,
                 selectedCutID: selectedCutID, selectedRange: cutSelection,
@@ -781,7 +792,7 @@ struct ProjectEditorView: View {
                 }, onCutRange: { cutSelectedSection() },
                 onRestoreCut: { applyCutMutation(.restoreCut(cutID: $0), name: "Restore section") },
                 onCutAnchor: { cutPopoverAnchor = $0 }, sourceEnvelopes: outputProjection?.envelopes ?? [:], speedCurves: speedCurves)
-                .frame(height: RecordingTimeline.clipLaneHeight + CGFloat(editor.project.audioSources.count * 30))
+                .frame(height: RecordingTimeline.clipLaneHeight + CGFloat(editor.project.audioSources.count * 30) + (editor.project.cameraFilename != nil ? 30 : 0))
                 .popover(isPresented: Binding(get: { selectedCutID != nil }, set: { if !$0 { selectedCutID = nil } }),
                     attachmentAnchor: .point(cutPopoverAnchor)) { cutControls }
                 .contextMenu {
@@ -890,7 +901,7 @@ struct ProjectEditorView: View {
                 Spacer(minLength: 0)
                 if selectedInspector == .camera {
                     cameraVisibility.disabled(hasAmbiguousFramingTarget)
-                        .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Show or hide the camera overlay.")
+                        .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Fade the camera using its opacity, movement duration and ramps.")
                 }
             }
             .frame(height: 24)
@@ -1261,8 +1272,8 @@ struct ProjectEditorView: View {
         if id == selectedEditID { playback.pause(); return }
         guard editor.finishDraft(), let edit = edits.first(where: { $0.id == id }) else { return }
         selectedEditID = id
-        if edit.zoomID == nil && edit.cameraID == nil && edit.speedID != nil { selectedInspector = .speed }
-        else if edit.zoomID == nil && edit.cameraID != nil { selectedInspector = .camera }
+        if edit.zoomID == nil && edit.cameraID == nil && edit.cameraOpacityID == nil && edit.speedID != nil { selectedInspector = .speed }
+        else if edit.zoomID == nil && (edit.cameraID != nil || edit.cameraOpacityID != nil) { selectedInspector = .camera }
         else if edit.cameraID == nil { selectedInspector = .zoom }
         playback.pause()
         synchronizeAnimationSelection()
@@ -1284,10 +1295,15 @@ struct ProjectEditorView: View {
             selectedEditID = nil
             return
         }
+        if selectedInspector == .camera, let selectedAnimationID, selectedAnimationID.lane == .cameraOpacity,
+           let selected = timelineAnimations.first(where: { $0.id == selectedAnimationID }),
+           selected.editID == selectedEditID || (selectedEditID == nil && !state.cameraOpacityKeyframes.contains(where: { $0.id == selectedAnimationID.componentID })) { return }
         if selectedInspector == .pointer {
             selectedAnimationID = timelineAnimations.first(where: { $0.lane == .pointer })?.id
         } else if let edit = selectedEdit {
-            let lane: TimelineAnimationLane = selectedInspector == .camera ? .camera : selectedInspector == .speed ? .speed : .screen
+            let lane: TimelineAnimationLane = selectedInspector == .camera
+                ? (edit.cameraID == nil && edit.cameraOpacityID != nil ? .cameraOpacity : .camera)
+                : selectedInspector == .speed ? .speed : .screen
             selectedAnimationID = timelineAnimations.first(where: { $0.editID == edit.id && $0.lane == lane })?.id
         } else if selectedInspector == .camera, selectedAnimationID?.lane == .camera,
                   selectedAnimationID?.componentID == state.pipKeyframes.first?.id {
@@ -1313,9 +1329,9 @@ struct ProjectEditorView: View {
         if let role = id.lane.audioRole { selectedInspector = .audio; audioRole = role; selectedEditID = nil; return }
         selectedEditID = edits.first(where: { edit in
             span.isReference ? edit.anchorID == id.componentID : id.lane == .screen ? edit.zoomID == id.componentID :
-                id.lane == .speed ? edit.speedID == id.componentID : edit.cameraID == id.componentID
+                id.lane == .speed ? edit.speedID == id.componentID : id.lane == .cameraOpacity ? edit.cameraOpacityID == id.componentID : edit.cameraID == id.componentID
         })?.id
-        selectedInspector = id.lane == .camera ? .camera : id.lane == .speed ? .speed : .zoom
+        selectedInspector = id.lane == .camera || id.lane == .cameraOpacity ? .camera : id.lane == .speed ? .speed : .zoom
     }
 
     private func editAnimation(_ request: AnimationDrag, final: Bool) {
@@ -1328,7 +1344,7 @@ struct ProjectEditorView: View {
             animationGesture = AnimationGestureSnapshot(id: request.id, state: editor.project.state, spans: spans,
                 replacements: EditorAnimationEditing.replacementIDs(for: spans), playhead: playback.time,
                 selection: selectedEditID, animationSelection: selectedAnimationID,
-                name: "\(verb) \(request.id.lane.rawValue) animation")
+                name: "\(verb) \(request.id.lane == .cameraOpacity ? "camera opacity" : request.id.lane.rawValue) animation")
         }
         guard let gesture = animationGesture, gesture.id == request.id,
               let original = gesture.spans.first(where: { $0.id == request.id }),
@@ -1342,9 +1358,9 @@ struct ProjectEditorView: View {
         let component = edit.aliases.first(where: { $0.lane == request.id.lane && $0.originalID == request.id.componentID })?.replacementID ?? request.id.componentID
         selectedEditID = edits.first(where: { value in
             original.isReference ? value.anchorID == component : request.id.lane == .screen ? value.zoomID == component :
-                request.id.lane == .speed ? value.speedID == component : value.cameraID == component
+                request.id.lane == .speed ? value.speedID == component : request.id.lane == .cameraOpacity ? value.cameraOpacityID == component : value.cameraID == component
         })?.id
-        selectedInspector = request.id.lane.audioRole != nil ? .audio : request.id.lane == .camera ? .camera : request.id.lane == .speed ? .speed : .zoom
+        selectedInspector = request.id.lane.audioRole != nil ? .audio : (request.id.lane == .camera || request.id.lane == .cameraOpacity) ? .camera : request.id.lane == .speed ? .speed : .zoom
         if let role = request.id.lane.audioRole { audioRole = role; selectedEditID = nil }
         selectedAnimationID = request.id
         let current = changes.first(where: { $0.id == request.id }) ?? original
@@ -1492,12 +1508,20 @@ struct ProjectEditorView: View {
         selectedInspector = .zoom
     }
 
+    private func beginOpacityGesture() {
+        beginCameraGesture()
+        selectedAnimationID = state.cameraOpacityKeyframes.first { abs($0.time - dragTime) < 0.000001 }
+            .map { TimelineAnimationID(lane: .cameraOpacity, componentID: $0.id) }
+    }
+
     private func beginCameraGesture() {
         assistant.cancel()
         dragTime = targetTime(editTime)
         canvasGesture = CanvasGestureSnapshot(state: state, time: dragTime, hadDraft: editor.draftState != nil, playhead: playback.time)
         inspectEditingTarget(at: dragTime)
         selectedInspector = .camera
+        selectedAnimationID = state.pipKeyframes.first { abs($0.time - dragTime) < 0.000001 }
+            .map { TimelineAnimationID(lane: .camera, componentID: $0.id) }
     }
 
     private func inspectEditingTarget(at time: Double) {
@@ -1568,11 +1592,44 @@ struct ProjectEditorView: View {
     }
 
     private var cameraVisibility: some View {
-        Toggle("Visible", isOn: Binding(get: { placement.visible }, set: { value in
-            var next = placement; next.visible = value
-            setPlacement(next, at: editTime, name: value ? "Show camera" : "Hide camera")
-        })).toggleStyle(.checkbox)
-            .help("Show or hide the camera at the selected edit or playhead.")
+        HStack(spacing: 8) {
+            CommitSlider(title: "Opacity", value: placement.renderedOpacity * 100, range: 0...100,
+                valueSuffix: "%", valueFormat: "%.0f", begin: { beginOpacityGesture() }, preview: { value in
+                    guard canvasGesture != nil else { return }
+                    setCameraOpacity(value / 100)
+                }) { value in
+                    guard canvasGesture != nil else { return }
+                    setCameraOpacity(value / 100)
+                    if editor.finishDraft(name: EditorActionDescription.cameraOpacityLabel(value / 100)) { canvasGesture = nil }
+                }.frame(width: 215)
+                .help("Camera transparency at this edit. Smooth fades using the Camera duration and ramps; Jump changes opacity instantly.")
+            Button {
+                let value = placement.renderedOpacity > 0 ? 0.0 : 1.0
+                beginOpacityGesture()
+                setCameraOpacity(value)
+                if editor.finishDraft(name: EditorActionDescription.cameraOpacityLabel(value)) { canvasGesture = nil }
+            } label: { Image(systemName: placement.renderedOpacity > 0 ? "eye" : "eye.slash") }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(placement.renderedOpacity > 0 ? "Hide camera" : "Show camera")
+                .help("Toggle camera opacity between 0% and 100%. Smooth uses the Camera duration and ramps to fade.")
+        }
+    }
+
+    private func setCameraOpacity(_ value: Double) {
+        guard value.isFinite, abs(state.cameraOpacity(at: editTime) - value) > 0.000000001 else { return }
+        playback.pause()
+        let time = targetTime(editTime), existing = opacityPoint
+        var edited = state
+        let keyframe = CameraOpacityKeyframe(id: existing?.id ?? UUID(), time: time, opacity: min(1, max(0, value)),
+            transition: existing?.transition ?? transition, duration: existing?.duration ?? transitionDuration,
+            easeIn: existing == nil ? cameraEaseIn : existing?.easeIn, easeOut: existing == nil ? cameraEaseOut : existing?.easeOut)
+        edited.cameraOpacityKeyframes.removeAll { abs($0.time - time) < 0.000001 }
+        edited.cameraOpacityKeyframes.append(keyframe)
+        edited.cameraOpacityKeyframes.sort { $0.time < $1.time }
+        if editor.updateDraft(edited, at: time) {
+            selectedAnimationID = TimelineAnimationID(lane: .cameraOpacity, componentID: keyframe.id)
+            selectedEditID = edited.timedEdits(includeCamera: true).first { $0.cameraOpacityID == keyframe.id }?.id
+        }
     }
 
     private var cameraCanvasSize: CGSize {
@@ -1669,7 +1726,10 @@ struct ProjectEditorView: View {
         let time = targetTime(position)
         let existing = edited.pipKeyframes.first { abs($0.time - time) < 0.000001 }
         let group = edits.first { abs($0.time - time) < 0.000001 }
-        let keyframe = PIPKeyframe(id: existing?.id ?? group?.id ?? UUID(), time: time, placement: next,
+        var geometry = next
+        let legacy = state.cameraGeometry(at: time)
+        geometry.visible = legacy.visible; geometry.opacity = legacy.opacity
+        let keyframe = PIPKeyframe(id: existing?.id ?? group?.id ?? UUID(), time: time, placement: geometry,
             transition: existing?.transition ?? transition, duration: existing?.duration ?? transitionDuration,
             easeIn: existing == nil ? cameraEaseIn : existing?.easeIn,
             easeOut: existing == nil ? cameraEaseOut : existing?.easeOut)
@@ -1708,33 +1768,43 @@ struct ProjectEditorView: View {
         inspectEditingTarget(at: targetTime(time))
         if editor.updateDraft(edited, at: targetTime(time)) {
             selectedEditID = edited.timedEdits(includeCamera: editor.project.cameraFilename != nil).first { abs($0.time - targetTime(time)) < 0.000001 }?.id
+            selectedAnimationID = edited.pipKeyframes.first { abs($0.time - targetTime(time)) < 0.000001 }
+                .map { TimelineAnimationID(lane: .camera, componentID: $0.id) }
         }
     }
 
     private func updateSelected(_ update: (inout PIPKeyframe) -> Void) {
-        guard var selected = point else { return }
+        guard var selected = cameraTimingPoint else { return }
         playback.pause()
         update(&selected)
         var edited = state
-        if let index = edited.pipKeyframes.firstIndex(where: { $0.id == selected.id }) { edited.pipKeyframes[index] = selected }
+        if usesCameraOpacityTiming {
+            if let index = edited.cameraOpacityKeyframes.firstIndex(where: { $0.id == selected.id }) {
+                edited.cameraOpacityKeyframes[index].transition = selected.transition
+                edited.cameraOpacityKeyframes[index].duration = selected.duration
+                edited.cameraOpacityKeyframes[index].easeIn = selected.easeIn
+                edited.cameraOpacityKeyframes[index].easeOut = selected.easeOut
+            }
+        } else if let index = edited.pipKeyframes.firstIndex(where: { $0.id == selected.id }) { edited.pipKeyframes[index] = selected }
         if edited != state { inspectEditingTarget(at: selected.time) }
         _ = editor.updateDraft(edited, at: selected.time)
     }
 
     private func transitionControls(camera: Bool) -> some View {
-        let mode = camera ? point?.transition ?? transition : zoomPoint?.transition ?? zoomTransition
-        let requested = camera ? point?.duration ?? transitionDuration : zoomPoint?.duration ?? zoomDuration
-        let previous = camera ? state.pipKeyframes.last(where: { $0.time < editTime })?.time ?? 0
+        let mode = camera ? cameraTimingPoint?.transition ?? transition : zoomPoint?.transition ?? zoomTransition
+        let requested = camera ? cameraTimingPoint?.duration ?? transitionDuration : zoomPoint?.duration ?? zoomDuration
+        let previous = camera ? (usesCameraOpacityTiming ? state.cameraOpacityEvents.last(where: { $0.time < editTime })?.time ?? 0
+            : state.pipKeyframes.last(where: { $0.time < editTime })?.time ?? 0)
                               : state.zoomKeyframes.last(where: { $0.time < editTime })?.time ?? 0
         let span = max(0, min(requested, editTime - previous))
-        let hasComponent = camera ? point != nil : zoomPoint != nil
-        let easeIn = camera ? point?.easeIn : zoomPoint?.easeIn
-        let easeOut = camera ? point?.easeOut : zoomPoint?.easeOut
+        let hasComponent = camera ? cameraTimingPoint != nil : zoomPoint != nil
+        let easeIn = camera ? cameraTimingPoint?.easeIn : zoomPoint?.easeIn
+        let easeOut = camera ? cameraTimingPoint?.easeOut : zoomPoint?.easeOut
         let ramps = MotionInterpolation.rampDurations(duration: span, easeIn: easeIn, easeOut: easeOut)
         let showsMovement = selectedEdit != nil && hasComponent && editTime > previous
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                if camera { cameraCornerControls }
+                if camera && !usesCameraOpacityTiming { cameraCornerControls }
                 if showsMovement {
                     Picker("Movement", selection: Binding(get: { mode }, set: { value in
                         if camera { transition = value; updateSelected { $0.transition = value } }

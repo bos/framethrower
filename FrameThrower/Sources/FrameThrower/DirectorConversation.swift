@@ -252,7 +252,7 @@ final class DirectorConversation: ObservableObject {
                 changes[key] = new[key] ?? NSNull()
             }
         }
-        for key in ["zoomKeyframes", "pipKeyframes", "regions", "editAnchors", "cuts", "speedKeyframes"] where changes[key] != nil {
+        for key in ["zoomKeyframes", "pipKeyframes", "cameraOpacityKeyframes", "regions", "editAnchors", "cuts", "speedKeyframes"] where changes[key] != nil {
             guard let previous = old[key] as? [[String: Any]], let next = new[key] as? [[String: Any]] else { continue }
             let oldIDs = previous.compactMap { $0["id"] as? String }, newIDs = next.compactMap { $0["id"] as? String }
             guard oldIDs.count == previous.count, newIDs.count == next.count,

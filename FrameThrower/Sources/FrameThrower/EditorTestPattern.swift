@@ -52,7 +52,8 @@ final class EditorTestPattern {
             .offsetBy(dx: output.minX, dy: output.minY)
         let localCamera = cameraFrame.offsetBy(dx: -output.minX, dy: -output.minY)
         cameraClip.frame = localCamera
-        cameraClip.isHidden = !cameraEnabled || !placement.visible
+        cameraClip.isHidden = !cameraEnabled || placement.renderedOpacity == 0
+        cameraClip.opacity = Float(placement.renderedOpacity)
         cameraClip.cornerRadius = placement.cornerRadius(in: localCamera.size)
         let cameraSource = CGSize(width: Self.sourceSize.height * cameraAspect, height: Self.sourceSize.height)
         cameraViewport = placement.sourceViewport(in: cameraSource, canvas: output.size)

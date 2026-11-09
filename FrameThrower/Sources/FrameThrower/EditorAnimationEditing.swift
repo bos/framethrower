@@ -44,14 +44,17 @@ enum EditorAnimationEditing {
         }
         if includeCamera {
             previous = 0
-            for (index, point) in state.pipKeyframes.sorted(by: { $0.time < $1.time }).enumerated() {
+            let cameraPoints = state.pipKeyframes.sorted(by: { $0.time < $1.time })
+            for (index, point) in cameraPoints.enumerated() {
                 let group = groups.first { $0.cameraID == point.id }
                     ?? TimedEdit(id: point.id, time: point.time, zoomID: nil, cameraID: point.id)
                 let referenceID = references.edits[point.id.uuidString] != nil ? point.id : group.id
                 let cameraEdit = TimedEdit(id: referenceID, time: point.time, zoomID: nil, cameraID: point.id)
                 let description = EditorActionDescription.describe(cameraEdit, in: state, references: references)
                 let letter = references.editLabel(for: referenceID).map { String($0.dropFirst(5)) }
-                let label = index == 0 ? "Initial" : "Camera" + (letter.map { " " + $0 } ?? "")
+                let prior = index > 0 ? cameraPoints[index - 1].placement : PIPPlacement()
+                let cameraAction = EditorActionDescription.cameraFadeLabel(point.placement, previous: prior) ?? "Camera"
+                let label = index == 0 ? "Initial" : cameraAction + (letter.map { " " + $0 } ?? "")
                 let help = index == 0 ? "Initial camera appearance. Select to change its framing and size." : description.tooltip
                 result.append(animation(id: point.id, editID: group.id, lane: .camera, end: point.time,
                     previous: previous, transition: point.transition, duration: point.duration,
@@ -94,6 +97,23 @@ enum EditorAnimationEditing {
                 result.append(span); previous = point.time; gain = point.gain
             }
         }
+        if includeCamera {
+            previous = 0
+            var previousAlpha = state.cameraOpacityEvents.first?.opacity ?? 1
+            let ownIDs = Set(state.cameraOpacityKeyframes.map(\.id))
+            for (index, point) in state.cameraOpacityEvents.enumerated() {
+                let group = groups.first { $0.cameraOpacityID == point.id }
+                let letter = references.editLabel(for: point.id).map { String($0.dropFirst(5)) }
+                let action = point.opacity == previousAlpha ? String(format: "Opacity %.0f%%", point.opacity * 100)
+                    : EditorActionDescription.cameraOpacityLabel(point.opacity)
+                let label = index == 0 && !ownIDs.contains(point.id) ? "Initial opacity" : action + (letter.map { " " + $0 } ?? "")
+                result.append(animation(id: point.id, editID: group?.id ?? point.id, lane: .cameraOpacity,
+                    end: point.time, previous: previous, transition: point.transition, duration: point.duration,
+                    easeIn: point.easeIn, easeOut: point.easeOut,
+                    label: label, help: label + ". Camera opacity is independent of camera movement.", editable: ownIDs.contains(point.id)))
+                previous = point.time; previousAlpha = point.opacity
+            }
+        }
         for anchor in state.editAnchors {
             let attachedScreen = state.zoomKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
             let attachedCamera = state.pipKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
@@ -123,7 +143,7 @@ enum EditorAnimationEditing {
         let baseline = animations(in: state, references: EditorReferences(), duration: duration)
         var result = state
         var aliases: [EditorAnimationIdentityAlias] = []
-        let existingIDs = Set(state.zoomKeyframes.map(\.id) + state.pipKeyframes.map(\.id) + state.editAnchors.map(\.id) + state.speedKeyframes.map(\.id))
+        let existingIDs = Set(state.zoomKeyframes.map(\.id) + state.pipKeyframes.map(\.id) + state.cameraOpacityKeyframes.map(\.id) + state.editAnchors.map(\.id) + state.speedKeyframes.map(\.id))
         var usedReplacements = Set<UUID>()
         for change in changes {
             guard let original = baseline.first(where: { $0.id == change.id }), original.editable,
@@ -154,6 +174,7 @@ enum EditorAnimationEditing {
             let anchored = state.editAnchors.contains { $0.id == change.componentID }
             let shared = (change.lane != .screen && state.zoomKeyframes.contains { $0.id == change.componentID }) ||
                 (change.lane != .camera && state.pipKeyframes.contains { $0.id == change.componentID }) ||
+                (change.lane != .cameraOpacity && state.cameraOpacityKeyframes.contains { $0.id == change.componentID }) ||
                 (change.lane != .speed && state.speedKeyframes.contains { $0.id == change.componentID })
             if retimed && (anchored || shared) {
                 guard let replacement = replacementIDs[change.id], !existingIDs.contains(replacement),
@@ -202,14 +223,28 @@ enum EditorAnimationEditing {
                     if change.easeIn != original.easeIn { result.speedKeyframes[index].easeIn = change.easeIn }
                     if change.easeOut != original.easeOut { result.speedKeyframes[index].easeOut = change.easeOut }
                 }
+            case .cameraOpacity:
+                guard let index = result.cameraOpacityKeyframes.firstIndex(where: { $0.id == change.componentID }) else { return nil }
+                result.cameraOpacityKeyframes[index].id = newID
+                result.cameraOpacityKeyframes[index].time = change.end
+                if change.start != original.start || change.end != original.end {
+                    if !change.isInstant { result.cameraOpacityKeyframes[index].duration = change.duration }
+                    result.cameraOpacityKeyframes[index].transition = change.isInstant ? .jump : .smooth
+                    result.cameraOpacityKeyframes[index].easeIn = change.easeIn
+                    result.cameraOpacityKeyframes[index].easeOut = change.easeOut
+                } else {
+                    if change.easeIn != original.easeIn { result.cameraOpacityKeyframes[index].easeIn = change.easeIn }
+                    if change.easeOut != original.easeOut { result.cameraOpacityKeyframes[index].easeOut = change.easeOut }
+                }
             case .pointer, .audioMicrophone, .audioSystem: return nil
             }
         }
         result.zoomKeyframes.sort { $0.time < $1.time }
         result.pipKeyframes.sort { $0.time < $1.time }
         result.speedKeyframes.sort { $0.time < $1.time }
+        result.cameraOpacityKeyframes.sort { $0.time < $1.time }
         result.editAnchors.sort { $0.time < $1.time }
-        guard ordered(result.zoomKeyframes.map(\.time)), ordered(result.pipKeyframes.map(\.time)),
+        guard ordered(result.zoomKeyframes.map(\.time)), ordered(result.pipKeyframes.map(\.time)), ordered(result.cameraOpacityKeyframes.map(\.time)),
               ordered(result.editAnchors.map(\.time)), ordered(result.speedKeyframes.map(\.time)) else { return nil }
         // A source point may store a long duration whose visible start was
         // clipped by its predecessor. Keep an otherwise untouched follower's
@@ -248,6 +283,12 @@ enum EditorAnimationEditing {
                             channel.points[index].easeIn = original.easeIn; channel.points[index].easeOut = original.easeOut
                         }
                     }
+                case .cameraOpacity:
+                    guard let index = result.cameraOpacityKeyframes.firstIndex(where: { $0.id == original.componentID }) else { continue }
+                    if !original.isInstant { result.cameraOpacityKeyframes[index].duration = original.duration }
+                    result.cameraOpacityKeyframes[index].transition = original.isInstant ? .jump : .smooth
+                    result.cameraOpacityKeyframes[index].easeIn = original.easeIn
+                    result.cameraOpacityKeyframes[index].easeOut = original.easeOut
                 case .pointer: break
                 }
             }

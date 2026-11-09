@@ -4,7 +4,7 @@ import Foundation
 /// durable identity when a target changes, moves, or is undone.
 struct EditorActionDescription: Equatable, Sendable {
     enum Kind: String, Sendable {
-        case zoom = "Zoom", pan = "Pan", fullFrame = "Full frame", hold = "Hold", reference = "Reference", camera = "Camera", speed = "Speed"
+        case zoom = "Zoom", pan = "Pan", fullFrame = "Full frame", hold = "Hold", reference = "Reference", camera = "Camera", speed = "Speed", cameraOpacity = "Opacity"
     }
 
     let kind: Kind
@@ -19,6 +19,9 @@ struct EditorActionDescription: Equatable, Sendable {
         let zoom = state.zoomKeyframes.first { $0.id == edit.zoomID }
         let camera = state.pipKeyframes.first { $0.id == edit.cameraID }
         let speed = state.speedKeyframes.first { $0.id == edit.speedID }
+        let opacity = state.cameraOpacityKeyframes.first { $0.id == edit.cameraOpacityID }
+        let priorOpacity = opacity.flatMap { point in state.cameraOpacityEvents.last { $0.time < point.time } }?.opacity
+            ?? state.cameraOpacityEvents.first?.opacity ?? 1
         let priorZoom = state.zoomKeyframes.last { $0.time < (zoom?.time ?? edit.time) }
         let priorCamera = state.pipKeyframes.last { $0.time < (camera?.time ?? edit.time) }
         let previous = priorZoom?.placement.clamped ?? ZoomPlacement()
@@ -29,6 +32,7 @@ struct EditorActionDescription: Equatable, Sendable {
         let cameraChanged = camera.map { $0.placement != (priorCamera?.placement ?? PIPPlacement()) } ?? false
         let kind: Kind
         if zoom == nil && camera == nil && speed != nil { kind = .speed }
+        else if zoom == nil && camera == nil && opacity != nil { kind = .cameraOpacity }
         else if zoom == nil && camera == nil { kind = .reference }
         else if !screenChanged && cameraChanged { kind = .camera }
         else if zoom != nil && target.scale == 1 && (screenChanged || edit.time == 0) { kind = .fullFrame }
@@ -53,14 +57,20 @@ struct EditorActionDescription: Equatable, Sendable {
             detail = zoom != nil ? "Keep the screen framing at \(factor)." : "Keep the camera framing."
         case .camera: detail = cameraDetail(camera!.placement, previous: priorCamera?.placement ?? PIPPlacement())
         case .speed: detail = String(format: "Export at %.2f× speed. Source-time edits remain anchored to their footage.", speed!.rate)
+        case .cameraOpacity:
+            detail = opacity!.opacity == priorOpacity ? String(format: "Keep camera opacity at %.0f%%.", opacity!.opacity * 100)
+                : cameraOpacityLabel(opacity!.opacity) + "."
         }
         if screenChanged && cameraChanged, let camera {
             detail += " " + cameraDetail(camera.placement, previous: priorCamera?.placement ?? PIPPlacement())
         }
         if kind != .speed, let speed { detail += String(format: " Export speed %.2f×.", speed.rate) }
+        if let opacity, kind != .cameraOpacity { detail += " " + cameraOpacityLabel(opacity.opacity) + "." }
         let legacy = references.editLabel(for: edit.id)
         let letter = legacy.map { String($0.dropFirst("Edit ".count)) }
-        let label = kind.rawValue + (letter.map { " " + $0 } ?? "")
+        let action = kind == .cameraOpacity && opacity!.opacity != priorOpacity ? cameraOpacityLabel(opacity!.opacity)
+            : kind == .camera ? cameraFadeLabel(camera!.placement, previous: priorCamera?.placement ?? PIPPlacement()) ?? kind.rawValue : kind.rawValue
+        let label = action + (letter.map { " " + $0 } ?? "")
         let pointTime = String(format: "%.2f s", edit.time)
         var tooltip = "\(label) at \(pointTime). \(detail)"
         if screenChanged, let zoom, zoom.transition == .smooth {
@@ -72,7 +82,7 @@ struct EditorActionDescription: Equatable, Sendable {
         }
         let abbreviatedReference = kind == .reference ? letter.map { "Ref " + $0 } : nil
         return Self(kind: kind, shortLabel: label, detail: detail, tooltip: tooltip, legacyLabel: legacy,
-                    aliases: [label, legacy, letter, abbreviatedReference].compactMap { $0 }, isMovement: screenChanged || cameraChanged || speed != nil)
+                    aliases: [label, legacy, letter, abbreviatedReference].compactMap { $0 }, isMovement: screenChanged || cameraChanged || speed != nil || opacity != nil)
     }
 
     /// Descriptive prefixes can change after a revision. Resolve all known
@@ -83,7 +93,7 @@ struct EditorActionDescription: Equatable, Sendable {
         guard let letter = letter(in: label) else { return nil }
         let expected = "Edit " + letter
         let matches = state.timedEdits(includeCamera: includeCamera).filter { edit in
-            [edit.id, edit.zoomID, edit.cameraID, edit.anchorID, edit.speedID].compactMap { $0 }
+            [edit.id, edit.zoomID, edit.cameraID, edit.anchorID, edit.speedID, edit.cameraOpacityID].compactMap { $0 }
                 .contains { references.editLabel(for: $0) == expected }
         }
         // A Screen and Camera animation can retain the same stable letter
@@ -91,7 +101,8 @@ struct EditorActionDescription: Equatable, Sendable {
         // an unqualified Edit/letter remains ambiguous and needs clarification.
         let prefix = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let qualified: [TimedEdit]
-        if prefix.hasPrefix("camera ") { qualified = matches.filter { $0.cameraID.map { references.editLabel(for: $0) == expected } == true } }
+        if prefix.hasPrefix("fade camera ") || prefix.hasPrefix("opacity ") { qualified = matches.filter { $0.cameraOpacityID.map { references.editLabel(for: $0) == expected } == true } }
+        else if prefix.hasPrefix("camera ") { qualified = matches.filter { $0.cameraID.map { references.editLabel(for: $0) == expected } == true } }
         else if prefix.hasPrefix("speed ") { qualified = matches.filter { $0.speedID.map { references.editLabel(for: $0) == expected } == true } }
         else if ["zoom ", "pan ", "full frame ", "full-frame ", "hold "].contains(where: { prefix.hasPrefix($0) }) {
             qualified = matches.filter { $0.zoomID.map { references.editLabel(for: $0) == expected } == true }
@@ -103,6 +114,9 @@ struct EditorActionDescription: Equatable, Sendable {
 
     static func unambiguousLabel(for edit: TimedEdit, in state: EditState, references: EditorReferences) -> String {
         if let legacy = references.editLabel(for: edit.id), resolve(legacy, in: state, references: references)?.id == edit.id { return legacy }
+        if edit.zoomID == nil, edit.cameraID == nil, edit.cameraOpacityID != nil, let legacy = references.editLabel(for: edit.id) {
+            return "Opacity " + String(legacy.dropFirst(5))
+        }
         if edit.zoomID == nil, edit.cameraID != nil, let legacy = references.editLabel(for: edit.id) {
             return "Camera " + String(legacy.dropFirst(5))
         }
@@ -111,7 +125,7 @@ struct EditorActionDescription: Equatable, Sendable {
 
     static func mentions(_ edit: TimedEdit, in request: String, state: EditState, references: EditorReferences) -> Bool {
         guard let legacy = references.editLabel(for: edit.id), let letter = letter(in: legacy) else { return false }
-        let prefixed = "(?i)(?<![A-Za-z0-9])(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed)\\s*" + letter + "(?![A-Za-z0-9])"
+        let prefixed = "(?i)(?<![A-Za-z0-9])(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed|opacity|fade\\s+camera\\s+(?:in|out|to\\s+\\d+(?:\\.\\d+)?%))\\s*" + letter + "(?![A-Za-z0-9])"
         if request.range(of: prefixed, options: .regularExpression) != nil { return true }
         // Require a label-shaped context for bare letters. The article in
         // 'move to a box' must not silently identify timeline reference A.
@@ -122,7 +136,7 @@ struct EditorActionDescription: Equatable, Sendable {
     /// Action words inside an identifier are not new movement instructions.
     /// In particular, mentioning Full frame E does not request a waypoint.
     static func neutralizingLabels(in request: String, state: EditState, references: EditorReferences) -> String {
-        let pattern = "\\b(?i:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed)\\s+(?:[A-Za-z]|[A-Z]{2,6})\\b"
+        let pattern = "\\b(?i:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed|opacity|fade\\s+camera\\s+(?:in|out|to\\s+\\d+(?:\\.\\d+)?%))\\s+(?:[A-Za-z]|[A-Z]{2,6})\\b"
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return request }
         let source = request as NSString
         let result = NSMutableString(string: request)
@@ -135,27 +149,40 @@ struct EditorActionDescription: Equatable, Sendable {
     }
 
     private static func letter(in label: String) -> String? {
-        let pattern = "^\\s*(?:(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed)\\s*)?([a-z]{1,6})\\s*$"
+        let pattern = "^\\s*(?:(?:edit|step|zoom|pan|full[ -]?frame|hold|ref(?:erence)?|camera|speed|opacity|fade\\s+camera\\s+(?:in|out|to\\s+\\d+(?:\\.\\d+)?%))\\s*)?([a-z]{1,6})\\s*$"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
         let value = label as NSString
         guard let match = regex.firstMatch(in: label, range: NSRange(location: 0, length: value.length)) else { return nil }
         return value.substring(with: match.range(at: 1)).uppercased()
     }
 
+    static func cameraOpacityLabel(_ opacity: Double) -> String {
+        if opacity <= 0 { return "Fade camera out" }
+        if opacity >= 1 { return "Fade camera in" }
+        return String(format: "Fade camera to %.0f%%", opacity * 100)
+    }
+
+    static func cameraFadeLabel(_ target: PIPPlacement, previous: PIPPlacement) -> String? {
+        guard target.visible,
+              abs(target.renderedOpacity - previous.renderedOpacity) > 0.000001 else { return nil }
+        return cameraOpacityLabel(target.opacity)
+    }
+
     private static func cameraDetail(_ target: PIPPlacement, previous: PIPPlacement) -> String {
-        if target.visible != previous.visible { return target.visible ? "Show the camera." : "Hide the camera." }
+        let fade = cameraFadeLabel(target, previous: previous).map { $0 + ". " } ?? ""
+        if target.visible != previous.visible && fade.isEmpty { return target.visible ? "Show the camera." : "Hide the camera." }
         if target.fullscreenFraction != previous.fullscreenFraction {
-            if target.fullscreenFraction == 1 { return "Expand the camera to full screen." }
-            if target.fullscreenFraction == 0 { return "Return the camera to its picture-in-picture layout." }
-            return "Resize the camera toward full screen."
+            if target.fullscreenFraction == 1 { return fade + "Expand the camera to full screen." }
+            if target.fullscreenFraction == 0 { return fade + "Return the camera to its picture-in-picture layout." }
+            return fade + "Resize the camera toward full screen."
         }
         let moved = target.x != previous.x || target.y != previous.y
         let resized = target.scale != previous.scale
         let reframed = target.shape != previous.shape || target.aspectRatio != previous.aspectRatio || target.crop != previous.crop || target.sourceZoom != previous.sourceZoom
-        if reframed { return "Change the camera framing." }
-        if moved && resized { return "Move and resize the camera." }
-        if moved { return "Move the camera." }
-        if resized { return "Resize the camera." }
-        return "Keep the camera framing."
+        if reframed { return fade + "Change the camera framing." }
+        if moved && resized { return fade + "Move and resize the camera." }
+        if moved { return fade + "Move the camera." }
+        if resized { return fade + "Resize the camera." }
+        return fade.isEmpty ? "Keep the camera framing." : String(fade.dropLast())
     }
 }

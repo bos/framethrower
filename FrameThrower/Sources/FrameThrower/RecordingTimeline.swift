@@ -154,6 +154,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var onDeleteAnimation: (TimelineAnimationID) -> Void = { _ in }
 
     var showsClipLane = false
+    var showsCameraOpacityLane = false
     var showsTrimHandles = true
     var allowsSeekingOutsideTrim = false
     var clockID = "source"
@@ -173,6 +174,7 @@ struct RecordingTimeline: NSViewRepresentable {
     func updateNSView(_ view: RecordingTimelineView, context: Context) {
         view.setClock(clockID, duration: duration)
         view.showsClipLane = showsClipLane
+        view.showsCameraOpacityLane = showsCameraOpacityLane
         view.showsTrimHandles = showsTrimHandles
         view.allowsSeekingOutsideTrim = allowsSeekingOutsideTrim
         view.clipBands = clipBands
@@ -318,6 +320,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var conflictOverlaps: [ClosedRange<Double>] = [] {
         didSet { if conflictOverlaps != oldValue { needsDisplay = true; updateTooltips() } }
     }
+    var showsCameraOpacityLane = false { didSet { if oldValue != showsCameraOpacityLane { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } } }
     var showsClipLane = false { didSet { if oldValue != showsClipLane { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } } }
     var showsTrimHandles = true { didSet { needsDisplay = true } }
     var allowsSeekingOutsideTrim = false
@@ -644,9 +647,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     func animationLanes() -> [AnimationLaneGeometry] {
-        TimelineAnimationLane.allCases.filter { lane in lane == .screen || lane == .camera || lane == .speed || lane == .pointer || animationSpans.contains(where: { $0.lane == lane }) }.enumerated().map { index, lane in
+        TimelineAnimationLane.allCases.filter { lane in
+            if lane == .cameraOpacity { return showsCameraOpacityLane }
+            if lane == .audioMicrophone || lane == .audioSystem { return animationSpans.contains { $0.lane == lane } }
+            return true
+        }.enumerated().map { index, lane in
             let y = CGFloat(40 + index * 30) + laneOffset
-            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .speed: "Speed"; case .pointer: "Pointer"; case .audioMicrophone: "Mic"; case .audioSystem: "System" }
+            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .cameraOpacity: "Opacity"; case .speed: "Speed"; case .pointer: "Pointer"; case .audioMicrophone: "Mic"; case .audioSystem: "System" }
             return AnimationLaneGeometry(lane: lane, title: title,
                 frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
                 labelFrame: CGRect(x: 8, y: y + 5, width: 52, height: 16))
@@ -734,7 +741,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
-        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .speed: .systemOrange; case .pointer: .secondaryLabelColor; case .audioMicrophone: .systemGreen; case .audioSystem: .systemBlue }
+        switch lane { case .screen: .systemPurple; case .camera: .systemTeal; case .cameraOpacity: .systemPink; case .speed: .systemOrange; case .pointer: .secondaryLabelColor; case .audioMicrophone: .systemGreen; case .audioSystem: .systemBlue }
     }
 
     func playheadLine() -> NSBezierPath {
@@ -1371,7 +1378,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         while tick <= last + step * 0.000_001 {
             let position = x(for: tick)
             let path = NSBezierPath()
-            let tickY: CGFloat = showsAnimationLanes ? 130 + laneOffset : 57
+            let tickY: CGFloat = showsAnimationLanes ? CGFloat(40 + animationLanes().count * 30) + laneOffset : 57
             path.move(to: CGPoint(x: position, y: tickY))
             path.line(to: CGPoint(x: position, y: tickY + 3))
             NSColor.tertiaryLabelColor.setStroke()
@@ -1379,7 +1386,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let text = String(format: "%.*f s", decimals, tick) as NSString
             let width = text.size(withAttributes: attributes).width
             let labelX = min(max(position - width / 2, 0), bounds.width - width)
-            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? 134 + laneOffset : 61), withAttributes: attributes)
+            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? CGFloat(44 + animationLanes().count * 30) + laneOffset : 61), withAttributes: attributes)
             tick += step
         }
     }

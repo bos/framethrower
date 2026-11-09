@@ -17,7 +17,7 @@ production = list(dict.fromkeys(values['production'] + [
 suites = values['suites'] + ['EditorAutomationChecks','NativeAutomationConflictChecks','EditorComponentInspectionChecks',
     'RecordingTimeMapChecks','EditorMutationChecks','EditorCutMutationChecks','EditorCutPlaybackChecks',
     'EditorPreviewCommandChecks','EditorSimulationChecks','CutTimelineChecks',
-    'RecordingSpeedTimeMapChecks','EditorSpeedPlaybackChecks','EditorSpeedEditingChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks']
+    'RecordingSpeedTimeMapChecks','EditorSpeedPlaybackChecks','EditorSpeedEditingChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks','PIPOpacityChecks']
 live = 'NativeDirectorLiveChecks'
 paths = [source/(name+'.swift') for name in production] + [root/'Tests'/(name+'.swift') for name in suites+[live]]
 override = os.environ.get('FRAMETHROWER_TEST_SOURCE_SNAPSHOT')
@@ -40,13 +40,13 @@ if not binary.exists():
         text=data.decode(); assert text.count('@main')==1,name
         path=folder/(name+'.swift'); path.write_text(text.replace('@main','',1)); tests.append(path)
     calls='\n'.join('if selected.isEmpty || selected.contains("'+name+'") { try '+
-        ('' if name in ('EditorAutomationPlannerChecks','EditorMutationChecks','RecordingTimeMapChecks','EditorCutMutationChecks','CutTimelineChecks','RecordingSpeedTimeMapChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks') else 'await ')+name+
+        ('' if name in ('EditorAutomationPlannerChecks','EditorMutationChecks','RecordingTimeMapChecks','EditorCutMutationChecks','CutTimelineChecks','RecordingSpeedTimeMapChecks','RecordingAudioMixChecks','IndependentAudioChecks','RetimedAudioMixChecks','PIPOpacityChecks') else 'await ')+name+
         ('.run()' if name=='DirectorInspectionSessionChecks' else '.main()')+' }' for name in suites)
     entry=folder/'IntegrationMain.swift'
     entry.write_text('import Foundation\nimport Darwin\n@main @MainActor struct NativeEditingMain { static func main() async { let selected=Set(CommandLine.arguments.dropFirst()); do {\n'+
         'if selected.contains("'+live+'") { await '+live+'.main(); return }\n'+calls+
         '\n} catch { FileHandle.standardError.write(Data("Native editing integration failed: \\(error)\\n".utf8)); exit(1) } } }\n')
-    flags=['-whole-module-optimization','-Onone','-num-threads','1','-parse-as-library','-warnings-as-errors',
+    flags=['-D','FRAMETHROWER_FULL_EDITING_CHECKS','-whole-module-optimization','-Onone','-num-threads','1','-parse-as-library','-warnings-as-errors',
         '-strict-concurrency=complete','-enable-upcoming-feature','ExistentialAny','-target',platform.machine()+'-apple-macos15.0']
     subprocess.run(['swiftc']+flags+[str(p) for p in copied]+[str(p) for p in tests]+[str(entry),'-o',str(binary)],check=True)
 subprocess.run([str(binary)]+sys.argv[2:],check=True)

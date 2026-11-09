@@ -130,8 +130,11 @@ struct EditorMutationChecks {
         try EditorMutation.cameraOverlay(.init(scale: 0.3, shape: .circle, visible: false), timing: .at(0)).apply(to: &state, project: base)
         try require(state.pipKeyframes.first?.id == sharedID && state.zoomKeyframes.first?.id == sharedID,
                     "editing initial appearance preserves shared raw identities without editing screen")
-        try require(state.pipKeyframes.first?.placement.crop == before.crop && state.pipKeyframes.first?.placement.visible == false,
-                    "appearance patch does not reset camera framing")
+        try require(state.pipKeyframes.first?.placement.crop == before.crop &&
+                    state.pipKeyframes.first?.placement.sourceZoom == before.sourceZoom &&
+                    state.pipKeyframes.first?.placement.scale == 0.3 && state.pipKeyframes.first?.placement.shape == .circle &&
+                    state.placement(at: 0).renderedOpacity == 0 && state.cameraOpacityKeyframes.count == 1,
+                    "appearance patch preserves framing and hides through the independent alpha track")
         var absent = base; absent.cameraFilename = nil
         var absentState = absent.state
         try rejects({ try EditorMutation.cameraOverlay(.init(scale: 0.2), timing: interval).apply(to: &absentState, project: absent) }, "no fabricated camera source")

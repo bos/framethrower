@@ -384,7 +384,7 @@ final class EditorCanvasView: NSView {
                     zoom: second.zoom, placement: second.placement, cameraEnabled: showsCameraPattern, cameraAspect: cameraAspect)
             } else { incomingTestPattern?.layer.isHidden = true }
         }
-        outline.isHidden = !cameraEnabled || !current.visible
+        outline.isHidden = !cameraEnabled || current.renderedOpacity == 0
         handles.isHidden = outline.isHidden
         let rect = current.frame(in: canvasRect.size, cameraAspect: cameraAspect)
             .offsetBy(dx: canvasRect.minX, dy: canvasRect.minY)
@@ -587,7 +587,7 @@ final class EditorCanvasView: NSView {
         guard conflictOutlines == nil else { return .arrow }
         if zoomDrag != nil { return .closedHand }
         if scribbleMode, guideBadges.contains(where: { $0.frame.contains(point) }) { return .pointingHand }
-        if cameraEnabled, placement.visible {
+        if cameraEnabled, placement.renderedOpacity > 0 {
             if let corner = cameraCorner(at: point) {
                 let position: NSCursor.FrameResizePosition
                 switch corner {
@@ -641,7 +641,7 @@ final class EditorCanvasView: NSView {
         }
         let rect = cameraRect
         let corner = cameraCorner(at: point)
-        if cameraEnabled, placement.visible, corner != nil || rect.contains(point) {
+        if cameraEnabled, placement.renderedOpacity > 0, corner != nil || rect.contains(point) {
             window?.makeFirstResponder(self)
             guard corner != nil || placement.fullscreenFraction < 1 else { return }
             finishTrackpad()

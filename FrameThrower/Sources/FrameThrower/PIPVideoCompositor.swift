@@ -410,7 +410,7 @@ private final class PIPFrameComposer: @unchecked Sendable {
         // Camera placement is in the final output canvas, so it stays steady
         // while the screen content zooms or pans underneath it.
         let placement = state.placement(at: seconds)
-        if placement.visible, seconds >= instruction.cameraStart, seconds < instruction.cameraEnd,
+        if placement.renderedOpacity > 0, seconds >= instruction.cameraStart, seconds < instruction.cameraEnd,
            let geometry = instruction.cameraGeometry, let cameraBuffer {
             let sourceCrop = placement.sourceViewport(in: geometry.size, canvas: canvas.size)
             let ciCrop = CGRect(x: sourceCrop.minX, y: geometry.size.height - sourceCrop.maxY,
@@ -430,6 +430,11 @@ private final class PIPFrameComposer: @unchecked Sendable {
                 camera = camera.applyingFilter("CIBlendWithAlphaMask", parameters: [
                     kCIInputBackgroundImageKey: CIImage(color: .clear).cropped(to: destination),
                     kCIInputMaskImageKey: mask
+                ])
+            }
+            if placement.renderedOpacity < 1 {
+                camera = camera.applyingFilter("CIColorMatrix", parameters: [
+                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: placement.renderedOpacity)
                 ])
             }
             image = camera.composited(over: image)

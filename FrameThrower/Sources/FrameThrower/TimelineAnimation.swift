@@ -1,7 +1,7 @@
 import Foundation
 
 enum TimelineAnimationLane: String, CaseIterable, Hashable, Sendable {
-    case screen, camera, speed, pointer, audioMicrophone, audioSystem
+    case screen, camera, cameraOpacity, speed, pointer, audioMicrophone, audioSystem
 }
 
 struct TimelineAnimationID: Hashable, Sendable {

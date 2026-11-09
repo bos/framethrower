@@ -80,7 +80,7 @@ struct EditorReferences: Codable, Equatable, Sendable {
     func edit(in state: EditState, id: UUID, includeCamera: Bool = true) -> TimedEdit? {
         let active = state.timedEdits(includeCamera: includeCamera)
         if let direct = active.first(where: { $0.id == id }) { return direct }
-        if let component = active.first(where: { $0.zoomID == id || $0.cameraID == id || $0.anchorID == id || $0.speedID == id }) { return component }
+        if let component = active.first(where: { $0.zoomID == id || $0.cameraID == id || $0.anchorID == id || $0.speedID == id || $0.cameraOpacityID == id }) { return component }
         guard let number = edits[id.uuidString] else { return nil }
         let matches = active.filter { edits[$0.id.uuidString] == number }
         return matches.count == 1 ? matches[0] : nil
@@ -89,7 +89,7 @@ struct EditorReferences: Codable, Equatable, Sendable {
     mutating func register(state: EditState, includeCamera: Bool = true) {
         var nextEditNumber = max(0, min(1_000_000, edits.values.max() ?? 0)) + 1
         for edit in state.timedEdits(includeCamera: includeCamera) {
-            let ids = [edit.id, edit.zoomID, edit.cameraID, edit.speedID].compactMap { $0 }
+            let ids = [edit.id, edit.zoomID, edit.cameraID, edit.speedID, edit.cameraOpacityID].compactMap { $0 }
             let existing = ids.compactMap { edits[$0.uuidString] }.first
             let number = existing ?? nextEditNumber
             if existing == nil { nextEditNumber = min(1_000_001, nextEditNumber + 1) }

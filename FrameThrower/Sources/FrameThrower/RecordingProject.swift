@@ -189,9 +189,11 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     /// nil/0 retains normal overlay geometry; 1 fills the final output canvas.
     /// Normal placement/shape remain intact so returning to zero restores them.
     var fullscreen: Double? = nil
+    var opacity: Double = 1
+    var renderedOpacity: Double { visible && opacity.isFinite ? min(1, max(0, opacity)) : 0 }
 
     init(x: Double = 0.95, y: Double = 0.95, scale: Double = 0.25, visible: Bool = true,
-         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1, fullscreen: Double? = nil) {
+         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1, fullscreen: Double? = nil, opacity: Double = 1) {
         self.x = x
         self.y = y
         self.scale = scale
@@ -201,10 +203,11 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         self.crop = crop
         self.sourceZoom = sourceZoom
         self.fullscreen = fullscreen
+        self.opacity = opacity
     }
 
     private enum CodingKeys: String, CodingKey {
-        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom, fullscreen
+        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom, fullscreen, opacity
     }
 
     /// Decode defaults on each placement so old projects and every old undo/redo
@@ -220,6 +223,17 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         crop = try values.decodeIfPresent(PIPCrop.self, forKey: .crop) ?? PIPCrop()
         sourceZoom = try values.decodeIfPresent(Double.self, forKey: .sourceZoom) ?? 1
         fullscreen = try values.decodeIfPresent(Double.self, forKey: .fullscreen)
+        opacity = try values.decodeIfPresent(Double.self, forKey: .opacity) ?? 1
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(x, forKey: .x); try values.encode(y, forKey: .y)
+        try values.encode(scale, forKey: .scale); try values.encode(visible, forKey: .visible)
+        try values.encode(shape, forKey: .shape); try values.encode(aspectRatio, forKey: .aspectRatio)
+        try values.encode(crop, forKey: .crop); try values.encode(sourceZoom, forKey: .sourceZoom)
+        try values.encodeIfPresent(fullscreen, forKey: .fullscreen)
+        try values.encode(opacity, forKey: .opacity)
     }
 
     var fullscreenFraction: Double {
@@ -316,6 +330,17 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         next.y = min(1, max(0, originY / max(1, canvas.height - resized.height)))
         return next
     }
+}
+
+/// Camera alpha owns its source clock independently of placement keyframes.
+struct CameraOpacityKeyframe: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+    var opacity: Double
+    var transition: PIPTransition = .jump
+    var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
 }
 
 struct PIPKeyframe: Codable, Equatable, Identifiable, Sendable {
@@ -1139,6 +1164,7 @@ struct EditState: Codable, Equatable, Sendable {
     var trimStart: Double
     var trimEnd: Double
     var pipKeyframes: [PIPKeyframe]
+    var cameraOpacityKeyframes: [CameraOpacityKeyframe] = []
     var zoomKeyframes: [ZoomKeyframe] = []
     var cursorStyle: CursorStyle = CursorStyle()
     var presentation: CanvasPresentation = CanvasPresentation()
@@ -1157,7 +1183,7 @@ struct EditState: Codable, Equatable, Sendable {
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
          editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = [],
-         contentLayers: [ContentLayer] = [], speedKeyframes: [RecordingSpeedKeyframe] = [], preservesAudioPitch: Bool = true) {
+         contentLayers: [ContentLayer] = [], speedKeyframes: [RecordingSpeedKeyframe] = [], preservesAudioPitch: Bool = true, cameraOpacityKeyframes: [CameraOpacityKeyframe] = []) {
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -1171,10 +1197,11 @@ struct EditState: Codable, Equatable, Sendable {
         self.contentLayers = contentLayers
         self.speedKeyframes = speedKeyframes
         self.preservesAudioPitch = preservesAudioPitch
+        self.cameraOpacityKeyframes = cameraOpacityKeyframes
     }
 
     private enum CodingKeys: String, CodingKey {
-        case trimStart, trimEnd, pipKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion,
+        case trimStart, trimEnd, pipKeyframes, cameraOpacityKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion,
              speedKeyframes, preservesAudioPitch
     }
 
@@ -1185,6 +1212,7 @@ struct EditState: Codable, Equatable, Sendable {
         trimStart = try values.decode(Double.self, forKey: .trimStart)
         trimEnd = try values.decode(Double.self, forKey: .trimEnd)
         pipKeyframes = try values.decode([PIPKeyframe].self, forKey: .pipKeyframes)
+        cameraOpacityKeyframes = try values.decodeIfPresent([CameraOpacityKeyframe].self, forKey: .cameraOpacityKeyframes) ?? []
         zoomKeyframes = try values.decodeIfPresent([ZoomKeyframe].self, forKey: .zoomKeyframes) ?? []
         cursorStyle = try values.decodeIfPresent(CursorStyle.self, forKey: .cursorStyle) ?? CursorStyle()
         presentation = try values.decodeIfPresent(CanvasPresentation.self, forKey: .presentation) ?? CanvasPresentation()
@@ -1231,6 +1259,62 @@ struct EditState: Codable, Equatable, Sendable {
     }
 
     func placement(at time: Double) -> PIPPlacement {
+        var result = cameraGeometry(at: time)
+        if !cameraOpacityKeyframes.isEmpty {
+            result.visible = true
+            result.opacity = cameraOpacity(at: time)
+        }
+        return result
+    }
+
+    /// Only real legacy visibility/alpha changes enter this clock. Geometry
+    /// targets that retain appearance never truncate or restart a fade.
+    var cameraOpacityEvents: [CameraOpacityKeyframe] {
+        let geometry = pipKeyframes.sorted { $0.time < $1.time }
+        let initial = geometry.first
+        var events = [CameraOpacityKeyframe(id: initial?.id ?? UUID(uuidString: "00000000-0000-0000-0000-000000000004")!, time: 0,
+            opacity: initial?.placement.renderedOpacity ?? 1)]
+        var previous = events[0].opacity
+        var previousGeometry = initial
+        for point in geometry.dropFirst() {
+            let opacity = point.placement.renderedOpacity
+            if opacity != previous {
+                let visibilityChanged = previousGeometry?.placement.visible != point.placement.visible
+                let start = max(previousGeometry?.time ?? 0, point.time - point.duration)
+                events.append(CameraOpacityKeyframe(id: point.id, time: point.time, opacity: opacity,
+                    transition: visibilityChanged ? .jump : point.transition,
+                    duration: max(0.000001, point.time - start), easeIn: point.easeIn, easeOut: point.easeOut))
+            }
+            previous = opacity; previousGeometry = point
+        }
+        let independent = cameraOpacityKeyframes.sorted { $0.time < $1.time }
+        var merged: [CameraOpacityKeyframe] = [], legacyIndex = 0, ownIndex = 0
+        while legacyIndex < events.count || ownIndex < independent.count {
+            if ownIndex == independent.count { merged.append(events[legacyIndex]); legacyIndex += 1 }
+            else if legacyIndex == events.count { merged.append(independent[ownIndex]); ownIndex += 1 }
+            else if abs(events[legacyIndex].time - independent[ownIndex].time) < 0.000001 {
+                merged.append(independent[ownIndex]); ownIndex += 1; legacyIndex += 1
+            } else if events[legacyIndex].time < independent[ownIndex].time {
+                merged.append(events[legacyIndex]); legacyIndex += 1
+            } else { merged.append(independent[ownIndex]); ownIndex += 1 }
+        }
+        return merged
+    }
+
+    func cameraOpacity(at time: Double) -> Double {
+        let events = cameraOpacityEvents
+        guard var previous = events.first else { return 1 }
+        guard time.isFinite, time > previous.time else { return previous.opacity }
+        for point in events.dropFirst() {
+            if time >= point.time { previous = point; continue }
+            let progress = MotionInterpolation.progress(at: time, from: previous.time, to: point.time,
+                duration: point.duration, transition: point.transition, easeIn: point.easeIn, easeOut: point.easeOut)
+            return MotionInterpolation.blend(previous.opacity, point.opacity, progress: progress)
+        }
+        return previous.opacity
+    }
+
+    func cameraGeometry(at time: Double) -> PIPPlacement {
         let points = pipKeyframes.sorted { $0.time < $1.time }
         guard var previous = points.first else { return PIPPlacement() }
         guard time.isFinite, time > previous.time else { return previous.placement }
@@ -1255,7 +1339,8 @@ struct EditState: Codable, Equatable, Sendable {
                                               y: blend(previous.placement.crop.y, point.placement.crop.y)),
                                 sourceZoom: blend(previous.placement.sourceZoom, point.placement.sourceZoom),
                                 fullscreen: previous.placement.fullscreen == nil && point.placement.fullscreen == nil ? nil :
-                                    blend(previous.placement.fullscreen ?? 0, point.placement.fullscreen ?? 0))
+                                    blend(previous.placement.fullscreen ?? 0, point.placement.fullscreen ?? 0),
+                                opacity: blend(previous.placement.opacity, point.placement.opacity))
         }
         return previous.placement
     }
@@ -1377,14 +1462,16 @@ struct TimedEdit: Identifiable, Equatable {
     let cameraID: UUID?
     let anchorID: UUID?
     let speedID: UUID?
+    let cameraOpacityID: UUID?
 
-    init(id: UUID, time: Double, zoomID: UUID?, cameraID: UUID?, anchorID: UUID? = nil, speedID: UUID? = nil) {
+    init(id: UUID, time: Double, zoomID: UUID?, cameraID: UUID?, anchorID: UUID? = nil, speedID: UUID? = nil, cameraOpacityID: UUID? = nil) {
         self.id = id
         self.time = time
         self.zoomID = zoomID
         self.cameraID = cameraID
         self.anchorID = anchorID
         self.speedID = speedID
+        self.cameraOpacityID = cameraOpacityID
     }
 }
 
@@ -1405,16 +1492,25 @@ extension EditState {
             if let index = result.firstIndex(where: { abs($0.time - speed.time) < 0.000001 }) {
                 let combined = result[index]
                 result[index] = TimedEdit(id: combined.id, time: combined.time, zoomID: combined.zoomID,
-                    cameraID: combined.cameraID, anchorID: combined.anchorID, speedID: speed.id)
+                    cameraID: combined.cameraID, anchorID: combined.anchorID, speedID: speed.id, cameraOpacityID: combined.cameraOpacityID)
             } else {
                 result.append(TimedEdit(id: speed.id, time: speed.time, zoomID: nil, cameraID: nil, speedID: speed.id))
+            }
+        }
+        if includeCamera {
+            for opacity in cameraOpacityKeyframes {
+                if let index = result.firstIndex(where: { abs($0.time - opacity.time) < 0.000001 }) {
+                    let combined = result[index]
+                    result[index] = TimedEdit(id: combined.id, time: combined.time, zoomID: combined.zoomID,
+                        cameraID: combined.cameraID, anchorID: combined.anchorID, speedID: combined.speedID, cameraOpacityID: opacity.id)
+                } else { result.append(TimedEdit(id: opacity.id, time: opacity.time, zoomID: nil, cameraID: nil, cameraOpacityID: opacity.id)) }
             }
         }
         for anchor in editAnchors {
             if let index = result.firstIndex(where: { abs($0.time - anchor.time) < 0.000001 }) {
                 let combined = result[index]
                 result[index] = TimedEdit(id: anchor.id, time: anchor.time, zoomID: combined.zoomID,
-                                         cameraID: combined.cameraID, anchorID: anchor.id, speedID: combined.speedID)
+                                         cameraID: combined.cameraID, anchorID: anchor.id, speedID: combined.speedID, cameraOpacityID: combined.cameraOpacityID)
             } else {
                 result.append(TimedEdit(id: anchor.id, time: anchor.time, zoomID: nil, cameraID: nil, anchorID: anchor.id))
             }
@@ -1444,6 +1540,7 @@ extension EditState {
         zoomKeyframes.removeAll { $0.id == edit.zoomID }
         pipKeyframes.removeAll { $0.id == edit.cameraID && $0.time > 0 }
         speedKeyframes.removeAll { $0.id == edit.speedID }
+        cameraOpacityKeyframes.removeAll { $0.id == edit.cameraOpacityID }
         editAnchors.removeAll { $0.id == edit.anchorID }
     }
 
@@ -1452,9 +1549,11 @@ extension EditState {
         if let index = pipKeyframes.firstIndex(where: { $0.id == edit.cameraID && $0.time > 0 }) { pipKeyframes[index].time = time }
         if let index = speedKeyframes.firstIndex(where: { $0.id == edit.speedID }) { speedKeyframes[index].time = time }
         if let index = editAnchors.firstIndex(where: { $0.id == edit.anchorID }) { editAnchors[index].time = time }
+        if let index = cameraOpacityKeyframes.firstIndex(where: { $0.id == edit.cameraOpacityID }) { cameraOpacityKeyframes[index].time = time }
         zoomKeyframes.sort { $0.time < $1.time }
         pipKeyframes.sort { $0.time < $1.time }
         speedKeyframes.sort { $0.time < $1.time }
+        cameraOpacityKeyframes.sort { $0.time < $1.time }
         editAnchors.sort { $0.time < $1.time }
     }
 }
@@ -1695,6 +1794,17 @@ struct RecordingProject: Codable, Equatable, Sendable {
         guard state.editAnchors.count <= 100_000 else {
             throw ProjectError.invalid("Keep at most 100,000 reference marks in a recording.")
         }
+        guard state.cameraOpacityKeyframes.count <= 100_000 else { throw ProjectError.invalid("Keep at most 100,000 camera opacity points.") }
+        var priorOpacityTime = -Double.infinity, opacityIDs = Set<UUID>()
+        for point in state.cameraOpacityKeyframes {
+            guard point.time.isFinite, point.time >= 0, point.time <= duration, point.time - priorOpacityTime >= 0.000001,
+                  opacityIDs.insert(point.id).inserted, point.opacity.isFinite, (0...1).contains(point.opacity),
+                  point.duration.isFinite, point.duration > 0,
+                  [point.easeIn, point.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                throw ProjectError.invalid("Camera opacity points need unique ordered times, opacity from 0 to 1, and valid ramps.")
+            }
+            priorOpacityTime = point.time
+        }
         var priorAnchorTime = -Double.infinity
         var anchorIdentities = Set<UUID>()
         for anchor in state.editAnchors {
@@ -1705,7 +1815,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
             }
             let componentTimes = [state.zoomKeyframes.first(where: { $0.id == anchor.id })?.time,
                                   state.pipKeyframes.first(where: { $0.id == anchor.id })?.time,
-                                  state.speedKeyframes.first(where: { $0.id == anchor.id })?.time].compactMap { $0 }
+                                  state.speedKeyframes.first(where: { $0.id == anchor.id })?.time,
+                                  state.cameraOpacityKeyframes.first(where: { $0.id == anchor.id })?.time].compactMap { $0 }
             guard componentTimes.allSatisfy({ abs($0 - anchor.time) < 0.000001 }) else {
                 throw ProjectError.invalid("An edit and its reference mark must share the same time.")
             }
@@ -1750,6 +1861,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   placement.crop.x.isFinite, (0...1).contains(placement.crop.x),
                   placement.crop.y.isFinite, (0...1).contains(placement.crop.y),
                   placement.sourceZoom.isFinite, (1...3).contains(placement.sourceZoom),
+                  placement.opacity.isFinite, (0...1).contains(placement.opacity),
                   placement.fullscreen.map({ $0.isFinite && (0...1).contains($0) }) ?? true else {
                 throw ProjectError.invalid("Camera placements must have unique, ordered times and valid positions and sizes.")
             }

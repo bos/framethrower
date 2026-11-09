@@ -1022,6 +1022,347 @@ struct RecordingTimeMap: Equatable, Sendable {
     }
 }
 
+// Immutable source descriptors are kept outside history; clips are occurrences.
+enum VideoSourceRole: String, Codable, CaseIterable, Sendable { case screen, camera, footage }
+enum VideoSourceKind: String, Codable, CaseIterable, Sendable { case file, testPattern }
+enum VideoClipLayout: String, Codable, CaseIterable, Sendable { case screen, camera, custom }
+enum VideoFit: String, Codable, CaseIterable, Sendable { case fit, fill }
+enum VideoClipTransition: String, Codable, CaseIterable, Sendable { case cut, crossfade }
+
+struct VideoSource: Codable, Equatable, Identifiable, Sendable {
+    static let legacyScreenID = UUID(uuidString: "56494445-4F00-4000-8000-000000000001")!
+    static let legacyCameraID = UUID(uuidString: "56494445-4F00-4000-8000-000000000002")!
+    var id: UUID = UUID()
+    var name: String
+    var role: VideoSourceRole = .footage
+    var kind: VideoSourceKind
+    var relativePath: String? = nil
+    var duration: Double? = nil
+    var pixelWidth: Int? = nil
+    var pixelHeight: Int? = nil
+    var hasAudio: Bool? = nil
+    var patternSeed: Int = 0
+
+    var pixelSize: CGSize? {
+        guard let pixelWidth, let pixelHeight else { return nil }
+        return CGSize(width: pixelWidth, height: pixelHeight)
+    }
+    static func isSafeRelativePath(_ path: String) -> Bool {
+        !path.isEmpty && !path.hasPrefix("/") && !path.contains("\\") &&
+        !path.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) &&
+        path.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+    func resolvedURL(in directory: URL) throws -> URL {
+        guard kind == .file, let relativePath, Self.isSafeRelativePath(relativePath) else {
+            throw ProjectError.invalid("This video source has no safe relative file path.")
+        }
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        var target = root
+        // Foundation may leave a missing leaf unresolved even when its parent
+        // is a symlink. Resolve each existing ancestor before appending a leaf.
+        for component in relativePath.split(separator: "/") {
+            target = target.appendingPathComponent(String(component)).standardizedFileURL.resolvingSymlinksInPath()
+            guard target.path.hasPrefix(prefix) else {
+                throw ProjectError.invalid("A video source cannot follow a symbolic link outside the project folder.")
+            }
+        }
+        return target
+    }
+    func validate(isExtra: Bool = true) throws {
+        try RecordingProject.validateTitle(name)
+        guard duration.map({ $0.isFinite && $0 > 0 }) ?? (!isExtra && role == .camera),
+              (pixelWidth == nil) == (pixelHeight == nil),
+              pixelWidth.map({ (1...131_072).contains($0) }) ?? true,
+              pixelHeight.map({ (1...131_072).contains($0) }) ?? true else {
+            throw ProjectError.invalid("A video source needs a positive duration and paired positive pixel dimensions.")
+        }
+        if isExtra, hasAudio == nil { throw ProjectError.invalid("Registered video sources need explicit audio availability.") }
+        if isExtra, role != .footage { throw ProjectError.invalid("Imported video sources use the footage role.") }
+        switch kind {
+        case .file:
+            guard let relativePath, Self.isSafeRelativePath(relativePath) else {
+                throw ProjectError.invalid("Video source paths must be relative and cannot contain traversal or control characters.")
+            }
+        case .testPattern:
+            guard relativePath == nil, pixelSize != nil, hasAudio == false else {
+                throw ProjectError.invalid("Test patterns need dimensions and must not refer to a file or audio.")
+            }
+        }
+    }
+}
+
+struct VideoGeometry: Codable, Equatable, Sendable {
+    static let fullRect = EditorRegionRect(x: 0, y: 0, width: 1, height: 1)
+    var rect: EditorRegionRect = fullRect
+    var crop: EditorRegionRect = fullRect
+    var fit: VideoFit = .fit
+
+    func sourceRect(in size: CGSize) -> CGRect {
+        CGRect(x: crop.x * size.width, y: crop.y * size.height,
+               width: crop.width * size.width, height: crop.height * size.height)
+    }
+    func frame(in canvas: CGSize, sourceSize: CGSize) -> CGRect {
+        let target = CGRect(x: rect.x * canvas.width, y: rect.y * canvas.height,
+                            width: rect.width * canvas.width, height: rect.height * canvas.height)
+        let source = sourceRect(in: sourceSize)
+        guard fit == .fit, source.width > 0, source.height > 0 else { return target }
+        let scale = min(target.width / source.width, target.height / source.height)
+        let size = CGSize(width: source.width * scale, height: source.height * scale)
+        return CGRect(x: target.midX - size.width / 2, y: target.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+    func viewport(in sourceSize: CGSize, canvas: CGSize) -> CGRect {
+        let source = sourceRect(in: sourceSize)
+        let target = frame(in: canvas, sourceSize: sourceSize)
+        guard fit == .fill, source.width > 0, source.height > 0, target.width > 0, target.height > 0 else { return source }
+        let scale = max(target.width / source.width, target.height / source.height)
+        let width = target.width / scale, height = target.height / scale
+        return CGRect(x: source.midX - width / 2, y: source.midY - height / 2, width: width, height: height)
+    }
+    fileprivate static func blend(_ first: Self, _ last: Self, progress: Double) -> Self {
+        func rect(_ a: EditorRegionRect, _ b: EditorRegionRect) -> EditorRegionRect {
+            EditorRegionRect(x: MotionInterpolation.blend(a.x, b.x, progress: progress),
+                y: MotionInterpolation.blend(a.y, b.y, progress: progress),
+                width: MotionInterpolation.blend(a.width, b.width, progress: progress),
+                height: MotionInterpolation.blend(a.height, b.height, progress: progress))
+        }
+        return Self(rect: rect(first.rect, last.rect), crop: rect(first.crop, last.crop),
+                    fit: progress >= 1 ? last.fit : first.fit)
+    }
+}
+
+/// All per-clip keyframe times and ramp durations are original asset seconds.
+/// Trimming, moving, and retiming an occurrence never rewrites these points.
+struct VideoGeometryKeyframe: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+    var geometry: VideoGeometry
+    var transition: PIPTransition = .smooth
+    var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
+}
+struct VideoOpacityKeyframe: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+    var opacity: Double
+    var transition: PIPTransition = .smooth
+    var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
+}
+struct VideoVolumeKeyframe: Codable, Equatable, Identifiable, Sendable {
+    var id: UUID = UUID()
+    var time: Double
+    var gain: Double
+    var transition: PIPTransition = .smooth
+    var duration: Double = 0.4
+    var easeIn: Double? = nil
+    var easeOut: Double? = nil
+}
+
+struct VideoClip: Codable, Equatable, Identifiable, Sendable {
+    static let legacyScreenID = UUID(uuidString: "56494445-4F00-4000-8000-000000000005")!
+    static let legacyCameraID = UUID(uuidString: "56494445-4F00-4000-8000-000000000006")!
+    var id: UUID = UUID()
+    var sourceID: UUID
+    var start: Double
+    var end: Double
+    var sourceStart: Double = 0
+    var rate: Double = 1
+    var layout: VideoClipLayout = .custom
+    var geometry = VideoGeometry()
+    var geometryKeyframes: [VideoGeometryKeyframe] = []
+    var opacity: Double = 1
+    var opacityKeyframes: [VideoOpacityKeyframe] = []
+    var fadeIn: Double = 0
+    var fadeOut: Double = 0
+    var volume: Double = 1
+    var isMuted = false
+    var transition: VideoClipTransition = .crossfade
+    var volumeKeyframes: [VideoVolumeKeyframe] = []
+
+    var sourceEnd: Double { sourceStart + (end - start) * rate }
+    func sourceTime(at projectTime: Double) -> Double { sourceStart + (projectTime - start) * rate }
+    func projectTime(atSourceTime time: Double) -> Double { start + (time - sourceStart) / rate }
+    func geometry(atSourceTime time: Double) -> VideoGeometry {
+        var previous = geometry, previousTime = 0.0
+        for point in geometryKeyframes {
+            if time >= point.time { previous = point.geometry; previousTime = point.time; continue }
+            let progress = MotionInterpolation.progress(at: time, from: previousTime, to: point.time,
+                duration: point.duration, transition: point.transition, easeIn: point.easeIn, easeOut: point.easeOut)
+            return VideoGeometry.blend(previous, point.geometry, progress: progress)
+        }
+        return previous
+    }
+    func opacity(atSourceTime time: Double) -> Double {
+        Self.scalar(at: time, initial: opacity, points: opacityKeyframes) {
+            ($0.time, $0.opacity, $0.transition, $0.duration, $0.easeIn, $0.easeOut)
+        }
+    }
+    func envelopeGain(atSourceTime time: Double) -> Double {
+        Self.scalar(at: time, initial: 1, points: volumeKeyframes) {
+            ($0.time, $0.gain, $0.transition, $0.duration, $0.easeIn, $0.easeOut)
+        }
+    }
+    private static func scalar<Point>(at time: Double, initial: Double, points: [Point],
+        values: (Point) -> (Double, Double, PIPTransition, Double, Double?, Double?)) -> Double {
+        var previous = initial, previousTime = 0.0
+        for sourcePoint in points {
+            let point = values(sourcePoint)
+            if time >= point.0 { previous = point.1; previousTime = point.0; continue }
+            let progress = MotionInterpolation.progress(at: time, from: previousTime, to: point.0,
+                duration: point.3, transition: point.2, easeIn: point.4, easeOut: point.5)
+            return MotionInterpolation.blend(previous, point.1, progress: progress)
+        }
+        return previous
+    }
+    func alpha(at projectTime: Double) -> Double {
+        guard projectTime >= start, projectTime < end else { return 0 }
+        let fades = MotionInterpolation.rampDurations(duration: end - start, easeIn: fadeIn, easeOut: fadeOut)
+        let incoming = fades.easeIn > 0 ? MotionInterpolation.progress(at: projectTime, from: start,
+            to: start + fades.easeIn, duration: fades.easeIn, transition: .smooth) : 1
+        let outgoing = fades.easeOut > 0 ? 1 - MotionInterpolation.progress(at: projectTime,
+            from: end - fades.easeOut, to: end, duration: fades.easeOut, transition: .smooth) : 1
+        return opacity(atSourceTime: sourceTime(at: projectTime)) * incoming * outgoing
+    }
+}
+
+struct VideoLayer: Codable, Equatable, Identifiable, Sendable {
+    static let legacyScreenID = UUID(uuidString: "56494445-4F00-4000-8000-000000000003")!
+    static let legacyCameraID = UUID(uuidString: "56494445-4F00-4000-8000-000000000004")!
+    var id: UUID = UUID()
+    var name: String
+    var clips: [VideoClip] = []
+}
+
+/// Same-layer weights form a weighted image sum before source-over compositing
+/// the layer. Independent source-over operations would darken a crossdissolve.
+struct VideoLayerSample: Equatable, Sendable {
+    var layerID: UUID
+    var clipID: UUID
+    var sourceID: UUID
+    var sourceTime: Double
+    var weight: Double
+    var geometry: VideoGeometry
+    var opacity: Double
+    var layout: VideoClipLayout
+    var volume: Double
+    var isMuted: Bool
+    var audioGain: Double
+}
+
+extension VideoSource {
+    private enum DecodingKeys: String, CodingKey { case id, name, role, kind, relativePath, duration, pixelWidth, pixelHeight, hasAudio, patternSeed }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            name: try values.decode(String.self, forKey: .name),
+            role: try values.decodeIfPresent(VideoSourceRole.self, forKey: .role) ?? .footage,
+            kind: try values.decode(VideoSourceKind.self, forKey: .kind),
+            relativePath: try values.decodeIfPresent(String.self, forKey: .relativePath),
+            duration: try values.decodeIfPresent(Double.self, forKey: .duration),
+            pixelWidth: try values.decodeIfPresent(Int.self, forKey: .pixelWidth),
+            pixelHeight: try values.decodeIfPresent(Int.self, forKey: .pixelHeight),
+            hasAudio: try values.decodeIfPresent(Bool.self, forKey: .hasAudio),
+            patternSeed: try values.decodeIfPresent(Int.self, forKey: .patternSeed) ?? 0)
+    }
+}
+
+extension VideoGeometry {
+    private enum DecodingKeys: String, CodingKey { case rect, crop, fit }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            rect: try values.decodeIfPresent(EditorRegionRect.self, forKey: .rect) ?? VideoGeometry.fullRect,
+            crop: try values.decodeIfPresent(EditorRegionRect.self, forKey: .crop) ?? VideoGeometry.fullRect,
+            fit: try values.decodeIfPresent(VideoFit.self, forKey: .fit) ?? .fit)
+    }
+}
+
+extension VideoClip {
+    private enum DecodingKeys: String, CodingKey { case id, sourceID, start, end, sourceStart, rate, layout, geometry, geometryKeyframes, opacity, opacityKeyframes, fadeIn, fadeOut, volume, isMuted, transition, volumeKeyframes }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            sourceID: try values.decode(UUID.self, forKey: .sourceID),
+            start: try values.decode(Double.self, forKey: .start),
+            end: try values.decode(Double.self, forKey: .end),
+            sourceStart: try values.decodeIfPresent(Double.self, forKey: .sourceStart) ?? 0,
+            rate: try values.decodeIfPresent(Double.self, forKey: .rate) ?? 1,
+            layout: try values.decodeIfPresent(VideoClipLayout.self, forKey: .layout) ?? .custom,
+            geometry: try values.decodeIfPresent(VideoGeometry.self, forKey: .geometry) ?? VideoGeometry(),
+            geometryKeyframes: try values.decodeIfPresent([VideoGeometryKeyframe].self, forKey: .geometryKeyframes) ?? [],
+            opacity: try values.decodeIfPresent(Double.self, forKey: .opacity) ?? 1,
+            opacityKeyframes: try values.decodeIfPresent([VideoOpacityKeyframe].self, forKey: .opacityKeyframes) ?? [],
+            fadeIn: try values.decodeIfPresent(Double.self, forKey: .fadeIn) ?? 0,
+            fadeOut: try values.decodeIfPresent(Double.self, forKey: .fadeOut) ?? 0,
+            volume: try values.decodeIfPresent(Double.self, forKey: .volume) ?? 1,
+            isMuted: try values.decodeIfPresent(Bool.self, forKey: .isMuted) ?? false,
+            transition: try values.decodeIfPresent(VideoClipTransition.self, forKey: .transition) ?? .crossfade,
+            volumeKeyframes: try values.decodeIfPresent([VideoVolumeKeyframe].self, forKey: .volumeKeyframes) ?? [])
+    }
+}
+
+extension VideoLayer {
+    private enum DecodingKeys: String, CodingKey { case id, name, clips }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            name: try values.decode(String.self, forKey: .name),
+            clips: try values.decodeIfPresent([VideoClip].self, forKey: .clips) ?? [])
+    }
+}
+
+extension VideoGeometryKeyframe {
+    private enum DecodingKeys: String, CodingKey { case id, time, geometry, transition, duration, easeIn, easeOut }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            time: try values.decode(Double.self, forKey: .time),
+            geometry: try values.decode(VideoGeometry.self, forKey: .geometry),
+            transition: try values.decodeIfPresent(PIPTransition.self, forKey: .transition) ?? .smooth,
+            duration: try values.decodeIfPresent(Double.self, forKey: .duration) ?? 0.4,
+            easeIn: try values.decodeIfPresent(Double.self, forKey: .easeIn),
+            easeOut: try values.decodeIfPresent(Double.self, forKey: .easeOut))
+    }
+}
+
+extension VideoOpacityKeyframe {
+    private enum DecodingKeys: String, CodingKey { case id, time, opacity, transition, duration, easeIn, easeOut }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            time: try values.decode(Double.self, forKey: .time),
+            opacity: try values.decode(Double.self, forKey: .opacity),
+            transition: try values.decodeIfPresent(PIPTransition.self, forKey: .transition) ?? .smooth,
+            duration: try values.decodeIfPresent(Double.self, forKey: .duration) ?? 0.4,
+            easeIn: try values.decodeIfPresent(Double.self, forKey: .easeIn),
+            easeOut: try values.decodeIfPresent(Double.self, forKey: .easeOut))
+    }
+}
+
+extension VideoVolumeKeyframe {
+    private enum DecodingKeys: String, CodingKey { case id, time, gain, transition, duration, easeIn, easeOut }
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: DecodingKeys.self)
+        self.init(
+            id: try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            time: try values.decode(Double.self, forKey: .time),
+            gain: try values.decode(Double.self, forKey: .gain),
+            transition: try values.decodeIfPresent(PIPTransition.self, forKey: .transition) ?? .smooth,
+            duration: try values.decodeIfPresent(Double.self, forKey: .duration) ?? 0.4,
+            easeIn: try values.decodeIfPresent(Double.self, forKey: .easeIn),
+            easeOut: try values.decodeIfPresent(Double.self, forKey: .easeOut))
+    }
+}
+
 enum ContentLayerKind: String, Codable, CaseIterable, Sendable {
     case text, arrow, rectangle, circle, image
     var title: String { rawValue.capitalized }
@@ -1174,6 +1515,7 @@ struct EditState: Codable, Equatable, Sendable {
     var cuts: [RecordingCut] = []
     var contentLayers: [ContentLayer] = []
     var speedKeyframes: [RecordingSpeedKeyframe] = []
+    var videoLayers: [VideoLayer]? = nil
     var preservesAudioPitch = true
     /// Missing only in legacy states. A persisted version prevents a manually
     /// detached target from being inferred again after a later save/reopen.
@@ -1183,7 +1525,8 @@ struct EditState: Codable, Equatable, Sendable {
          zoomKeyframes: [ZoomKeyframe] = [], cursorStyle: CursorStyle = CursorStyle(),
          presentation: CanvasPresentation = CanvasPresentation(), regions: [EditorRegion] = [],
          editAnchors: [EditAnchor] = [], audio: RecordingAudio = RecordingAudio(), cuts: [RecordingCut] = [],
-         contentLayers: [ContentLayer] = [], speedKeyframes: [RecordingSpeedKeyframe] = [], preservesAudioPitch: Bool = true, cameraOpacityKeyframes: [CameraOpacityKeyframe] = []) {
+         contentLayers: [ContentLayer] = [], speedKeyframes: [RecordingSpeedKeyframe] = [], preservesAudioPitch: Bool = true, cameraOpacityKeyframes: [CameraOpacityKeyframe] = [], videoLayers: [VideoLayer]? = nil) {
+        self.videoLayers = videoLayers
         self.trimStart = trimStart
         self.trimEnd = trimEnd
         self.pipKeyframes = pipKeyframes
@@ -1202,7 +1545,7 @@ struct EditState: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case trimStart, trimEnd, pipKeyframes, cameraOpacityKeyframes, zoomKeyframes, cursorStyle, presentation, regions, editAnchors, audio, cuts, contentLayers, boxConnectionsVersion,
-             speedKeyframes, preservesAudioPitch
+             speedKeyframes, preservesAudioPitch, videoLayers
     }
 
     /// Migration lives on each state so prior undo/redo snapshots also gain
@@ -1222,6 +1565,7 @@ struct EditState: Codable, Equatable, Sendable {
         cuts = try values.decodeIfPresent([RecordingCut].self, forKey: .cuts) ?? []
         contentLayers = try values.decodeIfPresent([ContentLayer].self, forKey: .contentLayers) ?? []
         speedKeyframes = try values.decodeIfPresent([RecordingSpeedKeyframe].self, forKey: .speedKeyframes) ?? []
+        videoLayers = try values.decodeIfPresent([VideoLayer].self, forKey: .videoLayers)
         preservesAudioPitch = try values.decodeIfPresent(Bool.self, forKey: .preservesAudioPitch) ?? true
         if values.contains(.boxConnectionsVersion) {
             boxConnectionsVersion = try values.decode(Int.self, forKey: .boxConnectionsVersion)
@@ -1233,6 +1577,10 @@ struct EditState: Codable, Equatable, Sendable {
             boxConnectionsVersion = 1
             self = EditorBoxConnections.migratingLegacy(self)
         }
+    }
+
+    mutating func materializeVideoLayers(project: RecordingProject) {
+        if videoLayers == nil { videoLayers = project.effectiveVideoLayers(in: self) }
     }
 
     func speed(at time: Double) -> Double { RecordingRetime.rate(at: time, points: speedKeyframes) }
@@ -1602,13 +1950,14 @@ struct RecordingProject: Codable, Equatable, Sendable {
     var references = EditorReferences()
     var contentAssets: [ContentImageAsset] = []
     var audioSources: [RecordingAudioSource] = []
+    var videoAssets: [VideoSource] = []
 
     init(version: Int = 1, screenFilename: String, cameraFilename: String? = nil, cursorFilename: String? = nil,
          sceneFilename: String? = nil,
          cameraOffset: Double = 0, duration: Double, state: EditState? = nil,
          undoHistory: [NamedEditSnapshot] = [], redoHistory: [NamedEditSnapshot] = [], title: String? = nil,
          captureFrameDuration: Double? = nil, references: EditorReferences = EditorReferences(),
-         automationID: UUID? = UUID(), audioSources: [RecordingAudioSource] = []) {
+         automationID: UUID? = UUID(), audioSources: [RecordingAudioSource] = [], videoAssets: [VideoSource] = []) {
         self.version = version
         self.screenFilename = screenFilename
         self.cameraFilename = cameraFilename
@@ -1624,6 +1973,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
         self.undoHistory = undoHistory
         self.redoHistory = redoHistory
         self.references = references
+        self.videoAssets = videoAssets
         self.audioSources = audioSources
         for source in audioSources where !self.state.audio.channels.contains(where: { $0.role == source.role }) {
             self.state.audio.channels.append(.init(role: source.role))
@@ -1633,7 +1983,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case version, screenFilename, cameraFilename, cursorFilename, sceneFilename, title, automationID, cameraOffset,
-             captureFrameDuration, duration, state, undoHistory, redoHistory, references, contentAssets, audioSources
+             captureFrameDuration, duration, state, undoHistory, redoHistory, references, contentAssets, audioSources, videoAssets
     }
 
     init(from decoder: any Decoder) throws {
@@ -1653,9 +2003,129 @@ struct RecordingProject: Codable, Equatable, Sendable {
         redoHistory = try values.decodeIfPresent([NamedEditSnapshot].self, forKey: .redoHistory) ?? []
         references = try values.decodeIfPresent(EditorReferences.self, forKey: .references) ?? EditorReferences()
         contentAssets = try values.decodeIfPresent([ContentImageAsset].self, forKey: .contentAssets) ?? []
+        videoAssets = try values.decodeIfPresent([VideoSource].self, forKey: .videoAssets) ?? []
         audioSources = try values.decodeIfPresent([RecordingAudioSource].self, forKey: .audioSources) ?? []
         try references.validate()
         ensureReferences()
+    }
+
+    /// The two legacy identities never change on reload or Undo/Redo. Registered
+    /// footage is immutable and remains available after occurrences are removed.
+    var videoSources: [VideoSource] {
+        var result = [VideoSource(id: VideoSource.legacyScreenID, name: "Screen", role: .screen, kind: .file,
+            relativePath: screenFilename, duration: duration)]
+        if let cameraFilename {
+            result.append(VideoSource(id: VideoSource.legacyCameraID, name: "Camera", role: .camera, kind: .file,
+                relativePath: cameraFilename, duration: nil, hasAudio: false))
+        }
+        return result + videoAssets
+    }
+
+    func effectiveVideoLayers(in state: EditState? = nil) -> [VideoLayer] {
+        if let layers = (state ?? self.state).videoLayers { return layers }
+        var result = [VideoLayer(id: VideoLayer.legacyScreenID, name: "Screen", clips: [
+            VideoClip(id: VideoClip.legacyScreenID, sourceID: VideoSource.legacyScreenID, start: 0,
+                      end: duration, layout: .screen)
+        ])]
+        if cameraFilename != nil {
+            let beginning = max(0, cameraOffset)
+            let clips: [VideoClip] = beginning < duration ? [VideoClip(id: VideoClip.legacyCameraID,
+                sourceID: VideoSource.legacyCameraID, start: beginning, end: duration,
+                sourceStart: max(0, -cameraOffset), layout: .camera, isMuted: true)] : []
+            result.append(VideoLayer(id: VideoLayer.legacyCameraID, name: "Camera", clips: clips))
+        }
+        return result
+    }
+
+    func videoSamples(at time: Double, state: EditState? = nil) -> [VideoLayerSample] {
+        guard time.isFinite, time >= 0, time < duration else { return [] }
+        let sources = Dictionary(videoSources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var samples: [VideoLayerSample] = []
+        for layer in effectiveVideoLayers(in: state) {
+            let active = layer.clips.filter { time >= $0.start && time < $0.end }.sorted {
+                $0.start == $1.start ? $0.id.uuidString < $1.id.uuidString : $0.start < $1.start
+            }
+            for (index, clip) in active.enumerated() {
+                guard let source = sources[clip.sourceID] else { continue }
+                let sourceTime = clip.sourceTime(at: time)
+                guard sourceTime.isFinite, sourceTime >= 0,
+                      source.duration.map({ sourceTime < $0 }) ?? true else { continue }
+                var weight = 1.0
+                if active.count == 2 {
+                    let outgoing = active[0], incoming = active[1]
+                    if incoming.transition == .cut { weight = index == 1 ? 1 : 0 }
+                    else {
+                        let span = min(outgoing.end, incoming.end) - incoming.start
+                        let fraction = span > 0 ? min(1, max(0, (time - incoming.start) / span)) : 1
+                        weight = index == 0 ? 1 - fraction : fraction
+                    }
+                }
+                guard weight > 0 else { continue }
+                samples.append(VideoLayerSample(layerID: layer.id, clipID: clip.id, sourceID: source.id,
+                    sourceTime: sourceTime, weight: weight, geometry: clip.geometry(atSourceTime: sourceTime),
+                    opacity: clip.alpha(at: time), layout: clip.layout, volume: clip.volume, isMuted: clip.isMuted,
+                    audioGain: clip.isMuted ? 0 : clip.volume * clip.envelopeGain(atSourceTime: sourceTime) * weight))
+            }
+        }
+        return samples
+    }
+
+    private func validateVideoLayers(_ layers: [VideoLayer]?) throws {
+        guard let layers else { return }
+        guard layers.count <= 128, Set(layers.map(\.id)).count == layers.count else {
+            throw ProjectError.invalid("Use at most 128 video layers with unique identities.")
+        }
+        let sources = Dictionary(uniqueKeysWithValues: videoSources.map { ($0.id, $0) })
+        var clipIDs = Set<UUID>(), pointIDs = Set<UUID>()
+        for layer in layers {
+            try Self.validateTitle(layer.name)
+            guard layer.clips.count <= 4096 else { throw ProjectError.invalid("A video layer has too many clips.") }
+            let ordered = layer.clips.sorted { $0.start < $1.start }
+            for (index, clip) in ordered.enumerated() {
+                guard clipIDs.insert(clip.id).inserted, let source = sources[clip.sourceID] else {
+                    throw ProjectError.invalid("Video clips need unique identities and registered source IDs.")
+                }
+                guard [clip.start, clip.end, clip.sourceStart, clip.rate, clip.opacity, clip.fadeIn, clip.fadeOut, clip.volume].allSatisfy(\.isFinite),
+                      clip.start >= 0, clip.end > clip.start, clip.end <= duration,
+                      clip.sourceStart >= 0, (0.1...8).contains(clip.rate), clip.sourceEnd.isFinite,
+                      source.duration.map({ clip.sourceEnd <= $0 + max(1, $0) * 1e-12 }) ?? true,
+                      (0...1).contains(clip.opacity), (0...1).contains(clip.volume), clip.fadeIn >= 0, clip.fadeOut >= 0,
+                      clip.geometry.rect.isValid, clip.geometry.crop.isValid else {
+                    throw ProjectError.invalid("Video clip timing, source trim, framing, opacity, or audio level is invalid.")
+                }
+                // Contained clips would dissolve in and then pop back out. A
+                // sequence advances both boundaries; overlays use another layer.
+                if index > 0 {
+                    let previous = ordered[index - 1]
+                    guard clip.start > previous.start, clip.end > previous.end else {
+                        throw ProjectError.invalid("Clips in one video layer must advance in time; put overlays in another layer.")
+                    }
+                }
+                if index > 1, ordered[index - 2].end > clip.start {
+                    throw ProjectError.invalid("Only two clips may overlap in a video layer.")
+                }
+                func points(_ values: [(UUID, Double, Double, Double?, Double?)]) throws {
+                    var previous = -Double.infinity
+                    for (id, time, ramp, easeIn, easeOut) in values {
+                        guard pointIDs.insert(id).inserted, time.isFinite, time >= 0, time > previous,
+                              source.duration.map({ time <= $0 }) ?? true,
+                              ramp.isFinite, ramp >= 0,
+                              [easeIn, easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                            throw ProjectError.invalid("Video animation points need unique identities, increasing source times, and finite ramps inside the source.")
+                        }
+                        previous = time
+                    }
+                }
+                try points(clip.geometryKeyframes.map { ($0.id, $0.time, $0.duration, $0.easeIn, $0.easeOut) })
+                try points(clip.opacityKeyframes.map { ($0.id, $0.time, $0.duration, $0.easeIn, $0.easeOut) })
+                try points(clip.volumeKeyframes.map { ($0.id, $0.time, $0.duration, $0.easeIn, $0.easeOut) })
+                guard clip.geometryKeyframes.allSatisfy({ $0.geometry.rect.isValid && $0.geometry.crop.isValid }),
+                      clip.opacityKeyframes.allSatisfy({ $0.opacity.isFinite && (0...1).contains($0.opacity) }),
+                      clip.volumeKeyframes.allSatisfy({ $0.gain.isFinite && (0...1).contains($0.gain) }) else {
+                    throw ProjectError.invalid("Video animation targets must use valid framing and levels between zero and one.")
+                }
+            }
+        }
     }
 
     mutating func ensureReferences(in extraState: EditState? = nil) {
@@ -1742,6 +2212,10 @@ struct RecordingProject: Codable, Equatable, Sendable {
               audioSources.allSatisfy({ $0.identifier == $0.role.metadataIdentifier }) else {
             throw ProjectError.invalid("Audio source roles require unique explicit capture metadata bindings.")
         }
+        guard Set(videoSources.map(\.id)).count == videoSources.count, videoAssets.count <= 4096 else {
+            throw ProjectError.invalid("Video sources need unique identities and a bounded source library.")
+        }
+        for source in videoAssets { try source.validate() }
         // Visual-only history commonly repeats the same timing. Compile each
         // distinct plan once per validation, without retaining global state or
         // skipping validation of any other snapshot properties.
@@ -1771,6 +2245,7 @@ struct RecordingProject: Codable, Equatable, Sendable {
     }
 
     private func validate(_ state: EditState, timingPlans: inout Set<TimingSignature>) throws {
+        try validateVideoLayers(state.videoLayers)
         guard state.contentLayers.count <= 256, Set(state.contentLayers.map(\.id)).count == state.contentLayers.count else {
             throw ProjectError.invalid("Keep at most 256 content layers with unique identities.")
         }
@@ -1970,6 +2445,9 @@ final class ProjectEditor: ObservableObject {
         let data = try Data(contentsOf: url)
         let project = try JSONDecoder().decode(RecordingProject.self, from: data)
         try project.validate()
+        for source in project.videoAssets where source.kind == .file {
+            _ = try source.resolvedURL(in: url.deletingLastPathComponent())
+        }
         let editor = ProjectEditor(project: project, url: url)
         editor.savedProjectDigest = digest(data)
         editor.savedProjectByteCount = data.count
@@ -2053,6 +2531,43 @@ final class ProjectEditor: ObservableObject {
     @discardableResult
     func commit(_ state: EditState, name: String) -> Bool {
         commitDocument(state: state, title: nil, name: name)
+    }
+
+    /// Registers immutable bytes/metadata and their initial occurrences as one
+    /// edit. Undo removes occurrences but retains the source for Redo and reuse.
+    @discardableResult
+    func registerVideoSource(_ source: VideoSource, state: EditState, name: String = "Add video") -> Bool {
+        registerVideoSources([source], state: state, name: name)
+    }
+
+    /// A multi-file import is one document transaction. Validate every source
+    /// before publishing any of their descriptors or occurrences.
+    @discardableResult
+    func registerVideoSources(_ sources: [VideoSource], state: EditState, name: String = "Add videos") -> Bool {
+        guard !sources.isEmpty else { return commit(state, name: name) }
+        var candidate = project
+        candidate.videoAssets.append(contentsOf: sources)
+        candidate.state = state
+        do {
+            try candidate.validate()
+            for source in sources where source.kind == .file {
+                _ = try source.resolvedURL(in: url.deletingLastPathComponent())
+            }
+        } catch { errorMessage = error.localizedDescription; return false }
+        guard finishDraft() else { return false }
+        candidate = project
+        candidate.videoAssets.append(contentsOf: sources)
+        candidate.undoHistory.append(NamedEditSnapshot(name: name, state: project.state, title: project.title))
+        candidate.redoHistory.removeAll()
+        candidate.state = state
+        return persist(candidate, operation: ProjectHistoryOperation(kind: .edit, names: [name]))
+    }
+
+    func videoSourceURL(for sourceID: UUID) throws -> URL {
+        guard let source = project.videoSources.first(where: { $0.id == sourceID }) else {
+            throw ProjectError.invalid("The video source is no longer registered.")
+        }
+        return try source.resolvedURL(in: url.deletingLastPathComponent())
     }
 
     /// Adding an image and its layer is one saved edit. Immutable assets remain
@@ -2185,7 +2700,8 @@ final class ProjectEditor: ObservableObject {
             // Reserve original names even when their files are currently
             // missing. A copy or its future journal must never become a source.
             var reserved = [url.lastPathComponent, recoveryURL.lastPathComponent] +
-                [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 }
+                [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 } +
+                project.videoAssets.compactMap(\.relativePath)
             // A deleted project can still own an open window and journal.
             // Its URL must not be reused for a new independent document.
             reserved += projectURLs.filter {
@@ -2323,7 +2839,9 @@ final class ProjectEditor: ObservableObject {
     private func validateRecoveryTarget() throws {
         let target = recoveryURL.standardizedFileURL.resolvingSymlinksInPath()
         let originals = [url] + [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename]
-            .compactMap { $0 }.map { mediaURL(for: $0) }
+            .compactMap { $0 }.map { mediaURL(for: $0) } + project.videoAssets.compactMap {
+                $0.relativePath.map { mediaURL(for: $0) }
+            }
         guard !originals.contains(where: { $0.standardizedFileURL.resolvingSymlinksInPath() == target }) else {
             throw ProjectError.invalid("The recovery file cannot replace original media or the saved project.")
         }
@@ -2378,6 +2896,11 @@ final class ProjectEditor: ObservableObject {
         for id in Set(oldLayers.keys).union(newLayers.keys) where oldLayers[id] != newLayers[id] {
             if let layer = newLayers[id] ?? oldLayers[id] { times.append(layer.start) }
         }
+        let oldVideos = Dictionary(uniqueKeysWithValues: project.effectiveVideoLayers(in: previous).flatMap(\.clips).map { ($0.id, $0) })
+        let newVideos = Dictionary(uniqueKeysWithValues: project.effectiveVideoLayers(in: next).flatMap(\.clips).map { ($0.id, $0) })
+        for id in Set(oldVideos.keys).union(newVideos.keys) where oldVideos[id] != newVideos[id] {
+            if let clip = newVideos[id] ?? oldVideos[id] { times.append(clip.start) }
+        }
         historyNavigationTime = preferredTime ?? times.min()
         if historyNavigationTime != nil { historyNavigationToken = UUID() }
     }
@@ -2393,6 +2916,12 @@ final class ProjectEditor: ObservableObject {
             for filename in [candidate.screenFilename, candidate.cameraFilename, candidate.cursorFilename, candidate.sceneFilename].compactMap({ $0 }) {
                 guard mediaURL(for: filename).standardizedFileURL.resolvingSymlinksInPath() != target else {
                     throw ProjectError.invalid("The project file cannot replace original media.")
+                }
+            }
+            for source in candidate.videoAssets where source.kind == .file {
+                let sourceURL = try source.resolvedURL(in: url.deletingLastPathComponent())
+                guard sourceURL != target else {
+                    throw ProjectError.invalid("The project file cannot replace original video media.")
                 }
             }
             let encoder = JSONEncoder()

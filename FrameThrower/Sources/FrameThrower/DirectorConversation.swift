@@ -237,6 +237,48 @@ final class DirectorConversation: ObservableObject {
          "state": object(after.state), "title": after.title.map { $0 as Any } ?? NSNull()]
     }
 
+    /// Machine notifications carry the exact changed collection entries, not
+    /// another copy of every unchanged keyframe. No events or values are
+    /// dropped and no model history is summarized. To replay a delta: remove
+    /// removed_ids and the upsert IDs, then insert upserts in ascending index.
+    static func nativeEvent(_ event: [String: Any], from before: EditState, to after: EditState) -> [String: Any] {
+        let old = object(before) as? [String: Any] ?? [:]
+        let new = object(after) as? [String: Any] ?? [:]
+        var notification = event
+        var changes = event["changes"] as? [String: Any] ?? [:]
+        if event["state"] != nil {
+            notification.removeValue(forKey: "state")
+            for key in Set(old.keys).union(new.keys) where jsonText(["value": old[key] ?? NSNull()]) != jsonText(["value": new[key] ?? NSNull()]) {
+                changes[key] = new[key] ?? NSNull()
+            }
+        }
+        for key in ["zoomKeyframes", "pipKeyframes", "regions", "editAnchors"] where changes[key] != nil {
+            guard let previous = old[key] as? [[String: Any]], let next = new[key] as? [[String: Any]] else { continue }
+            let oldIDs = previous.compactMap { $0["id"] as? String }, newIDs = next.compactMap { $0["id"] as? String }
+            guard oldIDs.count == previous.count, newIDs.count == next.count,
+                  Set(oldIDs).count == oldIDs.count, Set(newIDs).count == newIDs.count else { continue }
+            let oldRows = Dictionary(uniqueKeysWithValues: zip(oldIDs, previous))
+            let nextIDs = Set(newIDs)
+            let removed = oldIDs.filter { !nextIDs.contains($0) }
+            var changed = Set(zip(newIDs, next).compactMap { id, row in
+                oldRows[id].map { jsonText($0) == jsonText(row) } == true ? nil : id
+            })
+            // A pure order change is still factual state. If unaffected rows
+            // also moved, include them rather than losing their ordering.
+            if oldIDs.filter({ nextIDs.contains($0) && !changed.contains($0) }) != newIDs.filter({ !changed.contains($0) }) {
+                changed = Set(newIDs)
+            }
+            let upsert: [[String: Any]] = next.enumerated().compactMap { index, row in
+                guard let id = row["id"] as? String, changed.contains(id) else { return nil }
+                return ["index": index, "value": row]
+            }
+            changes[key] = ["encoding": "indexed_collection_delta", "removed_ids": removed,
+                            "upsert": upsert, "count": next.count]
+        }
+        notification["changes"] = changes
+        return notification
+    }
+
     @discardableResult
     func save() -> Bool {
         guard let storageURL else { return true }

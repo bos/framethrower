@@ -28,8 +28,8 @@ private final class NativeFixtureEndpoint: EditorAutomationEndpoint {
 }
 @main @MainActor
 struct NativeDirectorSessionChecks {
-    static func require(_ value: @autoclosure () -> Bool, _ message: String) throws {
-        if !value() { throw NativeCheckFailure.failed(message) }
+    static func require(_ value: @autoclosure () throws -> Bool, _ message: String) throws {
+        if try !value() { throw NativeCheckFailure.failed(message) }
     }
     static func wait(_ session: EditorAssistantSession) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -39,6 +39,7 @@ struct NativeDirectorSessionChecks {
         }
     }
     static func main() async throws {
+        try checkExactCollectionNotifications()
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-native-session-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -127,5 +128,41 @@ struct NativeDirectorSessionChecks {
             failedRows.last?.text == failed.errorMessage, "infrastructure failure shows its actual cause instead of misleading model prose")
         try require(failed.instruction == "Expand the camera.", "failed native turn preserves the user's input")
         print("Native Director Session checks passed (new turns only, no app history reconstruction/truncation, actual manual events, natural replies and untouched drafts).")
+    }
+
+    static func checkExactCollectionNotifications() throws {
+        var original = RecordingProject(screenFilename: "unopened.mov", duration: 14)
+        original.state.zoomKeyframes = (0..<160).map { ZoomKeyframe(time: Double($0) / 20, scale: 1.5) }
+        original.references.register(state: original.state, includeCamera: false)
+        var next = original
+        next.state.zoomKeyframes[80].scale = 2
+        let full = DirectorConversation.projectEvent(from: original, to: next)
+        let delta = DirectorConversation.nativeEvent(full, from: original.state, to: next.state)
+        let changes = delta["changes"] as! [String: Any]
+        let collection = changes["zoomKeyframes"] as! [String: Any]
+        try require((collection["upsert"] as? [Any])?.count == 1 && (collection["removed_ids"] as? [String]) == [],
+            "one changed point does not repeat all unchanged points")
+        try require(try JSONSerialization.data(withJSONObject: delta).count < JSONSerialization.data(withJSONObject: full).count / 8,
+            "native notifications carry exact deltas without a model-context budget")
+        let base = DirectorConversation.object(original.state.zoomKeyframes) as! [[String: Any]]
+        func replay(_ notification: [String: Any]) throws -> [ZoomKeyframe] {
+            let changes = notification["changes"] as! [String: Any]
+            let value = changes["zoomKeyframes"] as! [String: Any]
+            let upsert = value["upsert"] as! [[String: Any]]
+            let ids = Set((value["removed_ids"] as! [String]) + upsert.map { ($0["value"] as! [String: Any])["id"] as! String })
+            var rows = base.filter { !ids.contains($0["id"] as! String) }
+            for entry in upsert.sorted(by: { ($0["index"] as! Int) < ($1["index"] as! Int) }) {
+                rows.insert(entry["value"] as! [String: Any], at: entry["index"] as! Int)
+            }
+            try require(rows.count == value["count"] as? Int, "delta carries exact collection size")
+            return try JSONDecoder().decode([ZoomKeyframe].self, from: JSONSerialization.data(withJSONObject: rows))
+        }
+        try require(try replay(delta) == next.state.zoomKeyframes, "updated values replay exactly")
+        next.state.zoomKeyframes.remove(at: 12)
+        next.state.zoomKeyframes.insert(ZoomKeyframe(time: 0.025, scale: 2.5), at: 1)
+        next.state.zoomKeyframes.swapAt(2, 3)
+        let edited = DirectorConversation.nativeEvent(DirectorConversation.projectEvent(from: original, to: next),
+            from: original.state, to: next.state)
+        try require(try replay(edited) == next.state.zoomKeyframes, "insertions, removals and order changes replay without losing facts")
     }
 }

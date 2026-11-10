@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 private enum EditorInspector: String, CaseIterable {
-    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", speed = "Speed", canvas = "Canvas", audio = "Audio", layers = "Layers"
+    case zoom = "Zoom", pointer = "Pointer", camera = "Camera", speed = "Speed", canvas = "Canvas", audio = "Audio", videos = "Videos", layers = "Layers"
 }
 
 private enum PreviewTool: String, CaseIterable {
@@ -26,6 +26,13 @@ struct ProjectEditorView: View {
     @StateObject private var automation: EditorAutomationHost
     @State private var editorRenameRequest: UUID?
     @State private var selectedInspector: EditorInspector = .zoom
+    @State private var selectedVideoLayerID: UUID?
+    @State private var selectedVideoClipID: UUID?
+    @State private var selectedVideoVolumeID: UUID?
+    @State private var videoGestureState: EditState?
+    @State private var importingVideos = false
+    @State private var videoFramingClipID: UUID?
+    @State private var videoFramingTime: Double?
     @State private var selectedContentLayerID: UUID?
     @State private var selectedEditID: UUID?
     @State private var presentationDraft: CanvasPresentation?
@@ -250,9 +257,23 @@ struct ProjectEditorView: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 820, idealWidth: 940, maxWidth: .infinity,
+        .frame(minWidth: 940, idealWidth: 1040, maxWidth: .infinity,
                minHeight: 760, idealHeight: 780, maxHeight: .infinity)
         .background(.background)
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !MediaProcessing.isSuspended, !urls.isEmpty, !importingVideos else { return false }
+            playback.pause(); assistant.cancel(); importingVideos = true
+            let time = playback.editingTime
+            Task {
+                defer { importingVideos = false }
+                do {
+                    let selected = try await ProjectVideoImport.addSources(urls, to: editor, at: time)
+                    selectedVideoLayerID = selected.0; selectedVideoClipID = selected.1; selectedVideoVolumeID = nil
+                    selectedInspector = .videos
+                } catch { timelineError = error.localizedDescription }
+            }
+            return true
+        }
         .background(EditorDraftLifecycle(editor: editor).frame(width: 0, height: 0))
         .navigationTitle(editor.displayName)
         .focusedSceneObject(editor)
@@ -285,8 +306,15 @@ struct ProjectEditorView: View {
                 map: isSourceTimeline ? nil : timelineMap)
         }
         .onChange(of: editor.project.state) { old, next in
+            let videoLayers = editor.project.effectiveVideoLayers(in: next)
+            if let selectedVideoLayerID, !videoLayers.contains(where: { $0.id == selectedVideoLayerID }) {
+                self.selectedVideoLayerID = nil; selectedVideoClipID = nil; selectedVideoVolumeID = nil
+            }
+            if let selectedVideoClipID, let clip = videoLayers.flatMap(\.clips).first(where: { $0.id == selectedVideoClipID }) {
+                if let selectedVideoVolumeID, !clip.volumeKeyframes.contains(where: { $0.id == selectedVideoVolumeID }) { self.selectedVideoVolumeID = nil }
+            } else { selectedVideoClipID = nil; selectedVideoVolumeID = nil }
             if let selectedContentLayerID, !next.contentLayers.contains(where: { $0.id == selectedContentLayerID }) { self.selectedContentLayerID = nil }
-            animationGesture = nil
+            animationGesture = nil; videoGestureState = nil; videoFramingClipID = nil; videoFramingTime = nil
             if let selectedRegionID, !next.regions.contains(where: { $0.id == selectedRegionID }) { self.selectedRegionID = nil }
             if let selectedEditID, !edits.contains(where: { $0.id == selectedEditID }) { self.selectedEditID = nil }
             if let selectedAnimationID, !timelineAnimations.contains(where: { $0.id == selectedAnimationID }) {
@@ -341,7 +369,8 @@ struct ProjectEditorView: View {
             if let selectedCutID, !state.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
         }
         .onChange(of: selectedInspector) { _, next in
-            if next == .layers { selectedEditID = nil; selectedAnimationID = nil }
+            if next == .videos { selectedEditID = nil; selectedAnimationID = nil }
+            else if next == .layers { selectedEditID = nil; selectedAnimationID = nil }
             else if animationGesture == nil { synchronizeAnimationSelection() }
         }
         .onAppear {
@@ -361,6 +390,7 @@ struct ProjectEditorView: View {
         .onDeleteCommand {
             if cutSelection != nil { cutSelectedSection() }
             else if let selectedCutID { applyCutMutation(.restoreCut(cutID: selectedCutID), name: "Restore section") }
+            else if let layer = selectedVideoLayerID, let clip = selectedVideoClipID { deleteVideo(layer: layer, clip: clip, point: selectedVideoVolumeID) }
             else { deleteSelectedBox() }
         }
         .toolbarRole(.editor)
@@ -496,7 +526,7 @@ struct ProjectEditorView: View {
     private var player: some View {
         EditorCanvas(player: playback.canvasPlayer, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
-            placement: state.placement(at: playback.time), cameraEnabled: editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil && !isBlendedCanvas,
+            placement: state.placement(at: playback.time), cameraEnabled: selectedInspector != .videos && editor.project.effectiveVideoLayers(in: state).contains(where: { $0.clips.contains(where: { $0.layout == .camera && playback.time >= $0.start && playback.time < $0.end }) }) && editor.project.cameraFilename != nil && !playback.isScrubbing && !playback.isPlaying && conflictReview == nil && !isBlendedCanvas,
             showsCameraPattern: editor.project.cameraFilename != nil && conflictReview == nil,
             showsStill: !playback.isPlaying,
             onBegin: { beginCameraGesture() },
@@ -521,7 +551,7 @@ struct ProjectEditorView: View {
             prepareEditingPose: { EditorCanvasEditingPose(zoom: state.zoom(at: dragTime), placement: state.placement(at: dragTime)) },
             onEditingEnded: { canvasGesture = nil },
             zoom: conflictReview == nil ? state.zoom(at: playback.time) : ZoomPlacement(),
-            allowsZoomEditing: !playback.isLoading && !playback.isScrubbing && conflictReview == nil && !isBlendedCanvas,
+            allowsZoomEditing: selectedInspector != .videos && !playback.isLoading && !playback.isScrubbing && conflictReview == nil && !isBlendedCanvas,
             panEditingScale: zoom.scale,
             onZoomBegin: { beginZoomGesture() },
             onZoomPreview: { next in setZoom(next, at: dragTime, name: "Edit") },
@@ -543,7 +573,8 @@ struct ProjectEditorView: View {
             },
             onDrawRegion: { addRegion($0) }, onSelectRegion: { selectRegion($0) },
             onDeleteRegion: { removeRegion($0) },
-            conflictOutlines: conflictReview?.outlines(at: playback.time), outputSamples: canvasOutputSamples)
+            conflictOutlines: conflictReview?.outlines(at: playback.time), outputSamples: canvasOutputSamples,
+            videoProject: editor.project, videoState: state, videoTime: playback.time)
             .frame(minHeight: 260, idealHeight: 310, maxHeight: .infinity)
             .overlay {
                 ContentLayersOverlay(layers: state.contentLayers, sourceSize: playback.sourceSize,
@@ -560,6 +591,34 @@ struct ProjectEditorView: View {
                         _ = editor.updateDraft(next, at: playback.editingTime)
                     }, commit: { name in _ = editor.finishDraft(name: name) }, cancel: { _ = editor.cancelDraft() })
                 .allowsHitTesting(selectedInspector == .layers && conflictReview == nil && !isBlendedCanvas && !playback.isPlaying)
+            }
+            .overlay {
+                VideoClipOverlay(project: editor.project, state: state, sourceSize: playback.sourceSize, time: playback.time,
+                    selection: selectedVideoClipID,
+                    isEditing: selectedInspector == .videos && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil,
+                    select: { layer, clip in
+                        if clip != selectedVideoClipID { guard editor.finishDraft() else { return } }
+                        selectedVideoLayerID = layer; selectedVideoClipID = clip; selectedVideoVolumeID = nil
+                        if clip != nil { selectedEditID = nil; selectedAnimationID = nil; selectedRegionID = nil }
+                    },
+                    begin: {
+                        assistant.cancel(); playback.pause()
+                        if videoFramingClipID != selectedVideoClipID || videoFramingTime != playback.editingTime {
+                            guard editor.finishDraft() else { return false }
+                        }
+                        videoFramingClipID = selectedVideoClipID; videoFramingTime = playback.editingTime
+                        videoGestureState = state; return true
+                    },
+                    preview: { layer, clip in
+                        guard videoGestureState != nil else { return }
+                        let next = VideoClipEditing.replacing(clip, layerID: layer, in: state, project: editor.project)
+                        _ = editor.updateDraft(next, at: playback.editingTime)
+                    }, commit: { videoGestureState = nil }, cancel: {
+                        if let before = videoGestureState, before != editor.project.state { _ = editor.updateDraft(before, at: playback.editingTime) }
+                        else { _ = editor.cancelDraft() }
+                        videoGestureState = nil
+                    })
+                .allowsHitTesting(selectedInspector == .videos && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil)
             }
             .overlay(alignment: .topTrailing) { previewTools.padding(10) }
             .overlay(alignment: .bottomLeading) {
@@ -679,6 +738,12 @@ struct ProjectEditorView: View {
         if cutSelection != nil || selectedCutID != nil { cutSelection = nil; selectedCutID = nil; return }
         if conflictReview != nil { assistant.cancel(); return }
         if let snapshot = canvasGesture { restoreCanvasGesture(snapshot); return }
+        if videoGestureState != nil { videoGestureState = nil; _ = editor.cancelDraft(); return }
+        if selectedVideoClipID != nil {
+            if editor.draftState != nil { _ = editor.cancelDraft() }
+            else { selectedVideoClipID = nil; selectedVideoVolumeID = nil }
+            return
+        }
         if animationGesture != nil { cancelAnimationGesture() }
         else if movingEditState != nil { cancelMove() }
         else if editor.draftState != nil || presentationDraft != nil { cancelDraft() }
@@ -743,7 +808,7 @@ struct ProjectEditorView: View {
                     Text("Source").tag(EditorCutTimeBase.source).disabled(!playback.supportsSourceAudition)
                 }
                 .pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 160)
-                .disabled(animationGesture != nil || canvasGesture != nil)
+                .disabled(animationGesture != nil || canvasGesture != nil || videoGestureState != nil)
                 .help(playback.supportsSourceAudition
                     ? "Finished shows exported time and joins. Drag complete animation spans to adjust timing; use Source for spans split by cuts or fades and for removed footage."
                     : "Finished shows exported time and joins. Original Source inspection is unavailable for this composed preview.")
@@ -754,6 +819,7 @@ struct ProjectEditorView: View {
                 Text("\(timelinePosition, specifier: "%.2f") / \(timelineDuration, specifier: "%.2f") s")
                     .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
             }.frame(height: 24)
+            ScrollView(.vertical) {
             RecordingTimeline(duration: timelineDuration, trimStart: isSourceTimeline ? state.trimStart : 0,
                 trimEnd: isSourceTimeline ? state.trimEnd : timelineDuration, playhead: timelinePosition,
                 onInteractionBegan: { playback.pause() },
@@ -805,8 +871,17 @@ struct ProjectEditorView: View {
                     cutDuration = requested > 0 ? requested : 0.5
                 }, onCutRange: { cutSelectedSection() },
                 onRestoreCut: { applyCutMutation(.restoreCut(cutID: $0), name: "Restore section") },
-                onCutAnchor: { cutPopoverAnchor = $0 }, sourceEnvelopes: outputProjection?.envelopes ?? [:], speedCurves: speedCurves)
-                .frame(height: RecordingTimeline.clipLaneHeight + CGFloat(editor.project.audioSources.count * 30) + (editor.project.cameraFilename != nil ? 30 : 0))
+                onCutAnchor: { cutPopoverAnchor = $0 }, sourceEnvelopes: outputProjection?.envelopes ?? [:], speedCurves: speedCurves,
+                videoRows: videoTimelineRows, selectedVideoClipID: selectedVideoClipID, selectedVideoVolumeID: selectedVideoVolumeID,
+                onSelectVideo: { layer, clip, point in
+                    guard editor.finishDraft() else { return }
+                    selectedVideoLayerID = layer; selectedVideoClipID = clip; selectedVideoVolumeID = point
+                    selectedAnimationID = nil; selectedEditID = nil; selectedCutID = nil; cutSelection = nil
+                    if clip != nil { selectedInspector = .videos }
+                }, onVideoEdit: { request, final in editVideo(request, final: final) },
+                onVideoCancel: { videoGestureState = nil; _ = editor.cancelDraft() },
+                onDeleteVideo: { layer, clip, point in deleteVideo(layer: layer, clip: clip, point: point) })
+                .frame(height: videoTimelineHeight)
                 .popover(isPresented: Binding(get: { selectedCutID != nil }, set: { if !$0 { selectedCutID = nil } }),
                     attachmentAnchor: .point(cutPopoverAnchor)) { cutControls }
                 .contextMenu {
@@ -825,7 +900,79 @@ struct ProjectEditorView: View {
                         }
                     }
                 }
+            }.frame(height: min(340, videoTimelineHeight))
         }
+    }
+
+    private var videoTimelineHeight: CGFloat {
+        RecordingTimeline.clipLaneHeight + CGFloat(editor.project.audioSources.count * 30) +
+            (editor.project.cameraFilename != nil ? 30 : 0) + CGFloat(videoTimelineRows.count) * TimelineVideoRow.height
+    }
+
+    private var videoTimelineRows: [TimelineVideoRow] {
+        TimelineVideoRow.make(project: editor.project, state: state, map: isSourceTimeline ? nil : timelineMap)
+    }
+
+    private func editVideo(_ request: TimelineVideoEdit, final: Bool) {
+        assistant.cancel(); playback.pause()
+        if videoGestureState == nil {
+            guard editor.finishDraft() else { return }
+            videoGestureState = editor.editingState
+        }
+        guard let base = videoGestureState,
+              let original = editor.project.effectiveVideoLayers(in: base).first(where: { $0.id == request.layerID })?.clips.first(where: { $0.id == request.clipID }) else { return }
+        let source = editor.project.videoSources.first { $0.id == original.sourceID }
+        var clip = original
+        switch request.handle {
+        case .move:
+            let length = original.end - original.start
+            clip.start = min(max(0, request.projectTime), editor.project.duration - length)
+            clip.end = clip.start + length
+        case .start:
+            let earliest = max(0, original.start - original.sourceStart / original.rate)
+            clip.start = min(max(earliest, request.projectTime), original.end - min(0.01, (original.end - original.start) / 2))
+            clip.sourceStart = max(0, original.sourceStart + (clip.start - original.start) * original.rate)
+        case .end:
+            let latest = min(editor.project.duration, original.start + ((source?.duration ?? .greatestFiniteMagnitude) - original.sourceStart) / original.rate)
+            clip.end = min(latest, max(original.start + min(0.01, (original.end - original.start) / 2), request.projectTime))
+        case .volume(let id):
+            let time = min(original.sourceEnd.nextDown, max(original.sourceStart, original.sourceTime(at: request.projectTime)))
+            var point = original.volumeKeyframes.first { $0.id == id }
+                ?? original.volumeKeyframes.first { abs($0.time - time) < 0.000001 && !original.volumeKeyframes.contains(where: { $0.id == id }) }
+                ?? VideoVolumeKeyframe(id: id, time: time, gain: request.gain, transition: time == 0 ? .jump : .smooth)
+            point.time = time; point.gain = request.gain
+            clip.volumeKeyframes.removeAll { $0.id == point.id }
+            clip.volumeKeyframes.append(point); clip.volumeKeyframes.sort { $0.time < $1.time }
+            selectedVideoVolumeID = point.id
+        }
+        let next = VideoClipEditing.replacing(clip, layerID: request.layerID, in: base, project: editor.project)
+        var check = editor.project; check.state = next
+        if (try? check.validate()) == nil {
+            // Stop at the last valid preview rather than saving an overlap or
+            // discarding an entire valid drag when its final event is blocked.
+            if final { _ = editor.finishDraft(name: "Adjust video clip"); videoGestureState = nil }
+            return
+        }
+        if final {
+            if editor.draftState != nil { _ = editor.updateDraft(next, at: playback.editingTime); _ = editor.finishDraft(name: "Adjust video clip") }
+            else { _ = editor.commit(next, name: "Adjust video clip") }
+            videoGestureState = nil
+        } else { _ = editor.updateDraft(next, at: playback.editingTime) }
+    }
+
+    private func deleteVideo(layer: UUID, clip: UUID, point: UUID?) {
+        playback.pause(); assistant.cancel(); videoGestureState = nil
+        guard editor.finishDraft() else { return }
+        let mutation: EditorMutation = point.map { .removeVideoAnimation(layerID: layer, clipID: clip, property: .volume, pointID: $0) }
+            ?? .removeVideoClip(layerID: layer, clipID: clip)
+        var next = editor.editingState
+        do {
+            try mutation.apply(to: &next, project: editor.project)
+            if editor.commit(next, name: point == nil ? "Remove video clip" : "Remove clip volume change") {
+                if point == nil { selectedVideoClipID = nil }
+                selectedVideoVolumeID = nil
+            }
+        } catch { timelineError = error.localizedDescription }
     }
 
     @ViewBuilder
@@ -911,7 +1058,7 @@ struct ProjectEditorView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 500, height: 24)
+                .frame(width: 580, height: 24)
                 Spacer(minLength: 0)
                 if selectedInspector == .camera {
                     cameraVisibility.disabled(hasAmbiguousFramingTarget)
@@ -930,6 +1077,9 @@ struct ProjectEditorView: View {
                         .help(hasAmbiguousFramingTarget ? "Inspect Source or select a source edit to choose which side to change." : "Adjust the camera overlay.")
                 case .audio: audioControls
                 case .speed: speedControls
+                case .videos:
+                    VideoLayersInspector(editor: editor, sourceTime: playback.editingTime, layerID: $selectedVideoLayerID, clipID: $selectedVideoClipID, volumeID: $selectedVideoVolumeID,
+                        prepare: { assistant.cancel(); leaveConflictForManualEdit(); playback.pause() })
                 case .layers:
                     ContentLayersInspector(editor: editor, sourceTime: playback.time, selection: $selectedContentLayerID,
                         prepare: { assistant.cancel(); leaveConflictForManualEdit(); playback.pause() }, seek: { playback.seek($0) })
@@ -955,7 +1105,7 @@ struct ProjectEditorView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
             // Four audio rows plus the effective-fade caption set the maximum;
             // reserve it across tabs without keeping the former extra track row.
-            .frame(height: editor.project.audioSources.isEmpty ? 100 : 144, alignment: .top)
+            .frame(height: 144, alignment: .top)
         }
         .padding(14)
         .fixedSize(horizontal: false, vertical: true)

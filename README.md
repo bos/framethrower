@@ -189,6 +189,44 @@ Import remains disabled during the temporary media suspension. Run
 `bash Tests/check-video-import.sh` for project/file checks with supplied metadata
 and plain text; these checks do not inspect or create video.
 
+### Multiple video clips
+
+In the editor's **Videos** tab, **Add video** imports files into new layers.
+Dropping files onto the editor does the same thing. Each original is copied
+unchanged into the project's `.media` sidecar directory; keep that directory
+with the project. Reusing a library source or duplicating a clip does not copy
+its bytes again. Removing a clip retains its source for reuse and Undo/Redo.
+A multi-file drop is one undoable action.
+
+Layers run together, back to front. Clips in a layer run in sequence; overlap
+supports a cut or an alpha-blended crossfade. The inspector provides source in,
+project start, length, speed, fit/fill, layout, opacity and audio controls. Clip
+placement currently stays within the existing project's duration. A source
+longer than that project is retained in full but its initial occurrence is
+trimmed to fit.
+
+Each clip has a strip on the shared timeline and its own volume curve below it.
+Click a curve to add a volume change; drag a point to change its time and level.
+Select a point for smooth/jump and ramp controls, or press Delete to remove it.
+Move a selected clip's edges to trim; drag its body to move it. Source-anchored
+volume, geometry and opacity points survive moves, trims and speed changes,
+including points hidden outside the current trim. Separate occurrences remain
+independent. Pinch and pan in the preview to frame a selected custom clip; edits
+at one instant stay together until leaving that instant. Escape cancels.
+
+Import, actual video playback and export remain blocked by the temporary media
+interlock. The Add video menu supplies landscape and portrait vector patterns
+for safe interaction testing. Known-silent sources do not show active audio
+controls. Director can inspect registered sources, manage layers/clips, and
+change geometry, opacity and volume through typed undoable operations. It does
+not receive arbitrary filesystem access.
+
+Safe checks: `Tests/check-multi-video-model.sh`,
+`Tests/check-multi-video-import.sh`, `Tests/check-multi-video-rendering.sh`,
+`Tests/check-multi-video-director.sh`, and `Tests/check-multi-video-window.sh`.
+The window checks link an existing Debug build and use offscreen vector views;
+they do not launch or focus the installed app.
+
 ## Editing
 
 ### Content layers

@@ -126,6 +126,9 @@ struct EditorCanvas: NSViewRepresentable {
     var onDeleteRegion: (UUID) -> Void = { _ in }
     var conflictOutlines: EditorConflictOutlines? = nil
     var outputSamples: [EditorCanvasSample] = []
+    var videoProject: RecordingProject? = nil
+    var videoState: EditState? = nil
+    var videoTime: Double = 0
 
     func makeNSView(context: Context) -> EditorCanvasView { EditorCanvasView() }
     func updateNSView(_ view: EditorCanvasView, context: Context) {
@@ -154,7 +157,8 @@ struct EditorCanvas: NSViewRepresentable {
         view.configure(player: player, image: showsStill ? frames.image : nil,
             sourceSize: sourceSize, cameraAspect: cameraAspect,
             placement: placement, cameraEnabled: cameraEnabled, showsCameraPattern: showsCameraPattern, zoom: zoom,
-            presentation: presentation, nativeSourceSize: nativeSourceSize, outputSamples: outputSamples)
+            presentation: presentation, nativeSourceSize: nativeSourceSize, outputSamples: outputSamples,
+            videoProject: videoProject, videoState: videoState, videoTime: videoTime)
     }
 }
 
@@ -180,6 +184,9 @@ final class EditorCanvasView: NSView {
     private(set) var testPattern: EditorTestPattern?
     private(set) var incomingTestPattern: EditorTestPattern?
     private var outputSamples: [EditorCanvasSample] = []
+    private var videoProject: RecordingProject?
+    private var videoState: EditState?
+    private var videoTime = 0.0
     let stillLayer = CALayer()
     private let canvasBorder = CALayer()
     private let outline = CAShapeLayer()
@@ -315,7 +322,8 @@ final class EditorCanvasView: NSView {
                    cameraAspect: Double, placement: PIPPlacement, cameraEnabled: Bool,
                    showsCameraPattern: Bool? = nil, zoom: ZoomPlacement = ZoomPlacement(),
                    presentation: CanvasPresentation = CanvasPresentation(), nativeSourceSize: CGSize? = nil,
-                   outputSamples: [EditorCanvasSample] = []) {
+                   outputSamples: [EditorCanvasSample] = [], videoProject: RecordingProject? = nil,
+                   videoState: EditState? = nil, videoTime: Double = 0) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if MediaProcessing.isSuspended {
@@ -343,6 +351,7 @@ final class EditorCanvasView: NSView {
         self.showsCameraPattern = showsCameraPattern ?? cameraEnabled
         self.placement = placement
         self.outputSamples = outputSamples
+        self.videoProject = videoProject; self.videoState = videoState; self.videoTime = videoTime
         // Frame delivery and SwiftUI updates may arrive between native gesture
         // samples. Continue from the gesture's viewport, never from an older
         // frame's configuration.
@@ -367,7 +376,10 @@ final class EditorCanvasView: NSView {
         stillLayer.frame = canvasRect
         canvasBorder.frame = canvasRect
         let current = drag?.draft ?? placement
-        if MediaProcessing.isSuspended {
+        if MediaProcessing.isSuspended, let videoProject, let videoState, videoState.videoLayers != nil {
+            incomingTestPattern?.layer.isHidden = true
+            testPattern?.update(project: videoProject, state: videoState, at: videoTime, outputSamples: outputSamples, in: bounds)
+        } else if MediaProcessing.isSuspended {
             let usesOutputSamples = drag == nil && trackpad == nil && zoomDrag == nil && !outputSamples.isEmpty
             let first = usesOutputSamples ? outputSamples.first : nil
             testPattern?.update(in: bounds, sourceSize: sourceSize, presentation: presentation, zoom: first?.zoom ?? zoom,

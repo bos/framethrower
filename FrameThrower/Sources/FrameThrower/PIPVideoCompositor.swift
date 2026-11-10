@@ -81,9 +81,9 @@ final class CutCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
             .sorted().map { NSNumber(value: $0) }
         super.init()
     }
-    func applying(_ state: EditState, renderSize: CGSize? = nil) -> CutCompositionInstruction {
+    func applying(_ state: EditState, renderSize: CGSize? = nil, preservePreviewFrames: Bool = true) -> CutCompositionInstruction {
         CutCompositionInstruction(timingMap: timingMap, branches: branches,
-            template: template.applying(state, preservePreviewFrames: false, renderSize: renderSize))
+            template: template.applying(state, preservePreviewFrames: preservePreviewFrames, renderSize: renderSize))
     }
 }
 
@@ -102,6 +102,7 @@ final class MultiVideoCompositionInstruction: NSObject, AVVideoCompositionInstru
     let sourceSize: CGSize
     let renderSize: CGSize
     let cursorRecording: CursorRecording?
+    let previewFrames: PreviewSourceFrames?
     let timeRange: CMTimeRange
     let enablePostProcessing = false
     let containsTweening = true
@@ -109,17 +110,19 @@ final class MultiVideoCompositionInstruction: NSObject, AVVideoCompositionInstru
     let requiredSourceTrackIDs: [NSValue]?
 
     init(project: RecordingProject, plan: MultiVideoRenderPlan, bindings: [Binding], sourceSize: CGSize,
-         renderSize: CGSize, cursorRecording: CursorRecording? = nil) {
+         renderSize: CGSize, cursorRecording: CursorRecording? = nil, previewFrames: PreviewSourceFrames? = nil) {
         self.project = project; self.plan = plan; self.bindings = bindings
         self.sourceSize = sourceSize; self.renderSize = renderSize; self.cursorRecording = cursorRecording
+        self.previewFrames = previewFrames
         timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: plan.timingMap.outputDuration, preferredTimescale: 60_000))
         requiredSourceTrackIDs = Set(bindings.map(\.trackID)).sorted().map { NSNumber(value: $0) }
         super.init()
     }
-    func applying(_ state: EditState, renderSize: CGSize? = nil) -> MultiVideoCompositionInstruction {
+    func applying(_ state: EditState, renderSize: CGSize? = nil, preservePreviewFrames: Bool = true) -> MultiVideoCompositionInstruction {
         var snapshot = project; snapshot.state = state
         return MultiVideoCompositionInstruction(project: snapshot, plan: plan, bindings: bindings,
-            sourceSize: sourceSize, renderSize: renderSize ?? self.renderSize, cursorRecording: cursorRecording)
+            sourceSize: sourceSize, renderSize: renderSize ?? self.renderSize, cursorRecording: cursorRecording,
+            previewFrames: preservePreviewFrames ? previewFrames : nil)
     }
 }
 
@@ -250,26 +253,16 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
                           userInfo: [NSLocalizedDescriptionKey: "A recording frame could not be allocated."])
         }
         if let multi = request.videoCompositionInstruction as? MultiVideoCompositionInstruction {
-            let image = try composer.image(request: request, instruction: multi, renderSize: multi.renderSize)
+            multi.previewFrames?.captureComposition(request: request, instruction: .multi(multi))
+            let image = try composer.image(at: request.compositionTime.seconds, frames: { request.sourceFrame(byTrackID: $0) },
+                instruction: multi, renderSize: multi.renderSize)
             composer.context.render(image, to: output, bounds: CGRect(origin: .zero, size: multi.renderSize), colorSpace: composer.colorSpace)
             return output
         } else if let cut = request.videoCompositionInstruction as? CutCompositionInstruction {
-            let canvas = CGRect(origin: .zero, size: cut.template.renderSize)
-            var blended: CIImage?
-            for sample in cut.timingMap.samples(at: request.compositionTime.seconds) {
-                let branch = cut.branches[sample.clipIndex]
-                let image = try composer.image(screen: request.sourceFrame(byTrackID: branch.screenTrackID),
-                    camera: branch.cameraTrackID.flatMap { request.sourceFrame(byTrackID: $0) },
-                    instruction: cut.template, state: cut.template.state, at: sample.sourceTime,
-                    renderSize: cut.template.renderSize)
-                if let outgoing = blended {
-                    blended = outgoing.applyingFilter("CIDissolveTransition", parameters: [
-                        kCIInputTargetImageKey: image, kCIInputTimeKey: sample.weight
-                    ]).cropped(to: canvas)
-                } else { blended = image }
-            }
-            let image = blended ?? CIImage(color: .black).cropped(to: canvas)
-            composer.context.render(image, to: output, bounds: canvas, colorSpace: composer.colorSpace)
+            cut.template.previewFrames?.captureComposition(request: request, instruction: .cut(cut))
+            let image = try composer.image(at: request.compositionTime.seconds, frames: { request.sourceFrame(byTrackID: $0) },
+                instruction: cut, renderSize: cut.template.renderSize)
+            composer.context.render(image, to: output, bounds: CGRect(origin: .zero, size: cut.template.renderSize), colorSpace: composer.colorSpace)
             return output
         }
         guard let instruction = request.videoCompositionInstruction as? PIPCompositionInstruction else {
@@ -425,14 +418,27 @@ private final class PIPFrameComposer: @unchecked Sendable {
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private let layerArtwork = ContentLayerRasterCache()
 
-    func image(request: AVAsynchronousVideoCompositionRequest, instruction: MultiVideoCompositionInstruction,
-               renderSize: CGSize) throws -> CIImage {
+    func image(at time: Double, frames: (CMPersistentTrackID) -> CVPixelBuffer?,
+               instruction: CutCompositionInstruction, renderSize: CGSize) throws -> CIImage {
+        let canvas = CGRect(origin: .zero, size: renderSize)
+        var images: [(CIImage, Double)] = []
+        for sample in instruction.timingMap.samples(at: time) {
+            let branch = instruction.branches[sample.clipIndex]
+            let image = try image(screen: frames(branch.screenTrackID), camera: branch.cameraTrackID.flatMap(frames),
+                instruction: instruction.template, state: instruction.template.state, at: sample.sourceTime, renderSize: renderSize)
+            images.append((image, sample.weight))
+        }
+        return linearBlend(images, canvas: canvas)
+    }
+
+    func image(at time: Double, frames: (CMPersistentTrackID) -> CVPixelBuffer?,
+               instruction: MultiVideoCompositionInstruction, renderSize: CGSize) throws -> CIImage {
         let project = instruction.project, state = project.state
         let canvas = CGRect(origin: .zero, size: renderSize)
         let clear = CIImage(color: .clear).cropped(to: canvas)
         let sources = Dictionary(uniqueKeysWithValues: project.videoSources.map { ($0.id, $0) })
         var finished: [(CIImage, Double)] = []
-        for branch in instruction.plan.timingMap.samples(at: request.compositionTime.seconds) {
+        for branch in instruction.plan.timingMap.samples(at: time) {
             let color = state.presentation.background
             var composition = CIImage(color: CIColor(red: color.red, green: color.green, blue: color.blue)).cropped(to: canvas)
             let samples = project.videoSamples(at: branch.sourceTime)
@@ -446,7 +452,7 @@ private final class PIPFrameComposer: @unchecked Sendable {
                         sourceSize: size, primarySize: instruction.sourceSize, canvas: renderSize)
                     var raw: CIImage?
                     if source.kind == .testPattern { raw = vectorPattern(size: size, seed: source.patternSeed) }
-                    else if let binding, let frame = request.sourceFrame(byTrackID: binding.trackID) {
+                    else if let binding, let frame = frames(binding.trackID) {
                         raw = binding.geometry.orientedImage(frame)
                     }
                     if var sourceImage = raw {
@@ -823,6 +829,72 @@ final class LivePreviewSources: @unchecked Sendable {
     }
 }
 
+/// Cut blends and multi-video edits need all native source buffers at the frozen
+/// Finished playhead. Recompose those pixels during a gesture; never rely on a
+/// paused AVPlayer to invalidate a zero-distance seek or reopen a decoder.
+final class FrozenCompositionSources: @unchecked Sendable {
+    enum Instruction: Sendable {
+        case cut(CutCompositionInstruction)
+        case multi(MultiVideoCompositionInstruction)
+        var detached: Self {
+            switch self {
+            case .cut(let value): return .cut(value.applying(value.template.state, preservePreviewFrames: false))
+            case .multi(let value): return .multi(value.applying(value.project.state, preservePreviewFrames: false))
+            }
+        }
+        var trackIDs: [CMPersistentTrackID] {
+            switch self {
+            case .cut(let value): return value.branches.flatMap { [$0.screenTrackID] + [$0.cameraTrackID].compactMap { $0 } }
+            case .multi(let value): return value.bindings.map(\.trackID)
+            }
+        }
+        var sourceSize: CGSize {
+            switch self {
+            case .cut(let value): return value.template.screenGeometry.size
+            case .multi(let value): return value.sourceSize
+            }
+        }
+    }
+    let time: CMTime
+    private let instruction: Instruction
+    private let frames: [CMPersistentTrackID: CVPixelBuffer]
+    private lazy var composer = PIPFrameComposer()
+    private let queue = DispatchQueue(label: "framethrower.frozen-composition-render")
+
+    fileprivate init(request: AVAsynchronousVideoCompositionRequest, instruction: Instruction) {
+        time = request.compositionTime
+        self.instruction = instruction.detached
+        frames = Dictionary(instruction.trackIDs.compactMap { id in request.sourceFrame(byTrackID: id).map { (id, $0) } },
+                            uniquingKeysWith: { first, _ in first })
+    }
+    func render(applying state: EditState, maximumSize: CGSize = CGSize(width: 1920, height: 1080)) async throws -> CGImage {
+        try MediaProcessing.requireEnabled()
+        try Task.checkCancellation()
+        let image: CGImage = try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                autoreleasepool {
+                    let native = PresentationGeometry(sourceSize: instruction.sourceSize, presentation: state.presentation).outputSize
+                    let scale = min(1, maximumSize.width / native.width, maximumSize.height / native.height)
+                    let size = CGSize(width: max(1, (native.width * scale).rounded(.down)), height: max(1, (native.height * scale).rounded(.down)))
+                    do {
+                        let image: CIImage
+                        switch instruction {
+                        case .cut(let value): image = try composer.image(at: time.seconds, frames: { frames[$0] }, instruction: value.applying(state, renderSize: size), renderSize: size)
+                        case .multi(let value): image = try composer.image(at: time.seconds, frames: { frames[$0] }, instruction: value.applying(state, renderSize: size), renderSize: size)
+                        }
+                        guard let result = composer.context.createCGImage(image, from: CGRect(origin: .zero, size: size), format: .RGBA8, colorSpace: composer.colorSpace) else {
+                            throw ProjectError.invalid("The paused composition frame could not be rendered.")
+                        }
+                        continuation.resume(returning: result)
+                    } catch { continuation.resume(throwing: error) }
+                }
+            }
+        }
+        try Task.checkCancellation()
+        return image
+    }
+}
+
 /// Retains only the closest native-decoded source pair for one explicitly
 /// requested playhead. Exports never request a playhead, so they retain nothing.
 /// Capture stores raw buffers and immutable geometry only; the Core Image
@@ -841,6 +913,7 @@ final class PreviewSourceFrames: @unchecked Sendable {
     private var closestDistance = Double.infinity
     private var snapshot: Snapshot?
     private var frozenSources: LivePreviewSources?
+    private var compositionSources: FrozenCompositionSources?
 
     init(frameDuration: CMTime = CMTime(value: 1, timescale: 30)) {
         let seconds = frameDuration.seconds
@@ -855,6 +928,7 @@ final class PreviewSourceFrames: @unchecked Sendable {
             closestDistance = .infinity
             snapshot = nil
             frozenSources = nil
+            compositionSources = nil
             return
         }
         // AVPlayer can finish an exact zero-distance seek without rendering a
@@ -864,6 +938,7 @@ final class PreviewSourceFrames: @unchecked Sendable {
         closestDistance = .infinity
         snapshot = nil
         frozenSources = nil
+        compositionSources = nil
     }
 
     func capture(screen: CVPixelBuffer?, camera: CVPixelBuffer?, at time: CMTime,
@@ -880,6 +955,24 @@ final class PreviewSourceFrames: @unchecked Sendable {
         snapshot = Snapshot(sourceTime: time, screen: screen, camera: camera,
             instruction: instruction.applying(instruction.state, preservePreviewFrames: false))
         frozenSources = nil
+    }
+
+    fileprivate func captureComposition(request: AVAsynchronousVideoCompositionRequest, instruction: FrozenCompositionSources.Instruction) {
+        let time = request.compositionTime
+        guard time.seconds.isFinite else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard let target else { return }
+        let distance = abs(time.seconds - target.seconds)
+        guard distance <= tolerance, distance < closestDistance else { return }
+        closestDistance = distance
+        compositionSources = FrozenCompositionSources(request: request, instruction: instruction)
+    }
+
+    func composition(at time: CMTime) -> FrozenCompositionSources? {
+        lock.lock(); defer { lock.unlock() }
+        guard let target, CMTimeCompare(target, time) == 0, let compositionSources,
+              abs(compositionSources.time.seconds - time.seconds) <= tolerance else { return nil }
+        return compositionSources
     }
 
     func sources(at time: CMTime) -> LivePreviewSources? {

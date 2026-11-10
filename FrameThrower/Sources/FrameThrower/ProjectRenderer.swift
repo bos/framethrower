@@ -407,12 +407,13 @@ enum ProjectRenderer {
             branches.append(.init(screenTrackID: screenTracks[lane].trackID,
                 cameraTrackID: cameraTracks.isEmpty ? nil : cameraTracks[lane].trackID))
         }
+        let previewFrames = PreviewSourceFrames(frameDuration: time(project.captureFrameDuration ?? 1.0 / 30))
         let template = PIPCompositionInstruction(timeRange: CMTimeRange(start: .zero, duration: time(map.outputDuration)),
             screenTrackID: screenTracks[0].trackID, cameraTrackID: cameraTracks.first?.trackID,
             screenGeometry: screenGeometry, cameraGeometry: cameraGeometry, renderSize: renderSize,
             cameraStart: cameraStart, cameraEnd: cameraEnd, state: project.state,
             cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) },
-            contentAssets: project.contentAssets)
+            previewFrames: previewFrames, contentAssets: project.contentAssets)
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = PIPVideoCompositor.self
         video.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
@@ -423,7 +424,7 @@ enum ProjectRenderer {
         video.instructions = [CutCompositionInstruction(timingMap: map, branches: branches, template: template)]
         return RenderedProject(asset: composition, videoComposition: video, screenSize: renderSize,
             cameraAspect: cameraGeometry.map { $0.size.width / $0.size.height } ?? 16.0 / 9.0,
-            sourceSize: screenGeometry.size, audioMix: cutAudioMix(for: project.state, timingMap: map, segments: audioSegments),
+            sourceSize: screenGeometry.size, previewFrames: previewFrames, audioMix: cutAudioMix(for: project.state, timingMap: map, segments: audioSegments),
             audioTrackIDs: audioTracks.flatMap { $0.map(\.trackID) }, timingMap: map, cutAudioSegments: audioSegments)
     }
 
@@ -555,9 +556,10 @@ enum ProjectRenderer {
                 }
             }
         }
+        let previewFrames = PreviewSourceFrames(frameDuration: time(project.captureFrameDuration ?? 1.0 / 30))
         let instruction = MultiVideoCompositionInstruction(project: project, plan: plan, bindings: bindings,
             sourceSize: primarySize, renderSize: renderSize,
-            cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) })
+            cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) }, previewFrames: previewFrames)
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = PIPVideoCompositor.self
         video.renderSize = renderSize
@@ -568,7 +570,7 @@ enum ProjectRenderer {
         video.instructions = [instruction]
         return RenderedProject(asset: composition, videoComposition: video, screenSize: renderSize,
             cameraAspect: geometries[VideoSource.legacyCameraID].map { $0.size.width / $0.size.height } ?? 16.0 / 9.0,
-            sourceSize: primarySize,
+            sourceSize: primarySize, previewFrames: previewFrames,
             audioMix: multiVideoAudioMix(project: project, state: project.state, plan: plan, segments: audioSegments),
             audioTrackIDs: Array(Set(audioSegments.map(\.trackID))).sorted(), timingMap: plan.timingMap,
             multiVideoAudioSegments: audioSegments, multiVideoProject: project)

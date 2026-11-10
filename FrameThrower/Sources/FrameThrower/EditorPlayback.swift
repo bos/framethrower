@@ -301,9 +301,10 @@ final class EditorPlayback: ObservableObject {
             let position = bounded(time, to: sourceBounds)
             // The player may preroll its first frame as soon as the item is
             // attached, before a zero-distance seek asks it to render again.
-            if rendered.supportsDirectSourcePreview {
-                rendered.previewFrames.request(at: Self.frameTime(at: position, bounds: sourceBounds))
-            }
+            let initialFrame = rendered.supportsDirectSourcePreview
+                ? Self.frameTime(at: position, bounds: sourceBounds)
+                : Self.frameTime(at: outputPosition(for: position), bounds: 0...outputDuration)
+            rendered.previewFrames.request(at: initialFrame)
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
             sourceSize = rendered.sourceSize
@@ -513,10 +514,24 @@ final class EditorPlayback: ObservableObject {
             return
         }
         if renderedProject?.supportsDirectSourcePreview == false {
-            // AVPlayerLayer already holds the completed mixed frame. A cut
-            // composition has two source pairs, so the single-pair still
-            // cache must never decode or pretend one branch is the result.
-            isScrubbing = false
+            let target = Self.frameTime(at: outputTime, bounds: 0...outputDuration)
+            let sourceRequest = generation, seekRequest = seekGeneration
+            nativeFrameTask?.cancel()
+            nativeFrameTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await self.nativeCompositionSource(at: target, generation: sourceRequest, seekGeneration: seekRequest)
+                    guard !Task.isCancelled else { return }
+                    self.isScrubbing = false
+                    if let draft = self.pendingDraftState { self.pendingDraftState = nil; self.preview(draft) }
+                    else { self.updateStillFrame() }
+                } catch is CancellationError { return }
+                catch {
+                    guard !Task.isCancelled, sourceRequest == self.generation, seekRequest == self.seekGeneration else { return }
+                    self.isScrubbing = false; self.pendingDraftState = nil
+                    self.errorMessage = error.localizedDescription
+                }
+            }
             return
         }
         let target = Self.frameTime(at: time, bounds: sourceBounds)
@@ -543,6 +558,20 @@ final class EditorPlayback: ObservableObject {
                 self.errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func nativeCompositionSource(at target: CMTime, generation request: Int,
+                                         seekGeneration seekRequest: UInt64) async throws -> FrozenCompositionSources {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            guard !isClosed, request == generation, seekRequest == seekGeneration,
+                  CMTimeCompare(Self.frameTime(at: outputTime, bounds: 0...outputDuration), target) == 0,
+                  let renderedProject else { throw CancellationError() }
+            if let source = renderedProject.previewFrames.composition(at: target) { return source }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw NativeFrameError.unavailable
     }
 
     private func nativeSource(at target: CMTime, generation request: Int,
@@ -650,7 +679,9 @@ final class EditorPlayback: ObservableObject {
         isPlaying = false
         if wasPlaying, mediaUsesOutputTime {
             let current = player.currentTime().seconds
-            updateMediaPosition(bounded(current, to: outputPlaybackBounds))
+            let position = bounded(current, to: outputPlaybackBounds)
+            updateMediaPosition(position)
+            requestCompositionSeek(position)
             finishAuditionIfNeeded()
             return
         }
@@ -702,14 +733,32 @@ final class EditorPlayback: ObservableObject {
             return
         }
         if let renderedProject, !renderedProject.supportsDirectSourcePreview {
-            guard !isClosed, !isLoading else { return }
-            pause()
+            guard !isClosed, !isLoading, !isScrubbing, draftState != state else { return }
+            if seekInFlight || pendingSeek != nil { pendingDraftState = state; return }
+            let position = Self.frameTime(at: outputTime, bounds: 0...outputDuration)
+            guard let source = renderedProject.previewFrames.composition(at: position) else {
+                pendingDraftState = state
+                requestCompositionSeek(outputTime)
+                return
+            }
+            pendingDraftState = nil
+            if draftState == nil {
+                mediaPlayer?.pause(); isPlaying = false
+                stillRequests.invalidate()
+                committedStillFrame = stillFrame; committedStillTime = time
+                draftGeneration &+= 1
+            }
             draftState = state
-            let draft = ProjectRenderer.preview(renderedProject, applying: state)
-            screenSize = draft.screenSize
-            mediaPlayer?.currentItem?.videoComposition = draft.videoComposition
-            mediaPlayer?.currentItem?.audioMix = draft.audioMix
-            requestCompositionSeek(outputTime)
+            let request = draftGeneration
+            let size = PresentationGeometry(sourceSize: sourceSize, presentation: state.presentation).outputSize
+            if screenSize != size { screenSize = size }
+            stillRequests.request(generate: { try await source.render(applying: state) }, cancel: {}, receive: { [weak self] image in
+                guard let self, self.draftGeneration == request, self.draftState != nil, !self.isClosed, !self.isPlaying else { return }
+                self.stillFrame = image
+            }, failure: { [weak self] in
+                guard let self, self.draftGeneration == request else { return }
+                self.errorMessage = NativeFrameError.unavailable.localizedDescription
+            }, policy: .coalesced)
             return
         }
         guard !isClosed, !isLoading, !isScrubbing,
@@ -764,16 +813,9 @@ final class EditorPlayback: ObservableObject {
             }
             return
         }
-        if let renderedProject, !renderedProject.supportsDirectSourcePreview {
-            draftState = nil; pendingDraftState = nil
-            screenSize = renderedProject.screenSize
-            mediaPlayer?.currentItem?.videoComposition = renderedProject.videoComposition
-            mediaPlayer?.currentItem?.audioMix = renderedProject.audioMix
-            requestCompositionSeek(outputTime)
-            return
-        }
         guard !isClosed, isPreviewing else { return }
         discardPreview(restoringFrame: true)
+        if let renderedProject, screenSize != renderedProject.screenSize { screenSize = renderedProject.screenSize }
         updateStillFrame()
     }
 
@@ -902,7 +944,16 @@ final class EditorPlayback: ObservableObject {
 
     private func updateStillFrame() {
         guard !isClosed, !isPlaying, !isScrubbing, !seekInFlight, pendingSeek == nil,
-              draftState == nil, let renderedProject, renderedProject.supportsDirectSourcePreview, let committedState else { return }
+              draftState == nil, let renderedProject, let committedState else { return }
+        if !renderedProject.supportsDirectSourcePreview {
+            let position = Self.frameTime(at: outputTime, bounds: 0...outputDuration)
+            guard let source = renderedProject.previewFrames.composition(at: position) else { return }
+            stillRequests.request(generate: { try await source.render(applying: committedState) }, cancel: {}, receive: { [weak self] image in
+                guard let self, !self.isClosed, !self.isPlaying, !self.isScrubbing, !self.seekInFlight, self.pendingSeek == nil else { return }
+                self.stillFrame = image
+            }, failure: { [weak self] in self?.stillFrame = nil })
+            return
+        }
         let position = Self.frameTime(at: time, bounds: sourceBounds)
         guard let source = sourceCache(for: renderedProject, at: position) else {
             if errorMessage == nil { errorMessage = "The paused recording frame could not be prepared." }

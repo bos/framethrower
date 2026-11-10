@@ -142,6 +142,7 @@ struct EditorPlaybackChecks {
                     "fractional media end must remain exclusive")
 
         try await draftPreviewChecks()
+        try await composedDraftPreviewChecks()
         try await scrubbingChecks()
         try await sourceInspectionChecks()
 
@@ -302,6 +303,70 @@ struct EditorPlaybackChecks {
         let cameraAfter = try Data(contentsOf: camera)
         try require(screenAfter == originalScreen && cameraAfter == originalCamera,
                     "draft preview changed original captured media")
+    }
+
+    /// Regression for paused AVPlayer composition invalidation. A zero-distance
+    /// seek can reuse the previous rendered frame; dragging must instead update
+    /// real camera pixels through the native frozen-source compositor, without
+    /// Play, playhead movement, layout invalidation, or durable intermediate edits.
+    @MainActor
+    private static func composedDraftPreviewChecks() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("framethrower-composed-draft-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let screen = directory.appendingPathComponent("screen.mov"), camera = directory.appendingPathComponent("camera.mov")
+        try await movie(to: screen, width: 160, height: 120, camera: false)
+        try await movie(to: camera, width: 80, height: 40, camera: true)
+        let originals = [try Data(contentsOf: screen), try Data(contentsOf: camera)]
+        for mode in ["cut", "speed", "layers"] {
+            var project = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 2)
+            project.state.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 0, scale: 0.25)
+            if mode == "cut" { project.state.cuts = [RecordingCut(start: 0.7, end: 1, crossfade: 0.1)] }
+            if mode == "speed" { project.state.speedKeyframes = [RecordingSpeedKeyframe(time: 0, rate: 2, transition: .jump)] }
+            if mode == "layers" { project.state.videoLayers = project.effectiveVideoLayers() }
+            let editor = ProjectEditor(project: project, url: directory.appendingPathComponent(mode + ".framethrower"))
+            try require(editor.save(), "save \(mode) composition fixture")
+            let playback = EditorPlayback()
+            let display = HeadlessPlayerDisplay(player: playback.player)
+            await playback.rebuild(editor: editor)
+            playback.seekOutput(mode == "cut" ? 0.65 : 0.25)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            let item = playback.player.currentItem, sourceTime = playback.time, outputTime = playback.outputTime
+            let size = playback.screenSize
+            var draft = project.state
+            playback.preview(draft)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            var layoutChanges = 0, imageChanges = 0
+            let parentObservation = playback.objectWillChange.sink { layoutChanges += 1 }
+            let imageObservation = playback.frameStore.objectWillChange.sink { imageChanges += 1 }
+            for step in 0..<100 {
+                draft.pipKeyframes[0].placement.x = Double(step) / 99
+                draft.pipKeyframes[0].placement.y = Double(step) / 99
+                playback.preview(draft)
+            }
+            _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+            try require(imageChanges > 0 && layoutChanges == 0, "\(mode): actual paused camera pixels move without parent layout changes")
+            parentObservation.cancel(); imageObservation.cancel()
+            try require(!playback.isPlaying && !playback.isLoading && playback.screenSize == size,
+                        "\(mode): paused drag must not start playback or resize canvas")
+            try require(playback.player.currentItem === item && playback.time == sourceTime && playback.outputTime == outputTime,
+                        "\(mode): paused drag preserves player item and both playhead clocks")
+            try require(editor.project.undoHistory.isEmpty && editor.project.state == project.state,
+                        "\(mode): preview creates no intermediate saved edit")
+            playback.cancelPreview()
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            playback.preview(draft)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+            try require(editor.commit(draft, name: "Move camera"), "\(mode): commit gesture once")
+            await playback.rebuild(editor: editor)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+            try require(editor.project.undoHistory.count == 1 && editor.undo(), "\(mode): one Undo restores the gesture")
+            await playback.rebuild(editor: editor)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            playback.preview(draft); playback.close(); display.close()
+        }
+        let unchanged = [try Data(contentsOf: screen), try Data(contentsOf: camera)]
+        try require(unchanged == originals, "Composed paused edits never rewrite recorded originals")
     }
 
     @MainActor

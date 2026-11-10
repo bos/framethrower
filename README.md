@@ -4,21 +4,20 @@ A native macOS screen recorder built with SwiftUI and ScreenCaptureKit. Record a
 window, a display, or an area selected by dragging, then optionally upload the
 recording to Google Drive or a Slack person/channel.
 
-## Temporary media suspension
+## Live capture restriction
 
-Video processing is currently disabled in source at the user's request because
-of repeated kernel video-scaler hangs. Capture, camera sessions, live source
-previews, video playback, thumbnails, composition, and export are blocked. The
-editor plays edits over a drawn vector test pattern using a separate clock.
-This exercises zooms, pans, PIP, scrubbing, and trim timing without opening
-footage or creating a media player. Timeline edits, naming, project saving,
-and Undo/Redo remain usable. Existing recordings are untouched.
+Recorded-video processing was re-enabled on November 10, 2026. Import, playback,
+thumbnails, composition and export of existing files are allowed. Live screen,
+window, area and camera capture, camera sessions and live source screenshots
+remain disabled. The capture restriction is fixed in source with
+`MediaProcessing.isCaptureSuspended = true`; enabling recorded-file work does
+not enable a capture device or stream.
 
-`MediaProcessing.isSuspended` is fixed to `true`, with no preference or launch
-argument override. Media test scripts stop before compilation with `SKIP` and
-exit status 77; fixture creation also checks the interlock. Do not re-enable
-those paths on this machine without explicit approval. The feature descriptions
-below document the implementation behind this temporary interlock.
+`FRAMETHROWER_VECTOR_PREVIEW=1` selects a disabling-only vector mode for test
+processes. It cannot enable capture. Metadata and UI test runners set this mode
+explicitly; recorded integration tests use small prerecorded fixtures. Run
+`Tests/check-recorded-video-policy.sh` to verify both policies without opening
+media or devices. Live-capture test scripts remain skipped.
 
 ## Local speech recognition
 
@@ -185,9 +184,9 @@ available through the editor's audio controls. Camera, pointer, and scene sideca
 are not inferred from nearby files. The video's timing is retained; the editor's
 render cadence is limited to 1–120 fps.
 
-Import remains disabled during the temporary media suspension. Run
-`bash Tests/check-video-import.sh` for project/file checks with supplied metadata
-and plain text; these checks do not inspect or create video.
+Import of recorded files is enabled. Run `bash Tests/check-video-import.sh` for
+project/file checks with supplied metadata and plain text; that runner selects
+vector mode and does not inspect or create video.
 
 ### Multiple video clips
 
@@ -214,10 +213,10 @@ including points hidden outside the current trim. Separate occurrences remain
 independent. Pinch and pan in the preview to frame a selected custom clip; edits
 at one instant stay together until leaving that instant. Escape cancels.
 
-Import, actual video playback and export remain blocked by the temporary media
-interlock. The Add video menu supplies landscape and portrait vector patterns
-for safe interaction testing. Known-silent sources do not show active audio
-controls. Director can inspect registered sources, manage layers/clips, and
+Recorded footage can be imported, played and exported while live capture stays
+blocked. Vector-mode tests expose landscape and portrait test patterns in Add
+video. Known-silent sources do not show active audio controls. Director can
+inspect registered sources, manage layers/clips, and
 change geometry, opacity and volume through typed undoable operations. It does
 not receive arbitrary filesystem access.
 
@@ -586,9 +585,10 @@ four scene/frame lookups. The runtime retains bounded observation IDs and only
 the most recent paired image in model context. Inspection alone creates no Undo
 entry. A read-only question can finish with an observation report.
 
-Video processing remains suspended. Actual footage extraction, capture,
-rendering and export stay unavailable. The image-capable CLI paths can accept
-explicitly requested PNG attachments; tests use static synthetic fixtures only.
+Recorded-file rendering and export are enabled; live capture stays disabled.
+Director does not yet have a real recorded-frame inspection provider. The
+image-capable CLI paths can accept explicitly requested PNG attachments;
+inspection tests currently use static synthetic fixtures only.
 Local Qwen3-8B is text-only. Image pixels are excluded from interaction logs;
 only attachment identities, dimensions and hashes are retained there.
 
@@ -695,10 +695,10 @@ Use `Tools/build-debug.sh` for an incremental Debug build without terminal
 indexing; append `CODE_SIGNING_ALLOWED=NO` for a compile-only check. Regenerate the
 Xcode project after adding source files or changing `project.yml`.
 
-The current suspended build can be checked with `Tests/check-media-suspension.sh`
-without opening media or starting capture. Model, project-file, and text-control
-checks also remain available. The media checks below are currently skipped;
-their descriptions record what they verify when media processing is enabled.
+Use `Tests/check-recorded-video-policy.sh` to verify that recorded-file processing
+is enabled while live capture remains blocked, without opening media or devices.
+Metadata/vector checks set `FRAMETHROWER_VECTOR_PREVIEW=1`; actual recorded-media
+checks use generated fixtures. Live-capture checks remain skipped.
 
 Automated checks run without camera hardware or connected accounts:
 

@@ -30,7 +30,7 @@ final class CameraPreviewView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func setSession(_ session: AVCaptureSession) {
-        guard !MediaProcessing.isSuspended else {
+        guard !MediaProcessing.isCaptureSuspended else {
             previewLayer.session = nil
             return
         }

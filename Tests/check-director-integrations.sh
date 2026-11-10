@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compile the shared Director module once; reuse it across the integration suites.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec taskpolicy -b python3 - "$repo_dir" "$@" <<'PY'
 import hashlib, pathlib, platform, subprocess, sys

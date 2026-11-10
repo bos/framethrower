@@ -1,6 +1,7 @@
 #!/bin/sh
 # Exercise the actual compiled editor; fixture changes do not rebuild production.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 products=${FRAMETHROWER_FINISHED_TEST_PRODUCTS:-"$repo_dir/build/Build/Products/Debug"}
 dylibs="$products/FrameThrower.app/Contents/MacOS"

@@ -1,6 +1,7 @@
 #!/bin/sh
 # One cached compile for the Director, domain/MCP, and optional live fixture.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec taskpolicy -b python3 - "$repo_dir" "$@" <<'PY'
 import ast, hashlib, os, pathlib, platform, subprocess, sys

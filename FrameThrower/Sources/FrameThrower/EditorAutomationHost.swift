@@ -104,7 +104,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 preview: playback?.previewSnapshot, selectedEditID: selected.0, selectedBoxID: selected.1,
                 selectedAnimationID: selected.2, inspector: selected.3, recordingID: editor.automationID,
                 timelineTimeBase: timelineTimeBase, selectedVideoLayerID: layer?.id,
-                selectedVideoClipID: clip?.id, selectedVideoVolumeID: volume?.id)
+                selectedVideoClipID: clip?.id, selectedVideoVolumeID: volume?.id,
+                liveCaptureSuspended: MediaProcessing.isCaptureSuspended, mediaProcessingSuspended: MediaProcessing.isSuspended)
         }
     }
     var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { events.eraseToAnyPublisher() }
@@ -623,7 +624,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 "video_source_count": editor.project.videoSources.count,
                 "video_layer_count": editor.project.effectiveVideoLayers(in: state).count,
                 "video_clip_count": editor.project.effectiveVideoLayers(in: state).reduce(0) { $0 + $1.clips.count }, "undo_count": editor.historyState.undo.count,
-                "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
+                "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended,
+                "live_capture_suspended": MediaProcessing.isCaptureSuspended]
         case "pending":
             invalidateFramingProposal(for: editor.project)
             if let pendingFramingProposal { return ["proposal": framingProposalDescription(pendingFramingProposal)] }

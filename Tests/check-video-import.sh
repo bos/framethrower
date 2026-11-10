@@ -1,5 +1,6 @@
 #!/bin/bash
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 check_dir=$(mktemp -d -t framethrower-import-check)
 trap 'rm -rf "$check_dir"' EXIT

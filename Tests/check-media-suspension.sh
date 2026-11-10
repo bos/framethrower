@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 check_dir=$(mktemp -d -t framethrower-suspension-check)
 trap 'rm -rf "$check_dir"' EXIT
 sources="$repo_dir/FrameThrower/Sources/FrameThrower"
-swiftc -parse-as-library -warnings-as-errors -strict-concurrency=complete \
+taskpolicy -b swiftc -whole-module-optimization -Onone -num-threads 1 -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   -target "$(uname -m)-apple-macos15.0" \
-  "$sources/EditorRegion.swift" \
+  "$sources/EditorRegion.swift" "$sources/EditorPreviewCommand.swift" \
   "$sources/MediaProcessing.swift" "$sources/RecordingProject.swift" \
   "$sources/ProjectRenderer.swift" "$sources/PIPVideoCompositor.swift" "$sources/CursorRecording.swift" \
   "$sources/EditorPlayback.swift" "$sources/EditorSimulationClock.swift" "$sources/ScreenMasterWriter.swift" "$sources/RecordingQuality.swift" \

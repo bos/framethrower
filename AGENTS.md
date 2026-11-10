@@ -14,15 +14,20 @@ process exit through read-only process inspection, replace the installed build,
 then acquire a fresh app handle to launch and inspect it. Do not retry stale
 handles or batch a post-quit inspection with the Quit action.
 
-# Temporary video-driver interlock
+# Video capture restriction
 
-Keep `MediaProcessing.isSuspended` enabled while the video-scaling driver is
-unstable. Do not run capture, video fixture creation, decoding, encoding,
-compositing, scaling, or the blocked media test scripts. Do not remove or bypass
-the source and test interlocks without Bryan explicitly authorizing it. Compile
-builds and tests of models, files, text controls, and the suspended editor are
-permitted. Use empty or vector previews for UI work.
+Bryan lifted the recorded-video moratorium on November 10, 2026. Importing,
+creating recorded test fixtures, decoding, playback, encoding, compositing and
+export of recorded video are permitted.
 
-This is a video/media restriction, not a general GPU restriction. Native Metal
+Keep `MediaProcessing.isCaptureSuspended` fixed true. Do not start live screen,
+window, area or camera capture, live previews, or screenshot capture. Do not
+remove or bypass that capture interlock without Bryan explicitly authorizing it.
+`MediaProcessing.requireEnabled()` guards recorded processing;
+`requireCaptureEnabled()` guards live capture. The disabling-only
+`FRAMETHROWER_VECTOR_PREVIEW=1` environment switch keeps metadata/vector tests
+independent from codecs and devices; it cannot enable capture.
+
+This is a live-video restriction, not a general GPU restriction. Native Metal
 compute for text-only local language models is allowed. Use Metal by default for
 local model interaction tests; CPU mode is an explicit diagnostic option.

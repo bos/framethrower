@@ -1,6 +1,7 @@
 #!/bin/sh
 # Plans, vector layers and AV gain parameters only. Never opens video or audio.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 check_dir=$(mktemp -d -t framethrower-multi-video-rendering)
 trap 'rm -rf "$check_dir"' EXIT

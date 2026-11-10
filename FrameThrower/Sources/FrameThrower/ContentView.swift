@@ -18,7 +18,7 @@ struct ContentView: View {
 
     private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy || model.isImportingVideo }
     private var canRecord: Bool {
-        guard !MediaProcessing.isSuspended else { return false }
+        guard !MediaProcessing.isCaptureSuspended else { return false }
         guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.isImportingVideo, model.isCameraReadyForCapture else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
@@ -534,7 +534,7 @@ struct ContentView: View {
         if model.isImportingVideo { return "Importing video…" }
         if model.isCaptureBusy { return model.isRecording ? "Finishing recording…" : "Starting recording…" }
         if model.isRecording { return "Recording" }
-        if MediaProcessing.isSuspended { return MediaProcessing.statusMessage }
+        if MediaProcessing.isCaptureSuspended { return MediaProcessing.captureStatusMessage }
         if let remaining = model.countdownRemainingSeconds { return "Recording starts in \(remaining)s" }
         if !model.hasScreenRecordingPermission { return "Screen recording permission required" }
         if model.camera.isPreparing { return "Starting camera…" }

@@ -47,16 +47,17 @@ final class CameraRecorder: ObservableObject {
     @Published private(set) var isReady = false
     @Published private(set) var isRecording = false
 
-    var session: AVCaptureSession { engine.session }
+    var session: AVCaptureSession? { engine?.session }
 
-    private let engine = CameraCaptureEngine()
+    // Do not even construct a native capture session while live capture is off.
+    private let engine: CameraCaptureEngine? = MediaProcessing.isCaptureSuspended ? nil : CameraCaptureEngine()
     private var selectionGeneration = 0
     private var observers: [any NSObjectProtocol] = []
 
     init() {
-        guard !MediaProcessing.isSuspended else { return }
+        guard !MediaProcessing.isCaptureSuspended else { return }
         refreshDevices()
-        engine.reportError = { [weak self] message in
+        engine?.reportError = { [weak self] message in
             Task { @MainActor [weak self] in
                 self?.errorMessage = message
                 self?.isReady = false
@@ -73,24 +74,24 @@ final class CameraRecorder: ObservableObject {
 
     deinit {
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        engine.shutDown()
+        engine?.shutDown()
     }
 
     func refreshDevices() {
-        guard !MediaProcessing.isSuspended else { devices = []; return }
+        guard !MediaProcessing.isCaptureSuspended else { devices = []; return }
         devices = Self.discover().map { CameraDevice(id: $0.uniqueID, name: $0.localizedName) }
         if let selectedDeviceID, !devices.contains(where: { $0.id == selectedDeviceID }) {
             isReady = false
             errorMessage = CameraRecordingError.unavailable.localizedDescription
-            engine.failIfRecording(CameraRecordingError.unavailable)
+            engine?.failIfRecording(CameraRecordingError.unavailable)
         }
     }
 
     func selectDevice(_ id: String?) async {
-        guard !MediaProcessing.isSuspended else {
+        guard !MediaProcessing.isCaptureSuspended else {
             selectedDeviceID = nil
             isReady = false
-            errorMessage = id == nil ? nil : MediaProcessing.statusMessage
+            errorMessage = id == nil ? nil : MediaProcessing.captureStatusMessage
             return
         }
         guard !isRecording else { return }
@@ -118,6 +119,7 @@ final class CameraRecorder: ObservableObject {
         }
         guard generation == selectionGeneration else { return }
         do {
+            guard let engine else { throw MediaProcessing.CaptureSuspended() }
             try await engine.configure(id: id)
             guard generation == selectionGeneration else { return }
             isReady = id != nil
@@ -130,7 +132,8 @@ final class CameraRecorder: ObservableObject {
     /// Returns the host-clock timestamp of the first frame written, not the time
     /// this method was called. Use it to align the independent screen track.
     func startRecording(to url: URL, quality: RecordingQuality = .compact) async throws -> Double {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
+        guard let engine else { throw MediaProcessing.CaptureSuspended() }
         guard selectedDeviceID != nil, isReady, !isPreparing else {
             throw CameraRecordingError.unavailable
         }
@@ -147,7 +150,7 @@ final class CameraRecorder: ObservableObject {
     }
 
     func stopRecording() async throws {
-        guard isRecording else { return }
+        guard isRecording, let engine else { return }
         defer { isRecording = false }
         do {
             try await engine.stopRecording()
@@ -158,7 +161,8 @@ final class CameraRecorder: ObservableObject {
     }
 
     private static func discover() -> [AVCaptureDevice] {
-        AVCaptureDevice.DiscoverySession(
+        guard !MediaProcessing.isCaptureSuspended else { return [] }
+        return AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
             mediaType: .video,
             position: .unspecified
@@ -188,6 +192,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
 
     override init() {
         super.init()
+        guard !MediaProcessing.isCaptureSuspended else { return }
         runtimeObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
@@ -208,7 +213,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func configure(id: String?) async throws {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
@@ -265,7 +270,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     func startRecording(to url: URL, quality: RecordingQuality) async throws -> Double {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
@@ -403,7 +408,7 @@ final class CameraTrackWriter: @unchecked Sendable {
     /// Returns true only when this sample was actually accepted by the encoder.
     @discardableResult
     func append(_ sample: CMSampleBuffer, hostTime: Double) throws -> Bool {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
         guard !isFinishing, hostTime.isFinite, timestamp.isNumeric,
               timestamp.seconds.isFinite, CMSampleBufferDataIsReady(sample) else {

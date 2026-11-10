@@ -1,6 +1,7 @@
 #!/bin/sh
 # Use the compiled Debug dylib instead of compiling the complete app again.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 products="$repo_dir/build/Build/Products/Debug"
 dylibs="$products/FrameThrower.app/Contents/MacOS"

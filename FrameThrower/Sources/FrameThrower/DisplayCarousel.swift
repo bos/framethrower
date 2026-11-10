@@ -37,8 +37,8 @@ struct DisplayCarousel: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 10)
 
-                if MediaProcessing.isSuspended {
-                    Text(MediaProcessing.statusMessage)
+                if MediaProcessing.isCaptureSuspended {
+                    Text(MediaProcessing.captureStatusMessage)
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.55))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -104,7 +104,7 @@ struct DisplayCarousel: View {
 
     @MainActor
     private func refreshPreviews() async {
-        guard !MediaProcessing.isSuspended else {
+        guard !MediaProcessing.isCaptureSuspended else {
             images = [:]
             failedDisplays = []
             isLoading = false
@@ -151,6 +151,7 @@ struct DisplayCarousel: View {
                     configuration.height = max(2, Int(size.height * scale))
                     configuration.showsCursor = false
                     do {
+                        try MediaProcessing.requireCaptureEnabled()
                         let capture = try await SCScreenshotManager.captureImage(
                             contentFilter: filter, configuration: configuration
                         )

@@ -430,8 +430,10 @@ struct VideoLayersInspector: View {
                 Menu {
                     Button("Import video…") { importVideo() }.disabled(MediaProcessing.isSuspended || importing)
                     Divider()
-                    Button("Landscape test pattern") { addPattern(portrait: false) }
-                    Button("Portrait test pattern") { addPattern(portrait: true) }
+                    if MediaProcessing.isSuspended {
+                        Button("Landscape test pattern") { addPattern(portrait: false) }
+                        Button("Portrait test pattern") { addPattern(portrait: true) }
+                    }
                     if !editor.project.videoAssets.isEmpty { Divider() }
                     ForEach(editor.project.videoSources) { source in Button(source.name) { add(source, to: nil) } }
                 } label: { Label("Add video", systemImage: "plus") }.fixedSize()

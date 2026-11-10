@@ -52,7 +52,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOutput,
     func start(filter: SCContentFilter, configuration: SCStreamConfiguration,
                outputURL: URL, quality: RecordingQuality = .compact,
                sceneSource: RecordedSceneSource? = nil) async throws -> Double {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
         try callbackQueue.sync { guard stream == nil else { throw RecorderError.alreadyRecording } }
         if quality == .highQuality { configuration.colorSpaceName = CGColorSpace.sRGB }
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: self)

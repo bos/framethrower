@@ -1,6 +1,7 @@
 #!/bin/sh
 # Link a matching Debug product; this check never builds or launches the app.
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 products=${1:-"$repo_dir/build/Build/Products/Debug"}
 dylibs="$products/FrameThrower.app/Contents/MacOS"

@@ -328,7 +328,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startSourceAutoRefresh() {
-        guard !MediaProcessing.isSuspended else { return }
+        guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isSourceRefreshConfigured else { return }
         isSourceRefreshConfigured = true
         isAppActive = NSApp.isActive
@@ -349,6 +349,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func refreshSources(logSuccess: Bool = true, logErrors: Bool = true) async {
+        guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isSourceRefreshing else { return }
         isSourceRefreshing = true
         defer { isSourceRefreshing = false }
@@ -1019,7 +1020,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !MediaProcessing.isSuspended else { return }
+        guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive, isCameraReadyForCapture else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
@@ -1344,7 +1345,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecordingAfterDelay(seconds: Int) async {
-        guard !MediaProcessing.isSuspended else { return }
+        guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
@@ -1534,7 +1535,8 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func shareableContent() async throws -> SCShareableContent {
-        try await withCheckedThrowingContinuation { continuation in
+        try MediaProcessing.requireCaptureEnabled()
+        return try await withCheckedThrowingContinuation { continuation in
             SCShareableContent.getExcludingDesktopWindows(
                 true,
                 onScreenWindowsOnly: true

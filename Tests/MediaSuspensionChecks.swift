@@ -59,7 +59,7 @@ struct MediaSuspensionChecks {
             _ = try ScreenMasterWriter(url: directory.appendingPathComponent("master.mov"), width: 16, height: 16,
                 audioTracks: [], onFirstVideo: { _ in }, onFailure: { _ in })
             throw SuspensionCheckError.failed("master writer opened while suspended")
-        } catch is MediaProcessing.Suspended { }
+        } catch is MediaProcessing.CaptureSuspended { }
 
         var decodedThumbnail = false
         let cache = RecordingThumbnailCache(loader: { _ in decodedThumbnail = true; return nil })

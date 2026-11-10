@@ -365,7 +365,7 @@ struct RecordedSceneBuilder {
 /// recording is enabled; construction and all pure archive operations are inert.
 enum RecordedSceneCollector {
     static func collect(source: RecordedSceneSource, includeAccessibility: Bool = true) throws -> RecordedSceneSnapshot {
-        try MediaProcessing.requireEnabled()
+        try MediaProcessing.requireCaptureEnabled()
         try source.validate()
         let trusted = AXIsProcessTrusted()
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
@@ -590,7 +590,7 @@ private final class RecordedSceneAXWatch: @unchecked Sendable {
     let windowID: UInt32
 
     init?(processID: Int32, windowID: UInt32, changed: @escaping @Sendable () -> Void) {
-        guard !MediaProcessing.isSuspended, AXIsProcessTrusted() else { return nil }
+        guard !MediaProcessing.isCaptureSuspended, AXIsProcessTrusted() else { return nil }
         var observer: AXObserver?
         guard AXObserverCreate(processID, { _, _, _, context in
             guard let context else { return }
@@ -669,7 +669,7 @@ final class RecordedSceneSampler: @unchecked Sendable {
 
     @discardableResult
     func start(source: RecordedSceneSource) -> Bool {
-        guard (injectedCollector != nil || !MediaProcessing.isSuspended), (try? source.validate()) != nil else { return false }
+        guard (injectedCollector != nil || !MediaProcessing.isCaptureSuspended), (try? source.validate()) != nil else { return false }
         lock.lock()
         defer { lock.unlock() }
         guard !active else { return false }
@@ -744,7 +744,7 @@ final class RecordedSceneSampler: @unchecked Sendable {
         let lastAX = lastAccessibilityHostTime
         if shouldCollect { collecting = true }
         lock.unlock()
-        guard shouldCollect, injectedCollector != nil || !MediaProcessing.isSuspended else { return }
+        guard shouldCollect, injectedCollector != nil || !MediaProcessing.isCaptureSuspended else { return }
         defer {
             lock.lock()
             if generation == token { collecting = false }
@@ -818,7 +818,7 @@ final class RecordedSceneSampler: @unchecked Sendable {
         lock.lock()
         let enabled = active && generation == token
         lock.unlock()
-        guard enabled, !MediaProcessing.isSuspended else { return }
+        guard enabled, !MediaProcessing.isCaptureSuspended else { return }
         let center = NSWorkspace.shared.notificationCenter
         let values = [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
                       NSWorkspace.didTerminateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification].map { name in

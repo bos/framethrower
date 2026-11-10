@@ -206,6 +206,68 @@ struct EditorCanvasPatch: Codable, Equatable, Sendable {
     var isEmpty: Bool { aspect == nil && padding == nil && cornerRadius == nil && background == nil }
 }
 
+/// Clip placement uses project seconds; its independent automation uses the
+/// registered source clock so moving or trimming a clip never erases animation.
+enum EditorVideoTimeBase: String, Codable, Sendable { case source, project }
+enum EditorVideoProperty: String, Codable, Sendable { case geometry, opacity, volume }
+
+struct EditorVideoClipPatch: Codable, Equatable, Sendable {
+    var sourceID: UUID? = nil
+    var start: Double? = nil
+    var end: Double? = nil
+    var sourceStart: Double? = nil
+    var rate: Double? = nil
+    var layout: VideoClipLayout? = nil
+    var geometry: VideoGeometry? = nil
+    var opacity: Double? = nil
+    var fadeIn: Double? = nil
+    var fadeOut: Double? = nil
+    var volume: Double? = nil
+    var isMuted: Bool? = nil
+    var transition: VideoClipTransition? = nil
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case sourceID, start, end, sourceStart, rate, layout, geometry, opacity, fadeIn, fadeOut, volume, isMuted, transition
+    }
+    init(sourceID: UUID? = nil, start: Double? = nil, end: Double? = nil, sourceStart: Double? = nil,
+         rate: Double? = nil, layout: VideoClipLayout? = nil, geometry: VideoGeometry? = nil, opacity: Double? = nil,
+         fadeIn: Double? = nil, fadeOut: Double? = nil, volume: Double? = nil, isMuted: Bool? = nil,
+         transition: VideoClipTransition? = nil) {
+        self.sourceID = sourceID; self.start = start; self.end = end; self.sourceStart = sourceStart; self.rate = rate
+        self.layout = layout; self.geometry = geometry; self.opacity = opacity; self.fadeIn = fadeIn; self.fadeOut = fadeOut
+        self.volume = volume; self.isMuted = isMuted; self.transition = transition
+    }
+    init(from decoder: any Decoder) throws {
+        let c = try mutationContainer(CodingKeys.self, decoder)
+        sourceID = try c.optional(UUID.self, .sourceID); start = try c.optional(Double.self, .start)
+        end = try c.optional(Double.self, .end); sourceStart = try c.optional(Double.self, .sourceStart)
+        rate = try c.optional(Double.self, .rate); layout = try c.optional(VideoClipLayout.self, .layout)
+        if c.contains(.geometry) { geometry = try decodeVideoGeometry(c.superDecoder(forKey: .geometry)) }
+        opacity = try c.optional(Double.self, .opacity); fadeIn = try c.optional(Double.self, .fadeIn)
+        fadeOut = try c.optional(Double.self, .fadeOut); volume = try c.optional(Double.self, .volume)
+        isMuted = try c.optional(Bool.self, .isMuted); transition = try c.optional(VideoClipTransition.self, .transition)
+    }
+    var isEmpty: Bool { self == Self() }
+    func apply(to clip: inout VideoClip) {
+        if let sourceID { clip.sourceID = sourceID }; if let start { clip.start = start }; if let end { clip.end = end }
+        if let sourceStart { clip.sourceStart = sourceStart }; if let rate { clip.rate = rate }; if let layout { clip.layout = layout }
+        if let geometry { clip.geometry = geometry }; if let opacity { clip.opacity = opacity }
+        if let fadeIn { clip.fadeIn = fadeIn }; if let fadeOut { clip.fadeOut = fadeOut }; if let volume { clip.volume = volume }
+        if let isMuted { clip.isMuted = isMuted }; if let transition { clip.transition = transition }
+    }
+}
+
+private enum VideoGeometryKey: String, CodingKey, CaseIterable { case rect, crop, fit }
+private enum VideoRectKey: String, CodingKey, CaseIterable { case x, y, width, height }
+private func decodeVideoGeometry(_ decoder: any Decoder) throws -> VideoGeometry {
+    let c = try mutationContainer(VideoGeometryKey.self, decoder)
+    func rect(_ key: VideoGeometryKey) throws -> EditorRegionRect {
+        let r = try mutationContainer(VideoRectKey.self, c.superDecoder(forKey: key))
+        return EditorRegionRect(x: try r.decode(Double.self, forKey: .x), y: try r.decode(Double.self, forKey: .y),
+            width: try r.decode(Double.self, forKey: .width), height: try r.decode(Double.self, forKey: .height))
+    }
+    return VideoGeometry(rect: try rect(.rect), crop: try rect(.crop), fit: try c.decode(VideoFit.self, forKey: .fit))
+}
+
 /// Host-only verified recording geometry. Never decoded from a model command.
 struct EditorMutationGeometry: Equatable, Sendable {
     var sourceSize: CGSize
@@ -228,6 +290,9 @@ struct EditorMutationConflict: Equatable, Sendable {
     var componentID: UUID
     var start: Double
     var end: Double
+    var layerID: UUID? = nil
+    var clipID: UUID? = nil
+    var property: EditorVideoProperty? = nil
 }
 
 enum EditorMutationError: LocalizedError {
@@ -240,7 +305,12 @@ enum EditorMutationError: LocalizedError {
         case let .invalid(message): message
         case .geometryUnavailable: "Exact camera-to-box alignment requires verified original screen and camera geometry. No source file was opened."
         case .unreachableAlignment: "That exact alignment cannot fit inside the recording at the requested size. Choose another zoom or alignment; nothing was changed."
-        case let .conflicts(items): "The requested movement overlaps \(items.count) existing \(items.first?.lane.rawValue ?? "") animation(s). Resolve those movements explicitly before applying this interval."
+        case let .conflicts(items):
+            if let property = items.first?.property {
+                "This clip's \(property.rawValue) change overlaps \(items.count) existing animation(s). Revise or remove those changes first."
+            } else {
+                "The requested movement overlaps \(items.count) existing \(items.first?.lane.rawValue ?? "") animation(s). Resolve those movements explicitly before applying this interval."
+            }
         }
     }
 }
@@ -272,10 +342,21 @@ enum EditorMutation: Codable, Equatable, Sendable {
     case updateContentLayer(ContentLayer)
     case removeContentLayer(layerID: UUID)
     case reorderContentLayer(layerID: UUID, index: Int)
+    case addVideoLayer(id: UUID, name: String)
+    case renameVideoLayer(layerID: UUID, name: String)
+    case removeVideoLayer(layerID: UUID)
+    case reorderVideoLayer(layerID: UUID, index: Int)
+    case addVideoClip(layerID: UUID, clipID: UUID, patch: EditorVideoClipPatch)
+    case updateVideoClip(layerID: UUID, clipID: UUID, patch: EditorVideoClipPatch)
+    case removeVideoClip(layerID: UUID, clipID: UUID)
+    case videoGeometry(layerID: UUID, clipID: UUID, target: VideoGeometry, timing: EditorMutationTiming, timeBase: EditorVideoTimeBase = .source, id: UUID? = nil)
+    case videoOpacity(layerID: UUID, clipID: UUID, opacity: Double, timing: EditorMutationTiming, timeBase: EditorVideoTimeBase = .source, id: UUID? = nil)
+    case videoVolume(layerID: UUID, clipID: UUID, gain: Double, timing: EditorMutationTiming, timeBase: EditorVideoTimeBase = .source, id: UUID? = nil)
+    case removeVideoAnimation(layerID: UUID, clipID: UUID, property: EditorVideoProperty, pointID: UUID)
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case operation, center, timing, scale, regionID, subjectAnchor, targetAnchor, axes, scalePolicy, patch, start, end,
-             timeBase, crossfade, cutID, duration, layer, layerID, index, rate, preservesPitch, animationID, role, gain, id, pointID
+             timeBase, crossfade, cutID, duration, layer, layerID, index, rate, preservesPitch, animationID, role, gain, id, pointID, name, clipID, target, opacity, property
     }
     init(from decoder: any Decoder) throws {
         let c = try mutationContainer(CodingKeys.self, decoder)
@@ -332,6 +413,34 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case "reorderContentLayer":
             try c.only([.operation, .layerID, .index])
             self = .reorderContentLayer(layerID: try c.decode(UUID.self, forKey: .layerID), index: try c.decode(Int.self, forKey: .index))
+        case "addVideoLayer":
+            try c.only([.operation, .id, .name]); self = .addVideoLayer(id: try c.optional(UUID.self, .id) ?? UUID(), name: try c.decode(String.self, forKey: .name))
+        case "renameVideoLayer":
+            try c.only([.operation, .layerID, .name]); self = .renameVideoLayer(layerID: try c.decode(UUID.self, forKey: .layerID), name: try c.decode(String.self, forKey: .name))
+        case "removeVideoLayer":
+            try c.only([.operation, .layerID]); self = .removeVideoLayer(layerID: try c.decode(UUID.self, forKey: .layerID))
+        case "reorderVideoLayer":
+            try c.only([.operation, .layerID, .index]); self = .reorderVideoLayer(layerID: try c.decode(UUID.self, forKey: .layerID), index: try c.decode(Int.self, forKey: .index))
+        case "addVideoClip", "updateVideoClip":
+            try c.only([.operation, .layerID, .clipID, .patch])
+            let layer = try c.decode(UUID.self, forKey: .layerID), patch = try c.decode(EditorVideoClipPatch.self, forKey: .patch)
+            if try c.decode(String.self, forKey: .operation) == "addVideoClip" {
+                self = .addVideoClip(layerID: layer, clipID: try c.optional(UUID.self, .clipID) ?? UUID(), patch: patch)
+            } else { self = .updateVideoClip(layerID: layer, clipID: try c.decode(UUID.self, forKey: .clipID), patch: patch) }
+        case "removeVideoClip":
+            try c.only([.operation, .layerID, .clipID]); self = .removeVideoClip(layerID: try c.decode(UUID.self, forKey: .layerID), clipID: try c.decode(UUID.self, forKey: .clipID))
+        case "videoGeometry", "videoOpacity", "videoVolume":
+            let op = try c.decode(String.self, forKey: .operation)
+            try c.only([.operation, .layerID, .clipID, .timing, .timeBase, .id, op == "videoGeometry" ? .target : op == "videoOpacity" ? .opacity : .gain])
+            let layer = try c.decode(UUID.self, forKey: .layerID), clip = try c.decode(UUID.self, forKey: .clipID)
+            let timing = try c.decode(EditorMutationTiming.self, forKey: .timing), base = try c.optional(EditorVideoTimeBase.self, .timeBase) ?? .source
+            let id = try c.optional(UUID.self, .id)
+            if op == "videoGeometry" { self = .videoGeometry(layerID: layer, clipID: clip, target: try decodeVideoGeometry(c.superDecoder(forKey: .target)), timing: timing, timeBase: base, id: id) }
+            else if op == "videoOpacity" { self = .videoOpacity(layerID: layer, clipID: clip, opacity: try c.decode(Double.self, forKey: .opacity), timing: timing, timeBase: base, id: id) }
+            else { self = .videoVolume(layerID: layer, clipID: clip, gain: try c.decode(Double.self, forKey: .gain), timing: timing, timeBase: base, id: id) }
+        case "removeVideoAnimation":
+            try c.only([.operation, .layerID, .clipID, .property, .pointID])
+            self = .removeVideoAnimation(layerID: try c.decode(UUID.self, forKey: .layerID), clipID: try c.decode(UUID.self, forKey: .clipID), property: try c.decode(EditorVideoProperty.self, forKey: .property), pointID: try c.decode(UUID.self, forKey: .pointID))
         default: throw EditorMutationError.invalid("The requested mutation operation is not supported.")
         }
     }
@@ -378,6 +487,29 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .removeContentLayer(id): try c.encode("removeContentLayer", forKey: .operation); try c.encode(id, forKey: .layerID)
         case let .reorderContentLayer(id, index):
             try c.encode("reorderContentLayer", forKey: .operation); try c.encode(id, forKey: .layerID); try c.encode(index, forKey: .index)
+        case let .addVideoLayer(id, name):
+            try c.encode("addVideoLayer", forKey: .operation); try c.encode(id, forKey: .id); try c.encode(name, forKey: .name)
+        case let .renameVideoLayer(id, name):
+            try c.encode("renameVideoLayer", forKey: .operation); try c.encode(id, forKey: .layerID); try c.encode(name, forKey: .name)
+        case let .removeVideoLayer(id):
+            try c.encode("removeVideoLayer", forKey: .operation); try c.encode(id, forKey: .layerID)
+        case let .reorderVideoLayer(id, index):
+            try c.encode("reorderVideoLayer", forKey: .operation); try c.encode(id, forKey: .layerID); try c.encode(index, forKey: .index)
+        case let .addVideoClip(layer, clip, patch), let .updateVideoClip(layer, clip, patch):
+            let op: String; if case .addVideoClip = self { op = "addVideoClip" } else { op = "updateVideoClip" }
+            try c.encode(op, forKey: .operation); try c.encode(layer, forKey: .layerID); try c.encode(clip, forKey: .clipID); try c.encode(patch, forKey: .patch)
+        case let .removeVideoClip(layer, clip):
+            try c.encode("removeVideoClip", forKey: .operation); try c.encode(layer, forKey: .layerID); try c.encode(clip, forKey: .clipID)
+        case let .videoGeometry(layer, clip, target, timing, base, id):
+            try c.encode("videoGeometry", forKey: .operation); try c.encode(layer, forKey: .layerID); try c.encode(clip, forKey: .clipID)
+            try c.encode(target, forKey: .target); try c.encode(timing, forKey: .timing); try c.encode(base, forKey: .timeBase); try c.encodeIfPresent(id, forKey: .id)
+        case let .videoOpacity(layer, clip, value, timing, base, id), let .videoVolume(layer, clip, value, timing, base, id):
+            let op: String, key: CodingKeys; if case .videoOpacity = self { op = "videoOpacity"; key = .opacity } else { op = "videoVolume"; key = .gain }
+            try c.encode(op, forKey: .operation); try c.encode(layer, forKey: .layerID); try c.encode(clip, forKey: .clipID)
+            try c.encode(value, forKey: key); try c.encode(timing, forKey: .timing); try c.encode(base, forKey: .timeBase); try c.encodeIfPresent(id, forKey: .id)
+        case let .removeVideoAnimation(layer, clip, property, point):
+            try c.encode("removeVideoAnimation", forKey: .operation); try c.encode(layer, forKey: .layerID); try c.encode(clip, forKey: .clipID)
+            try c.encode(property, forKey: .property); try c.encode(point, forKey: .pointID)
         }
     }
 
@@ -403,7 +535,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
         case let .removeAnimation(id):
             id.hasPrefix("audioMicrophone:") || id.hasPrefix("audioSystem:") ? .audio :
                 EditorMutationLane(rawValue: String(id.split(separator: ":").first ?? "")) ?? .timing
-        case .addContentLayer, .updateContentLayer, .removeContentLayer, .reorderContentLayer: .content
+        case .addContentLayer, .updateContentLayer, .removeContentLayer, .reorderContentLayer,
+             .addVideoLayer, .renameVideoLayer, .removeVideoLayer, .reorderVideoLayer,
+             .addVideoClip, .updateVideoClip, .removeVideoClip, .videoGeometry, .videoOpacity, .videoVolume, .removeVideoAnimation: .content
         }
     }
     func effects(duration: Double) -> [EditorMutationEffect] {
@@ -694,7 +828,123 @@ enum EditorMutation: Codable, Equatable, Sendable {
             }
             let layer = state.contentLayers.remove(at: current)
             state.contentLayers.insert(layer, at: index)
+        case .addVideoLayer, .renameVideoLayer, .removeVideoLayer, .reorderVideoLayer,
+             .addVideoClip, .updateVideoClip, .removeVideoClip, .videoGeometry, .videoOpacity, .videoVolume, .removeVideoAnimation:
+            try applyVideo(to: &state, project: project)
         }
+    }
+
+    private func applyVideo(to state: inout EditState, project: RecordingProject) throws {
+        var layers = project.effectiveVideoLayers(in: state)
+        func layerIndex(_ id: UUID) throws -> Int {
+            guard let i = layers.firstIndex(where: { $0.id == id }) else { throw EditorMutationError.invalid("That video layer no longer exists.") }; return i
+        }
+        func clipIndex(_ id: UUID, in layer: Int) throws -> Int {
+            guard let i = layers[layer].clips.firstIndex(where: { $0.id == id }) else { throw EditorMutationError.invalid("That video clip no longer exists.") }; return i
+        }
+        func sourceTiming(_ timing: EditorMutationTiming, _ base: EditorVideoTimeBase, _ clip: VideoClip) throws -> EditorMutationTiming {
+            var result = timing
+            if base == .project {
+                guard timing.start >= clip.start, timing.end <= clip.end else { throw EditorMutationError.invalid("Animation project times must be inside this clip.") }
+                result.start = clip.sourceTime(at: timing.start); result.end = clip.sourceTime(at: timing.end)
+                result.easeIn = timing.easeIn.map { $0 * clip.rate }; result.easeOut = timing.easeOut.map { $0 * clip.rate }
+            }
+            let source = project.videoSources.first { $0.id == clip.sourceID }
+            if base == .project, let limit = source?.duration {
+                // Valid clip edges may differ by an ulp after rate conversion.
+                let tolerance = max(1, limit) * 1e-12
+                if result.start > limit, result.start - limit <= tolerance { result.start = limit }
+                if result.end > limit, result.end - limit <= tolerance { result.end = limit }
+            }
+            guard result.start.isFinite, result.end.isFinite, result.start >= 0, result.end >= result.start,
+                  source?.duration.map({ result.end <= $0 }) ?? true,
+                  result.transition == .smooth ? result.end > result.start : result.end == result.start else {
+                throw EditorMutationError.invalid("Use a valid source interval for this clip; a jump has one timestamp.")
+            }
+            guard [result.easeIn, result.easeOut].compactMap({ $0 }).allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                throw EditorMutationError.invalid("Clip animation ramps must be finite, nonnegative source durations.")
+            }
+            return result
+        }
+        func check(_ points: [(UUID, Double, PIPTransition, Double)], _ timing: EditorMutationTiming, excluding id: UUID?, layerID: UUID, clipID: UUID, property: EditorVideoProperty) throws {
+            var prior = 0.0
+            var conflicts: [EditorMutationConflict] = []
+            for (pointID, time, transition, duration) in points.sorted(by: { $0.1 < $1.1 }) {
+                let start = transition == .smooth ? max(prior, time - duration) : time
+                defer { prior = time }
+                guard pointID != id else { continue }
+                let overlap = timing.start == timing.end ? start < timing.end && time >= timing.end || abs(time - timing.end) < 1e-6
+                    : time > timing.start + 1e-6 && start < timing.end - 1e-6
+                if overlap { conflicts.append(.init(lane: .content, componentID: pointID, start: start, end: time, layerID: layerID, clipID: clipID, property: property)) }
+            }
+            guard conflicts.isEmpty else { throw EditorMutationError.conflicts(conflicts) }
+        }
+        switch self {
+        case let .addVideoLayer(id, name):
+            guard !layers.contains(where: { $0.id == id }) else { throw EditorMutationError.invalid("That video layer identity is already in use.") }
+            layers.append(VideoLayer(id: id, name: name))
+        case let .renameVideoLayer(id, name): layers[try layerIndex(id)].name = name
+        case let .removeVideoLayer(id): layers.remove(at: try layerIndex(id))
+        case let .reorderVideoLayer(id, index):
+            guard layers.indices.contains(index) else { throw EditorMutationError.invalid("Choose an index inside the video layer stack.") }
+            let layer = layers.remove(at: try layerIndex(id)); layers.insert(layer, at: index)
+        case let .addVideoClip(layerID, clipID, patch):
+            let l = try layerIndex(layerID)
+            guard !layers.flatMap(\.clips).contains(where: { $0.id == clipID }), let source = patch.sourceID, let start = patch.start, let end = patch.end else {
+                throw EditorMutationError.invalid("A new clip needs a unique identity, registered sourceID, project start and end.")
+            }
+            var clip = VideoClip(id: clipID, sourceID: source, start: start, end: end); patch.apply(to: &clip); layers[l].clips.append(clip)
+        case let .updateVideoClip(layerID, clipID, patch):
+            guard !patch.isEmpty else { throw EditorMutationError.invalid("Supply at least one clip property.") }
+            let l = try layerIndex(layerID), c = try clipIndex(clipID, in: l)
+            if let source = patch.sourceID, source != layers[l].clips[c].sourceID {
+                throw EditorMutationError.invalid("To use different footage, add a new clip. Existing source-anchored animations stay with their footage.")
+            }
+            patch.apply(to: &layers[l].clips[c])
+        case let .removeVideoClip(layerID, clipID):
+            let l = try layerIndex(layerID); layers[l].clips.remove(at: try clipIndex(clipID, in: l))
+        case let .videoGeometry(layerID, clipID, target, timing, base, id):
+            let l = try layerIndex(layerID), c = try clipIndex(clipID, in: l); var clip = layers[l].clips[c]
+            guard clip.layout == .custom else { throw EditorMutationError.invalid("Use screen or camera controls for this legacy layout, or explicitly choose a custom clip layout first.") }
+            let t = try sourceTiming(timing, base, clip), baseline = clip.geometry(atSourceTime: t.start)
+            try check(clip.geometryKeyframes.map { ($0.id, $0.time, $0.transition, $0.duration) }, t, excluding: id, layerID: layerID, clipID: clipID, property: .geometry)
+            if t.transition == .smooth, !clip.geometryKeyframes.contains(where: { abs($0.time - t.start) < 1e-6 }) {
+                clip.geometryKeyframes.append(VideoGeometryKeyframe(time: t.start, geometry: baseline, transition: .jump))
+            }
+            clip.geometryKeyframes.removeAll { $0.id == id || abs($0.time - t.end) < 1e-6 }
+            clip.geometryKeyframes.append(VideoGeometryKeyframe(id: id ?? UUID(), time: t.end, geometry: target, transition: t.transition, duration: t.motion.duration, easeIn: t.easeIn, easeOut: t.easeOut))
+            clip.geometryKeyframes.sort { $0.time < $1.time }; layers[l].clips[c] = clip
+        case let .videoOpacity(layerID, clipID, value, timing, base, id):
+            let l = try layerIndex(layerID), c = try clipIndex(clipID, in: l); var clip = layers[l].clips[c]
+            let t = try sourceTiming(timing, base, clip), baseline = clip.opacity(atSourceTime: t.start)
+            try check(clip.opacityKeyframes.map { ($0.id, $0.time, $0.transition, $0.duration) }, t, excluding: id, layerID: layerID, clipID: clipID, property: .opacity)
+            if t.transition == .smooth, !clip.opacityKeyframes.contains(where: { abs($0.time - t.start) < 1e-6 }) {
+                clip.opacityKeyframes.append(VideoOpacityKeyframe(time: t.start, opacity: baseline, transition: .jump))
+            }
+            clip.opacityKeyframes.removeAll { $0.id == id || abs($0.time - t.end) < 1e-6 }
+            clip.opacityKeyframes.append(VideoOpacityKeyframe(id: id ?? UUID(), time: t.end, opacity: value, transition: t.transition, duration: t.motion.duration, easeIn: t.easeIn, easeOut: t.easeOut))
+            clip.opacityKeyframes.sort { $0.time < $1.time }; layers[l].clips[c] = clip
+        case let .videoVolume(layerID, clipID, value, timing, base, id):
+            let l = try layerIndex(layerID), c = try clipIndex(clipID, in: l); var clip = layers[l].clips[c]
+            let t = try sourceTiming(timing, base, clip), baseline = clip.envelopeGain(atSourceTime: t.start)
+            try check(clip.volumeKeyframes.map { ($0.id, $0.time, $0.transition, $0.duration) }, t, excluding: id, layerID: layerID, clipID: clipID, property: .volume)
+            if t.transition == .smooth, !clip.volumeKeyframes.contains(where: { abs($0.time - t.start) < 1e-6 }) {
+                clip.volumeKeyframes.append(VideoVolumeKeyframe(time: t.start, gain: baseline, transition: .jump))
+            }
+            clip.volumeKeyframes.removeAll { $0.id == id || abs($0.time - t.end) < 1e-6 }
+            clip.volumeKeyframes.append(VideoVolumeKeyframe(id: id ?? UUID(), time: t.end, gain: value, transition: t.transition, duration: t.motion.duration, easeIn: t.easeIn, easeOut: t.easeOut))
+            clip.volumeKeyframes.sort { $0.time < $1.time }; layers[l].clips[c] = clip
+        case let .removeVideoAnimation(layerID, clipID, property, pointID):
+            let l = try layerIndex(layerID), c = try clipIndex(clipID, in: l)
+            let count: Int
+            switch property {
+            case .geometry: count = layers[l].clips[c].geometryKeyframes.count; layers[l].clips[c].geometryKeyframes.removeAll { $0.id == pointID }; guard count != layers[l].clips[c].geometryKeyframes.count else { throw EditorMutationError.invalid("That geometry change no longer exists.") }
+            case .opacity: count = layers[l].clips[c].opacityKeyframes.count; layers[l].clips[c].opacityKeyframes.removeAll { $0.id == pointID }; guard count != layers[l].clips[c].opacityKeyframes.count else { throw EditorMutationError.invalid("That opacity change no longer exists.") }
+            case .volume: count = layers[l].clips[c].volumeKeyframes.count; layers[l].clips[c].volumeKeyframes.removeAll { $0.id == pointID }; guard count != layers[l].clips[c].volumeKeyframes.count else { throw EditorMutationError.invalid("That volume change no longer exists.") }
+            }
+        default: throw EditorMutationError.invalid("Unsupported video operation.")
+        }
+        state.videoLayers = layers
     }
 
     private func region(_ id: UUID, in state: EditState) throws -> EditorRegion {
@@ -791,6 +1041,16 @@ enum EditorMutation: Codable, Equatable, Sendable {
         let canvas = object(["aspect": enumeration(["source", "wide", "portrait", "square"]), "padding": number(0, 0.2), "cornerRadius": number(0, 0.2),
             "background": object(["red": number(0, 1), "green": number(0, 1), "blue": number(0, 1)])], optional: ["aspect", "padding", "cornerRadius", "background"])
         let rectangle = object(["x": number(0, 1), "y": number(0, 1), "width": number(0.001, 1), "height": number(0.001, 1)])
+        let videoGeometry = object(["rect": rectangle, "crop": rectangle, "fit": enumeration(["fit", "fill"])])
+        let uuid: [String: Any] = ["type": "string", "format": "uuid"]
+        let videoPatchFields: [String: Any] = ["sourceID": uuid, "start": ["type": "number", "minimum": 0],
+            "end": ["type": "number", "minimum": 0], "sourceStart": ["type": "number", "minimum": 0], "rate": number(0.1, 8),
+            "layout": enumeration(["screen", "camera", "custom"]), "geometry": videoGeometry, "opacity": number(0, 1),
+            "volume": number(0, 1), "isMuted": ["type": "boolean"], "fadeIn": ["type": "number", "minimum": 0],
+            "fadeOut": ["type": "number", "minimum": 0], "transition": enumeration(["cut", "crossfade"])]
+        let videoAnimationFields: [String: Any] = ["layerID": uuid, "clipID": uuid, "timing": speedTiming,
+            "timeBase": enumeration(["source", "project"]), "id": uuid]
+        let videoAnimationHelp = "Independent source-anchored clip animation. timing defaults to SOURCE seconds of that clip's registered footage; timeBase=project converts through this clip's sourceStart/start/rate, including ease durations. It does not use Finished/output seconds. Translate Finished times with section=timing first. Smooth inserts a source baseline and arrives at end; jump start=end. Same-property overlaps reject. Optional id creates a stable new animation identity or revises that actual clip-scoped animation; different properties may overlap. Moving, trimming or changing clip rate preserves source automation, including hidden points."
         let layerFields: [String: Any] = ["id": ["type": "string", "format": "uuid"],
             "kind": enumeration(ContentLayerKind.allCases.map(\.rawValue)), "start": ["type": "number", "minimum": 0],
             "end": ["type": "number", "minimum": 0], "rect": rectangle, "endRect": rectangle,
@@ -801,6 +1061,17 @@ enum EditorMutation: Codable, Equatable, Sendable {
             "fadeIn": number(0, 60), "fadeOut": number(0, 60)]
         let layerOptional = Set(layerFields.keys).subtracting(["kind", "start", "end", "rect"])
         return [
+            operation("addVideoLayer", "Add a named video layer above existing video layers, below graphic content. Optional id permits later commands in the SAME atomic batch to refer to it. Materializes legacy screen/camera without changing their adapters. Never imports media or deletes source bytes.", ["id": uuid, "name": ["type": "string", "minLength": 1, "maxLength": 128]], optional: ["id"]),
+            operation("renameVideoLayer", "Rename an existing video layer without changing clips or source names.", ["layerID": uuid, "name": ["type": "string", "minLength": 1, "maxLength": 128]]),
+            operation("removeVideoLayer", "Remove a video layer and its clips from this composition only. Registered sources and Undo references are retained; no file is deleted.", ["layerID": uuid]),
+            operation("reorderVideoLayer", "Move a video layer to zero-based back-to-front stack index. Separate layers appear simultaneously; content graphics remain above the video stack.", ["layerID": uuid, "index": ["type": "integer", "minimum": 0]]),
+            operation("addVideoClip", "Add registered footage to an existing video layer. patch requires sourceID and half-open PROJECT start/end within project duration. sourceStart is footage seconds; rate is source seconds per project second. Inspect video_sources for valid IDs; paths/URLs are forbidden. Defaults: sourceStart0, rate1, custom full-canvas fit, opacity1, volume1, unmuted, fades0, incoming crossfade. Same-layer overlap with incoming crossfade blends across the intersection; max two active clips. Separate layers stack simultaneous footage. Optional clipID supports same-batch references.", ["layerID": uuid, "clipID": uuid, "patch": object(videoPatchFields, optional: Set(videoPatchFields.keys).subtracting(["sourceID", "start", "end"]))], optional: ["clipID"]),
+            operation("updateVideoClip", "Patch an existing clip; omitted values and all source-anchored automation remain unchanged. start/end use PROJECT seconds; sourceStart uses footage seconds. Source identity cannot change; add a new clip for different footage. Trim/rate changes never discard hidden automation. Layout screen/camera uses legacy screen/PIP animation; custom uses this clip's geometry.", ["layerID": uuid, "clipID": uuid, "patch": object(videoPatchFields, optional: Set(videoPatchFields.keys))]),
+            operation("removeVideoClip", "Remove one clip only; keep source media registered and every historical reference available to Undo/Redo.", ["layerID": uuid, "clipID": uuid]),
+            operation("videoGeometry", "Animate final-canvas normalized rect and source-normalized crop/fit on a custom-layout clip. " + videoAnimationHelp, videoAnimationFields.merging(["target": videoGeometry]) { _, b in b }, optional: ["timeBase", "id"]),
+            operation("videoOpacity", "Animate clip opacity0...1 independently of geometry and volume. " + videoAnimationHelp, videoAnimationFields.merging(["opacity": number(0, 1)]) { _, b in b }, optional: ["timeBase", "id"]),
+            operation("videoVolume", "Animate source-anchored volume multiplier0...1 on this clip, independently of its overall volume/mute and other clips. " + videoAnimationHelp, videoAnimationFields.merging(["gain": number(0, 1)]) { _, b in b }, optional: ["timeBase", "id"]),
+            operation("removeVideoAnimation", "Delete one geometry/opacity/volume point by actual clip-scoped UUID, preserving other properties, sources and clips.", ["layerID": uuid, "clipID": uuid, "property": enumeration(["geometry", "opacity", "volume"]), "pointID": uuid]),
             operation("addContentLayer", "Add visible text, arrow, rectangle, circle or image above screen and camera. Times are half-open original-source seconds; rect is final-canvas normalized top-left bounds. Omitted id is allocated by the host. Default white, opacity1, fontSize0.045 of canvas height, bold, strokeWidth0.004 of short edge, outline shapes, fades0.2s. Arrow points right; rotation degrees is clockwise. Optional endRect animates smoothly across the entire layer interval. Image requires an existing assetID from inspect_editor section=layers; no paths or image bytes are accepted.",
                 ["layer": object(layerFields, optional: layerOptional)]),
             operation("updateContentLayer", "Replace one existing content layer by its actual id, preserving stack position. Inspect section=layers first and include all fields to retain; omitted optional fields revert to documented defaults. Omitting endRect removes movement. Validation is atomic.",
@@ -863,11 +1134,14 @@ enum EditorMutation: Codable, Equatable, Sendable {
             return ["operations": [
                 "screen": ["panScreen", "zoomScreen", "alignScreen", "frameRegion", "fullFrame", "holdFraming", "reviseFraming", "moveBetweenEdits", "moveForDuration"],
                 "camera": ["cameraOverlay", "alignCameraOverlay", "cameraSource"],
+                "content": ["addContentLayer", "updateContentLayer", "removeContentLayer", "reorderContentLayer"],
+                "video": ["addVideoLayer", "renameVideoLayer", "removeVideoLayer", "reorderVideoLayer", "addVideoClip", "updateVideoClip", "removeVideoClip", "videoGeometry", "videoOpacity", "videoVolume", "removeVideoAnimation"],
                 "global": ["pointer", "audio", "audioTrack", "audioGain", "removeAudioGain", "canvas", "trim"],
                 "timing": ["cutSection", "restoreCut", "cutTransition", "speed"],
                 "boxes": ["addRegion", "labelRegion", "removeRegion"],
                 "edit_marks": ["createEdit", "moveEdit", "removeEdit", "removeScreenFraming", "removeAnimation"]],
                 "subjects": [
+                    "videoClip": "One occurrence of registered footage in a named video layer. Placement is project-authoring time; independent geometry/opacity/volume animation is footage-source time. Layer order is back-to-front and same-layer overlapping clips crossfade. Inspect video_sources/video_layers/video_clips on demand.",
                     "screen": "Main recorded screen viewport. panScreen preserves zoom; zoomScreen changes screen magnification; alignScreen matches Box anchors. These do not resize the PIP camera.",
                     "cameraOverlay": "PIP camera outline on the final canvas. cameraOverlay moves, resizes, reshapes or fades it with opacity0...1; fullscreen=1 fills the canvas and 0 restores normal placement. alignCameraOverlay aligns its outline to a Box.",
                     "cameraSource": "Camera image inside the unchanged PIP outline. cameraSource changes sourceZoom or crop, preserving the overlay size/position and main screen framing."],
@@ -880,7 +1154,9 @@ enum EditorMutation: Codable, Equatable, Sendable {
         }) {
             let command: [String: Any] = ["type": "object", "properties": ["action": ["type": "string", "const": "mutate"], "mutation": schema],
                 "required": ["action", "mutation"], "additionalProperties": false]
-            let units = operation == "speed"
+            let units = operation.contains("Video") || ["videoGeometry", "videoOpacity", "videoVolume"].contains(operation)
+                ? "Video clip start/end are project-authoring seconds before global cuts/speed. sourceStart and automation are footage-source seconds. Automation timeBase=project converts through the selected clip; Finished/output requires explicit timing-map translation. Inspect video_sources/video_layers/video_clips on demand. Stack is back-to-front; same-layer max-two overlaps crossfade when incoming transition=crossfade. No operation accepts arbitrary paths or deletes media."
+                : operation == "speed"
                 ? "rate is source seconds per output second (0.1...8). timeBase defaults to source; output times/ramps resolve through the original batch map and reject ambiguous crossfades. Smooth start<end; jump start=end; arrival may equal recording end. The target persists until the next speed point. preservesPitch is a whole-recording policy. This changes exported timing; control_preview.set_rate does not."
                 : ["cutSection", "restoreCut", "cutTransition"].contains(operation)
                 ? "Cut ranges require explicit timeBase source/output and start<end. Output endpoints with two different contributing source instants reject; choose source coordinates explicitly. Crossfade duration is requested output seconds, with effective overlap reported by the time map. Omitted crossfade preserves an existing merged cut's fade and defaults to zero only for a new cut. null is unsupported. Source edits are preserved."

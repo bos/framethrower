@@ -142,7 +142,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let value: Any
         switch name {
         case "inspect_editor":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time", "time_base"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time", "time_base", "layer_id", "clip_id"])
             value = try inspect(args, editor: editor)
         case "inspect_recording":
             try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "query", "window_id", "kind", "limit"])
@@ -215,7 +215,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             case "select_box", "go_to_box":
                 guard let id, editor.editingState.regions.contains(where: { $0.id == id }) else { throw EditorAutomationError.invalid("That box is no longer present.") }
             case "show_inspector":
-                guard let inspector = args["inspector"] as? String, ["Zoom", "Camera", "Pointer", "Canvas", "Audio", "Layers"].contains(inspector) else { throw EditorAutomationError.invalid("Choose an available inspector.") }
+                guard let inspector = args["inspector"] as? String, ["Zoom", "Camera", "Speed", "Pointer", "Canvas", "Audio", "Videos", "Layers"].contains(inspector) else { throw EditorAutomationError.invalid("Choose an available inspector.") }
             default: break
             }
             try Task.checkCancellation()
@@ -279,9 +279,19 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 guard case let .conflicts(items) = error else { throw error }
                 return try JSONSerialization.data(withJSONObject: ["ok": false, "error": [
                     "code": "animation_conflict", "message": error.localizedDescription,
-                    "conflicts": items.map { ["lane": $0.lane.rawValue,
-                        "animation_id": "\($0.lane.rawValue):\($0.componentID.uuidString)",
-                        "start": $0.start, "end": $0.end] as [String: Any] }]])
+                    "conflicts": items.map { conflict in
+                        var row: [String: Any] = ["lane": conflict.lane.rawValue,
+                            "animation_id": "\(conflict.lane.rawValue):\(conflict.componentID.uuidString)",
+                            "start": conflict.start, "end": conflict.end]
+                        if let layer = conflict.layerID, let clip = conflict.clipID, let property = conflict.property {
+                            row.removeValue(forKey: "animation_id")
+                            row["layer_id"] = layer.uuidString; row["clip_id"] = clip.uuidString
+                            row["property"] = property.rawValue; row["point_id"] = conflict.componentID.uuidString
+                            row["time_base"] = "footage_source"
+                            row["resolution_operation"] = "removeVideoAnimation"
+                        }
+                        return row
+                    }]])
             }
             await rebuildPreview()
             value = try inspect(["section": "summary"], editor: editor)
@@ -549,6 +559,12 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         if !["state", "timing"].contains(section ?? ""), args["time"] != nil || args["time_base"] != nil {
             throw EditorAutomationError.invalid("Time coordinates are available only for section=state or timing.")
         }
+        if args["layer_id"] != nil, !["video_clips", "video_animations"].contains(section ?? "") {
+            throw EditorAutomationError.invalid("layer_id is available only for video_clips or video_animations.")
+        }
+        if args["clip_id"] != nil, section != "video_animations" {
+            throw EditorAutomationError.invalid("clip_id is available only for video_animations.")
+        }
         let offset = try args["offset"].map { try EditorAutomationAPI.integer($0) } ?? 0
         let limit = try args["limit"].map { try EditorAutomationAPI.integer($0) } ?? 8
         guard offset >= 0, (1...16).contains(limit) else { throw EditorAutomationError.invalid("Use an offset of zero or greater and a limit of 1–16.") }
@@ -586,7 +602,10 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             return ["context": try EditorAutomationAPI.object(automationContext), "duration": editor.project.duration,
                 "source_duration": editor.project.duration, "output_duration": map.outputDuration, "cut_count": state.cuts.count, "speed_count": state.speedKeyframes.count, "preserves_audio_pitch": state.preservesAudioPitch,
                 "trim": ["start": state.trimStart, "end": state.trimEnd], "edit_count": state.timedEdits(includeCamera: editor.project.cameraFilename != nil).count,
-                "box_count": state.regions.count, "content_layer_count": state.contentLayers.count, "undo_count": editor.historyState.undo.count,
+                "box_count": state.regions.count, "content_layer_count": state.contentLayers.count,
+                "video_source_count": editor.project.videoSources.count,
+                "video_layer_count": editor.project.effectiveVideoLayers(in: state).count,
+                "video_clip_count": editor.project.effectiveVideoLayers(in: state).reduce(0) { $0 + $1.clips.count }, "undo_count": editor.historyState.undo.count,
                 "redo_count": editor.historyState.redo.count, "media_processing_suspended": MediaProcessing.isSuspended]
         case "pending":
             invalidateFramingProposal(for: editor.project)
@@ -599,6 +618,53 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             if args["component"] != nil { return try inspectComponent(args, editor: editor) }
             guard args["time"] == nil && args["time_base"] == nil else { throw EditorAutomationError.invalid("Choose a state component when specifying time coordinates.") }
             return try EditorAutomationAPI.object(state)
+        case "video_sources":
+            return page(editor.project.videoSources.map { source in
+                var result: [String: Any] = ["id": source.id.uuidString, "name": source.name,
+                    "role": source.role.rawValue, "kind": source.kind.rawValue]
+                if let duration = source.duration { result["source_duration"] = duration }
+                if let width = source.pixelWidth { result["pixel_width"] = width }
+                if let height = source.pixelHeight { result["pixel_height"] = height }
+                if let audio = source.hasAudio { result["has_audio"] = audio }
+                return result
+            })
+        case "video_layers":
+            return ["layers": page(editor.project.effectiveVideoLayers(in: state).enumerated().map { index, layer in
+                ["id": layer.id.uuidString, "name": layer.name, "index": index, "clip_count": layer.clips.count] as [String: Any]
+            }), "implicit_legacy": state.videoLayers == nil,
+                "coordinates": "Layer order is back-to-front. Clip start/end are project-authoring seconds, before global cuts/speed; clip automation uses footage-source seconds."]
+        case "video_clips", "video_animations":
+            guard let rawLayer = args["layer_id"] as? String, let layerID = UUID(uuidString: rawLayer),
+                  let layer = editor.project.effectiveVideoLayers(in: state).first(where: { $0.id == layerID }) else {
+                throw EditorAutomationError.invalid("Choose a current layer_id from video_layers.")
+            }
+            let sources = editor.project.videoSources
+            if section == "video_clips" {
+                return ["layer_id": layer.id.uuidString, "layer_name": layer.name, "clips": page(try layer.clips.map { clip in
+                    ["id": clip.id.uuidString, "source_id": clip.sourceID.uuidString,
+                     "source_name": sources.first { $0.id == clip.sourceID }?.name ?? "Video",
+                     "project_start": clip.start, "project_end": clip.end, "source_start": clip.sourceStart,
+                     "source_end": clip.sourceTime(at: clip.end), "rate": clip.rate, "layout": clip.layout.rawValue,
+                     "geometry": try EditorAutomationAPI.object(clip.geometry), "opacity": clip.opacity,
+                     "volume": clip.volume, "is_muted": clip.isMuted, "fade_in": clip.fadeIn, "fade_out": clip.fadeOut,
+                     "transition": clip.transition.rawValue, "geometry_point_count": clip.geometryKeyframes.count,
+                     "opacity_point_count": clip.opacityKeyframes.count, "volume_point_count": clip.volumeKeyframes.count] as [String: Any]
+                })]
+            }
+            guard let rawClip = args["clip_id"] as? String, let clipID = UUID(uuidString: rawClip),
+                  let clip = layer.clips.first(where: { $0.id == clipID }) else { throw EditorAutomationError.invalid("Choose a current clip_id from video_clips.") }
+            var rows: [(Double, String, Any)] = []
+            for point in clip.geometryKeyframes { rows.append((point.time, "geometry", try EditorAutomationAPI.object(point))) }
+            for point in clip.opacityKeyframes { rows.append((point.time, "opacity", try EditorAutomationAPI.object(point))) }
+            for point in clip.volumeKeyframes { rows.append((point.time, "volume", try EditorAutomationAPI.object(point))) }
+            let points: [Any] = rows.sorted { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0 }.map { time, property, point in
+                let projectTime = clip.start + (time - clip.sourceStart) / clip.rate
+                return ["property": property, "point": point, "source_time": time, "project_time": projectTime,
+                    "inside_clip": projectTime >= clip.start && projectTime < clip.end] as [String: Any]
+            }
+            return ["layer_id": layer.id.uuidString, "clip_id": clip.id.uuidString,
+                "source_id": clip.sourceID.uuidString, "source_name": sources.first { $0.id == clip.sourceID }?.name ?? "Video",
+                "points": page(points), "time_base": "footage_source"]
         case "layers":
             return ["layers": page(try state.contentLayers.enumerated().map { index, layer in
                 ["index": index, "layer": try EditorAutomationAPI.object(layer)] as [String: Any]
@@ -626,7 +692,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                             "redo": try historyDetails(.redo, offset: offset, limit: limit, editor: editor)]]
         case "events": return ["page": page(recentEvents), "first_retained_sequence": recentEvents.first?["sequence"] ?? eventSequence,
                                 "last_sequence": eventSequence, "retained_limit": 128]
-        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, layers, history, state, timing or events.")
+        default: throw EditorAutomationError.invalid("Choose summary, view, edits, boxes, layers, video_sources, video_layers, video_clips, video_animations, history, state, timing or events.")
         }
     }
 
@@ -634,8 +700,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     /// never seeks, finishes a gesture, creates history or opens source media.
     private func inspectComponent(_ args: [String: Any], editor: ProjectEditor) throws -> [String: Any] {
         guard let component = args["component"] as? String,
-              ["screen", "camera", "camera_opacity", "speed", "pointer", "audio", "canvas", "trim", "layers"].contains(component) else {
-            throw EditorAutomationError.invalid("Choose screen, camera, camera_opacity, speed, pointer, audio, canvas, trim or layers.")
+              ["screen", "camera", "camera_opacity", "speed", "pointer", "audio", "canvas", "trim", "layers", "videos"].contains(component) else {
+            throw EditorAutomationError.invalid("Choose screen, camera, camera_opacity, speed, pointer, audio, canvas, trim, layers or videos.")
         }
         let context = try automationContext
         let state = editor.editingState
@@ -643,6 +709,18 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         guard ["source", "output"].contains(timeBase) else { throw EditorAutomationError.invalid("Choose source or output time.") }
         func value(at sourceTime: Double) throws -> Any {
             switch component {
+            case "videos":
+                let samples = editor.project.videoSamples(at: sourceTime, state: state)
+                let offset = try args["offset"].map { try EditorAutomationAPI.integer($0) } ?? 0
+                let limit = try args["limit"].map { try EditorAutomationAPI.integer($0) } ?? 8
+                return ["project_time": sourceTime, "total": samples.count, "offset": offset,
+                    "items": try samples.dropFirst(offset).prefix(limit).map { sample in
+                        ["layer_id": sample.layerID.uuidString, "clip_id": sample.clipID.uuidString,
+                         "source_id": sample.sourceID.uuidString, "source_time": sample.sourceTime,
+                         "weight": sample.weight, "geometry": try EditorAutomationAPI.object(sample.geometry),
+                         "opacity": sample.opacity, "layout": sample.layout.rawValue, "volume": sample.volume,
+                         "is_muted": sample.isMuted, "audio_gain": sample.audioGain] as [String: Any]
+                    }] as [String: Any]
             case "screen": return try EditorAutomationAPI.object(state.zoom(at: sourceTime))
             case "camera": return try EditorAutomationAPI.object(state.placement(at: sourceTime))
             case "speed": return ["rate": state.speed(at: sourceTime), "preservesPitch": state.preservesAudioPitch] as [String: Any]
@@ -671,7 +749,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? context.preview?.time ?? 0
         guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
         var result: [String: Any] = ["component": component, "source_time": time, "value": try value(at: time),
-            "scope": ["screen", "camera", "camera_opacity", "speed", "layers"].contains(component) ? "source_time" : "recording",
+            "scope": ["screen", "camera", "camera_opacity", "speed", "layers", "videos"].contains(component) ? "source_time" : "recording",
             "context": try EditorAutomationAPI.object(context)]
         if component == "camera" { result["camera_recorded"] = editor.project.cameraFilename != nil }
         if component == "audio" { result["audio_sources"] = try editor.project.audioSources.map { try EditorAutomationAPI.object($0) } }

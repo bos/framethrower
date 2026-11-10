@@ -131,8 +131,9 @@ final class EditorAssistantSession: ObservableObject {
         if instruction.isEmpty { instruction = history.draftInstruction }
         if let previous = history.lastProject, previous.revision != (try? EditorCommandDispatcher.revision(for: editor.project)) {
             let event = DirectorConversation.restoredProjectEvent(from: previous, to: editor.project)
-            nativeEventLog.append(DirectorConversation.nativeEvent(event, from: previous.state, to: editor.project.state))
-            conversation.event(event)
+            let projected = DirectorConversation.nativeEvent(event, from: previous.state, to: editor.project.state)
+            nativeEventLog.append(projected)
+            conversation.event(projected)
             record("editor_changed_while_closed", details: event)
         }
         let revision = (try? EditorCommandDispatcher.revision(for: editor.project)) ?? ""
@@ -165,9 +166,10 @@ final class EditorAssistantSession: ObservableObject {
         var event = DirectorConversation.projectEvent(from: previous, to: next,
             operation: observedEditor?.publishingHistoryOperation)
         event["actor"] = applyingDirectorChange ? "director" : observedEditor?.publishingActor ?? "user"
-        nativeEventLog.append(DirectorConversation.nativeEvent(event, from: previous.state, to: next.state))
+        let projected = DirectorConversation.nativeEvent(event, from: previous.state, to: next.state)
+        nativeEventLog.append(projected)
         record("editor_changed", requestID: applyingDirectorChange ? currentRequestID : nil, details: event)
-        if !applyingDirectorChange { conversation.event(event) }
+        if !applyingDirectorChange { conversation.event(projected) }
         conversation.lastProject = DirectorProjectSnapshot(next)
         persist()
     }

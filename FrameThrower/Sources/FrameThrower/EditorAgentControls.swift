@@ -76,6 +76,7 @@ enum EditorHistoryInspector {
             ("trim", a.trimStart != b.trimStart || a.trimEnd != b.trimEnd),
             ("canvas", a.presentation != b.presentation), ("boxes", a.regions != b.regions),
             ("content_layers", a.contentLayers != b.contentLayers),
+            ("video_layers", a.videoLayers != b.videoLayers),
             ("reference_marks", a.editAnchors != b.editAnchors)].compactMap { $0.1 ? $0.0 : nil }
     }
 
@@ -131,6 +132,21 @@ enum EditorHistoryInspector {
                 let changed = state.cuts.filter { !other.state.cuts.contains($0) }
                 let samples = changed.prefix(2).map { "\(seconds($0.start))–\(seconds($0.end))s, crossfade \(seconds($0.crossfade))s" }.joined(separator: "; ")
                 details.append("Cuts: \(state.cuts.count) excluded sections\(samples.isEmpty ? "." : " (" + samples + ").")")
+            case "video_layers":
+                if let layers = state.videoLayers {
+                    let changed = layers.filter { !(other.state.videoLayers ?? []).contains($0) }
+                    let samples = changed.prefix(2).map { layer in
+                        let previous = other.state.videoLayers?.first { $0.id == layer.id }
+                        let clips = layer.clips.filter { !(previous?.clips ?? []).contains($0) }.prefix(2).map { clip in
+                            var text = "\(seconds(clip.start))–\(seconds(clip.end))s, \(seconds(clip.rate))×"
+                            text += ", geometry \(clip.geometryKeyframes.count), opacity \(clip.opacityKeyframes.count), volume \(clip.volumeKeyframes.count)"
+                            if let point = clip.volumeKeyframes.last { text += " (\(seconds(point.gain)) at \(seconds(point.time))s source)" }
+                            return text
+                        }.joined(separator: "; ")
+                        return "\(layer.name): \(layer.clips.count) clips\(clips.isEmpty ? "" : " (" + clips + ")")"
+                    }.joined(separator: "; ")
+                    details.append("Video: \(layers.count) layers\(samples.isEmpty ? "." : " (" + samples + ").")")
+                } else { details.append("Video: original screen/camera layout.") }
             case "content_layers":
                 let changed = state.contentLayers.filter { !other.state.contentLayers.contains($0) }
                 let samples = changed.prefix(2).map { "\($0.label): \(seconds($0.start))–\(seconds($0.end))s" }.joined(separator: "; ")

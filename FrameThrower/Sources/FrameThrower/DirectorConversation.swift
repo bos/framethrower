@@ -225,6 +225,17 @@ final class DirectorConversation: ObservableObject {
             }
         }
         if before.title != after.title { changes["title"] = after.title.map { $0 as Any } ?? NSNull() }
+        if before.videoAssets != after.videoAssets {
+            let previous = Set(before.videoAssets.map(\.id)), current = Set(after.videoAssets.map(\.id))
+            changes["video_sources"] = ["upsert": after.videoAssets.filter { !before.videoAssets.contains($0) }.map { source in
+                var value: [String: Any] = ["id": source.id.uuidString, "name": source.name, "kind": source.kind.rawValue, "role": source.role.rawValue]
+                if let duration = source.duration { value["source_duration"] = duration }
+                if let width = source.pixelWidth { value["pixel_width"] = width }
+                if let height = source.pixelHeight { value["pixel_height"] = height }
+                if let audio = source.hasAudio { value["has_audio"] = audio }
+                return value
+            }, "removed_ids": previous.subtracting(current).map(\.uuidString).sorted(), "count": after.videoSources.count] as [String: Any]
+        }
         return ["kind": kind, "actor": "user", "names": names, "changes": changes,
                 "edit_steps": object(DirectorTranscriptStep.changes(from: before.state, to: after.state, references: after.references)),
                 "revision": (try? EditorCommandDispatcher.revision(for: after)) ?? "",
@@ -275,8 +286,57 @@ final class DirectorConversation: ObservableObject {
             changes[key] = ["encoding": "indexed_collection_delta", "removed_ids": removed,
                             "upsert": upsert, "count": next.count]
         }
+        if changes["videoLayers"] != nil {
+            if let next = new["videoLayers"] as? [[String: Any]] {
+                let previous = old["videoLayers"] as? [[String: Any]]
+                var delta = videoCollectionDelta(from: previous ?? [], to: next)
+                // nil means implicit legacy screen/camera, whereas [] is an
+                // explicitly empty video composition. Never merge the two.
+                if previous == nil { delta["replace"] = true }
+                changes["videoLayers"] = delta
+            } else { changes["videoLayers"] = NSNull() }
+        }
         notification["changes"] = changes
         return notification
+    }
+
+    /// Exact video-only nested patches. A changed gain must not resend sibling
+    /// clips or their geometry/opacity/volume arrays. Existing rows carry only
+    /// changed fields; new rows carry their actual values. Pure reordering uses
+    /// identities only. This changes the representation, never the facts or the
+    /// provider's conversation/compaction policy.
+    private static func videoCollectionDelta(from previous: [[String: Any]], to next: [[String: Any]]) -> [String: Any] {
+        let oldIDs = previous.compactMap { $0["id"] as? String }, newIDs = next.compactMap { $0["id"] as? String }
+        guard oldIDs.count == previous.count, newIDs.count == next.count,
+              Set(oldIDs).count == oldIDs.count, Set(newIDs).count == newIDs.count else {
+            return ["encoding": "replacement", "value": next]
+        }
+        let oldRows = Dictionary(uniqueKeysWithValues: zip(oldIDs, previous)), nextIDs = Set(newIDs)
+        let collectionFields: Set<String> = ["clips", "geometryKeyframes", "opacityKeyframes", "volumeKeyframes"]
+        var added: [[String: Any]] = [], updated: [[String: Any]] = []
+        for (index, row) in next.enumerated() {
+            let id = newIDs[index]
+            guard let before = oldRows[id] else { added.append(["index": index, "value": row]); continue }
+            guard jsonText(before) != jsonText(row) else { continue }
+            var fields: [String: Any] = [:], collections: [String: Any] = [:], removedFields: [String] = []
+            for key in Set(before.keys).union(row.keys).sorted() where key != "id" {
+                guard jsonText(["value": before[key] ?? NSNull()]) != jsonText(["value": row[key] ?? NSNull()]) else { continue }
+                guard let value = row[key] else { removedFields.append(key); continue }
+                if collectionFields.contains(key), let newRows = value as? [[String: Any]],
+                   let priorRows = before[key] as? [[String: Any]] {
+                    collections[key] = videoCollectionDelta(from: priorRows, to: newRows)
+                } else { fields[key] = value }
+            }
+            var patch: [String: Any] = ["id": id]
+            if !fields.isEmpty { patch["set"] = fields }
+            if !removedFields.isEmpty { patch["removed_fields"] = removedFields }
+            if !collections.isEmpty { patch["collections"] = collections }
+            updated.append(patch)
+        }
+        var delta: [String: Any] = ["encoding": "nested_collection_delta", "removed_ids": oldIDs.filter { !nextIDs.contains($0) },
+            "added": added, "updated": updated, "count": next.count]
+        if oldIDs != newIDs { delta["order"] = newIDs }
+        return delta
     }
 
     @discardableResult

@@ -310,7 +310,10 @@ struct DirectorConversationChecks {
             next.attach(to: fixture.editor)
             if stale {
                 try require(!next.awaitsClarification && next.conversation.conflict == nil &&
-                            events(next.conversation.messages()).contains { $0["kind"] as? String == "recording_changed_outside_session" && $0["state"] as? [String: Any] != nil },
+                            events(next.conversation.messages()).contains {
+                                $0["kind"] as? String == "recording_changed_outside_session" &&
+                                $0["title"] as? String == "Changed while closed" && $0["state"] == nil
+                            },
                             "Changed projects invalidate pending conflict and record intervening real changes")
             } else {
                 try require(next.projectID != oldID && next.awaitsClarification &&

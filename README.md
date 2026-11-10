@@ -226,6 +226,11 @@ Safe checks: `Tests/check-multi-video-model.sh`,
 The window checks link an existing Debug build and use offscreen vector views;
 they do not launch or focus the installed app.
 
+After building the matching Debug app, run
+`Tests/check-multi-video-media-integration.sh --with-ui` for real prerecorded
+import, muted playback, pixel/audio export checks and offscreen editor controls.
+It generates tiny local fixtures and never starts live capture or takes focus.
+
 ## Editing
 
 ### Content layers

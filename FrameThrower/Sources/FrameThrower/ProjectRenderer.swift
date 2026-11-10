@@ -217,6 +217,7 @@ enum ProjectRenderer {
         try project.validate()
         if project.state.videoLayers != nil { return try await makeMultiVideoPreview(project: project, directory: directory) }
         let screenAsset = AVURLAsset(url: directory.appendingPathComponent(project.screenFilename))
+        defer { withExtendedLifetime(screenAsset) {} }
         guard let screenSource = try await screenAsset.loadTracks(withMediaType: .video).first else {
             throw RenderError.invalidVideo(project.screenFilename)
         }
@@ -264,6 +265,7 @@ enum ProjectRenderer {
 
         if let cameraFilename = project.cameraFilename {
             let cameraAsset = AVURLAsset(url: directory.appendingPathComponent(cameraFilename))
+            defer { withExtendedLifetime(cameraAsset) {} }
             guard let cameraSource = try await cameraAsset.loadTracks(withMediaType: .video).first else {
                 throw RenderError.invalidVideo(cameraFilename)
             }
@@ -321,6 +323,7 @@ enum ProjectRenderer {
     private static func makeCutPreview(project: RecordingProject, directory: URL,
                                        screenAsset: AVAsset, screenSource: AVAssetTrack,
                                        duration: Double) async throws -> RenderedProject {
+        defer { withExtendedLifetime(screenAsset) {} }
         let map = try RecordingTimeMap(duration: project.duration, trimStart: project.state.trimStart,
             trimEnd: min(project.state.trimEnd, duration), cuts: project.state.cuts, speedKeyframes: project.state.speedKeyframes)
         let screenGeometry = try await geometry(of: screenSource)
@@ -336,10 +339,13 @@ enum ProjectRenderer {
         }
         let screenTracks = try tracks(.video)
         var cameraSource: AVAssetTrack?
+        var retainedCameraAsset: AVAsset?
+        defer { withExtendedLifetime(retainedCameraAsset) {} }
         var cameraGeometry: PIPSourceGeometry?
         var cameraStart = 0.0, cameraEnd = 0.0
         if let filename = project.cameraFilename {
             let asset = AVURLAsset(url: directory.appendingPathComponent(filename))
+            retainedCameraAsset = asset
             guard let source = try await asset.loadTracks(withMediaType: .video).first else { throw RenderError.invalidVideo(filename) }
             cameraSource = source
             cameraGeometry = try await geometry(of: source)
@@ -429,6 +435,10 @@ enum ProjectRenderer {
         let plan = try MultiVideoRenderPlan(project: project)
         let composition = AVMutableComposition()
         composition.insertEmptyTimeRange(CMTimeRange(start: .zero, duration: time(plan.timingMap.outputDuration)))
+        // AVAssetTrack.asset is weak. Retaining tracks alone is insufficient:
+        // every source asset must survive through all time-range insertions.
+        var retainedAssets: [UUID: AVAsset] = [:]
+        defer { withExtendedLifetime(retainedAssets) {} }
         let sources = Dictionary(uniqueKeysWithValues: project.videoSources.map { ($0.id, $0) })
         let usedSources = Set(plan.segments.map(\.sourceID))
         var videos: [UUID: AVAssetTrack] = [:]
@@ -439,6 +449,7 @@ enum ProjectRenderer {
         var sourceRoles: [ObjectIdentifier: RecordingAudioRole] = [:]
         for source in project.videoSources where usedSources.contains(source.id) && source.kind == .file {
             let asset = AVURLAsset(url: try source.resolvedURL(in: directory))
+            retainedAssets[source.id] = asset
             guard let video = try await asset.loadTracks(withMediaType: .video).first else {
                 throw RenderError.invalidVideo(source.name)
             }
@@ -465,6 +476,7 @@ enum ProjectRenderer {
             let url = try primary.resolvedURL(in: directory)
             if FileManager.default.fileExists(atPath: url.path) {
                 let asset = AVURLAsset(url: url)
+                retainedAssets[VideoSource.legacyScreenID] = asset
                 guard let track = try await asset.loadTracks(withMediaType: .video).first else {
                     throw RenderError.invalidVideo(primary.name)
                 }
@@ -502,7 +514,15 @@ enum ProjectRenderer {
                     let outputStart = time(cell.outputTime(forSource: first)), outputEnd = time(cell.outputTime(forSource: last))
                     let range = CMTimeRange(start: time(first), end: time(last))
                     guard range.duration > .zero, outputEnd > outputStart else { continue }
-                    try target.insertTimeRange(range, of: source, at: outputStart)
+                    do { try target.insertTimeRange(range, of: source, at: outputStart) }
+                    catch {
+                        throw NSError(domain: "FrameThrower.Renderer", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "A video or audio source could not be placed in the recording.",
+                            NSUnderlyingErrorKey: error, "sourceTrack": source.trackID,
+                            "targetTrack": target.trackID, "sourceRange": "\(first)…\(last)",
+                            "outputRange": "\(outputStart.seconds)…\(outputEnd.seconds)"
+                        ])
+                    }
                     target.scaleTimeRange(CMTimeRange(start: outputStart, duration: range.duration), toDuration: outputEnd - outputStart)
                 }
             }

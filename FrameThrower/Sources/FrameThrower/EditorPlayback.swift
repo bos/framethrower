@@ -40,6 +40,14 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var screenSize = CGSize(width: 16, height: 9)
     @Published private(set) var sourceSize = CGSize(width: 16, height: 9)
     @Published private(set) var cameraAspect = 16.0 / 9.0
+    private(set) var videoProject: RecordingProject?
+    var videoState: EditState? { draftState ?? committedState }
+    /// Authoring seconds are mapped into each occurrence's source clock only
+    /// after selecting a Finished branch. Inspection can ask for either branch.
+    func videoSamples(at projectTime: Double) -> [VideoLayerSample] {
+        guard let videoProject else { return [] }
+        return videoProject.videoSamples(at: projectTime, state: videoState)
+    }
     @Published private(set) var errorMessage: String?
     let frameStore = EditorFrameStore()
     private(set) var stillFrame: CGImage? {
@@ -254,6 +262,7 @@ final class EditorPlayback: ObservableObject {
         // the old player's camera position; pending draft work is invalidated.
         let retainedDraftFrame = isPreviewing ? stillFrame : nil
         invalidateStillFrames()
+        videoProject = snapshot
         stillFrame = retainedDraftFrame
         renderedProject = nil
         isLoading = true
@@ -938,6 +947,7 @@ final class EditorPlayback: ObservableObject {
     }
 
     func close() {
+        videoProject = nil
         cachedCursorRecording = nil
         stopSimulation()
         simulationClock = nil

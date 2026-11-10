@@ -1,6 +1,108 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+/// A codec-free plan joins the project's Finished clock to each occurrence's
+/// original-source clock. Video and every audio track consume these same cells.
+struct MultiVideoRenderPlan: Sendable {
+    struct BindingKey: Hashable, Sendable { var clipID: UUID; var branchIndex: Int }
+    struct TrackAssignment: Equatable, Sendable {
+        var layerID: UUID
+        var clipID: UUID
+        var sourceID: UUID
+        var branchIndex: Int
+        var lane: Int
+        var outputStart: Double
+        var outputEnd: Double
+    }
+    struct Segment: Equatable, Sendable {
+        var layerID: UUID
+        var clipID: UUID
+        var sourceID: UUID
+        var branchIndex: Int
+        var projectStart: Double
+        var projectEnd: Double
+        var sourceStart: Double
+        var sourceEnd: Double
+        var outputStart: Double
+        var outputEnd: Double
+
+        func outputTime(forSource seconds: Double) -> Double {
+            outputStart + (seconds - sourceStart) / (sourceEnd - sourceStart) * (outputEnd - outputStart)
+        }
+    }
+
+    let timingMap: RecordingTimeMap
+    let segments: [Segment]
+    let trackAssignments: [TrackAssignment]
+
+    init(project: RecordingProject, state: EditState? = nil) throws {
+        let state = state ?? project.state
+        var snapshot = project; snapshot.state = state
+        try snapshot.validate()
+        timingMap = try RecordingTimeMap(duration: project.duration, trimStart: state.trimStart,
+            trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
+        let sources = Dictionary(uniqueKeysWithValues: project.videoSources.map { ($0.id, $0) })
+        var cells: [Segment] = []
+        for layer in project.effectiveVideoLayers(in: state) {
+            for clip in layer.clips {
+                guard let source = sources[clip.sourceID] else { continue }
+                let availableEnd = source.duration.map { clip.start + ($0 - clip.sourceStart) / clip.rate } ?? clip.end
+                for (branchIndex, branch) in timingMap.clips.enumerated() {
+                    for cell in branch.segments {
+                        let start = max(cell.sourceStart, clip.start)
+                        let end = min(cell.sourceEnd, clip.end, availableEnd)
+                        guard end > start else { continue }
+                        cells.append(.init(layerID: layer.id, clipID: clip.id, sourceID: source.id,
+                            branchIndex: branchIndex, projectStart: start, projectEnd: end,
+                            sourceStart: clip.sourceTime(at: start), sourceEnd: clip.sourceTime(at: end),
+                            outputStart: cell.outputTime(for: start), outputEnd: cell.outputTime(for: end)))
+                    }
+                }
+            }
+        }
+        segments = cells
+        let groups = Dictionary(grouping: cells) { BindingKey(clipID: $0.clipID, branchIndex: $0.branchIndex) }
+        let intervals = groups.values.compactMap { values -> TrackAssignment? in
+            guard let first = values.first, let start = values.map(\.outputStart).min(), let end = values.map(\.outputEnd).max() else { return nil }
+            return .init(layerID: first.layerID, clipID: first.clipID, sourceID: first.sourceID,
+                branchIndex: first.branchIndex, lane: 0, outputStart: start, outputEnd: end)
+        }.sorted {
+            if $0.outputStart != $1.outputStart { return $0.outputStart < $1.outputStart }
+            if $0.branchIndex != $1.branchIndex { return $0.branchIndex < $1.branchIndex }
+            return $0.clipID.uuidString < $1.clipID.uuidString
+        }
+        var ends: [UUID: [Double]] = [:]
+        trackAssignments = intervals.map { interval in
+            var assignment = interval
+            var lanes = ends[interval.layerID] ?? []
+            if let lane = lanes.firstIndex(where: { $0 <= interval.outputStart }) {
+                assignment.lane = lane; lanes[lane] = interval.outputEnd
+            } else {
+                assignment.lane = lanes.count; lanes.append(interval.outputEnd)
+            }
+            ends[interval.layerID] = lanes
+            return assignment
+        }
+    }
+
+    /// Transparent samples must be summed within a layer before that layer is
+    /// placed over the next. Independent source-over fades produce a dark dip.
+    static func blendedAlpha(_ samples: [(weight: Double, opacity: Double)]) -> Double {
+        min(1, max(0, samples.reduce(0) { $0 + $1.weight * $1.opacity }))
+    }
+
+    func audioGain(project: RecordingProject, state: EditState, clipID: UUID,
+                   branchIndex: Int, at outputTime: Double, role: RecordingAudioRole?) -> Double {
+        guard timingMap.clips.indices.contains(branchIndex),
+              let branch = timingMap.samples(at: outputTime).first(where: { $0.clipIndex == branchIndex }) else { return 0 }
+        guard let sample = project.videoSamples(at: branch.sourceTime, state: state).first(where: { $0.clipID == clipID }) else { return 0 }
+        // Channel envelopes for the recorded screen stay anchored to its
+        // original source. Extra footage has no invented microphone/system role.
+        return sample.audioGain * branch.weight * state.audio.gain(role: role,
+            sourceTime: sample.sourceTime, outputTime: outputTime, outputDuration: timingMap.outputDuration)
+    }
+}
+
 enum VideoExportPreset: String, CaseIterable, Sendable {
     case fullResolution, hd, small
 
@@ -47,6 +149,8 @@ struct RenderedProject {
     let audioRoles: [CMPersistentTrackID: RecordingAudioRole]
     let timingMap: RecordingTimeMap?
     let cutAudioSegments: [CutAudioSegment]
+    let multiVideoAudioSegments: [MultiVideoAudioSegment]
+    let multiVideoProject: RecordingProject?
     var supportsDirectSourcePreview: Bool { timingMap == nil }
 
     struct CutAudioSegment {
@@ -57,11 +161,21 @@ struct RenderedProject {
         var role: RecordingAudioRole? = nil
     }
 
+    struct MultiVideoAudioSegment {
+        let trackID: CMPersistentTrackID
+        let clipID: UUID
+        let branchIndex: Int
+        let outputStart: Double
+        let outputEnd: Double
+        let role: RecordingAudioRole?
+    }
+
     init(asset: AVComposition, videoComposition: AVVideoComposition, screenSize: CGSize,
          cameraAspect: Double, sourceSize: CGSize? = nil,
          previewFrames: PreviewSourceFrames = PreviewSourceFrames(),
          audioMix: AVAudioMix? = nil, audioTrackIDs: [CMPersistentTrackID] = [],
-         audioRoles: [CMPersistentTrackID: RecordingAudioRole] = [:], timingMap: RecordingTimeMap? = nil, cutAudioSegments: [CutAudioSegment] = []) {
+         audioRoles: [CMPersistentTrackID: RecordingAudioRole] = [:], timingMap: RecordingTimeMap? = nil, cutAudioSegments: [CutAudioSegment] = [],
+         multiVideoAudioSegments: [MultiVideoAudioSegment] = [], multiVideoProject: RecordingProject? = nil) {
         self.asset = asset
         self.videoComposition = videoComposition
         self.screenSize = screenSize
@@ -73,6 +187,8 @@ struct RenderedProject {
         self.audioRoles = audioRoles
         self.timingMap = timingMap
         self.cutAudioSegments = cutAudioSegments
+        self.multiVideoAudioSegments = multiVideoAudioSegments
+        self.multiVideoProject = multiVideoProject
     }
 }
 
@@ -99,6 +215,7 @@ enum ProjectRenderer {
     static func makePreview(project: RecordingProject, directory: URL) async throws -> RenderedProject {
         try MediaProcessing.requireEnabled()
         try project.validate()
+        if project.state.videoLayers != nil { return try await makeMultiVideoPreview(project: project, directory: directory) }
         let screenAsset = AVURLAsset(url: directory.appendingPathComponent(project.screenFilename))
         guard let screenSource = try await screenAsset.loadTracks(withMediaType: .video).first else {
             throw RenderError.invalidVideo(project.screenFilename)
@@ -304,6 +421,178 @@ enum ProjectRenderer {
             audioTrackIDs: audioTracks.flatMap { $0.map(\.trackID) }, timingMap: map, cutAudioSegments: audioSegments)
     }
 
+    /// Each occurrence owns an independent track per retained global branch.
+    /// This also supports two simultaneous occurrences of the same source at
+    /// different source times; source IDs alone cannot identify decoder tracks.
+    private static func makeMultiVideoPreview(project: RecordingProject, directory: URL) async throws -> RenderedProject {
+        try MediaProcessing.requireEnabled()
+        let plan = try MultiVideoRenderPlan(project: project)
+        let composition = AVMutableComposition()
+        composition.insertEmptyTimeRange(CMTimeRange(start: .zero, duration: time(plan.timingMap.outputDuration)))
+        let sources = Dictionary(uniqueKeysWithValues: project.videoSources.map { ($0.id, $0) })
+        let usedSources = Set(plan.segments.map(\.sourceID))
+        var videos: [UUID: AVAssetTrack] = [:]
+        var videoRanges: [UUID: CMTimeRange] = [:]
+        var geometries: [UUID: PIPSourceGeometry] = [:]
+        var audios: [UUID: [AVAssetTrack]] = [:]
+        var audioRanges: [ObjectIdentifier: CMTimeRange] = [:]
+        var sourceRoles: [ObjectIdentifier: RecordingAudioRole] = [:]
+        for source in project.videoSources where usedSources.contains(source.id) && source.kind == .file {
+            let asset = AVURLAsset(url: try source.resolvedURL(in: directory))
+            guard let video = try await asset.loadTracks(withMediaType: .video).first else {
+                throw RenderError.invalidVideo(source.name)
+            }
+            videos[source.id] = video
+            videoRanges[source.id] = try await video.load(.timeRange)
+            geometries[source.id] = try await geometry(of: video)
+            let tracks = try await asset.loadTracks(withMediaType: .audio)
+            audios[source.id] = tracks
+            for track in tracks {
+                audioRanges[ObjectIdentifier(track)] = try await track.load(.timeRange)
+                if source.id == VideoSource.legacyScreenID {
+                    sourceRoles[ObjectIdentifier(track)] = try await audioRole(of: track, bindings: project.audioSources)
+                }
+            }
+        }
+        try requireControlledAudioRoles(project.state.audio, found: Array(sourceRoles.values))
+        var primarySize = geometries[VideoSource.legacyScreenID]?.size
+            ?? sources[VideoSource.legacyScreenID]?.pixelSize ?? CGSize(width: 1920, height: 1080)
+        // Canvas .source belongs to the project, not whichever occurrence is
+        // currently visible. Removing its screen layer must not turn a portrait
+        // recording into a landscape canvas. Read metadata only if that source
+        // was not already loaded, inside the same media interlock as above.
+        if geometries[VideoSource.legacyScreenID] == nil, let primary = sources[VideoSource.legacyScreenID] {
+            let url = try primary.resolvedURL(in: directory)
+            if FileManager.default.fileExists(atPath: url.path) {
+                let asset = AVURLAsset(url: url)
+                guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                    throw RenderError.invalidVideo(primary.name)
+                }
+                primarySize = try await geometry(of: track).size
+            }
+        }
+        let renderSize = PresentationGeometry(sourceSize: primarySize, presentation: project.state.presentation).outputSize
+        var bindings: [MultiVideoCompositionInstruction.Binding] = []
+        var audioSegments: [RenderedProject.MultiVideoAudioSegment] = []
+        // Interval coloring reuses non-overlapping decoder tracks. At most two
+        // local clips × two global cut branches need pixels in one layer.
+        let groups = Dictionary(grouping: plan.segments) { MultiVideoRenderPlan.BindingKey(clipID: $0.clipID, branchIndex: $0.branchIndex) }
+        var videoPools: [UUID: [AVMutableCompositionTrack]] = [:]
+        struct AudioPoolKey: Hashable { var role: RecordingAudioRole? }
+        struct AudioSlot { var track: AVMutableCompositionTrack; var end: Double }
+        var audioPools: [AudioPoolKey: [AudioSlot]] = [:]
+        for assignment in plan.trackAssignments {
+            let key = MultiVideoRenderPlan.BindingKey(clipID: assignment.clipID, branchIndex: assignment.branchIndex)
+            guard let cells = groups[key], let sourceID = cells.first?.sourceID, let source = sources[sourceID], source.kind == .file,
+                  let videoSource = videos[sourceID], let sourceGeometry = geometries[sourceID] else { continue }
+            var pool = videoPools[assignment.layerID] ?? []
+            while pool.count <= assignment.lane {
+                guard let track = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                    throw RenderError.cannotExport
+                }
+                pool.append(track)
+            }
+            videoPools[assignment.layerID] = pool
+            let track = pool[assignment.lane]
+            func insert(_ source: AVAssetTrack, into target: AVMutableCompositionTrack, available: CMTimeRange? = nil) throws {
+                for cell in cells.sorted(by: { $0.outputStart < $1.outputStart }) {
+                    let first = max(cell.sourceStart, available?.start.seconds ?? cell.sourceStart)
+                    let last = min(cell.sourceEnd, available?.end.seconds ?? cell.sourceEnd)
+                    guard last > first else { continue }
+                    let outputStart = time(cell.outputTime(forSource: first)), outputEnd = time(cell.outputTime(forSource: last))
+                    let range = CMTimeRange(start: time(first), end: time(last))
+                    guard range.duration > .zero, outputEnd > outputStart else { continue }
+                    try target.insertTimeRange(range, of: source, at: outputStart)
+                    target.scaleTimeRange(CMTimeRange(start: outputStart, duration: range.duration), toDuration: outputEnd - outputStart)
+                }
+            }
+            try insert(videoSource, into: track, available: videoRanges[sourceID])
+            bindings.append(.init(clipID: key.clipID, branchIndex: key.branchIndex, trackID: track.trackID, geometry: sourceGeometry))
+            for audioSource in audios[sourceID] ?? [] {
+                guard let available = audioRanges[ObjectIdentifier(audioSource)] else { throw RenderError.cannotExport }
+                let covered = cells.compactMap { cell -> (Double, Double)? in
+                    let first = max(cell.sourceStart, available.start.seconds), last = min(cell.sourceEnd, available.end.seconds)
+                    return last > first ? (cell.outputTime(forSource: first), cell.outputTime(forSource: last)) : nil
+                }
+                guard let start = covered.map(\.0).min(), let end = covered.map(\.1).max() else { continue }
+                let role = sourceID == VideoSource.legacyScreenID ? sourceRoles[ObjectIdentifier(audioSource)] : nil
+                let audioKey = AudioPoolKey(role: role)
+                var audioPool = audioPools[audioKey] ?? []
+                let audio: AVMutableCompositionTrack
+                if let index = audioPool.firstIndex(where: { $0.end <= start }) {
+                    audio = audioPool[index].track; audioPool[index].end = end
+                } else {
+                    guard let added = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                        throw RenderError.cannotExport
+                    }
+                    audio = added; audioPool.append(.init(track: added, end: end))
+                }
+                audioPools[audioKey] = audioPool
+                try insert(audioSource, into: audio, available: available)
+                for range in covered {
+                    audioSegments.append(.init(trackID: audio.trackID, clipID: key.clipID, branchIndex: key.branchIndex,
+                        outputStart: range.0, outputEnd: range.1, role: role))
+                }
+            }
+        }
+        let instruction = MultiVideoCompositionInstruction(project: project, plan: plan, bindings: bindings,
+            sourceSize: primarySize, renderSize: renderSize,
+            cursorRecording: try project.cursorFilename.map { try CursorRecording.load(from: directory.appendingPathComponent($0)) })
+        let video = AVMutableVideoComposition()
+        video.customVideoCompositorClass = PIPVideoCompositor.self
+        video.renderSize = renderSize
+        video.frameDuration = time(project.captureFrameDuration ?? 1.0 / 30)
+        video.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+        video.colorTransferFunction = AVVideoTransferFunction_IEC_sRGB
+        video.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+        video.instructions = [instruction]
+        return RenderedProject(asset: composition, videoComposition: video, screenSize: renderSize,
+            cameraAspect: geometries[VideoSource.legacyCameraID].map { $0.size.width / $0.size.height } ?? 16.0 / 9.0,
+            sourceSize: primarySize,
+            audioMix: multiVideoAudioMix(project: project, state: project.state, plan: plan, segments: audioSegments),
+            audioTrackIDs: Array(Set(audioSegments.map(\.trackID))).sorted(), timingMap: plan.timingMap,
+            multiVideoAudioSegments: audioSegments, multiVideoProject: project)
+    }
+
+    static func multiVideoAudioMix(project: RecordingProject, state: EditState, plan: MultiVideoRenderPlan,
+                                   segments: [RenderedProject.MultiVideoAudioSegment]) -> AVAudioMix? {
+        guard !segments.isEmpty else { return nil }
+        let clips = Dictionary(uniqueKeysWithValues: project.effectiveVideoLayers(in: state).flatMap(\.clips).map { ($0.id, $0) })
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = Set(segments.map(\.trackID)).sorted().map { trackID in
+            let parameters = AVMutableAudioMixInputParameters()
+            parameters.trackID = trackID
+            parameters.audioTimePitchAlgorithm = state.preservesAudioPitch ? .spectral : .varispeed
+            parameters.setVolume(0, at: .zero)
+            for segment in segments.filter({ $0.trackID == trackID }).sorted(by: { $0.outputStart < $1.outputStart }) {
+                guard let clip = clips[segment.clipID] else { continue }
+                let branch = plan.timingMap.clips[segment.branchIndex]
+                var knots = [segment.outputStart, segment.outputEnd]
+                knots += branch.segments.flatMap { [$0.outputStart, $0.outputEnd] }
+                knots += plan.timingMap.joins.flatMap { [$0.outputStart, $0.outputEnd] }
+                knots += state.audio.envelope(trimStart: 0, trimEnd: plan.timingMap.outputDuration).map(\.time)
+                knots += state.audio.sourceKnots(role: segment.role).map { branch.outputTime(for: clip.start + ($0 - clip.sourceStart) / clip.rate) }
+                for key in clip.volumeKeyframes {
+                    knots += [key.time, key.time - key.duration].map { branch.outputTime(for: clip.start + ($0 - clip.sourceStart) / clip.rate) }
+                }
+                // Same-layer join boundaries are also gain-envelope knots.
+                knots += project.effectiveVideoLayers(in: state).flatMap(\.clips).flatMap { [branch.outputTime(for: $0.start), branch.outputTime(for: $0.end)] }
+                knots = knots.filter { $0 >= segment.outputStart && $0 <= segment.outputEnd }
+                let points = RecordingAudio.sampledEnvelope(knots: knots) { at in
+                    // A half-open media range keeps its left-limit gain until
+                    // its endpoint; silence is set separately after that range.
+                    let sampleTime = at == segment.outputEnd ? max(segment.outputStart, at - 1e-8) : at
+                    return plan.audioGain(project: project, state: state, clipID: segment.clipID,
+                        branchIndex: segment.branchIndex, at: sampleTime, role: segment.role)
+                }
+                applyGainPoints(points, to: parameters)
+                parameters.setVolume(0, at: time(segment.outputEnd))
+            }
+            return parameters
+        }
+        return mix
+    }
+
     /// The audio branches use the same linear cut gains as video. Multiplying
     /// by master fades is quadratic where ramps overlap; bounded subdivision
     /// approximates that product to <0.0001 gain instead of introducing a bump.
@@ -361,15 +650,25 @@ enum ProjectRenderer {
         videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
             if let pip = instruction as? PIPCompositionInstruction { return pip.applying(state) }
             if let cut = instruction as? CutCompositionInstruction { return cut.applying(state) }
+            if let multi = instruction as? MultiVideoCompositionInstruction { return multi.applying(state, renderSize: outputSize) }
             return instruction
+        }
+        let updatedAudioMix: AVAudioMix?
+        if let multi = rendered.videoComposition.instructions.compactMap({ $0 as? MultiVideoCompositionInstruction }).first {
+            updatedAudioMix = multiVideoAudioMix(project: multi.project, state: state, plan: multi.plan,
+                segments: rendered.multiVideoAudioSegments)
+        } else if let map = rendered.timingMap {
+            updatedAudioMix = cutAudioMix(for: state, timingMap: map, segments: rendered.cutAudioSegments)
+        } else {
+            updatedAudioMix = audioMix(for: state, trackIDs: rendered.audioTrackIDs, duration: rendered.asset.duration.seconds, roles: rendered.audioRoles)
         }
         return RenderedProject(asset: rendered.asset, videoComposition: videoComposition,
                                screenSize: outputSize, cameraAspect: rendered.cameraAspect, sourceSize: rendered.sourceSize,
                                previewFrames: rendered.previewFrames,
-                               audioMix: rendered.timingMap.map { cutAudioMix(for: state, timingMap: $0, segments: rendered.cutAudioSegments) }
-                                   ?? audioMix(for: state, trackIDs: rendered.audioTrackIDs, duration: rendered.asset.duration.seconds, roles: rendered.audioRoles),
+                               audioMix: updatedAudioMix,
                                audioTrackIDs: rendered.audioTrackIDs, audioRoles: rendered.audioRoles, timingMap: rendered.timingMap,
-                               cutAudioSegments: rendered.cutAudioSegments)
+                               cutAudioSegments: rendered.cutAudioSegments, multiVideoAudioSegments: rendered.multiVideoAudioSegments,
+                               multiVideoProject: rendered.multiVideoProject)
     }
 
     /// Source-time ramps preserve independent tracks and any leading gaps.
@@ -497,8 +796,11 @@ enum ProjectRenderer {
                        progress: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) async throws {
         try MediaProcessing.requireEnabled()
         try Task.checkCancellation()
-        let originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 }.map {
+        var originalURLs = [project.screenFilename, project.cameraFilename, project.cursorFilename, project.sceneFilename].compactMap { $0 }.map {
             directory.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath()
+        }
+        originalURLs += try project.videoSources.filter { $0.kind == .file }.map {
+            try $0.resolvedURL(in: directory).standardizedFileURL.resolvingSymlinksInPath()
         }
         let files = FileManager.default
         let existed = files.fileExists(atPath: destination.path)
@@ -526,6 +828,7 @@ enum ProjectRenderer {
                 return pip.applying(pip.state, preservePreviewFrames: false, renderSize: outputSize)
             }
             if let cut = instruction as? CutCompositionInstruction { return cut.applying(cut.template.state, renderSize: outputSize) }
+            if let multi = instruction as? MultiVideoCompositionInstruction { return multi.applying(multi.project.state, renderSize: outputSize) }
             return instruction
         }
         guard let exporter = AVAssetExportSession(asset: rendered.asset, presetName: AVAssetExportPresetHighestQuality) else {

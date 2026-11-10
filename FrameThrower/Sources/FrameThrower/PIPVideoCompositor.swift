@@ -87,6 +87,75 @@ final class CutCompositionInstruction: NSObject, AVVideoCompositionInstructionPr
     }
 }
 
+/// Immutable multi-source bindings. Two occurrences of one file may request
+/// different original frames, so each occurrence/Finished branch has its own ID.
+final class MultiVideoCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
+    struct Binding: Sendable {
+        let clipID: UUID
+        let branchIndex: Int
+        let trackID: CMPersistentTrackID
+        let geometry: PIPSourceGeometry
+    }
+    let project: RecordingProject
+    let plan: MultiVideoRenderPlan
+    let bindings: [Binding]
+    let sourceSize: CGSize
+    let renderSize: CGSize
+    let cursorRecording: CursorRecording?
+    let timeRange: CMTimeRange
+    let enablePostProcessing = false
+    let containsTweening = true
+    let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
+    let requiredSourceTrackIDs: [NSValue]?
+
+    init(project: RecordingProject, plan: MultiVideoRenderPlan, bindings: [Binding], sourceSize: CGSize,
+         renderSize: CGSize, cursorRecording: CursorRecording? = nil) {
+        self.project = project; self.plan = plan; self.bindings = bindings
+        self.sourceSize = sourceSize; self.renderSize = renderSize; self.cursorRecording = cursorRecording
+        timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: plan.timingMap.outputDuration, preferredTimescale: 60_000))
+        requiredSourceTrackIDs = Set(bindings.map(\.trackID)).sorted().map { NSNumber(value: $0) }
+        super.init()
+    }
+    func applying(_ state: EditState, renderSize: CGSize? = nil) -> MultiVideoCompositionInstruction {
+        var snapshot = project; snapshot.state = state
+        return MultiVideoCompositionInstruction(project: snapshot, plan: plan, bindings: bindings,
+            sourceSize: sourceSize, renderSize: renderSize ?? self.renderSize, cursorRecording: cursorRecording)
+    }
+}
+
+/// Source crop and destination bounds shared by vector previews and real
+/// compositions. Coordinates are top-left throughout this metadata-only step.
+struct VideoSampleDrawingGeometry: Equatable, Sendable {
+    var frame: CGRect
+    var viewport: CGRect
+    var cornerRadius: Double
+    var opacity: Double
+
+    init(sample: VideoLayerSample, state: EditState, at projectTime: Double,
+         sourceSize: CGSize, primarySize: CGSize, canvas: CGSize) {
+        let bounds = CGRect(origin: .zero, size: canvas)
+        opacity = sample.opacity
+        switch sample.layout {
+        case .screen:
+            let presentation = PresentationGeometry(sourceSize: primarySize, presentation: state.presentation)
+            frame = presentation.contentRect(in: bounds)
+            viewport = state.zoom(at: projectTime).viewport(in: sourceSize)
+            let scale = min(canvas.width / presentation.outputSize.width, canvas.height / presentation.outputSize.height)
+            cornerRadius = presentation.cornerRadius * scale
+        case .camera:
+            let placement = state.placement(at: projectTime)
+            frame = placement.frame(in: canvas, cameraAspect: sourceSize.width / sourceSize.height)
+            viewport = placement.sourceViewport(in: sourceSize, canvas: canvas)
+            cornerRadius = placement.cornerRadius(in: frame.size)
+            opacity *= placement.renderedOpacity
+        case .custom:
+            frame = sample.geometry.frame(in: canvas, sourceSize: sourceSize)
+            viewport = sample.geometry.viewport(in: sourceSize, canvas: canvas)
+            cornerRadius = 0
+        }
+    }
+}
+
 struct PIPSourceGeometry: Sendable {
     let size: CGSize
     /// Maps source top-left coordinates to oriented, origin-normalized top-left coordinates.
@@ -180,7 +249,11 @@ final class PIPVideoCompositor: NSObject, AVVideoCompositing, @unchecked Sendabl
             throw NSError(domain: "FrameThrower.Compositor", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "A recording frame could not be allocated."])
         }
-        if let cut = request.videoCompositionInstruction as? CutCompositionInstruction {
+        if let multi = request.videoCompositionInstruction as? MultiVideoCompositionInstruction {
+            let image = try composer.image(request: request, instruction: multi, renderSize: multi.renderSize)
+            composer.context.render(image, to: output, bounds: CGRect(origin: .zero, size: multi.renderSize), colorSpace: composer.colorSpace)
+            return output
+        } else if let cut = request.videoCompositionInstruction as? CutCompositionInstruction {
             let canvas = CGRect(origin: .zero, size: cut.template.renderSize)
             var blended: CIImage?
             for sample in cut.timingMap.samples(at: request.compositionTime.seconds) {
@@ -351,6 +424,121 @@ private final class PIPFrameComposer: @unchecked Sendable {
     let context = CIContext(options: [.cacheIntermediates: false])
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private let layerArtwork = ContentLayerRasterCache()
+
+    func image(request: AVAsynchronousVideoCompositionRequest, instruction: MultiVideoCompositionInstruction,
+               renderSize: CGSize) throws -> CIImage {
+        let project = instruction.project, state = project.state
+        let canvas = CGRect(origin: .zero, size: renderSize)
+        let clear = CIImage(color: .clear).cropped(to: canvas)
+        let sources = Dictionary(uniqueKeysWithValues: project.videoSources.map { ($0.id, $0) })
+        var finished: [(CIImage, Double)] = []
+        for branch in instruction.plan.timingMap.samples(at: request.compositionTime.seconds) {
+            let color = state.presentation.background
+            var composition = CIImage(color: CIColor(red: color.red, green: color.green, blue: color.blue)).cropped(to: canvas)
+            let samples = project.videoSamples(at: branch.sourceTime)
+            for layer in project.effectiveVideoLayers() {
+                var clips: [(CIImage, Double)] = []
+                for sample in samples where sample.layerID == layer.id {
+                    guard let source = sources[sample.sourceID] else { continue }
+                    let binding = instruction.bindings.first { $0.clipID == sample.clipID && $0.branchIndex == branch.clipIndex }
+                    let size = binding?.geometry.size ?? source.pixelSize ?? instruction.sourceSize
+                    let drawing = VideoSampleDrawingGeometry(sample: sample, state: state, at: branch.sourceTime,
+                        sourceSize: size, primarySize: instruction.sourceSize, canvas: renderSize)
+                    var raw: CIImage?
+                    if source.kind == .testPattern { raw = vectorPattern(size: size, seed: source.patternSeed) }
+                    else if let binding, let frame = request.sourceFrame(byTrackID: binding.trackID) {
+                        raw = binding.geometry.orientedImage(frame)
+                    }
+                    if var sourceImage = raw {
+                        if source.id == VideoSource.legacyScreenID, let recording = instruction.cursorRecording, state.cursorStyle.visible {
+                            sourceImage = cursor(over: sourceImage, recording: recording, style: state.cursorStyle,
+                                zoom: ZoomPlacement(), at: sample.sourceTime, canvas: CGRect(origin: .zero, size: size))
+                        }
+                        clips.append((place(sourceImage, sourceSize: size, drawing: drawing, canvas: canvas), sample.weight))
+                    } else { clips.append((clear, sample.weight)) }
+                }
+                // Form one weighted layer, including transparent pixels, then
+                // source-over exactly once. Two independently faded overlays
+                // would incorrectly darken even an opaque half-way dissolve.
+                composition = linearBlend(clips, canvas: canvas).composited(over: composition)
+            }
+            composition = try content(over: composition, project: project, at: branch.sourceTime, canvas: canvas)
+            finished.append((composition, branch.weight))
+        }
+        return linearBlend(finished, canvas: canvas)
+    }
+
+    private func linearBlend(_ images: [(CIImage, Double)], canvas: CGRect) -> CIImage {
+        var blended: CIImage?
+        var total = 0.0
+        for (image, weight) in images where weight > 0 {
+            if let previous = blended {
+                blended = previous.applyingFilter("CIDissolveTransition", parameters: [
+                    kCIInputTargetImageKey: image, kCIInputTimeKey: weight / (total + weight)
+                ]).cropped(to: canvas)
+            } else { blended = image }
+            total += weight
+        }
+        guard let blended else { return CIImage(color: .clear).cropped(to: canvas) }
+        return opacity(blended, min(1, total)).cropped(to: canvas)
+    }
+
+    private func opacity(_ image: CIImage, _ alpha: Double) -> CIImage {
+        guard alpha < 1 else { return image }
+        return image.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: max(0, alpha))])
+    }
+
+    private func place(_ image: CIImage, sourceSize: CGSize, drawing: VideoSampleDrawingGeometry, canvas: CGRect) -> CIImage {
+        let viewport = drawing.viewport, frame = drawing.frame
+        guard viewport.width > 0, viewport.height > 0, frame.width > 0, frame.height > 0 else {
+            return CIImage(color: .clear).cropped(to: canvas)
+        }
+        let crop = CGRect(x: viewport.minX, y: sourceSize.height - viewport.maxY, width: viewport.width, height: viewport.height)
+        let target = CGRect(x: frame.minX, y: canvas.height - frame.maxY, width: frame.width, height: frame.height)
+        var placed = image.cropped(to: crop)
+            .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+            .transformed(by: CGAffineTransform(scaleX: target.width / crop.width, y: target.height / crop.height))
+            .transformed(by: CGAffineTransform(translationX: target.minX, y: target.minY))
+            .cropped(to: target)
+        if drawing.cornerRadius > 0, let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+            "inputExtent": CIVector(cgRect: target), "inputRadius": drawing.cornerRadius, "inputColor": CIColor.white
+        ])?.outputImage?.cropped(to: target) {
+            placed = placed.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: CIImage(color: .clear).cropped(to: target), kCIInputMaskImageKey: mask
+            ])
+        }
+        return opacity(placed, drawing.opacity).cropped(to: canvas)
+    }
+
+    private func vectorPattern(size: CGSize, seed: Int) -> CIImage {
+        // This path constructs artwork only. It never opens an AVAsset or
+        // decodes a movie; export still goes through the media interlock.
+        let palette: [(Double, Double, Double)] = [(0.15, 0.45, 0.85), (0.65, 0.2, 0.6), (0.1, 0.65, 0.5), (0.85, 0.4, 0.1)]
+        let color = palette[((seed % palette.count) + palette.count) % palette.count]
+        return CIFilter(name: "CICheckerboardGenerator", parameters: [
+            "inputColor0": CIColor(red: color.0, green: color.1, blue: color.2),
+            "inputColor1": CIColor(red: color.0 * 0.65, green: color.1 * 0.65, blue: color.2 * 0.65),
+            "inputWidth": max(20, min(size.width / 8, size.height / 6)), "inputSharpness": 1
+        ])!.outputImage!.cropped(to: CGRect(origin: .zero, size: size))
+    }
+
+    private func content(over background: CIImage, project: RecordingProject, at seconds: Double, canvas: CGRect) throws -> CIImage {
+        var image = background
+        for layer in project.state.contentLayers {
+            let alpha = layer.alpha(at: seconds)
+            guard alpha > 0 else { continue }
+            let artwork = try layerArtwork.image(for: layer, assets: project.contentAssets, canvas: canvas.size)
+            let rect = layer.frame(at: seconds)
+            let frame = CGRect(x: rect.x * canvas.width, y: rect.y * canvas.height,
+                width: rect.width * canvas.width, height: rect.height * canvas.height)
+            let overlay = artwork.transformed(by: CGAffineTransform(scaleX: frame.width / artwork.extent.width, y: frame.height / artwork.extent.height))
+                .transformed(by: CGAffineTransform(translationX: -frame.width / 2, y: -frame.height / 2))
+                .transformed(by: CGAffineTransform(rotationAngle: -layer.rotation * .pi / 180))
+                .transformed(by: CGAffineTransform(translationX: frame.midX, y: canvas.height - frame.midY))
+            image = opacity(overlay, alpha).composited(over: image)
+        }
+        return image.cropped(to: canvas)
+    }
 
     func image(screen screenBuffer: CVPixelBuffer?, camera cameraBuffer: CVPixelBuffer?,
                instruction: PIPCompositionInstruction, state: EditState, at seconds: Double,

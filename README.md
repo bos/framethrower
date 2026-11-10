@@ -169,6 +169,26 @@ project stores edits and undo history. Keep these files together. The legacy
 filename prefix is retained for compatibility with the upload helper. Local
 recording and editing do not require connecting Google Drive or Slack.
 
+## Importing video
+
+Choose **File > Import video…** (Shift-Command-I), or the import button in the
+recorder toolbar. FrameThrower uses macOS's built-in AVFoundation support for
+containers and codecs, without third-party media libraries. The chooser includes
+the system's video types; the file's actual video track and decoding support are
+checked before creating a project. Audio-only, protected, unreadable, and
+unsupported files report an error.
+
+Import creates a `.framethrower` project beside the existing video, without
+copying, moving, or transcoding it. Keep both files together. Repeated imports
+create separately named projects and preserve earlier edits. Source audio stays
+available through the editor's audio controls. Camera, pointer, and scene sidecars
+are not inferred from nearby files. The video's timing is retained; the editor's
+render cadence is limited to 1–120 fps.
+
+Import remains disabled during the temporary media suspension. Run
+`bash Tests/check-video-import.sh` for project/file checks with supplied metadata
+and plain text; these checks do not inspect or create video.
+
 ## Editing
 
 ### Content layers

@@ -196,6 +196,8 @@ final class CaptureViewModel: ObservableObject {
     private var projectEditors: [URL: ProjectEditor] = [:]
     private var projectChanges: [URL: AnyCancellable] = [:]
     @Published private(set) var isCaptureBusy = false
+    @Published private(set) var isImportingVideo = false
+    @Published private(set) var videoImportError: String?
     @Published private(set) var isExporting = false
     private var activeCameraURL: URL?
     private var activeCameraOffset = 0.0
@@ -945,7 +947,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func uploadLastRecordingToSlack() async {
-        guard !isAnyUploadActive, !isRecording, !isCaptureBusy else { return }
+        guard !isAnyUploadActive, !isRecording, !isCaptureBusy, !isImportingVideo else { return }
         guard let token = slackTokens?.accessToken else {
             log("Connect Slack first.", level: .error)
             return
@@ -1018,7 +1020,7 @@ final class CaptureViewModel: ObservableObject {
 
     func startRecording() async {
         guard !MediaProcessing.isSuspended else { return }
-        guard !isRecording, !isCaptureBusy, !isAnyUploadActive, isCameraReadyForCapture else { return }
+        guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive, isCameraReadyForCapture else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         isCaptureBusy = true
@@ -1180,13 +1182,60 @@ final class CaptureViewModel: ObservableObject {
 
     @discardableResult
     func chooseProject() -> URL? {
-        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return nil }
+        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return nil }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.message = "Choose a FrameThrower project (.framethrower) to continue editing."
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         return openProject(at: url, present: true)?.url
+    }
+
+    var canImportVideo: Bool {
+        !MediaProcessing.isSuspended && !isRecording && !isCountdownActive &&
+            !isCaptureBusy && !isImportingVideo && !isAnyUploadActive
+    }
+
+    func chooseVideoToImport() {
+        guard canImportVideo else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Import Video"
+        panel.prompt = "Import"
+        panel.allowedContentTypes = VideoImporter.contentTypes
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Create an editable project beside the video. Keep both files together."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            if await importVideo(at: url) == nil, let videoImportError {
+                let alert = NSAlert()
+                alert.messageText = "Could not import video"
+                alert.informativeText = videoImportError
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
+    }
+
+    @discardableResult
+    func importVideo(at url: URL) async -> URL? {
+        guard !MediaProcessing.isSuspended else {
+            videoImportError = MediaProcessing.statusMessage
+            return nil
+        }
+        guard canImportVideo else { return nil }
+        isImportingVideo = true
+        videoImportError = nil
+        defer { isImportingVideo = false }
+        do {
+            let editor = try await VideoImporter.importVideo(at: url)
+            registerProjectEditor(editor)
+            return openProject(at: editor.url, present: true)?.url
+        } catch is CancellationError { return nil }
+        catch {
+            videoImportError = error.localizedDescription
+            return nil
+        }
     }
 
     func editor(for url: URL) throws -> ProjectEditor {
@@ -1211,12 +1260,12 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func openRecording(at url: URL) {
-        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isAnyUploadActive else { return }
+        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return }
         openProject(at: url, present: true)
     }
 
     var canDuplicateRecording: Bool {
-        !isRecording && !isCountdownActive && !isCaptureBusy && !isAnyUploadActive
+        !isRecording && !isCountdownActive && !isCaptureBusy && !isImportingVideo && !isAnyUploadActive
     }
 
     func duplicateRecording(_ editor: ProjectEditor) {
@@ -1227,7 +1276,7 @@ final class CaptureViewModel: ObservableObject {
 
     @discardableResult
     func selectRecordingForSharing(at url: URL) -> Bool {
-        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isAnyUploadActive else { return false }
+        guard !isRecording, !isCountdownActive, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return false }
         return openProject(at: url, present: false) != nil
     }
 
@@ -1296,7 +1345,7 @@ final class CaptureViewModel: ObservableObject {
 
     func startRecordingAfterDelay(seconds: Int) async {
         guard !MediaProcessing.isSuspended else { return }
-        guard !isRecording, !isCaptureBusy, !isAnyUploadActive else { return }
+        guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }
         guard ensureScreenRecordingPermissionForCaptureAction() else { return }
         let countdownSeconds = max(1, seconds)
@@ -1355,7 +1404,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func uploadLastRecording() async {
-        guard !isAnyUploadActive, !isRecording, !isCaptureBusy else { return }
+        guard !isAnyUploadActive, !isRecording, !isCaptureBusy, !isImportingVideo else { return }
         isUploading = true
         beginUploadProgress()
         defer {

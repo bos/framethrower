@@ -14,7 +14,13 @@ struct FrameThrowerApp: App {
         .windowStyle(.titleBar)
         .commands {
             ProjectEditingCommands()
-            CommandGroup(after: .newItem) { OpenProjectMenu(model: model) }
+            CommandGroup(after: .newItem) {
+                OpenProjectMenu(model: model)
+                Button("Import video…") { model.chooseVideoToImport() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(!model.canImportVideo)
+                    .help(MediaProcessing.isSuspended ? MediaProcessing.statusMessage : "Create a project from an existing video")
+            }
             EditorFileCommands()
         }
 
@@ -94,7 +100,7 @@ private struct OpenProjectMenu: View {
             }
         }
         .keyboardShortcut("o", modifiers: .command)
-        .disabled(model.isRecording || model.isCaptureBusy || model.isAnyUploadActive)
+        .disabled(model.isRecording || model.isCountdownActive || model.isCaptureBusy || model.isImportingVideo || model.isAnyUploadActive)
     }
 }
 

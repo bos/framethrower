@@ -16,10 +16,10 @@ struct ContentView: View {
     @State private var previewEnabled = false
     @StateObject private var sourcePreviews = CaptureSourcePreviews()
 
-    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy }
+    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy || model.isImportingVideo }
     private var canRecord: Bool {
         guard !MediaProcessing.isSuspended else { return false }
-        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, model.isCameraReadyForCapture else { return false }
+        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.isImportingVideo, model.isCameraReadyForCapture else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
         case .display: return model.selectedDisplayID != nil
@@ -61,6 +61,10 @@ struct ContentView: View {
         .toolbar {
             recordingTitleToolbar
             ToolbarItemGroup(placement: .primaryAction) {
+                Button { model.chooseVideoToImport() } label: { Label("Import video", systemImage: "square.and.arrow.down") }
+                    .labelStyle(.iconOnly)
+                    .disabled(!model.canImportVideo)
+                    .help(MediaProcessing.isSuspended ? MediaProcessing.statusMessage : "Import a video (⇧⌘I)")
                 Button { model.chooseProject() } label: { Label("Open Recording", systemImage: "folder") }
                     .labelStyle(.iconOnly)
                     .disabled(captureLocked || model.isAnyUploadActive)
@@ -527,6 +531,7 @@ struct ContentView: View {
     }
 
     private var recordingStatus: String? {
+        if model.isImportingVideo { return "Importing video…" }
         if model.isCaptureBusy { return model.isRecording ? "Finishing recording…" : "Starting recording…" }
         if model.isRecording { return "Recording" }
         if MediaProcessing.isSuspended { return MediaProcessing.statusMessage }

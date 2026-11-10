@@ -27,6 +27,7 @@
 		2F9F3324BB52605CDAA02B9A /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36ACB61C84F04DE05285C1AA /* OAuth.swift */; };
 		323105BF10991A94F95A197F /* StatusChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD520E85E319DD599528423A /* StatusChip.swift */; };
 		3926CB2F05E2D44AD38392DB /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6581FEB23256078CAFBAD45C /* CameraPreview.swift */; };
+		3C8C2299275114DA92446591 /* VideoImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 666AE7A52096857295A0771C /* VideoImport.swift */; };
 		46DA5C2341F10136C0538C49 /* CaptureRecordingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E7696DDAAAF4BE5FA5E30BF /* CaptureRecordingSettings.swift */; };
 		4781464A4A910CAE5339759E /* CursorRecording.swift in Sources */ = {isa = PBXBuildFile; fileRef = F905EC803998351752697F83 /* CursorRecording.swift */; };
 		485B2C647E5B8415DED8C557 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = D36B84B4B1F8D344D22C3892 /* Models.swift */; };
@@ -126,6 +127,7 @@
 		5B32D2985DF73F0B3F411A2A /* director-agent-client.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "director-agent-client.py"; sourceTree = "<group>"; };
 		61AE4578ECBAB11E12BB2339 /* Resources */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources; sourceTree = SOURCE_ROOT; };
 		6581FEB23256078CAFBAD45C /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
+		666AE7A52096857295A0771C /* VideoImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoImport.swift; sourceTree = "<group>"; };
 		6CF655690A9E839FF2C6B1E0 /* RecordingProject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingProject.swift; sourceTree = "<group>"; };
 		6E7696DDAAAF4BE5FA5E30BF /* CaptureRecordingSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureRecordingSettings.swift; sourceTree = "<group>"; };
 		76D0B9D32FDB084A40056FA3 /* MediaProcessing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaProcessing.swift; sourceTree = "<group>"; };
@@ -266,6 +268,7 @@
 				CD520E85E319DD599528423A /* StatusChip.swift */,
 				193104B3DA371A4F3C553CD9 /* TimelineAnimation.swift */,
 				EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */,
+				666AE7A52096857295A0771C /* VideoImport.swift */,
 				0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */,
 				DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */,
 				010F10320038E81B6F92F45A /* WindowSelection.swift */,
@@ -496,6 +499,7 @@
 				323105BF10991A94F95A197F /* StatusChip.swift in Sources */,
 				97344A8A1EF1C8702134C52D /* TimelineAnimation.swift in Sources */,
 				FE7F22F290D9756FD5EAA0DF /* VideoExportUI.swift in Sources */,
+				3C8C2299275114DA92446591 /* VideoImport.swift in Sources */,
 				05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */,
 				9AFD8FED94BF5747ADCFF2F0 /* WhisperSpeechSession.swift in Sources */,
 				5DE6C50872135C1523F17FB9 /* WindowSelection.swift in Sources */,

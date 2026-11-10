@@ -17,6 +17,10 @@ struct EditorAutomationContext: Codable, Equatable, Sendable {
     /// Persistent recording identity; documentID is an open endpoint handle.
     var recordingID: UUID? = nil
     var timelineTimeBase: String? = nil
+    var selectedVideoLayerID: UUID? = nil
+    var selectedVideoClipID: UUID? = nil
+    var selectedVideoVolumeID: UUID? = nil
+
 }
 
 struct EditorAutomationEvent: Sendable {
@@ -66,7 +70,7 @@ enum EditorAutomationAPI {
         }
         return [
             tool("list_recordings", "List open recording editors with opaque document identities. Does not inspect source media.", object([:]), readOnly: true),
-            tool("inspect_editor", "Read current editor metadata. video_sources/video_layers/video_clips/video_animations are paginated on demand. video_clips requires layer_id; video_animations requires layer_id+clip_id. Clip placement uses project-authoring seconds; its source_start and animation points use that registered footage source clock. No file paths are returned. component=videos evaluates active layers with both project/source times. section=timing returns kept sections, cut joins and both source/output durations. For section=state, component returns one source value by default; time_base=output returns weighted samples of both crossfade branches. section=timing accepts output time for a read-only mapping query. Existing time/frameTime fields remain source time; preview.outputTime is finished-video time. Omit component for the full state. Component is valid only with section=state; state time requires component. Selection and playhead are separate.", object(doc.merging([
+            tool("inspect_editor", "Read current editor metadata. video_sources/video_layers/video_clips/video_animations are paginated on demand. video_clips requires layer_id; video_animations requires layer_id+clip_id. Clip placement uses project-authoring seconds; its source_start and animation points use that registered footage source clock. No file paths are returned. component=videos evaluates active layers with both project/source times. section=timing returns kept sections, cut joins and both source/output durations. For section=state, component returns one source value by default; time_base=output returns weighted samples of both crossfade branches. section=timing accepts output time for a read-only mapping query. Existing time/frameTime fields remain source time; preview.outputTime is finished-video time. Omit component for the full state. Component is valid only with section=state; state time requires component. Selection and playhead are separate. Context selectedVideoLayerID/selectedVideoClipID/selectedVideoVolumeID identify the current video selection; use that clip for requests like this clip, then inspect video_clips/video_animations for the necessary values.", object(doc.merging([
                 "section": ["type": "string", "enum": ["summary", "view", "edits", "boxes", "history", "state", "events", "conversation", "pending", "timing", "layers", "video_sources", "video_layers", "video_clips", "video_animations"]],
                 "component": ["type": "string", "enum": ["screen", "camera", "camera_opacity", "speed", "pointer", "audio", "canvas", "trim", "layers", "videos"]],
                 "time": ["type": "number", "minimum": 0],

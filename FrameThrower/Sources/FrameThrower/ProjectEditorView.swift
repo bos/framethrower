@@ -84,6 +84,12 @@ struct ProjectEditorView: View {
     }
 
     private var state: EditState { editor.editingState }
+    private var videoEditingTime: Double {
+        guard !playback.isInspectingSource, playback.outputDuration > 0,
+              playback.outputTime >= playback.outputDuration,
+              let end = playback.outputSamples.last?.sourceTime else { return playback.editingTime }
+        return editor.project.editingTime(at: max(0, end.nextDown), frameDuration: frameDuration)
+    }
     private var conflictReview: EditorConflictReview? { assistant.conflictReview }
     private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
     private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil) }
@@ -299,6 +305,9 @@ struct ProjectEditorView: View {
         .onChange(of: playback.time) { _, _ in refreshConflictFrame() }
         .onChange(of: selectedEditID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
         .onChange(of: selectedRegionID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
+        .onChange(of: selectedVideoLayerID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
+        .onChange(of: selectedVideoClipID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
+        .onChange(of: selectedVideoVolumeID) { _, _ in if conflictReview == nil { automation.recordEvent("selection_changed") } }
         .onChange(of: playback.isScrubbing) { _, scrubbing in if !scrubbing { refreshConflictFrame(); automation.recordEvent("preview_seek") } }
         .onChange(of: playback.isLoading) { _, loading in if !loading { refreshConflictFrame() } }
         .onChange(of: speedProfileIdentity, initial: true) { _, _ in
@@ -369,6 +378,7 @@ struct ProjectEditorView: View {
             if let selectedCutID, !state.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
         }
         .onChange(of: selectedInspector) { _, next in
+            if next != .videos { selectedVideoClipID = nil; selectedVideoVolumeID = nil }
             if next == .videos { selectedEditID = nil; selectedAnimationID = nil }
             else if next == .layers { selectedEditID = nil; selectedAnimationID = nil }
             else if animationGesture == nil { synchronizeAnimationSelection() }
@@ -379,7 +389,7 @@ struct ProjectEditorView: View {
             assistant.attachAutomation(automation)
             EditorAutomationRegistry.shared.register(automation)
         }
-        .onDisappear { assistant.suspend(); EditorAutomationRegistry.shared.unregister(automation); automation.navigate = nil; automation.conversationPage = nil; automation.selection = { (nil, nil, nil, nil) }; exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
+        .onDisappear { assistant.suspend(); EditorAutomationRegistry.shared.unregister(automation); automation.navigate = nil; automation.conversationPage = nil; automation.selection = { (nil, nil, nil, nil) }; automation.videoSelection = { (nil, nil, nil) }; exportSession.cancel(); _ = editor.finishDraft(); playback.close() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             assistant.suspend()
             LocalModelRuntime.terminateOwnedProcess()
@@ -452,6 +462,7 @@ struct ProjectEditorView: View {
         automation.timelineTimeBase = timelineTimeBase.rawValue
         let edit = $selectedEditID, box = $selectedRegionID, animation = $selectedAnimationID
         let inspector = $selectedInspector, director = $directorMode
+        let videoLayer = $selectedVideoLayerID, videoClip = $selectedVideoClipID, videoVolume = $selectedVideoVolumeID
         automation.conversationPage = { [weak assistant] offset, limit in
             guard let assistant else { throw EditorAutomationError.unavailable }
             return try assistant.conversationPage(offset: offset, limit: limit)
@@ -460,6 +471,7 @@ struct ProjectEditorView: View {
             (edit.wrappedValue, box.wrappedValue,
              animation.wrappedValue.map { "\($0.lane.rawValue):\($0.componentID.uuidString)" }, inspector.wrappedValue.rawValue)
         }
+        automation.videoSelection = { (videoLayer.wrappedValue, videoClip.wrappedValue, videoVolume.wrappedValue) }
         automation.navigate = { [weak editor, weak playback] operation, id, name in
             guard let editor, let playback else { throw EditorAutomationError.unavailable }
             // Match native boundaries: changing inspectors or selecting a
@@ -473,6 +485,7 @@ struct ProjectEditorView: View {
             }
             switch operation {
             case "clear_selection": edit.wrappedValue = nil; box.wrappedValue = nil; animation.wrappedValue = nil
+                videoLayer.wrappedValue = nil; videoClip.wrappedValue = nil; videoVolume.wrappedValue = nil
             case "show_inspector":
                 guard let name, let value = EditorInspector(rawValue: name) else { throw EditorAutomationError.invalid("Unknown inspector.") }
                 inspector.wrappedValue = value
@@ -593,9 +606,9 @@ struct ProjectEditorView: View {
                 .allowsHitTesting(selectedInspector == .layers && conflictReview == nil && !isBlendedCanvas && !playback.isPlaying)
             }
             .overlay {
-                VideoClipOverlay(project: editor.project, state: state, sourceSize: playback.sourceSize, time: playback.time,
+                VideoClipOverlay(project: editor.project, state: state, sourceSize: playback.sourceSize, time: videoEditingTime,
                     selection: selectedVideoClipID,
-                    isEditing: selectedInspector == .videos && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil,
+                    isEditing: selectedInspector == .videos && !(directorMode && previewTool == .box) && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil,
                     select: { layer, clip in
                         if clip != selectedVideoClipID { guard editor.finishDraft() else { return } }
                         selectedVideoLayerID = layer; selectedVideoClipID = clip; selectedVideoVolumeID = nil
@@ -603,22 +616,22 @@ struct ProjectEditorView: View {
                     },
                     begin: {
                         assistant.cancel(); playback.pause()
-                        if videoFramingClipID != selectedVideoClipID || videoFramingTime != playback.editingTime {
+                        if videoFramingClipID != selectedVideoClipID || videoFramingTime != videoEditingTime {
                             guard editor.finishDraft() else { return false }
                         }
-                        videoFramingClipID = selectedVideoClipID; videoFramingTime = playback.editingTime
+                        videoFramingClipID = selectedVideoClipID; videoFramingTime = videoEditingTime
                         videoGestureState = state; return true
                     },
                     preview: { layer, clip in
                         guard videoGestureState != nil else { return }
                         let next = VideoClipEditing.replacing(clip, layerID: layer, in: state, project: editor.project)
-                        _ = editor.updateDraft(next, at: playback.editingTime)
+                        _ = editor.updateDraft(next, at: videoEditingTime)
                     }, commit: { videoGestureState = nil }, cancel: {
-                        if let before = videoGestureState, before != editor.project.state { _ = editor.updateDraft(before, at: playback.editingTime) }
+                        if let before = videoGestureState, before != editor.project.state { _ = editor.updateDraft(before, at: videoEditingTime) }
                         else { _ = editor.cancelDraft() }
                         videoGestureState = nil
                     })
-                .allowsHitTesting(selectedInspector == .videos && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil)
+                .allowsHitTesting(selectedInspector == .videos && !(directorMode && previewTool == .box) && !playback.isPlaying && !isBlendedCanvas && conflictReview == nil)
             }
             .overlay(alignment: .topTrailing) { previewTools.padding(10) }
             .overlay(alignment: .bottomLeading) {
@@ -727,6 +740,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectRegion(_ id: UUID?) {
+        selectedVideoClipID = nil; selectedVideoVolumeID = nil
         cutSelection = nil; selectedCutID = nil
         guard id == nil || state.regions.contains(where: { $0.id == id }) else { return }
         playback.pause()
@@ -876,7 +890,7 @@ struct ProjectEditorView: View {
                 onSelectVideo: { layer, clip, point in
                     guard editor.finishDraft() else { return }
                     selectedVideoLayerID = layer; selectedVideoClipID = clip; selectedVideoVolumeID = point
-                    selectedAnimationID = nil; selectedEditID = nil; selectedCutID = nil; cutSelection = nil
+                    selectedAnimationID = nil; selectedEditID = nil; selectedContentLayerID = nil; selectedCutID = nil; cutSelection = nil
                     if clip != nil { selectedInspector = .videos }
                 }, onVideoEdit: { request, final in editVideo(request, final: final) },
                 onVideoCancel: { videoGestureState = nil; _ = editor.cancelDraft() },
@@ -1078,7 +1092,7 @@ struct ProjectEditorView: View {
                 case .audio: audioControls
                 case .speed: speedControls
                 case .videos:
-                    VideoLayersInspector(editor: editor, sourceTime: playback.editingTime, layerID: $selectedVideoLayerID, clipID: $selectedVideoClipID, volumeID: $selectedVideoVolumeID,
+                    VideoLayersInspector(editor: editor, sourceTime: videoEditingTime, layerID: $selectedVideoLayerID, clipID: $selectedVideoClipID, volumeID: $selectedVideoVolumeID,
                         prepare: { assistant.cancel(); leaveConflictForManualEdit(); playback.pause() })
                 case .layers:
                     ContentLayersInspector(editor: editor, sourceTime: playback.time, selection: $selectedContentLayerID,
@@ -1434,6 +1448,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectEdit(_ id: UUID) {
+        selectedVideoClipID = nil; selectedVideoVolumeID = nil
         cutSelection = nil; selectedCutID = nil
         if id == selectedEditID { playback.pause(); return }
         guard editor.finishDraft(), let edit = edits.first(where: { $0.id == id }) else { return }
@@ -1486,6 +1501,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectAnimation(_ id: TimelineAnimationID) {
+        selectedVideoClipID = nil; selectedVideoVolumeID = nil
         cutSelection = nil; selectedCutID = nil
         playback.pause()
         if selectedAnimationID == id { return }

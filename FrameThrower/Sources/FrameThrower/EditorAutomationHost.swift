@@ -63,6 +63,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     }
 
     var selection: () -> (UUID?, UUID?, String?, String?) = { (nil, nil, nil, nil) }
+    var videoSelection: () -> (layerID: UUID?, clipID: UUID?, volumeID: UUID?) = { (nil, nil, nil) }
     var navigate: ((String, UUID?, String?) throws -> Void)?
     var conversationPage: ((Int, Int) throws -> [String: Any])?
     var timelineTimeBase = "output"
@@ -94,12 +95,16 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     var automationContext: EditorAutomationContext {
         get throws {
             guard let editor else { throw EditorAutomationError.unavailable }
-            let selected = selection()
+            let selected = selection(), video = videoSelection()
+            let layer = editor.project.effectiveVideoLayers(in: editor.editingState).first { $0.id == video.layerID }
+            let clip = layer?.clips.first { $0.id == video.clipID }
+            let volume = clip?.volumeKeyframes.first { $0.id == video.volumeID }
             return EditorAutomationContext(documentID: documentID, name: editor.displayName,
                 revision: try EditorCommandDispatcher.revision(for: editor.project), hasDraft: editor.draftState != nil,
                 preview: playback?.previewSnapshot, selectedEditID: selected.0, selectedBoxID: selected.1,
                 selectedAnimationID: selected.2, inspector: selected.3, recordingID: editor.automationID,
-                timelineTimeBase: timelineTimeBase)
+                timelineTimeBase: timelineTimeBase, selectedVideoLayerID: layer?.id,
+                selectedVideoClipID: clip?.id, selectedVideoVolumeID: volume?.id)
         }
     }
     var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { events.eraseToAnyPublisher() }
@@ -111,7 +116,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         if kind == "preview_transport", lastTransport == transport { return }
         if kind.hasPrefix("preview_") { lastTransport = transport }
         if kind == "selection_changed" {
-            let signature = "\(String(describing: context.selectedEditID)):\(String(describing: context.selectedBoxID)):\(context.selectedAnimationID ?? ""):\(context.inspector ?? "")"
+            let signature = "\(String(describing: context.selectedEditID)):\(String(describing: context.selectedBoxID)):\(context.selectedAnimationID ?? ""):\(context.inspector ?? ""):\(String(describing: context.selectedVideoLayerID)):\(String(describing: context.selectedVideoClipID)):\(String(describing: context.selectedVideoVolumeID))"
             if signature == lastSelection { return }
             lastSelection = signature
         }
@@ -119,6 +124,18 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         var item: [String: Any] = ["sequence": eventSequence, "actor": actor, "kind": kind,
                                   "revision": context.revision]
         if let view = context.preview, let value = try? EditorAutomationAPI.object(view) { item["preview"] = value }
+        if kind == "selection_changed" {
+            // Explicit nulls distinguish clearing a selection from an event
+            // that simply does not concern selection.
+            item["selection"] = [
+                "selectedEditID": context.selectedEditID?.uuidString as Any? ?? NSNull(),
+                "selectedBoxID": context.selectedBoxID?.uuidString as Any? ?? NSNull(),
+                "selectedAnimationID": context.selectedAnimationID as Any? ?? NSNull(),
+                "inspector": context.inspector as Any? ?? NSNull(),
+                "selectedVideoLayerID": context.selectedVideoLayerID?.uuidString as Any? ?? NSNull(),
+                "selectedVideoClipID": context.selectedVideoClipID?.uuidString as Any? ?? NSNull(),
+                "selectedVideoVolumeID": context.selectedVideoVolumeID?.uuidString as Any? ?? NSNull()]
+        }
         recentEvents.append(item)
         if recentEvents.count > 128 { recentEvents.removeFirst(recentEvents.count - 128) }
         events.send(.init(actor: actor, kind: kind, context: context))

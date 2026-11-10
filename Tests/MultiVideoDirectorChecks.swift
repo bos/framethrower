@@ -88,7 +88,12 @@ struct MultiVideoDirectorChecks {
             return try await call("apply_edits", ["expected_revision": expected ?? revision(), "commands": commands, "name": name])
         }
         var shownInspector: String?
-        host.navigate = { operation, _, inspector in if operation == "show_inspector" { shownInspector = inspector } }
+        var selectedVideo: (layerID: UUID?, clipID: UUID?, volumeID: UUID?) = (nil, nil, nil)
+        host.videoSelection = { selectedVideo }
+        host.navigate = { operation, _, inspector in
+            if operation == "show_inspector" { shownInspector = inspector }
+            if operation == "clear_selection" { selectedVideo = (nil, nil, nil) }
+        }
         for inspector in ["Videos", "Speed"] {
             _ = try await call("navigate_editor", ["operation": "show_inspector", "inspector": inspector])
             try require(shownInspector == inspector, "Every public inspector schema value reaches the native navigation callback")
@@ -104,6 +109,37 @@ struct MultiVideoDirectorChecks {
         ]))
         try require(receipt["ok"] as? Bool == true, "Actual MCP host applies typed footage batch")
         let composed = editor.project
+        let selectionRevision = try revision()
+        selectedVideo = (layer, clip, volumePoint)
+        host.recordEvent("selection_changed")
+        let selectedView = try result(await call("inspect_editor", ["section": "view"]))
+        let selectedContext = selectedView["context"] as! [String: Any]
+        try require(selectedContext["selectedVideoLayerID"] as? String == layer.uuidString &&
+            selectedContext["selectedVideoClipID"] as? String == clip.uuidString &&
+            selectedContext["selectedVideoVolumeID"] as? String == volumePoint.uuidString,
+            "Native view context identifies the selected layer, clip and volume point")
+        let selectedEventPage = try result(await call("inspect_editor", ["section": "events"]))
+        let selectionEvents = ((selectedEventPage["page"] as! [String: Any])["items"] as! [[String: Any]])
+        let selectedDetails = selectionEvents.last { $0["kind"] as? String == "selection_changed" }!["selection"] as! [String: Any]
+        try require(selectedDetails["selectedVideoClipID"] as? String == clip.uuidString && selectedDetails["selectedVideoVolumeID"] as? String == volumePoint.uuidString,
+            "Selection change events distinguish video-only changes")
+        _ = try await call("navigate_editor", ["operation": "clear_selection"])
+        let cleared = try host.automationContext
+        try require(cleared.selectedVideoLayerID == nil && cleared.selectedVideoClipID == nil && cleared.selectedVideoVolumeID == nil,
+            "Clear selection removes the current video target")
+        let clearedEventPage = try result(await call("inspect_editor", ["section": "events"]))
+        let clearedEvents = ((clearedEventPage["page"] as! [String: Any])["items"] as! [[String: Any]])
+        let clearedDetails = clearedEvents.last { $0["kind"] as? String == "selection_changed" }!["selection"] as! [String: Any]
+        try require(clearedDetails["selectedVideoLayerID"] is NSNull && clearedDetails["selectedVideoClipID"] is NSNull && clearedDetails["selectedVideoVolumeID"] is NSNull,
+            "Clearing selection is explicit in event details")
+        selectedVideo = (layer, clip, UUID())
+        try require(try host.automationContext.selectedVideoClipID == clip && host.automationContext.selectedVideoVolumeID == nil,
+            "Stale volume selection never advertises a nonexistent point")
+        selectedVideo = (layer, UUID(), volumePoint)
+        try require(try host.automationContext.selectedVideoClipID == nil && host.automationContext.selectedVideoVolumeID == nil,
+            "Stale clip selection never advertises a point from another clip")
+        selectedVideo = (nil, nil, nil)
+        try require(editor.project == composed && revision() == selectionRevision, "Video selection and inspection are transient, without edits or history")
         let layers = composed.state.videoLayers!
         try require(layers.count == 3 && layers[0].clips[0].layout == .screen && layers[1].clips[0].layout == .camera,
             "First explicit edit materializes original screen/camera adapters")

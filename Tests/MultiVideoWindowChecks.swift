@@ -174,6 +174,28 @@ struct MultiVideoWindowChecks {
         try require(editor.undo(), "Undo combined framing")
         try await settle(host) { editor.draftState == nil }
         try require(editor.project.state.videoLayers!.first { $0.id == audioLayer.id }!.clips[0] == clip, "combined framing Undo lost original clip")
+        // At the paused endpoint, display and handles use the final retained
+        // frame rather than the half-open instant just beyond all footage.
+        playback.seekOutput(12)
+        timeline.onSelectVideo?(phoneLayer.id, phoneClip.id, nil)
+        try await settle(host) { overlay.selection == phoneClip.id && overlay.time < 12 && overlay.time > 11 }
+        try require(overlay.isEditing && overlay.frame(phoneClip).width > 0,
+            "final-frame clip cannot be selected for direct framing")
+        var trimmed = editor.project.state
+        trimmed.trimEnd = 10
+        let phoneIndex = trimmed.videoLayers!.firstIndex { $0.id == phoneLayer.id }!
+        trimmed.videoLayers![phoneIndex].clips[0].end = 10
+        try require(editor.commit(trimmed, name: "Trim endpoint fixture"), "save endpoint fixture")
+        try await settle(host) { playback.outputDuration == 10 }
+        playback.seekOutput(10)
+        timeline.onSelectVideo?(phoneLayer.id, phoneClip.id, nil)
+        try await settle(host) { overlay.selection == phoneClip.id && overlay.time < 10 && overlay.time > 9 }
+        let atEnd = overlay.frame(phoneClip)
+        try drag(overlay, from: CGPoint(x: atEnd.midX, y: atEnd.midY), to: CGPoint(x: atEnd.midX - 10, y: atEnd.midY))
+        try await settle(host) { editor.draftState != nil }
+        try require(editor.draftState!.videoLayers![phoneIndex].clips[0].geometryKeyframes.last!.time < 10,
+            "last retained frame edited an invisible endpoint")
+        overlay.cancelOperation(nil)
         print("Multi-video window checks passed (offscreen vectors; no app focus or media)")
     }
 }

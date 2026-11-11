@@ -26,6 +26,8 @@ struct VideoImportChecks {
                     "Full source is referenced by its relative name")
         try require(project.state.trimStart == 0 && project.state.trimEnd == metadata.duration &&
                     project.captureFrameDuration == metadata.frameDuration, "Duration and fractional cadence survive saving")
+        try require(project.state.presentation.aspect == .source && project.state.presentation.padding == 0,
+                    "A fresh import adopts the source aspect without an inherited canvas preset or inset")
         try require(project.cameraFilename == nil && project.cursorFilename == nil && project.sceneFilename == nil &&
                     project.state.audio == RecordingAudio(), "No invented sidecars or changed audio settings")
 
@@ -54,6 +56,10 @@ struct VideoImportChecks {
         let slow = try VideoImporter.createProject(for: source, metadata: .init(duration: 3, frameDuration: 2))
         try require(fast.project.captureFrameDuration == 1.0 / 120 && slow.project.captureFrameDuration == 1,
                     "Render cadence respects editor bounds")
+        let phone = try VideoImporter.createProject(for: source, metadata: .init(duration: 3, frameDuration: 1.0 / 30,
+            pixelWidth: 1080, pixelHeight: 1920, hasAudio: true))
+        try require(phone.project.state.presentation.aspect == .source,
+                    "Portrait import retains exact source aspect rather than assuming a 9:16 preset")
         let beforeInvalid = try FileManager.default.contentsOfDirectory(atPath: directory.path).count
         for invalid in [VideoImporter.Metadata(duration: 0, frameDuration: 1.0 / 30),
                         .init(duration: .nan, frameDuration: 1.0 / 30), .init(duration: .infinity, frameDuration: 1.0 / 30),

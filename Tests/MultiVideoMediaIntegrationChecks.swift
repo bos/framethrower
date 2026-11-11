@@ -23,10 +23,17 @@ struct MultiVideoMediaIntegrationChecks {
     static func checks() async throws {
         try require(!MediaProcessing.isSuspended, "recorded media must be explicitly enabled")
         try require(MediaProcessing.isCaptureSuspended, "live capture must remain suspended")
-        guard CommandLine.arguments.count == 2 else { throw Failure.failed("fixture directory argument") }
+        guard CommandLine.arguments.count >= 2 else { throw Failure.failed("fixture directory argument") }
         let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         let originals = ["primary.mov", "A.mov", "B.mov", "portrait.mov"]
         let before = try Dictionary(uniqueKeysWithValues: originals.map { ($0, try Data(contentsOf: directory.appendingPathComponent($0))) })
+        try await sourceAspectImport(directory: directory)
+        if CommandLine.arguments.dropFirst(2).contains("--aspect-only") {
+            for name in originals { try require(try Data(contentsOf: directory.appendingPathComponent(name)) == before[name], "aspect checks preserve original bytes") }
+            print("Recorded import aspect checks passed; no live capture.")
+            return
+        }
+        phase = "multi-video import"
         let editor = try await VideoImporter.importVideo(at: directory.appendingPathComponent("primary.mov"))
         _ = try await ProjectVideoImport.addSources(["A.mov", "B.mov", "portrait.mov"].map { directory.appendingPathComponent($0) }, to: editor, at: 0)
         try require(editor.project.videoAssets.count == 3, "actual managed import registers three immutable sources")
@@ -155,6 +162,43 @@ struct MultiVideoMediaIntegrationChecks {
     static func frame(_ generator: AVAssetImageGenerator, at seconds: Double) async throws -> CGImage {
         try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 60_000)).image
     }
+    static func sourceAspectImport(directory: URL) async throws {
+        phase = "fresh portrait source aspect"
+        let phone = try await VideoImporter.importVideo(at: directory.appendingPathComponent("portrait.mov"))
+        try require(phone.project.state.presentation.aspect == .source, "fresh phone import selects its source aspect")
+        let initial = try await ProjectRenderer.makePreview(project: phone.project, directory: directory)
+        try require(initial.sourceSize == CGSize(width: 48, height: 96) && initial.screenSize == CGSize(width: 48, height: 96),
+            "fresh import adopts preferred-transform portrait dimensions rather than encoded landscape dimensions")
+        let preview = NativePreview(rendered: initial)
+        defer { preview.close() }
+        let image = try await preview.image(at: 0.5)
+        try require(image.width == 48 && image.height == 96, "actual imported preview frame has original portrait aspect")
+        let source = AVAssetImageGenerator(asset: AVURLAsset(url: directory.appendingPathComponent("portrait.mov")))
+        source.appliesPreferredTrackTransform = true
+        defer { source.cancelAllCGImageGeneration() }
+        let reference = try await frame(source, at: 0.5)
+        for (x, y) in [(4, 4), (40, 4), (4, 90)] {
+            let actual = try pixel(image, x: x, y: y), expected = try pixel(reference, x: x, y: y)
+            // This checks quadrant orientation, not independent decoder color
+            // management. The synthetic quadrants use distinct RGB primaries;
+            // their high/low channels survive profile-conversion differences.
+            try require(actual.map { $0 >= 128 } == expected.map { $0 >= 128 },
+                "full portrait preview preserves orientation at(\(x),\(y)): actual\(actual), expected\(expected)")
+        }
+        preview.close()
+        _ = try await ProjectVideoImport.addSources([directory.appendingPathComponent("A.mov")], to: phone, at: 0)
+        let later = try await ProjectRenderer.makePreview(project: phone.project, directory: directory)
+        try require(phone.project.state.presentation.aspect == .source && later.screenSize == initial.screenSize,
+            "adding landscape footage to a portrait project does not change its canvas")
+        var square = phone.project.state
+        square.presentation.aspect = .square
+        try require(phone.commit(square, name: "Square canvas"), "user can explicitly choose a different project canvas")
+        _ = try await ProjectVideoImport.addSources([directory.appendingPathComponent("B.mov")], to: phone, at: 0)
+        let chosen = try await ProjectRenderer.makePreview(project: phone.project, directory: directory)
+        try require(phone.project.state.presentation.aspect == .square && chosen.screenSize == CGSize(width: 96, height: 96),
+            "later footage also preserves an explicitly chosen canvas aspect")
+        print("Fresh rotated-phone import adopts48×96; later landscape imports preserve source or user-chosen canvas.")
+    }
     static func pixel(_ image: CGImage, x: Int, y: Int) throws -> [Int] {
         var data = [UInt8](repeating: 0, count: image.width * image.height * 4)
         try data.withUnsafeMutableBytes { bytes in
@@ -205,8 +249,10 @@ struct MultiVideoMediaIntegrationChecks {
         let item: AVPlayerItem
         let output: AVPlayerItemVideoOutput
         let player: AVPlayer
+        let renderSize: CGSize
         private var isClosed = false
         init(rendered: RenderedProject) {
+            renderSize = rendered.screenSize
             item = AVPlayerItem(asset: rendered.asset); item.videoComposition = rendered.videoComposition; item.audioMix = rendered.audioMix
             item.seekingWaitsForVideoCompositionRendering = true
             output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
@@ -227,7 +273,7 @@ struct MultiVideoMediaIntegrationChecks {
             let context = CIContext(options: [.cacheIntermediates: false])
             while ContinuousClock.now < deadline {
                 if let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil),
-                   let image = context.createCGImage(CIImage(cvPixelBuffer: buffer), from: CGRect(x: 0, y: 0, width: 96, height: 64)) { return image }
+                   let image = context.createCGImage(CIImage(cvPixelBuffer: buffer), from: CGRect(origin: .zero, size: renderSize)) { return image }
                 if item.status == .failed { throw item.error ?? Failure.failed("native preview failed") }
                 try await Task.sleep(for: .milliseconds(10))
             }

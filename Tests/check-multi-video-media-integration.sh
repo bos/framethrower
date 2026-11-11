@@ -1,7 +1,7 @@
 #!/bin/sh
 # Actual prerecorded media only. Never creates a capture session/device/stream.
 set -eu
-case "${1-}" in ""|--with-ui) ;; *) echo "Usage: check-multi-video-media-integration.sh [--with-ui]" >&2; exit 2;; esac
+case "${1-}" in ""|--with-ui|--aspect-only) ;; *) echo "Usage: check-multi-video-media-integration.sh [--with-ui|--aspect-only]" >&2; exit 2;; esac
 if [ "${FRAMETHROWER_VECTOR_PREVIEW:-}" = 1 ]; then
   printf '%s\n' 'SKIP: prerecorded media integration requires normal recorded playback.' >&2
   exit 77
@@ -36,7 +36,7 @@ taskpolicy -b ffmpeg -nostdin -v error -y -filter_threads 1 -f lavfi -i 'color=c
   -vf 'drawbox=x=48:y=0:w=48:h=24:color=cyan:t=fill,drawbox=x=0:y=24:w=48:h=24:color=magenta:t=fill,drawbox=x=48:y=24:w=48:h=24:color=white:t=fill' \
   -c:v libx264 -threads 1 -pix_fmt yuv420p "$check_dir/portrait-native.mov"
 taskpolicy -b ffmpeg -nostdin -v error -y -display_rotation 90 -i "$check_dir/portrait-native.mov" -c copy "$check_dir/portrait.mov"
-taskpolicy -b "$check_dir/check-multi-video-media" "$check_dir"
+taskpolicy -b "$check_dir/check-multi-video-media" "$check_dir" "$@"
 
 if [ "${1-}" = --with-ui ]; then
   "$repo_dir/Tests/check-multi-video-recorded-window.sh" "$check_dir"

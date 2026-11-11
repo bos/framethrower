@@ -97,7 +97,7 @@ struct DisplayCarousel: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .background(CapturePreviewVisibility(isVisible: $previewVisible))
-        .task(id: "\(displayKey):\(previewVisible):\(model.hasScreenRecordingPermission):\(captureLocked)") {
+        .task(id: "\(displayKey):\(previewVisible):\(model.hasScreenRecordingPermission):\(captureLocked):\(MediaProcessing.captureGeneration)") {
             await refreshPreviews()
         }
     }
@@ -116,6 +116,7 @@ struct DisplayCarousel: View {
             sourcePreviews.clear()
             return
         }
+        let captureGeneration = MediaProcessing.captureGeneration
         let displays = model.displays
         let displayIDs = Set(displays.map(\.id))
         images = images.filter { displayIDs.contains($0.key) }
@@ -142,7 +143,8 @@ struct DisplayCarousel: View {
                 var succeeded = true
                 for display in displays {
                     try Task.checkCancellation()
-                    guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                    guard !MediaProcessing.isCaptureSuspended, captureGeneration == MediaProcessing.captureGeneration,
+                          previewVisible, !captureLocked, model.hasScreenRecordingPermission,
                           CGPreflightScreenCaptureAccess(), let filter = filters[display.id] else { return false }
                     let size = filter.contentRect.size
                     let scale = min(1, 640 / max(size.width, size.height, 1))
@@ -156,7 +158,8 @@ struct DisplayCarousel: View {
                             contentFilter: filter, configuration: configuration
                         )
                         try Task.checkCancellation()
-                        guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                        guard !MediaProcessing.isCaptureSuspended, captureGeneration == MediaProcessing.captureGeneration,
+                          previewVisible, !captureLocked, model.hasScreenRecordingPermission,
                               CGPreflightScreenCaptureAccess() else { return false }
                         let source = CapturePreviewSource.display(id: display.id, frame: display.display.frame)
                         sourcePreviews.store(capture, contentSize: size, for: source)

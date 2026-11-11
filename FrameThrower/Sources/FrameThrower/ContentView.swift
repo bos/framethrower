@@ -16,10 +16,10 @@ struct ContentView: View {
     @State private var previewEnabled = false
     @StateObject private var sourcePreviews = CaptureSourcePreviews()
 
-    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy || model.isImportingVideo }
+    private var captureLocked: Bool { model.isRecording || model.isCountdownActive || model.isCaptureBusy || model.isImportingVideo || model.isChangingDebugCapture }
     private var canRecord: Bool {
         guard !MediaProcessing.isCaptureSuspended else { return false }
-        guard model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.isImportingVideo, model.isCameraReadyForCapture else { return false }
+        guard !model.isChangingDebugCapture, model.hasScreenRecordingPermission, !model.isAnyUploadActive, !model.isCaptureBusy, !model.isImportingVideo, model.isCameraReadyForCapture else { return false }
         switch model.captureKind {
         case .window: return model.selectedWindow != nil
         case .display: return model.selectedDisplayID != nil
@@ -83,6 +83,10 @@ struct ContentView: View {
             model.refreshScreenRecordingPermissionState()
             model.startSourceAutoRefresh()
             Task { await model.refreshSources() }
+        }
+        .onChange(of: MediaProcessing.isCaptureSuspended) { _, _ in
+            previewEnabled = false
+            sourcePreviews.clear()
         }
         .onChange(of: model.hasScreenRecordingPermission) { _, granted in
             if !granted { sourcePreviews.clear() }
@@ -568,6 +572,11 @@ struct ContentView: View {
                     .foregroundStyle(model.latestLogEntry?.level == .error ? RecorderStyle.accent : .secondary)
             }
             Spacer(minLength: 8)
+            #if DEBUG
+            DebugLiveCaptureToggle(isOn: model.debugLiveCaptureEnabled, isEnabled: model.canChangeDebugLiveCapture) { enabled in
+                Task { await model.setDebugLiveCaptureEnabled(enabled) }
+            }.frame(width: 145, height: 18)
+            #endif
             Button {
                 model.isLogExpanded.toggle()
             } label: {
@@ -705,3 +714,29 @@ struct RecorderWorkspace<Capture: View, Controls: View, Recordings: View>: View 
         }
     }
 }
+
+#if DEBUG
+/// Session-only diagnostic control. Native checkbox behavior is independently
+/// testable without invoking a recorder or requesting a device.
+struct DebugLiveCaptureToggle: NSViewRepresentable {
+    var isOn: Bool
+    var isEnabled: Bool
+    var changed: (Bool) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(checkboxWithTitle: "Debug: Live capture", target: context.coordinator, action: #selector(Coordinator.toggle(_:)))
+        button.controlSize = .small; button.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        button.setAccessibilityIdentifier("debug-live-capture")
+        button.toolTip = "Enable screen recording, camera and live previews for this run. Off again on next launch. Stop recording before changing it."
+        return button
+    }
+    func updateNSView(_ button: NSButton, context: Context) {
+        context.coordinator.changed = changed
+        button.state = isOn ? .on : .off; button.isEnabled = isEnabled
+    }
+    @MainActor final class Coordinator: NSObject {
+        var changed: (Bool) -> Void = { _ in }
+        @objc func toggle(_ sender: NSButton) { guard sender.isEnabled else { return }; changed(sender.state == .on) }
+    }
+}
+#endif

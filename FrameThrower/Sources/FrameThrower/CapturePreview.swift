@@ -39,12 +39,14 @@ struct CapturePreview: View {
         var requested: Bool
         var locked: Bool
         var visible: Bool
+        var captureGeneration: UInt64
     }
 
     private var refreshKey: RefreshKey {
         RefreshKey(source: source, kind: model.captureKind.rawValue, refreshID: refreshID,
                    hasPermission: model.hasScreenRecordingPermission, enabled: isEnabled,
-                   requested: previewRequested, locked: captureLocked, visible: previewVisible)
+                   requested: previewRequested, locked: captureLocked, visible: previewVisible,
+                   captureGeneration: MediaProcessing.captureGeneration)
     }
 
     private var currentImage: NSImage? { !MediaProcessing.isCaptureSuspended && imageSource == source ? image : nil }
@@ -190,6 +192,7 @@ struct CapturePreview: View {
         }
         failed = false
         guard previewVisible, !captureLocked, automaticallyUpdates || isEnabled || previewRequested else { return }
+        let captureGeneration = MediaProcessing.captureGeneration
         var cachedFilter: SCContentFilter?
         var displayFrame: CGRect?
         await sourcePreviews.refreshes.run(repeating: automaticallyUpdates) {
@@ -212,7 +215,8 @@ struct CapturePreview: View {
                     }
                 }
                 try Task.checkCancellation()
-                guard previewVisible, !captureLocked, model.hasScreenRecordingPermission,
+                guard !MediaProcessing.isCaptureSuspended, captureGeneration == MediaProcessing.captureGeneration,
+                      previewVisible, !captureLocked, model.hasScreenRecordingPermission,
                       CGPreflightScreenCaptureAccess(), source == requestedSource,
                       let filter = cachedFilter else { return false }
                 let configuration = SCStreamConfiguration()
@@ -224,7 +228,8 @@ struct CapturePreview: View {
                 try MediaProcessing.requireCaptureEnabled()
                 let capture = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
                 try Task.checkCancellation()
-                guard previewVisible, source == requestedSource, !captureLocked, model.hasScreenRecordingPermission,
+                guard !MediaProcessing.isCaptureSuspended, captureGeneration == MediaProcessing.captureGeneration,
+                      previewVisible, source == requestedSource, !captureLocked, model.hasScreenRecordingPermission,
                       CGPreflightScreenCaptureAccess() else { return false }
                 sourcePreviews.store(capture, contentSize: size, for: requestedSource)
                 imageDisplayFrame = displayFrame

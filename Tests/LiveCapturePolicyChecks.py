@@ -19,7 +19,10 @@ def before(source, function, guard, operation):
 
 def main():
     policy = read("MediaProcessing.swift")
-    assert re.search(r"static\s+let\s+isCaptureSuspended\s*=\s*true\b", policy), "Live capture must remain disabled in source"
+    assert re.search(r"static\s+let\s+isCaptureSuspended\s*=\s*true\b", policy), "Release capture must remain disabled"
+    assert "#if DEBUG" in policy and "setDebugLiveCaptureEnabled" in policy
+    assert "private var enabled = false" in policy and "private var generation: UInt64 = 0" in policy
+    assert "UserDefaults" not in policy, "Live capture must not persist across launches"
     assert "requireCaptureEnabled" in policy and "CaptureSuspended" in policy
 
     screen = read("ScreenRecorder.swift")
@@ -27,7 +30,8 @@ def main():
     before(screen, "func firstVideoPresentationTime", "MediaProcessing.requireEnabled()", "AVURLAsset(url:")
 
     camera = read("CameraRecorder.swift")
-    assert "private let engine: CameraCaptureEngine? = MediaProcessing.isCaptureSuspended ? nil : CameraCaptureEngine()" in camera, "Suspension must prevent eager camera session construction"
+    assert "private var engine: CameraCaptureEngine?" in camera, "Camera engine must be created lazily"
+    assert "= CameraCaptureEngine()" not in camera, "Capture session cannot be constructed eagerly"
     before(camera, "func configure(id:", "MediaProcessing.requireCaptureEnabled()", "queue.async")
     before(camera, "func startRecording(to", "MediaProcessing.requireCaptureEnabled()", "engine.startRecording")
     before(camera, "func append(_ sample:", "MediaProcessing.requireCaptureEnabled()", "AVAssetWriter(outputURL:")

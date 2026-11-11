@@ -49,37 +49,54 @@ final class CameraRecorder: ObservableObject {
 
     var session: AVCaptureSession? { engine?.session }
 
-    // Do not even construct a native capture session while live capture is off.
-    private let engine: CameraCaptureEngine? = MediaProcessing.isCaptureSuspended ? nil : CameraCaptureEngine()
-    private var selectionGeneration = 0
+    // Selection is restored after a Debug opt-in, but native objects are never
+    // constructed by startup or by device discovery alone.
+    private var engine: CameraCaptureEngine?
+    private var engineToken: UUID?
+    private var selectionGeneration: UInt64 = 0
     private var observers: [any NSObjectProtocol] = []
 
-    init() {
-        guard !MediaProcessing.isCaptureSuspended else { return }
-        refreshDevices()
-        engine?.reportError = { [weak self] message in
-            Task { @MainActor [weak self] in
-                self?.errorMessage = message
-                self?.isReady = false
-            }
-        }
-        for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
-            observers.append(NotificationCenter.default.addObserver(
-                forName: name, object: nil, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.refreshDevices() }
-            })
-        }
-    }
+    init() {}
 
     deinit {
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         engine?.shutDown()
     }
 
+    func resumeCaptureDiscovery() async {
+        guard !MediaProcessing.isCaptureSuspended else { return }
+        let captureGeneration = MediaProcessing.captureGeneration
+        if observers.isEmpty {
+            for name in [AVCaptureDevice.wasConnectedNotification, AVCaptureDevice.wasDisconnectedNotification] {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor [weak self] in self?.refreshDevices() }
+                })
+            }
+        }
+        refreshDevices()
+        guard captureIsCurrent(captureGeneration) else { return }
+        if let selectedDeviceID { await selectDevice(selectedDeviceID) }
+    }
+
+    /// Revocation is a shutdown action, so it remains permitted after Off.
+    /// Keep the selection and last device names for a later deliberate opt-in.
+    func suspendCapture() async {
+        selectionGeneration &+= 1
+        isPreparing = false; isReady = false; isRecording = false
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+        let previous = engine
+        engine = nil; engineToken = nil
+        previous?.invalidate()
+        await previous?.shutDownAndWait()
+    }
+
     func refreshDevices() {
-        guard !MediaProcessing.isCaptureSuspended else { devices = []; return }
-        devices = Self.discover().map { CameraDevice(id: $0.uniqueID, name: $0.localizedName) }
+        guard !MediaProcessing.isCaptureSuspended else { return }
+        let captureGeneration = MediaProcessing.captureGeneration
+        let discovered = Self.discover().map { CameraDevice(id: $0.uniqueID, name: $0.localizedName) }
+        guard captureIsCurrent(captureGeneration) else { return }
+        devices = discovered
         if let selectedDeviceID, !devices.contains(where: { $0.id == selectedDeviceID }) {
             isReady = false
             errorMessage = CameraRecordingError.unavailable.localizedDescription
@@ -88,45 +105,59 @@ final class CameraRecorder: ObservableObject {
     }
 
     func selectDevice(_ id: String?) async {
-        guard !MediaProcessing.isCaptureSuspended else {
-            selectedDeviceID = nil
-            isReady = false
-            errorMessage = id == nil ? nil : MediaProcessing.captureStatusMessage
-            return
-        }
         guard !isRecording else { return }
-        selectionGeneration += 1
+        selectionGeneration &+= 1
         let generation = selectionGeneration
         selectedDeviceID = id
-        errorMessage = nil
-        isReady = false
+        errorMessage = nil; isReady = false
+        if MediaProcessing.isCaptureSuspended {
+            errorMessage = id == nil ? nil : MediaProcessing.captureStatusMessage
+            await suspendCapture()
+            return
+        }
+        let captureGeneration = MediaProcessing.captureGeneration
+        guard let id else {
+            isPreparing = false
+            let previous = engine; engine = nil; engineToken = nil
+            previous?.invalidate()
+            await previous?.shutDownAndWait()
+            return
+        }
         isPreparing = true
-        defer {
-            if generation == selectionGeneration { isPreparing = false }
+        defer { if generation == selectionGeneration { isPreparing = false } }
+        let granted: Bool
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: granted = true
+        case .notDetermined: granted = await AVCaptureDevice.requestAccess(for: .video)
+        default: granted = false
         }
-        if id != nil {
-            let granted: Bool
-            switch AVCaptureDevice.authorizationStatus(for: .video) {
-            case .authorized: granted = true
-            case .notDetermined: granted = await AVCaptureDevice.requestAccess(for: .video)
-            default: granted = false
-            }
-            guard generation == selectionGeneration else { return }
-            guard granted else {
-                errorMessage = CameraRecordingError.permissionDenied.localizedDescription
-                return
+        // A permission response can arrive long after Off, or after a different
+        // selection. Never let that response create or restart a native session.
+        guard !Task.isCancelled, generation == selectionGeneration, captureIsCurrent(captureGeneration) else { return }
+        guard granted else { errorMessage = CameraRecordingError.permissionDenied.localizedDescription; return }
+        if engine == nil {
+            guard let created = CameraCaptureEngine(captureGeneration: captureGeneration) else { return }
+            let token = UUID(); engine = created; engineToken = token
+            created.reportError = { [weak self] message in
+                Task { @MainActor [weak self] in
+                    guard let self, self.engineToken == token, self.captureIsCurrent(captureGeneration) else { return }
+                    self.errorMessage = message; self.isReady = false
+                }
             }
         }
-        guard generation == selectionGeneration else { return }
+        guard let engine else { return }
         do {
-            guard let engine else { throw MediaProcessing.CaptureSuspended() }
             try await engine.configure(id: id)
-            guard generation == selectionGeneration else { return }
-            isReady = id != nil
+            guard !Task.isCancelled, generation == selectionGeneration, captureIsCurrent(captureGeneration), self.engine === engine else { return }
+            isReady = true
         } catch {
-            guard generation == selectionGeneration else { return }
+            guard generation == selectionGeneration, captureIsCurrent(captureGeneration), self.engine === engine else { return }
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func captureIsCurrent(_ generation: UInt64) -> Bool {
+        !MediaProcessing.isCaptureSuspended && MediaProcessing.captureGeneration == generation
     }
 
     /// Returns the host-clock timestamp of the first frame written, not the time
@@ -138,24 +169,27 @@ final class CameraRecorder: ObservableObject {
             throw CameraRecordingError.unavailable
         }
         guard !isRecording else { throw CameraRecordingError.alreadyRecording }
+        let generation = selectionGeneration, captureGeneration = MediaProcessing.captureGeneration
         isRecording = true
         errorMessage = nil
         do {
-            return try await engine.startRecording(to: url, quality: quality)
+            let time = try await engine.startRecording(to: url, quality: quality)
+            guard generation == selectionGeneration, captureIsCurrent(captureGeneration), self.engine === engine else { throw MediaProcessing.CaptureSuspended() }
+            return time
         } catch {
-            isRecording = false
-            errorMessage = error.localizedDescription
+            if generation == selectionGeneration { isRecording = false; errorMessage = error.localizedDescription }
             throw error
         }
     }
 
     func stopRecording() async throws {
         guard isRecording, let engine else { return }
-        defer { isRecording = false }
+        let generation = selectionGeneration
+        defer { if generation == selectionGeneration { isRecording = false } }
         do {
             try await engine.stopRecording()
         } catch {
-            errorMessage = error.localizedDescription
+            if generation == selectionGeneration { errorMessage = error.localizedDescription }
             throw error
         }
     }
@@ -170,10 +204,37 @@ final class CameraRecorder: ObservableObject {
     }
 }
 
+/// Thread-safe revocation and request ordering; it contains no native camera
+/// object. The injected policy seam lets tests cover Off/On ABA without touching
+/// the process's real opt-in or any device.
+final class CameraCaptureRequestGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let policy: @Sendable () -> (suspended: Bool, generation: UInt64)
+    private let captureGeneration: UInt64
+    private var active = true
+    private var request: UInt64 = 0
+    init(captureGeneration: UInt64, policy: @escaping @Sendable () -> (suspended: Bool, generation: UInt64) = {
+        (MediaProcessing.isCaptureSuspended, MediaProcessing.captureGeneration)
+    }) { self.captureGeneration = captureGeneration; self.policy = policy }
+    func nextRequest() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }; request &+= 1; return request
+    }
+    func invalidate() { lock.lock(); active = false; request &+= 1; lock.unlock() }
+    func allows(_ token: UInt64? = nil) -> Bool {
+        lock.lock(); let current = active && (token == nil || token == request); lock.unlock()
+        let value = policy()
+        return current && !value.suspended && value.generation == captureGeneration
+    }
+    func requireAllowed(_ token: UInt64? = nil) throws {
+        guard allows(token) else { throw MediaProcessing.CaptureSuspended() }
+    }
+}
+
 /// All mutable capture/writer state is confined to queue. The session is exposed
 /// only for AVCaptureVideoPreviewLayer; its configuration stays on this queue.
 private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
-    let session = AVCaptureSession()
+    let session: AVCaptureSession
+    private let gate: CameraCaptureRequestGate
     var reportError: (@Sendable (String) -> Void)?
 
     private let queue = DispatchQueue(label: "framethrower.camera.capture")
@@ -190,9 +251,13 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
     private var finishOperation: UUID?
     private var finishContinuation: CheckedContinuation<Void, any Error>?
 
-    override init() {
+    init?(captureGeneration: UInt64) {
+        let gate = CameraCaptureRequestGate(captureGeneration: captureGeneration)
+        guard gate.allows() else { return nil }
+        self.gate = gate
+        session = AVCaptureSession()
         super.init()
-        guard !MediaProcessing.isCaptureSuspended else { return }
+        guard gate.allows() else { return nil }
         runtimeObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil
         ) { [weak self] notification in
@@ -212,57 +277,52 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         if let interruptedObserver { NotificationCenter.default.removeObserver(interruptedObserver) }
     }
 
-    func configure(id: String?) async throws {
+    func configure(id: String) async throws {
         try MediaProcessing.requireCaptureEnabled()
+        let request = gate.nextRequest()
+        try gate.requireAllowed(request)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             queue.async {
                 guard self.outputURL == nil, !self.isFinishing else {
-                    continuation.resume(throwing: CameraRecordingError.alreadyRecording)
-                    return
+                    continuation.resume(throwing: CameraRecordingError.alreadyRecording); return
                 }
-                self.session.stopRunning()
-                self.session.beginConfiguration()
-                self.session.inputs.forEach { self.session.removeInput($0) }
-                self.session.outputs.forEach { self.session.removeOutput($0) }
-                self.videoOutput = nil
                 do {
-                    if let id {
-                        guard let device = AVCaptureDevice(uniqueID: id), device.isConnected else {
-                            throw CameraRecordingError.unavailable
-                        }
+                    try self.gate.requireAllowed(request)
+                    self.clearSession()
+                    try self.gate.requireAllowed(request)
+                    self.session.beginConfiguration()
+                    var configuring = true
+                    do {
+                        defer { if configuring { self.session.commitConfiguration() } }
+                        try self.gate.requireAllowed(request)
+                        guard let device = AVCaptureDevice(uniqueID: id), device.isConnected else { throw CameraRecordingError.unavailable }
                         let input = try AVCaptureDeviceInput(device: device)
-                        guard self.session.canAddInput(input) else {
-                            throw CameraRecordingError.configurationFailed
-                        }
+                        try self.gate.requireAllowed(request)
+                        guard self.session.canAddInput(input) else { throw CameraRecordingError.configurationFailed }
                         self.session.addInput(input)
-                        if self.session.canSetSessionPreset(.hd1280x720) {
-                            self.session.sessionPreset = .hd1280x720
-                        } else if self.session.canSetSessionPreset(.high) {
-                            self.session.sessionPreset = .high
-                        }
+                        if self.session.canSetSessionPreset(.hd1280x720) { self.session.sessionPreset = .hd1280x720 }
+                        else if self.session.canSetSessionPreset(.high) { self.session.sessionPreset = .high }
                         let output = AVCaptureVideoDataOutput()
                         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
                         output.alwaysDiscardsLateVideoFrames = true
-                        guard self.session.canAddOutput(output) else {
-                            throw CameraRecordingError.configurationFailed
-                        }
+                        try self.gate.requireAllowed(request)
+                        guard self.session.canAddOutput(output) else { throw CameraRecordingError.configurationFailed }
                         self.session.addOutput(output)
                         output.setSampleBufferDelegate(self, queue: self.queue)
-                        // Preview and saved camera use the same unmirrored image.
                         if let connection = output.connection(with: .video), connection.isVideoMirroringSupported {
-                            connection.automaticallyAdjustsVideoMirroring = false
-                            connection.isVideoMirrored = false
+                            connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false
                         }
                         self.videoOutput = output
+                        self.session.commitConfiguration(); configuring = false
                     }
-                    self.session.commitConfiguration()
-                    if id != nil {
-                        self.session.startRunning()
-                        guard self.session.isRunning else { throw CameraRecordingError.configurationFailed }
-                    }
+                    try self.gate.requireAllowed(request)
+                    self.session.startRunning()
+                    try self.gate.requireAllowed(request)
+                    guard self.session.isRunning else { throw CameraRecordingError.configurationFailed }
                     continuation.resume()
                 } catch {
-                    if self.videoOutput == nil { self.session.commitConfiguration() }
+                    // Cleanup is deliberately not capture-policy gated.
+                    self.clearSession()
                     continuation.resume(throwing: error)
                 }
             }
@@ -273,6 +333,7 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         try MediaProcessing.requireCaptureEnabled()
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
+                guard self.gate.allows() else { continuation.resume(throwing: MediaProcessing.CaptureSuspended()); return }
                 guard self.outputURL == nil, !self.isFinishing else {
                     continuation.resume(throwing: CameraRecordingError.alreadyRecording)
                     return
@@ -340,20 +401,43 @@ private final class CameraCaptureEngine: NSObject, AVCaptureVideoDataOutputSampl
         }
     }
 
+    func invalidate() { gate.invalidate() }
+
     func shutDown() {
-        queue.async {
-            self.fail(CameraRecordingError.unavailable)
-            // Finish an accepted take instead of cancelling it: cancellation
-            // can discard an already-created source file.
-            self.trackWriter?.finish { _ in }
-            self.trackWriter = nil
-            self.outputURL = nil
-            self.session.stopRunning()
+        invalidate()
+        queue.async { self.tearDown() }
+    }
+
+    func shutDownAndWait() async {
+        invalidate()
+        await withCheckedContinuation { continuation in
+            queue.async { self.tearDown(); continuation.resume() }
         }
     }
 
+    /// Called only on queue, including after capture policy becomes Off.
+    private func clearSession() {
+        videoOutput?.setSampleBufferDelegate(nil, queue: nil)
+        session.stopRunning()
+        session.beginConfiguration()
+        session.inputs.forEach { session.removeInput($0) }
+        session.outputs.forEach { session.removeOutput($0) }
+        session.commitConfiguration()
+        videoOutput = nil
+    }
+
+    private func tearDown() {
+        generation = UUID()
+        if let pendingStart { self.pendingStart = nil; pendingStart.resume(throwing: MediaProcessing.CaptureSuspended()) }
+        // Preserve an accepted take; shutdown must never cancel its source file.
+        trackWriter?.finish { _ in }; trackWriter = nil; outputURL = nil
+        clearSession()
+        if let runtimeObserver { NotificationCenter.default.removeObserver(runtimeObserver); self.runtimeObserver = nil }
+        if let interruptedObserver { NotificationCenter.default.removeObserver(interruptedObserver); self.interruptedObserver = nil }
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let outputURL, recordingError == nil, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        guard gate.allows(), let outputURL, recordingError == nil, CMSampleBufferDataIsReady(sampleBuffer) else { return }
         do {
             guard let clock = session.synchronizationClock else { throw CameraRecordingError.noFrames }
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)

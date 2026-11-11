@@ -20,9 +20,12 @@ Bryan lifted the recorded-video moratorium on November 10, 2026. Importing,
 creating recorded test fixtures, decoding, playback, encoding, compositing and
 export of recorded video are permitted.
 
-Keep `MediaProcessing.isCaptureSuspended` fixed true. Do not start live screen,
-window, area or camera capture, live previews, or screenshot capture. Do not
-remove or bypass that capture interlock without Bryan explicitly authorizing it.
+Live capture defaults off on each launch. Bryan explicitly authorized a
+Debug-only main-page toggle to opt into normal screen/window/area recording,
+camera sessions and live previews for that process. Release builds remain
+blocked. Do not persist or automatically enable this override. Automated checks
+must keep actual live capture off; exercise the policy or injected callbacks
+without opening devices or capturing the user's desktop.
 `MediaProcessing.requireEnabled()` guards recorded processing;
 `requireCaptureEnabled()` guards live capture. The disabling-only
 `FRAMETHROWER_VECTOR_PREVIEW=1` environment switch keeps metadata/vector tests

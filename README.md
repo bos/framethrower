@@ -8,16 +8,18 @@ recording to Google Drive or a Slack person/channel.
 
 Recorded-video processing was re-enabled on November 10, 2026. Import, playback,
 thumbnails, composition and export of existing files are allowed. Live screen,
-window, area and camera capture, camera sessions and live source screenshots
-remain disabled. The capture restriction is fixed in source with
-`MediaProcessing.isCaptureSuspended = true`; enabling recorded-file work does
-not enable a capture device or stream.
+window, area and camera capture start disabled. In Debug builds, the main page's
+**Debug: Live capture** checkbox enables capture and live previews for the current
+run. It resets to Off on every launch; release builds keep capture disabled.
+Turning it off shuts down camera sessions and stops source-preview refreshes.
+Stop any recording or countdown before changing it.
 
 `FRAMETHROWER_VECTOR_PREVIEW=1` selects a disabling-only vector mode for test
 processes. It cannot enable capture. Metadata and UI test runners set this mode
 explicitly; recorded integration tests use small prerecorded fixtures. Run
 `Tests/check-recorded-video-policy.sh` to verify both policies without opening
-media or devices. Live-capture test scripts remain skipped.
+media or devices. Native checkbox and camera-lifecycle tests use fake callbacks
+and policy gates; automated checks never enable actual live capture.
 
 ## Local speech recognition
 

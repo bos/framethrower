@@ -117,6 +117,30 @@ final class CaptureViewModel: ObservableObject {
         OAuthCredentials.bundled.slackClientSecret
     }
 
+    @Published private(set) var isChangingDebugCapture = false
+    #if DEBUG
+    var debugLiveCaptureEnabled: Bool { !MediaProcessing.isCaptureSuspended }
+    var canChangeDebugLiveCapture: Bool {
+        !isRecording && !isCountdownActive && !isCaptureBusy && !isChangingDebugCapture
+    }
+
+    func setDebugLiveCaptureEnabled(_ enabled: Bool) async {
+        guard canChangeDebugLiveCapture, enabled != debugLiveCaptureEnabled else { return }
+        isChangingDebugCapture = true
+        defer { isChangingDebugCapture = false }
+        MediaProcessing.setDebugLiveCaptureEnabled(enabled)
+        objectWillChange.send()
+        if enabled {
+            await camera.resumeCaptureDiscovery()
+            startSourceAutoRefresh()
+            await refreshSources(logSuccess: false, logErrors: false)
+        } else {
+            stopSourceAutoRefresh()
+            await camera.suspendCapture()
+        }
+    }
+    #endif
+
     let camera = CameraRecorder()
     let recordingLibrary: RecordingLibrary
     private var cameraChanges: AnyCancellable?
@@ -352,7 +376,13 @@ final class CaptureViewModel: ObservableObject {
         guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isSourceRefreshing else { return }
         isSourceRefreshing = true
-        defer { isSourceRefreshing = false }
+        let captureGeneration = MediaProcessing.captureGeneration
+        defer {
+            isSourceRefreshing = false
+            if !MediaProcessing.isCaptureSuspended, captureGeneration != MediaProcessing.captureGeneration {
+                sourceRefreshTriggered(force: true)
+            }
+        }
 
         refreshScreenRecordingPermissionState()
         guard hasScreenRecordingPermission else {
@@ -372,6 +402,7 @@ final class CaptureViewModel: ObservableObject {
 
         do {
             let content = try await shareableContent()
+            guard !MediaProcessing.isCaptureSuspended, captureGeneration == MediaProcessing.captureGeneration else { return }
             let allWindows = content.windows.map(ShareableWindow.init)
             let windowServerAttributes = windowServerAttributesByID()
             let appBundleID = Bundle.main.bundleIdentifier
@@ -596,7 +627,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func updateSourceRefreshScheduling() {
-        let shouldRunTimer = isSourceRefreshConfigured &&
+        let shouldRunTimer = !MediaProcessing.isCaptureSuspended && isSourceRefreshConfigured &&
             isAppActive &&
             !isRecording &&
             captureKind == .window
@@ -623,6 +654,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     private func sourceRefreshTriggered(force: Bool) {
+        guard !MediaProcessing.isCaptureSuspended else { return }
         if !force {
             guard isSourceRefreshConfigured,
                   isAppActive,
@@ -1020,6 +1052,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecording() async {
+        guard !isChangingDebugCapture else { return }
         guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive, isCameraReadyForCapture else { return }
         guard countdownRemainingSeconds == nil else { return }
@@ -1345,6 +1378,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecordingAfterDelay(seconds: Int) async {
+        guard !isChangingDebugCapture else { return }
         guard !MediaProcessing.isCaptureSuspended else { return }
         guard !isRecording, !isCaptureBusy, !isImportingVideo, !isAnyUploadActive else { return }
         guard countdownRemainingSeconds == nil else { return }

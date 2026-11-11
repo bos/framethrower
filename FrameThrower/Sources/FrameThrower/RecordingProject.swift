@@ -1745,6 +1745,14 @@ enum EditorBoxConnections {
         let removedIDs = regionIDs.intersection(Set(state.regions.map(\.id)))
         guard !removedIDs.isEmpty else { return state }
         var result = state
+        // Legacy files omitted anchor provenance. Preserve the inferred box
+        // role when its last guide is explicitly deleted, so it cannot turn
+        // into an unrequested visible bookmark after that operation.
+        for region in state.regions where removedIDs.contains(region.id) {
+            if let index = result.editAnchors.firstIndex(where: {
+                $0.id == region.editID && $0.origin == nil && abs($0.time - region.time) < 0.000001
+            }) { result.editAnchors[index].origin = .box }
+        }
         result.regions.removeAll { removedIDs.contains($0.id) }
         func isRemoved(_ point: ZoomKeyframe) -> Bool {
             point.sourceRegionID.map { removedIDs.contains($0) } ?? false
@@ -1797,8 +1805,14 @@ enum EditorBoxConnections {
 /// A named timeline reference can precede any visual edit. Drawing a box must
 /// not insert a zoom or alter an existing interpolation merely to name a time.
 struct EditAnchor: Codable, Equatable, Sendable {
+    enum Origin: String, Codable, Sendable {
+        case reference, box, generated
+    }
     var id: UUID = UUID()
     var time: Double
+    /// Missing in older files: infer box-only presentation without rewriting
+    /// their metadata. New intentional bookmarks are explicit references.
+    var origin: Origin? = .reference
 }
 
 /// One selectable moment, combining independently animated screen and camera
@@ -1866,6 +1880,36 @@ extension EditState {
         return result.sorted { $0.time < $1.time }
     }
 
+    /// Director can still address every anchor. Only deliberate bookmarks
+    /// belong in animation lanes; a box's naming identity is not an animation.
+    func showsReference(_ anchor: EditAnchor) -> Bool {
+        switch anchor.origin {
+        case .reference: return true
+        case .box, .generated: return false
+        case nil:
+            return !regions.contains { $0.editID == anchor.id && abs($0.time - anchor.time) < 0.000001 }
+        }
+    }
+
+    /// Visible edit navigation/cards exclude internal naming anchors while
+    /// raw timedEdits remains the complete addressable Director catalog.
+    func showsTimedEdit(_ edit: TimedEdit) -> Bool {
+        if edit.zoomID != nil || edit.cameraID != nil || edit.speedID != nil || edit.cameraOpacityID != nil { return true }
+        guard let anchor = editAnchors.first(where: { $0.id == edit.anchorID }) else { return true }
+        return showsReference(anchor)
+    }
+
+    /// An explicit bookmark request promotes an implicit identity in place,
+    /// preserving boxes, spoken references and the ordinary Undo snapshot.
+    mutating func createReference(at time: Double, includeCamera: Bool = true) {
+        if let index = editAnchors.firstIndex(where: { abs($0.time - time) < 0.000001 }) {
+            editAnchors[index].origin = .reference
+        } else if !timedEdits(includeCamera: includeCamera).contains(where: { abs($0.time - time) < 0.000001 }) {
+            editAnchors.append(EditAnchor(time: time))
+            editAnchors.sort { $0.time < $1.time }
+        }
+    }
+
     /// A box and its reference mark form one value edit and one undo snapshot.
     /// Additional boxes on this frame reuse its existing selectable moment.
     @discardableResult
@@ -1874,7 +1918,7 @@ extension EditState {
         if let existing = timedEdits(includeCamera: includeCamera).first(where: { abs($0.time - time) < 0.000001 }) {
             editID = existing.id
         } else {
-            let anchor = EditAnchor(time: time)
+            let anchor = EditAnchor(time: time, origin: .box)
             editAnchors.append(anchor)
             editAnchors.sort { $0.time < $1.time }
             editID = anchor.id

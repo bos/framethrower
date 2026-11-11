@@ -51,10 +51,7 @@ enum EditorAnimationEditing {
                 let referenceID = references.edits[point.id.uuidString] != nil ? point.id : group.id
                 let cameraEdit = TimedEdit(id: referenceID, time: point.time, zoomID: nil, cameraID: point.id)
                 let description = EditorActionDescription.describe(cameraEdit, in: state, references: references)
-                let letter = references.editLabel(for: referenceID).map { String($0.dropFirst(5)) }
-                let prior = index > 0 ? cameraPoints[index - 1].placement : PIPPlacement()
-                let cameraAction = EditorActionDescription.cameraFadeLabel(point.placement, previous: prior) ?? "Camera"
-                let label = index == 0 ? "Initial" : cameraAction + (letter.map { " " + $0 } ?? "")
+                let label = index == 0 ? "Initial" : description.shortLabel
                 let help = index == 0 ? "Initial camera appearance. Select to change its framing and size." : description.tooltip
                 result.append(animation(id: point.id, editID: group.id, lane: .camera, end: point.time,
                     previous: previous, transition: point.transition, duration: point.duration,
@@ -116,11 +113,12 @@ enum EditorAnimationEditing {
                 previous = point.time; previousAlpha = point.opacity
             }
         }
-        for anchor in state.editAnchors {
+        for anchor in state.editAnchors where state.showsReference(anchor) {
             let attachedScreen = state.zoomKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
             let attachedCamera = state.pipKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
             let attachedSpeed = state.speedKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
-            guard !attachedScreen && !attachedCamera && !attachedSpeed else { continue }
+            let attachedOpacity = state.cameraOpacityKeyframes.contains { $0.id == anchor.id && abs($0.time - anchor.time) < 0.000001 }
+            guard !attachedScreen && !attachedCamera && !attachedSpeed && !attachedOpacity else { continue }
             let group = TimedEdit(id: anchor.id, time: anchor.time, zoomID: nil, cameraID: nil, anchorID: anchor.id)
             let description = EditorActionDescription.describe(group, in: state, references: references)
             result.append(TimelineAnimation(id: TimelineAnimationID(lane: .screen, componentID: group.id),

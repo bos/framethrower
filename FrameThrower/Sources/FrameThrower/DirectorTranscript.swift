@@ -10,11 +10,11 @@ struct DirectorTranscriptStep: Codable, Equatable, Identifiable, Sendable {
     var tooltip: String
 
     static func changes(from before: EditState, to after: EditState, references: EditorReferences) -> [Self] {
-        let old = before.timedEdits(includeCamera: true)
-        let new = after.timedEdits(includeCamera: true)
+        let old = before.timedEdits(includeCamera: true).filter { before.showsTimedEdit($0) }
+        let new = after.timedEdits(includeCamera: true).filter { after.showsTimedEdit($0) }
         var result: [Self] = []
         for edit in new {
-            let previous = references.edit(in: before, id: edit.id)
+            let previous = references.edit(in: before, id: edit.id).flatMap { before.showsTimedEdit($0) ? $0 : nil }
             let changed = previous == nil || previous?.time != edit.time ||
                 before.zoomKeyframes.first(where: { $0.id == previous?.zoomID }) != after.zoomKeyframes.first(where: { $0.id == edit.zoomID }) ||
                 before.pipKeyframes.first(where: { $0.id == previous?.cameraID }) != after.pipKeyframes.first(where: { $0.id == edit.cameraID })
@@ -24,7 +24,7 @@ struct DirectorTranscriptStep: Codable, Equatable, Identifiable, Sendable {
                     detail: description.detail, tooltip: description.tooltip))
             }
         }
-        for edit in old where references.edit(in: after, id: edit.id) == nil {
+        for edit in old where references.edit(in: after, id: edit.id).map({ after.showsTimedEdit($0) }) != true {
             let description = EditorActionDescription.describe(edit, in: before, references: references)
             result.append(Self(id: edit.id, time: edit.time, label: "Removed " + description.shortLabel,
                 detail: "Removed this change.", tooltip: "Removed " + description.tooltip))
@@ -146,6 +146,7 @@ enum DirectorTranscript {
             guard let rawID = item["id"] as? String, let id = UUID(uuidString: rawID), let time = item["time"] as? Double else { return nil }
             if let snapshot, value["revision"] as? String == snapshot.revision,
                let edit = references.edit(in: snapshot.state, id: id) {
+                guard snapshot.state.showsTimedEdit(edit) else { return nil }
                 let description = EditorActionDescription.describe(edit, in: snapshot.state, references: references)
                 return DirectorTranscriptStep(id: id, time: time, label: description.shortLabel, detail: description.detail, tooltip: description.tooltip)
             }

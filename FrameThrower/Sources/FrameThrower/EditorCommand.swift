@@ -298,10 +298,7 @@ enum EditorCommandDispatcher {
                 guard time.isFinite, time >= 0, time < project.duration else {
                     throw EditorCommandError.invalid("The edit mark must be inside the recording.")
                 }
-                if !next.timedEdits(includeCamera: true).contains(where: { abs($0.time - time) < 0.000_001 }) {
-                    next.editAnchors.append(EditAnchor(time: time))
-                    next.editAnchors.sort { $0.time < $1.time }
-                }
+                next.createReference(at: time)
             case let .moveEdit(editID, time):
                 guard time.isFinite, time >= 0, time < project.duration else {
                     throw EditorCommandError.invalid("The edit mark must stay inside the recording.")
@@ -333,7 +330,7 @@ enum EditorCommandDispatcher {
                     // A pending replacement can still refer to this named
                     // moment. Without an anchor, a surviving camera track
                     // would change its identity when the zoom is removed.
-                    next.editAnchors.append(EditAnchor(id: edit.id, time: edit.time))
+                    next.editAnchors.append(EditAnchor(id: edit.id, time: edit.time, origin: .generated))
                     next.editAnchors.sort { $0.time < $1.time }
                 }
                 // Replacing screen movement must leave independent camera,
@@ -440,7 +437,7 @@ enum EditorCommandDispatcher {
                 } ?? EditorCommandMotion(transition: .jump)
                 put(source, at: start.time, motion: startMotion, preserving: original, sourceRegionID: fromRegionID)
                 if !next.timedEdits(includeCamera: true).contains(where: { abs($0.time - end) < 0.000_001 }) {
-                    next.editAnchors.append(EditAnchor(time: end))
+                    next.editAnchors.append(EditAnchor(time: end, origin: .generated))
                     next.editAnchors.sort { $0.time < $1.time }
                 }
                 if viaFullFrame {

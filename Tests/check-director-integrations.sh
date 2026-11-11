@@ -6,7 +6,7 @@ repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 exec taskpolicy -b python3 - "$repo_dir" "$@" <<'PY'
 import hashlib, pathlib, platform, subprocess, sys
 root=pathlib.Path(sys.argv[1]); source=root/'FrameThrower/Sources/FrameThrower'
-production=['MediaProcessing','EditorConflictGeometry','EditorConflictReview','EditorActionDescription','DirectorTranscript','DirectorMarkdown',
+production=['MediaProcessing','EditorConflictGeometry','EditorConflictReview','EditorActionDescription','DirectorTranscript','DirectorMarkdown','RecordingMetadataAccess',
  'EditorRegion','RecordingProject','EditorCommand','EditorMutation','EditorPreviewCommand','EditorAutomationAPI','EditorAgentControls','RecordedScene','DirectorInspection','LocalEditPlanner',
  'LocalModelRuntime','LocalSpeechInput','WhisperSpeechRuntime','WhisperSpeechSession','DirectorDiagnostics','DirectorConversation',
  'DirectorModelTransport','DirectorAgentRuntime','EditorAssistantPanel']

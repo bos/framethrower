@@ -181,6 +181,8 @@ struct ContentView: View {
             Divider().opacity(0.6)
             inputControls
                 .disabled(captureLocked)
+            RecordingMetadataAccessView(mode: .capture)
+                .disabled(captureLocked)
             if model.camera.selectedDeviceID != nil || model.camera.errorMessage != nil {
                 CameraSetupView(camera: model.camera, placement: $model.initialCameraPlacement, locked: captureLocked,
                     sourcePreviews: sourcePreviews, source: selectedPreviewSource,

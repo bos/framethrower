@@ -1075,6 +1075,9 @@ struct EditorAssistantPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            RecordingMetadataAccessView(mode: .recording(sceneURL: editor.project.sceneFilename.map {
+                editor.url.deletingLastPathComponent().appendingPathComponent($0)
+            }, time: nil))
             if !regions.isEmpty {
                 ScrollViewReader { reader in
                     ScrollView {

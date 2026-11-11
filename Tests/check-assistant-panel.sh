@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export FRAMETHROWER_VECTOR_PREVIEW=1
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 check_dir=$(mktemp -d -t framethrower-assistant-panel-check)
 trap 'rm -rf "$check_dir"' EXIT
@@ -10,6 +11,7 @@ swiftc -whole-module-optimization -Onone -num-threads 2 -parse-as-library -warni
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorConflictReview.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorActionDescription.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorTranscript.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorMarkdown.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorRegion.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/RecordingProject.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/EditorCommand.swift" \

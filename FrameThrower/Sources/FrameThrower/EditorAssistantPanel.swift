@@ -1374,7 +1374,10 @@ private struct DirectorConversationView: View {
                     .accessibilityLabel("Source frame inspected by Director")
             }
             HStack(alignment: .top, spacing: 6) {
-                Text(entry.text)
+                Group {
+                    if entry.kind == .assistant { DirectorMarkdownView(entry.text) }
+                    else { Text(entry.text) }
+                }
                     .font(entry.kind == .event ? .caption : .callout)
                     .foregroundStyle(entry.isError ? Color.red : entry.kind == .event ? Color.secondary : Color.primary)
                     .textSelection(.enabled)

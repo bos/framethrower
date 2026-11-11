@@ -48,6 +48,8 @@ struct TimelineVideoPart: Equatable {
     var authoringStart: Double
     var authoringEnd: Double
     var map: RecordingTimeMap.Clip? = nil
+    var timelineMap: RecordingTimeMap? = nil
+    var branchIndex: Int? = nil
     func projectTime(at time: Double) -> Double { map?.sourceTime(at: time) ?? time }
     func displayTime(at time: Double) -> Double { map?.outputTime(for: time) ?? time }
 }
@@ -58,29 +60,110 @@ struct TimelineVideoRow: Equatable {
     var hasAudio: Bool
     var parts: [TimelineVideoPart]
     var editable: Bool
+    var layerName: String? = nil
+    var sourceName: String? = nil
+    var isCamera = false
     static let height: CGFloat = 48
     static func make(project: RecordingProject, state: EditState, map: RecordingTimeMap?) -> [Self] {
-        guard state.videoLayers != nil else { return [] }
         return project.effectiveVideoLayers(in: state).flatMap { layer in
             layer.clips.sorted { $0.start < $1.start }.map { clip in
                 let source = project.videoSources.first { $0.id == clip.sourceID }
                 let parts: [TimelineVideoPart]
                 if let map {
-                    parts = map.clips.compactMap { branch in
+                    parts = map.clips.enumerated().compactMap { index, branch in
                         let a = max(clip.start, branch.sourceStart), b = min(clip.end, branch.sourceEnd)
                         guard a < b else { return nil }
                         return .init(start: branch.outputTime(for: a), end: branch.outputTime(for: b),
-                            authoringStart: a, authoringEnd: b, map: branch)
+                            authoringStart: a, authoringEnd: b, map: branch, timelineMap: map, branchIndex: index)
                     }
                 } else { parts = [.init(start: clip.start, end: clip.end, authoringStart: clip.start, authoringEnd: clip.end)] }
-                let whole = parts.count == 1 && parts[0].authoringStart == clip.start && parts[0].authoringEnd == clip.end
-                let blended = map?.joins.contains { join in
-                    parts.contains { $0.start < join.outputEnd && $0.end > join.outputStart }
-                } ?? false
                 return Self(layerID: layer.id, label: layer.name == source?.name ? layer.name : layer.name + " · " + (source?.name ?? "Missing source"),
-                    clip: clip, hasAudio: source?.hasAudio != false, parts: parts, editable: whole && !blended)
+                    clip: clip, hasAudio: source?.hasAudio != false, parts: parts, editable: !parts.isEmpty,
+                    layerName: layer.name, sourceName: source?.name, isCamera: clip.layout == .camera || source?.role == .camera)
             }
         }
+    }
+}
+
+/// One ordered row model drives native drawing, hit testing and SwiftUI height.
+/// Occurrence projection stays independent: clips in one layer share one row.
+struct TimelineTrackLayout: Equatable {
+    enum RowID: Hashable { case cuts, media(UUID), volume(UUID), animation(TimelineAnimationLane) }
+    struct Row: Equatable {
+        var id: RowID
+        var title: String
+        var help: String
+        var depth = 0
+        var height: CGFloat = 30
+    }
+    var rows: [Row]
+    static let top: CGFloat = 40
+    static let footer: CGFloat = 24
+    var contentHeight: CGFloat { Self.top + rows.reduce(0) { $0 + $1.height } + Self.footer }
+    func offset(of id: RowID) -> CGFloat? {
+        var offset = Self.top
+        for row in rows { if row.id == id { return offset }; offset += row.height }
+        return nil
+    }
+    static func make(videoRows: [TimelineVideoRow], animations: [TimelineAnimation],
+                     selectedAnimationID: TimelineAnimationID? = nil,
+                     pinnedAnimationLanes: Set<TimelineAnimationLane> = [],
+                     expandedVideoVolumeLayerIDs: Set<UUID> = [], selectedVideoVolumeID: UUID? = nil,
+                     conflictSpans: [EditorConflictSpan] = [], pointerClickTimes: [Double] = [],
+                     hasPointerRecording: Bool = false, recordedAudioRoles: Set<RecordingAudioRole> = [],
+                     showsClipLane: Bool = false) -> Self {
+        var visible = Set(animations.filter { !$0.isPlaceholder }.map(\.lane))
+        visible.formUnion(pinnedAnimationLanes)
+        if let selected = animations.first(where: { $0.id == selectedAnimationID && !$0.isPlaceholder }) { visible.insert(selected.lane) }
+        if !conflictSpans.isEmpty { visible.insert(.screen) }
+        if hasPointerRecording || !pointerClickTimes.isEmpty { visible.insert(.pointer) }
+        visible.formUnion(recordedAudioRoles.map { $0 == .microphone ? .audioMicrophone : .audioSystem })
+        var rows: [Row] = []
+        if showsClipLane { rows.append(.init(id: .cuts, title: "Cuts", help: "Select a range to remove it, or select a join to adjust its crossfade or restore footage.")) }
+        var layers: [UUID] = []
+        for row in videoRows where !layers.contains(row.layerID) { layers.append(row.layerID) }
+        var placed = Set<TimelineAnimationLane>()
+        func animation(_ lane: TimelineAnimationLane, parent: String? = nil) {
+            guard visible.contains(lane), placed.insert(lane).inserted else { return }
+            let title: String = switch lane {
+            case .screen, .camera: "Framing"
+            case .cameraOpacity: "Opacity"
+            case .speed: "Speed"
+            case .pointer: "Pointer"
+            case .audioMicrophone: "Microphone"
+            case .audioSystem: "System audio"
+            }
+            let help: String = switch lane {
+            case .screen: "Screen zoom and pan animations. Select a span to change its timing, framing or easing."
+            case .camera: "Camera/PIP position, size and crop animations."
+            case .cameraOpacity: "Camera/PIP fades. These change camera opacity independently of the screen."
+            case .speed: "Recorded-video playback speed animations; review speed is a separate transport preference."
+            case .pointer: "Recorded pointer movement and clicks. Select to adjust the pointer's appearance."
+            case .audioMicrophone: "Recorded microphone volume automation."
+            case .audioSystem: "Recorded system-audio volume automation."
+            }
+            let name = parent == nil && (lane == .screen || lane == .camera || lane == .cameraOpacity)
+                ? (lane == .screen ? "Screen " : "PIP ") + title.lowercased() : title
+            rows.append(.init(id: .animation(lane), title: name, help: help, depth: parent == nil ? 0 : 1))
+        }
+        for layerID in layers {
+            let clips = videoRows.filter { $0.layerID == layerID }
+            guard let first = clips.first else { continue }
+            let name = first.layerName ?? first.label
+            let camera = clips.contains(where: \.isCamera)
+            let title = camera && !name.localizedCaseInsensitiveContains("PIP") ? name + " / PIP" : name
+            rows.append(.init(id: .media(layerID), title: title,
+                help: title + ". Clips in this layer play in sequence; overlapping clips crossfade. Drag a clip to move it; select it to trim or edit it."))
+            if clips.contains(where: { $0.clip.layout == .screen }) { animation(.screen, parent: title) }
+            if camera { animation(.camera, parent: title); animation(.cameraOpacity, parent: title) }
+            let hasEnvelope = clips.contains { !$0.clip.volumeKeyframes.isEmpty }
+            let selectedVolume = selectedVideoVolumeID.map { selected in clips.contains { $0.clip.volumeKeyframes.contains { $0.id == selected } } } ?? false
+            if clips.contains(where: \.hasAudio) && (hasEnvelope || selectedVolume || expandedVideoVolumeLayerIDs.contains(layerID)) {
+                rows.append(.init(id: .volume(layerID), title: "Volume", help: "\(title) source-volume envelope. Click the curve to add a point; drag points to adjust level and time.", depth: 1, height: 26))
+            }
+        }
+        for lane in TimelineAnimationLane.allCases { animation(lane) }
+        return Self(rows: rows)
     }
 }
 enum TimelineVideoHandle: Equatable { case move, start, end, volume(UUID) }
@@ -142,42 +225,37 @@ struct TimelineOutputProjection {
 
     init(animations: [TimelineAnimation], map: RecordingTimeMap) {
         for original in animations {
-            let binding = FinishedTimelineBinding.make(animation: original, map: map)
-            if let binding { editableBindings[original.id] = binding }
             if original.lane == .pointer {
                 var item = original; item.start = 0; item.end = map.outputDuration; item.editable = false
                 self.animations.append(item); sourceIDs[item.id] = original.id
                 continue
             }
-            if original.isInstant {
-                guard let position = map.outputTime(for: original.start) else { continue }
-                var item = original; item.start = position; item.end = position; item.editable = binding != nil
-                if binding != nil { item.help += " Drag to adjust source timing through the finished-video clock." }
-                self.animations.append(item); sourceIDs[item.id] = original.id
-                continue
-            }
             for (index, clip) in map.clips.enumerated() {
-                let start = max(original.start, clip.sourceStart), end = min(original.end, clip.sourceEnd)
-                guard start < end else { continue }
+                let first = max(original.start, clip.sourceStart), last = min(original.end, clip.sourceEnd)
+                if original.isInstant {
+                    guard original.start >= clip.sourceStart,
+                          original.start < clip.sourceEnd || (index == map.clips.count - 1 && original.start == clip.sourceEnd) else { continue }
+                } else if first >= last { continue }
                 var item = original
-                // Fixed clip boundaries make identity independent of view size,
-                // magnification and playback position.
-                let key = "\(original.componentID.uuidString):\(clip.sourceStart.bitPattern):\(clip.sourceEnd.bitPattern)"
-                let digest = Array(SHA256.hash(data: Data(key.utf8)).prefix(16))
-                let uuid = UUID(uuid: (digest[0],digest[1],digest[2],digest[3],digest[4],digest[5],digest[6],digest[7],digest[8],digest[9],digest[10],digest[11],digest[12],digest[13],digest[14],digest[15]))
-                item.id = binding == nil ? TimelineAnimationID(lane: original.lane, componentID: uuid) : original.id
-                item.start = clip.outputTime(for: start)
-                item.end = clip.outputTime(for: end)
-                item.editable = binding != nil
-                if binding != nil {
-                    item.easeIn = max(0, clip.outputTime(for: original.start + original.easeIn) - item.start)
-                    item.easeOut = max(0, item.end - clip.outputTime(for: original.end - original.easeOut))
-                    item.help = original.help + " Drag to adjust source timing through the finished-video clock."
-                } else {
-                    item.help = original.help + String(format: " Source %.3f–%.3f s (clip %d). Adjust timing in Source mode.", start, end, index + 1)
-                }
+                let key = "\(original.lane.rawValue):\(original.componentID.uuidString):\(clip.sourceStart.bitPattern):\(clip.sourceEnd.bitPattern)"
+                let bytes = Array(SHA256.hash(data: Data(key.utf8)).prefix(16))
+                item.id = TimelineAnimationID(lane: original.lane, componentID: UUID(uuid: (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])))
+                item.start = clip.outputTime(for: first); item.end = clip.outputTime(for: last)
+                item.editable = original.editable
+                item.showsStartHandle = original.start >= first && original.start <= last
+                item.showsEndHandle = original.end >= first && original.end <= last
+                let incoming = original.start + original.easeIn, outgoing = original.end - original.easeOut
+                item.showsEaseInHandle = incoming >= first && incoming <= last
+                item.showsEaseOutHandle = outgoing >= first && outgoing <= last
+                item.easeIn = max(0, min(item.duration, clip.outputTime(for: incoming) - item.start))
+                item.easeOut = max(0, min(item.duration, item.end - clip.outputTime(for: outgoing)))
+                item.help = original.help + " Drag this visible span to retime the edit. Cut edges are not animation endpoints."
                 self.animations.append(item); sourceIDs[item.id] = original.id
                 envelopes[item.id] = TimelineSourceEnvelope(animation: original, sourceOffset: clip.sourceStart - clip.outputStart, clip: clip)
+                if original.editable {
+                    editableBindings[item.id] = FinishedTimelineBinding(original: original, clip: clip, branchIndex: index,
+                        visibleSourceStart: first, visibleSourceEnd: last)
+                }
             }
         }
     }
@@ -186,67 +264,46 @@ struct TimelineOutputProjection {
 struct FinishedTimelineBinding {
     let original: TimelineAnimation
     let clip: RecordingTimeMap.Clip
-    let sourceBounds: ClosedRange<Double>
+    let branchIndex: Int
+    let visibleSourceStart: Double
+    let visibleSourceEnd: Double
+    var sourceBounds: ClosedRange<Double> { clip.sourceStart...clip.sourceEnd }
 
     static func make(animation: TimelineAnimation, map: RecordingTimeMap) -> Self? {
         guard animation.editable, animation.lane != .pointer else { return nil }
-        if animation.isInstant && map.outputTime(for: animation.start) == nil { return nil }
-        let matches = map.clips.enumerated().compactMap { index, clip -> Self? in
-            var lower = clip.sourceStart, upper = clip.sourceEnd
-            for join in map.joins where join.duration > 0 {
-                if join.incomingClipIndex == index { lower = max(lower, clip.sourceTime(at: join.outputEnd)) }
-                if join.outgoingClipIndex == index { upper = min(upper, clip.sourceTime(at: join.outputStart)) }
+        for (index, clip) in map.clips.enumerated() {
+            let first = max(animation.start, clip.sourceStart), last = min(animation.end, clip.sourceEnd)
+            if first < last || (animation.isInstant && animation.start >= clip.sourceStart && animation.start < clip.sourceEnd) {
+                return Self(original: animation, clip: clip, branchIndex: index, visibleSourceStart: first, visibleSourceEnd: last)
             }
-            guard animation.start >= lower, animation.end <= upper, lower <= upper else { return nil }
-            return Self(original: animation, clip: clip, sourceBounds: lower...upper)
         }
-        return matches.count == 1 ? matches[0] : nil
+        return nil
     }
 
     func sourceDrag(_ request: AnimationDrag) -> AnimationDrag {
         let anchor: Double = switch request.handle {
-        case .move, .start: original.start
+        case .move: visibleSourceStart
+        case .start: original.start
         case .end: original.end
         case .easeIn: original.start + original.easeIn
         case .easeOut: original.end - original.easeOut
         }
         let destination = clip.sourceTime(at: clip.outputTime(for: anchor) + request.deltaSeconds)
-        return AnimationDrag(id: request.id, handle: request.handle, deltaSeconds: destination - anchor,
+        return AnimationDrag(id: original.id, handle: request.handle, deltaSeconds: destination - anchor,
             push: request.push, snapTolerance: 0)
     }
 }
 
 enum FinishedTimelineEditing {
-    /// Every request uses the gesture's pre-edit map and source spans. Locked
-    /// fragments cannot be moved implicitly by an Option ripple.
+    /// Visible fragments name a real source edit and the branch touched by the
+    /// gesture. The source solver, not a hidden alternate mode, owns its bounds.
     static func changes(_ request: AnimationDrag, animations: [TimelineAnimation], map: RecordingTimeMap,
                         sourceDuration: Double) -> [TimelineAnimation]? {
         let projection = TimelineOutputProjection(animations: animations, map: map)
-        guard let binding = projection.editableBindings[request.id], request.deltaSeconds.isFinite else { return nil }
-        let locked = animations.map { animation in
-            var item = animation
-            item.editable = projection.editableBindings[item.id] != nil
-            return item
-        }
-        func candidate(_ delta: Double) -> [TimelineAnimation]? {
-            var output = request; output.deltaSeconds = delta
-            guard let changes = TimelineAnimationSolver.solve(binding.sourceDrag(output), animations: locked, duration: sourceDuration),
-                  changes.allSatisfy({ value in
-                      guard let bounds = projection.editableBindings[value.id]?.sourceBounds else { return false }
-                      return value.start >= bounds.lowerBound && value.end <= bounds.upperBound
-                  }) else { return nil }
-            return changes
-        }
-        if let changes = candidate(request.deltaSeconds) { return changes }
-        var lower = 0.0, upper = 1.0
-        var result = candidate(0)
-        guard result != nil else { return nil }
-        for _ in 0..<48 {
-            let middle = (lower + upper) / 2
-            if let next = candidate(request.deltaSeconds * middle) { lower = middle; result = next }
-            else { upper = middle }
-        }
-        return result
+        guard let binding = projection.editableBindings[request.id], request.deltaSeconds.isFinite,
+              let source = TimelineAnimationSolver.sourceDrag(request, original: binding.original, map: map,
+                branchIndex: binding.branchIndex, moveAnchor: binding.visibleSourceStart) else { return nil }
+        return TimelineAnimationSolver.solve(source, animations: animations, duration: sourceDuration)
     }
 
     static func projectedPreview(_ request: AnimationDrag, animations: [TimelineAnimation], map: RecordingTimeMap,
@@ -308,6 +365,12 @@ struct RecordingTimeline: NSViewRepresentable {
     var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:]
     var speedCurves: [[TimelineSpeedSample]] = []
     var videoRows: [TimelineVideoRow] = []
+    var rowLayout: TimelineTrackLayout? = nil
+    var pinnedAnimationLanes: Set<TimelineAnimationLane> = []
+    var expandedVideoVolumeLayerIDs: Set<UUID> = []
+    var hasPointerRecording = false
+    var recordedAudioRoles: Set<RecordingAudioRole> = []
+    var onToggleVideoVolume: (UUID) -> Void = { _ in }
     var selectedVideoClipID: UUID? = nil
     var selectedVideoVolumeID: UUID? = nil
     var onSelectVideo: (UUID?, UUID?, UUID?) -> Void = { _, _, _ in }
@@ -337,6 +400,12 @@ struct RecordingTimeline: NSViewRepresentable {
         view.sourceEnvelopes = sourceEnvelopes
         view.speedCurves = speedCurves
         view.videoRows = videoRows
+        view.rowLayout = rowLayout
+        view.pinnedAnimationLanes = pinnedAnimationLanes
+        view.expandedVideoVolumeLayerIDs = expandedVideoVolumeLayerIDs
+        view.hasPointerRecording = hasPointerRecording
+        view.recordedAudioRoles = recordedAudioRoles
+        view.onToggleVideoVolume = onToggleVideoVolume
         view.selectedVideoClipID = selectedVideoClipID
         view.selectedVideoVolumeID = selectedVideoVolumeID
         view.onSelectVideo = onSelectVideo; view.onVideoEdit = onVideoEdit
@@ -489,6 +558,28 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var sourceEnvelopes: [TimelineAnimationID: TimelineSourceEnvelope] = [:] { didSet { needsDisplay = true } }
     var speedCurves: [[TimelineSpeedSample]] = [] { didSet { if speedCurves != oldValue { needsDisplay = true } } }
     var videoRows: [TimelineVideoRow] = [] { didSet { if videoRows != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } } }
+    var rowLayout: TimelineTrackLayout? { didSet { if rowLayout != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } } }
+    var pinnedAnimationLanes: Set<TimelineAnimationLane> = [] { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var expandedVideoVolumeLayerIDs: Set<UUID> = [] { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() } }
+    var hasPointerRecording = false { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var recordedAudioRoles: Set<RecordingAudioRole> = [] { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var onToggleVideoVolume: ((UUID) -> Void)?
+    private var frozenRowLayout: TimelineTrackLayout?
+    private var frozenVideoRows: [TimelineVideoRow]?
+    var trackLayout: TimelineTrackLayout {
+        frozenRowLayout ?? rowLayout ?? TimelineTrackLayout.make(videoRows: videoRows, animations: animationSpans,
+            selectedAnimationID: selectedAnimationID, pinnedAnimationLanes: pinnedAnimationLanes,
+            expandedVideoVolumeLayerIDs: expandedVideoVolumeLayerIDs, selectedVideoVolumeID: selectedVideoVolumeID,
+            conflictSpans: conflictSpans, pointerClickTimes: pointerClickTimes, hasPointerRecording: hasPointerRecording,
+            recordedAudioRoles: recordedAudioRoles,
+            showsClipLane: showsClipLane)
+    }
+    private func rowFrame(_ id: TimelineTrackLayout.RowID) -> CGRect {
+        guard let offset = trackLayout.offset(of: id), let row = trackLayout.rows.first(where: { $0.id == id }) else { return .null }
+        return CGRect(x: railOrigin, y: offset, width: railWidth, height: row.height - 3)
+    }
+    private func freezeRows() { if frozenRowLayout == nil { frozenRowLayout = trackLayout; frozenVideoRows = videoRows } }
+    private func thawRows() { frozenRowLayout = nil; frozenVideoRows = nil; invalidateIntrinsicContentSize(); needsDisplay = true; updateTooltips() }
     var selectedVideoClipID: UUID? { didSet { needsDisplay = true } }
     var selectedVideoVolumeID: UUID? { didSet { needsDisplay = true } }
     var onSelectVideo: ((UUID?, UUID?, UUID?) -> Void)?
@@ -509,110 +600,172 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
     private var videoGesture: VideoGesture?
     private var videoEmptyClick = false
-    var videoRowsHeight: CGFloat { CGFloat(videoRows.count) * TimelineVideoRow.height }
-    private var videoRowsTop: CGFloat { CGFloat(40 + animationLanes().count * 30) + laneOffset }
+    var videoRowsHeight: CGFloat { trackLayout.rows.filter { row in
+        switch row.id { case .media, .volume: true; default: false }
+    }.reduce(0) { $0 + $1.height } }
+    private var videoRowsTop: CGFloat { trackLayout.rows.compactMap { row -> CGFloat? in
+        if case .media = row.id { return trackLayout.offset(of: row.id) }; return nil
+    }.min() ?? TimelineTrackLayout.top }
     func videoRowFrame(_ index: Int) -> CGRect {
-        CGRect(x: railOrigin, y: videoRowsTop + CGFloat(index) * TimelineVideoRow.height,
-            width: railWidth, height: TimelineVideoRow.height - 3)
+        guard videoRows.indices.contains(index) else { return .null }
+        return rowFrame(.media(videoRows[index].layerID))
+    }
+    private func clipSlot(_ clipID: UUID, layerID: UUID) -> (index: Int, split: Bool) {
+        let clips = (frozenVideoRows ?? videoRows).filter { $0.layerID == layerID }.map(\.clip).sorted { $0.start < $1.start }
+        var ends: [Double] = [], slots: [UUID: Int] = [:]
+        for clip in clips {
+            let slot = ends.firstIndex(where: { $0 <= clip.start }) ?? ends.count
+            if slot == ends.count { ends.append(clip.end) } else { ends[slot] = clip.end }
+            slots[clip.id] = slot
+        }
+        guard let clip = clips.first(where: { $0.id == clipID }) else { return (0, false) }
+        let split = clips.contains { $0.id != clipID && $0.start < clip.end && $0.end > clip.start }
+        return (slots[clipID] ?? 0, split)
+    }
+    private func videoBodyFrame(_ index: Int, part: TimelineVideoPart) -> CGRect {
+        let row = videoRows[index], frame = videoRowFrame(index)
+        let slot = clipSlot(row.clip.id, layerID: row.layerID)
+        return CGRect(x: x(for: part.start), y: frame.minY + 1 + (slot.split ? CGFloat(slot.index % 2) * 12 : 0),
+            width: max(1, x(for: part.end) - x(for: part.start)), height: slot.split ? 12 : 24)
     }
     func videoClipFrames() -> [(UUID, UUID, CGRect)] {
         videoRows.enumerated().flatMap { index, row in row.parts.map { part in
-            (row.layerID, row.clip.id, CGRect(x: x(for: part.start), y: videoRowFrame(index).minY,
-                width: max(1, x(for: part.end) - x(for: part.start)), height: 20))
+            (row.layerID, row.clip.id, videoBodyFrame(index, part: part))
         } }
     }
     func videoDeleteFrames() -> [(UUID, UUID, CGRect)] {
         videoClipFrames().compactMap { layer, clip, frame in
             guard selectedVideoClipID == clip, frame.width > 85,
                   frame.maxX >= railOrigin + 30, frame.maxX <= bounds.maxX - 12 else { return nil }
-            return (layer, clip, CGRect(x: frame.maxX - 23, y: frame.minY + 4, width: 12, height: 12))
+            return (layer, clip, CGRect(x: frame.maxX - 29, y: frame.midY - 5, width: 10, height: 10))
+        }
+    }
+    func videoVolumeDisclosureFrames() -> [(UUID, CGRect)] {
+        var seen = Set<UUID>()
+        return videoRows.compactMap { row in
+            guard row.hasAudio, !videoRows.contains(where: { $0.layerID == row.layerID && !$0.clip.volumeKeyframes.isEmpty }),
+                  seen.insert(row.layerID).inserted else { return nil }
+            let frame = rowFrame(.media(row.layerID))
+            return (row.layerID, CGRect(x: railOrigin - 40, y: frame.midY - 10, width: 36, height: 20))
         }
     }
     private func volumeFrame(_ rowIndex: Int, part: TimelineVideoPart) -> CGRect {
-        CGRect(x: x(for: part.start), y: videoRowFrame(rowIndex).minY + 23,
-            width: max(1, x(for: part.end) - x(for: part.start)), height: 19)
+        guard videoRows.indices.contains(rowIndex) else { return .null }
+        let lane = rowFrame(.volume(videoRows[rowIndex].layerID))
+        guard !lane.isNull else { return .null }
+        return CGRect(x: x(for: part.start), y: lane.minY + 3,
+            width: max(1, x(for: part.end) - x(for: part.start)), height: lane.height - 6)
     }
     func videoVolumePoints() -> [(UUID, UUID, UUID, CGRect)] {
         videoRows.enumerated().flatMap { index, row in row.parts.flatMap { part in
-            guard videoRowFrame(index).intersects(visibleRect) else { return [(UUID, UUID, UUID, CGRect)]() }
+            let frame = volumeFrame(index, part: part)
+            guard !frame.isNull, frame.intersects(visibleRect) else { return [(UUID, UUID, UUID, CGRect)]() }
             return row.clip.volumeKeyframes.compactMap { point -> (UUID, UUID, UUID, CGRect)? in
                 let project = row.clip.projectTime(atSourceTime: point.time)
                 let display = part.displayTime(at: project)
                 guard project >= part.authoringStart, project <= part.authoringEnd, display >= visibleStart, display <= visibleStart + visibleDuration else { return nil }
-                let frame = volumeFrame(index, part: part)
                 return (row.layerID, row.clip.id, point.id,
-                    CGRect(x: x(for: part.displayTime(at: project)) - 4, y: frame.maxY - CGFloat(point.gain) * frame.height - 4, width: 8, height: 8))
+                    CGRect(x: x(for: display) - 4, y: frame.maxY - CGFloat(point.gain) * frame.height - 4, width: 8, height: 8))
             }
         } }
     }
     private func drawVideoRows() {
+        let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
+        for row in trackLayout.rows {
+            let isMedia: Bool = switch row.id { case .media, .volume: true; default: false }
+            guard isMedia else { continue }
+            let frame = rowFrame(row.id)
+            guard frame.intersects(visibleRect) else { continue }
+            NSColor.black.withAlphaComponent(0.13).setFill(); NSBezierPath(roundedRect: frame, xRadius: 3, yRadius: 3).fill()
+            let hasDisclosure = videoVolumeDisclosureFrames().contains { row.id == .media($0.0) }
+            (row.title as NSString).draw(in: CGRect(x: 8 + CGFloat(row.depth) * 10, y: frame.minY + 7,
+                width: railOrigin - (hasDisclosure ? 54 : 22) - CGFloat(row.depth) * 10, height: 15), withAttributes: [
+                .font: NSFont.systemFont(ofSize: row.depth == 0 ? 10 : 9, weight: row.depth == 0 ? .medium : .regular),
+                .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
+        }
         for (index, row) in videoRows.enumerated() {
-            let lane = videoRowFrame(index)
-            guard lane.intersects(visibleRect) else { continue }
-            NSColor.black.withAlphaComponent(0.13).setFill(); NSBezierPath(roundedRect: lane, xRadius: 3, yRadius: 3).fill()
-            ("Video" as NSString).draw(in: CGRect(x: 8, y: lane.minY + 3, width: 52, height: 15),
-                withAttributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
-            ((row.hasAudio ? "Volume" : "Silent") as NSString).draw(in: CGRect(x: 8, y: lane.minY + 26, width: 52, height: 15),
-                withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor])
-            NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: lane).addClip()
             for part in row.parts {
-                let body = CGRect(x: x(for: part.start), y: lane.minY + 1, width: max(1, x(for: part.end) - x(for: part.start)), height: 19)
+                let body = videoBodyFrame(index, part: part)
+                guard body.intersects(visibleRect) else { continue }
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: CGRect(x: railOrigin, y: body.minY, width: railWidth, height: body.height)).addClip()
                 let selected = selectedVideoClipID == row.clip.id
                 NSColor.systemIndigo.withAlphaComponent(selected ? 0.6 : 0.3).setFill()
                 NSBezierPath(roundedRect: body, xRadius: 3, yRadius: 3).fill()
                 if selected { NSColor.systemIndigo.setStroke(); NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5), xRadius: 3, yRadius: 3).stroke() }
-                let text = NSMutableParagraphStyle(); text.lineBreakMode = .byTruncatingTail
-                (row.label as NSString).draw(in: body.insetBy(dx: 7, dy: 2), withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.labelColor, .paragraphStyle: text])
+                let title = row.sourceName ?? row.label
+                (title as NSString).draw(in: body.insetBy(dx: 6, dy: body.height > 16 ? 5 : 0), withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.labelColor, .paragraphStyle: style])
                 if selected, row.editable {
                     NSColor.systemIndigo.setFill()
-                    for edge in [body.minX, body.maxX] { NSBezierPath(roundedRect: CGRect(x: edge - 3, y: body.minY - 1, width: 6, height: 21), xRadius: 2, yRadius: 2).fill() }
+                    let edges = (part.authoringStart == row.clip.start ? [body.minX] : []) + (part.authoringEnd == row.clip.end ? [body.maxX] : [])
+                    for edge in edges { NSBezierPath(roundedRect: CGRect(x: edge - 2, y: body.minY, width: 4, height: body.height), xRadius: 1.5, yRadius: 1.5).fill() }
                 }
-                guard row.hasAudio else { continue }
+                NSGraphicsContext.restoreGraphicsState()
                 let volume = volumeFrame(index, part: part)
-                let curve = NSBezierPath()
-                for step in 0...max(2, Int(min(512, volume.width))) {
-                    let denominator = Double(max(2, Int(min(512, volume.width))))
-                    let t = part.start + (part.end - part.start) * Double(step) / denominator
-                    let source = row.clip.sourceTime(at: part.projectTime(at: t))
-                    let point = CGPoint(x: x(for: t), y: volume.maxY - CGFloat(row.clip.envelopeGain(atSourceTime: source)) * volume.height)
+                guard row.hasAudio, !volume.isNull else { continue }
+                NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rowFrame(.volume(row.layerID))).addClip()
+                let curve = NSBezierPath(), count = max(2, Int(min(512, volume.width)))
+                for step in 0...count {
+                    let time = part.start + (part.end - part.start) * Double(step) / Double(count)
+                    let source = row.clip.sourceTime(at: part.projectTime(at: time))
+                    let point = CGPoint(x: x(for: time), y: volume.maxY - CGFloat(row.clip.envelopeGain(atSourceTime: source)) * volume.height)
                     if step == 0 { curve.move(to: point) } else { curve.line(to: point) }
                 }
                 (row.clip.isMuted ? NSColor.secondaryLabelColor : NSColor.systemGreen).setStroke(); curve.lineWidth = 1.5; curve.stroke()
+                NSGraphicsContext.restoreGraphicsState()
             }
-            NSGraphicsContext.restoreGraphicsState()
         }
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: CGRect(x: railOrigin, y: videoRowsTop - 4, width: railWidth, height: videoRowsHeight + 4)).addClip()
+        for (layer, frame) in videoVolumeDisclosureFrames() {
+            let expanded = trackLayout.rows.contains { $0.id == .volume(layer) }
+            ("Audio" as NSString).draw(at: CGPoint(x: frame.minX, y: frame.midY - 5), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor])
+            let x = frame.maxX - 7, y = frame.midY - 3
+            let chevron = NSBezierPath(); chevron.lineWidth = 1.2
+            chevron.move(to: CGPoint(x: x, y: y))
+            chevron.line(to: CGPoint(x: x + (expanded ? 3 : 4), y: y + 3))
+            chevron.line(to: CGPoint(x: x + (expanded ? 6 : 0), y: y + (expanded ? 0 : 6)))
+            NSColor.secondaryLabelColor.setStroke(); chevron.stroke()
+        }
         for (_, _, frame) in videoDeleteFrames() {
             NSColor.labelColor.setStroke(); let cross = NSBezierPath()
             cross.move(to: CGPoint(x: frame.minX + 2, y: frame.minY + 2)); cross.line(to: CGPoint(x: frame.maxX - 2, y: frame.maxY - 2))
-            cross.move(to: CGPoint(x: frame.minX + 2, y: frame.maxY - 2)); cross.line(to: CGPoint(x: frame.maxX - 2, y: frame.minY + 2))
+            cross.move(to: CGPoint(x: frame.minX + 2, y: frame.maxY - 2)); cross.line(to: CGPoint(x: frame.minX + 2, y: frame.minY + 2))
             cross.lineWidth = 1.5; cross.stroke()
         }
         for (_, clip, id, frame) in videoVolumePoints() {
-            (id == selectedVideoVolumeID ? NSColor.labelColor : NSColor.systemGreen).setFill()
-            NSBezierPath(ovalIn: frame).fill()
+            (id == selectedVideoVolumeID ? NSColor.labelColor : NSColor.systemGreen).setFill(); NSBezierPath(ovalIn: frame).fill()
             if clip == selectedVideoClipID { NSColor.systemGreen.setStroke(); NSBezierPath(ovalIn: frame.insetBy(dx: -1, dy: -1)).stroke() }
         }
-        NSGraphicsContext.restoreGraphicsState()
     }
     private func beginVideo(at point: CGPoint) -> Bool {
-        if let (layer, clip, _) = videoDeleteFrames().first(where: { $0.2.insetBy(dx: -3, dy: -3).contains(point) }) {
+        if let (layer, _) = videoVolumeDisclosureFrames().first(where: { $0.1.contains(point) }) {
+            onToggleVideoVolume?(layer); return true
+        }
+        if let (layer, clip, _) = videoDeleteFrames().first(where: { $0.2.insetBy(dx: -4, dy: -4).contains(point) }) {
             onDeleteVideo?(layer, clip, nil); return true
         }
-        guard let index = videoRows.indices.first(where: { videoRowFrame($0).contains(point) }) else { return false }
-        let row = videoRows[index]
-        guard let part = row.parts.reversed().first(where: { point.x >= x(for: $0.start) - 4 && point.x <= x(for: $0.end) + 4 }) else {
-            videoEmptyClick = true; return true
+        let candidates = videoRows.enumerated().flatMap { index, row in row.parts.map { (index, row, $0) } }
+        let pointTarget = videoVolumePoints().first { $0.3.insetBy(dx: -4, dy: -4).contains(point) }
+        let target = pointTarget.flatMap { target in candidates.first { $0.1.clip.id == target.1 && volumeFrame($0.0, part: $0.2).contains(point) } }
+            ?? candidates.reversed().first { index, _, part in
+                videoBodyFrame(index, part: part).insetBy(dx: -4, dy: 0).contains(point)
+                    || volumeFrame(index, part: part).contains(point)
+            }
+        guard let (index, row, part) = target else {
+            if trackLayout.rows.contains(where: { record in
+                switch record.id { case .media, .volume: rowFrame(record.id).contains(point); default: false }
+            }) { videoEmptyClick = true; return true }
+            return false
         }
         let volume = volumeFrame(index, part: part)
         let handle: TimelineVideoHandle
         var creates = false
-        if point.y >= volume.minY - 3, row.hasAudio {
-            if let target = videoVolumePoints().first(where: { $0.1 == row.clip.id && $0.3.insetBy(dx: -4, dy: -4).contains(point) }) { handle = .volume(target.2) }
+        if !volume.isNull, volume.insetBy(dx: 0, dy: 3).contains(point), row.hasAudio {
+            if let pointTarget { handle = .volume(pointTarget.2) }
             else { handle = .volume(UUID()); creates = true }
-        } else if selectedVideoClipID == row.clip.id && abs(point.x - x(for: part.start)) <= 7 { handle = .start }
-        else if selectedVideoClipID == row.clip.id && abs(point.x - x(for: part.end)) <= 7 { handle = .end }
+        } else if selectedVideoClipID == row.clip.id && part.authoringStart == row.clip.start && abs(point.x - x(for: part.start)) <= 7 { handle = .start }
+        else if selectedVideoClipID == row.clip.id && part.authoringEnd == row.clip.end && abs(point.x - x(for: part.end)) <= 7 { handle = .end }
         else { handle = .move }
         let pointID: UUID? = { if case .volume(let id) = handle { return id }; return nil }()
         onSelectVideo?(row.layerID, row.clip.id, pointID)
@@ -627,28 +780,37 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard gesture.moved || (final && gesture.createsPoint) else { if final { videoGesture = nil }; return }
         let origin = gesture.part.projectTime(at: gesture.originDisplay)
         let destinationDisplay = gesture.originDisplay + Double((point.x - gesture.origin.x) / gesture.railWidth) * gesture.visibleDuration
-        let destination = gesture.part.projectTime(at: destinationDisplay)
+        let handle: TimelineAnimationHandle = switch gesture.handle { case .start: .start; case .end: .end; default: .move }
+        let sourceDelta: Double
+        if let map = gesture.part.timelineMap, let branch = gesture.part.branchIndex {
+            let original = TimelineAnimation(id: .init(lane: .screen, componentID: gesture.row.clip.id), editID: gesture.row.clip.id,
+                start: gesture.row.clip.start, end: gesture.row.clip.end, easeIn: 0, easeOut: 0, label: "", help: "", editable: true)
+            let drag = AnimationDrag(id: original.id, handle: handle, deltaSeconds: destinationDisplay - gesture.originDisplay)
+            guard let converted = TimelineAnimationSolver.sourceDrag(drag, original: original, map: map,
+                branchIndex: branch, moveAnchor: origin) else { return }
+            sourceDelta = converted.deltaSeconds
+        } else { sourceDelta = destinationDisplay - gesture.originDisplay }
         let position: Double
         switch gesture.handle {
-        case .move: position = gesture.row.clip.start + destination - origin
-        case .start: position = gesture.row.clip.start + destination - origin
-        case .end: position = gesture.row.clip.end + destination - origin
-        case .volume: position = min(gesture.row.clip.end.nextDown, max(gesture.row.clip.start, destination))
+        case .move, .start: position = gesture.row.clip.start + sourceDelta
+        case .end: position = gesture.row.clip.end + sourceDelta
+        case .volume: position = min(gesture.row.clip.end.nextDown, max(gesture.row.clip.start, origin + sourceDelta))
         }
         let index = videoRows.firstIndex { $0.clip.id == gesture.row.clip.id } ?? 0
         let frame = volumeFrame(index, part: gesture.part)
+        let gain = frame.isNull ? 1 : min(1, max(0, Double((frame.maxY - point.y) / max(1, frame.height))))
         let request = TimelineVideoEdit(layerID: gesture.row.layerID, clipID: gesture.row.clip.id, handle: gesture.handle,
-            projectTime: position, gain: min(1, max(0, Double((frame.maxY - point.y) / frame.height))))
+            projectTime: position, gain: gain)
         gesture.request = request; videoGesture = gesture
         onVideoEdit?(request, final)
         if final { videoGesture = nil }
     }
+    private var rangeSelectionOnly = false
     private var clipOrigin: CGPoint?
     private var clipRange: ClosedRange<Double>?
     private var clockID = "source"
     private var hasClock = false
     private var savedViewports: [String: (Double, Double)] = [:]
-    private var laneOffset: CGFloat { showsClipLane ? 30 : 0 }
 
     func setClock(_ id: String, duration value: Double) {
         if !hasClock {
@@ -656,6 +818,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             setViewport(start: 0, span: value); return
         }
         if id != clockID {
+            frozenRowLayout = nil; frozenVideoRows = nil
             savedViewports[clockID] = (visibleStart, visibleDuration)
             cancelAnimationGesture(); drag = nil; scrubTime = nil; clipOrigin = nil; clipRange = nil
             if videoGesture != nil { videoGesture = nil; onVideoCancel?() }; videoEmptyClick = false
@@ -666,13 +829,13 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         } else { duration = value }
     }
 
-    var clipLaneFrame: CGRect { CGRect(x: railOrigin, y: 38, width: railWidth, height: 26) }
+    var clipLaneFrame: CGRect { rowFrame(.cuts) }
     func cutMarkerFrames() -> [(TimelineCutMarker, CGRect)] {
         cutMarkers.filter { $0.end >= visibleStart && $0.start <= visibleStart + visibleDuration }.map {
             let left = max(railOrigin, x(for: $0.start)), right = min(bounds.width - 12, x(for: $0.end))
             let textWidth = ($0.badgeLabel as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 9, weight: .medium)]).width
             let width = min(80, max(28, ceil(textWidth) + 10))
-            return ($0, CGRect(x: max(railOrigin, min((left + right) / 2 - width / 2, bounds.width - 12 - width)), y: 42, width: width, height: 18))
+            return ($0, CGRect(x: max(railOrigin, min((left + right) / 2 - width / 2, bounds.width - 12 - width)), y: clipLaneFrame.minY + 4, width: width, height: 18))
         }
     }
     func cutAnchor(for id: UUID) -> UnitPoint? {
@@ -682,25 +845,19 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
     func cutTransitionFrames() -> [(TimelineCutMarker, CGRect)] {
         cutMarkers.filter { $0.showsTransitionSpan && $0.end > $0.start && $0.end >= visibleStart && $0.start <= visibleStart + visibleDuration }.map {
-            ($0, CGRect(x: x(for: $0.start), y: 40, width: max(1, x(for: $0.end) - x(for: $0.start)), height: 22))
+            ($0, CGRect(x: x(for: $0.start), y: clipLaneFrame.minY + 2, width: max(1, x(for: $0.end) - x(for: $0.start)), height: 22))
         }
     }
     private func drawClipLane() {
-        ("Clips" as NSString).draw(at: CGPoint(x: 8, y: 44), withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+        ("Cuts" as NSString).draw(at: CGPoint(x: 8, y: clipLaneFrame.minY + 6), withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
         NSColor.black.withAlphaComponent(0.13).setFill(); NSBezierPath(roundedRect: clipLaneFrame, xRadius: 3, yRadius: 3).fill()
         NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: clipLaneFrame).addClip()
-        for band in clipBands {
-            let rect = CGRect(x: x(for: band.start), y: 40, width: max(1, x(for: band.end) - x(for: band.start)), height: 22)
-            (band.excluded ? NSColor.secondaryLabelColor.withAlphaComponent(0.15) : NSColor.controlAccentColor.withAlphaComponent(0.3)).setFill()
-            NSBezierPath(roundedRect: rect.width > 2 ? rect.insetBy(dx: 1, dy: 0) : rect, xRadius: 2, yRadius: 2).fill()
-            if rect.width > 45 { (band.label as NSString).draw(in: rect.insetBy(dx: 5, dy: 6), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]) }
-        }
         for (_, rect) in cutTransitionFrames() {
             NSColor.systemTeal.withAlphaComponent(0.4).setFill(); NSBezierPath(rect: rect).fill()
             let lines = NSBezierPath(); lines.move(to: CGPoint(x: rect.minX, y: rect.minY)); lines.line(to: CGPoint(x: rect.maxX, y: rect.maxY)); lines.move(to: CGPoint(x: rect.minX, y: rect.maxY)); lines.line(to: CGPoint(x: rect.maxX, y: rect.minY)); NSColor.systemTeal.setStroke(); lines.stroke()
         }
         if let range = clipRange ?? selectedRange {
-            let rect = CGRect(x: x(for: range.lowerBound), y: 39, width: max(1, x(for: range.upperBound) - x(for: range.lowerBound)), height: 24)
+            let rect = CGRect(x: x(for: range.lowerBound), y: clipLaneFrame.minY + 1, width: max(1, x(for: range.upperBound) - x(for: range.lowerBound)), height: 24)
             NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).setFill(); NSBezierPath(rect: rect).fill()
             NSColor.controlAccentColor.setStroke(); NSBezierPath(rect: rect).stroke()
         }
@@ -782,12 +939,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var scrubTime: Double?
     private var keyboardFocus = false
     private var lastFitRequest: UUID?
-    private var railOrigin: CGFloat { showsAnimationLanes ? 64 : 12 }
+    private var railOrigin: CGFloat { showsAnimationLanes ? 132 : 12 }
     private var railWidth: CGFloat { max(1, bounds.width - railOrigin - 12) }
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? (showsClipLane ? RecordingTimeline.clipLaneHeight : RecordingTimeline.animationLaneHeight) + CGFloat(max(0, animationLanes().count - 4) * 30) + videoRowsHeight : 72) }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? trackLayout.contentHeight : 72) }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -823,10 +980,19 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         tooltipText.removeAll()
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
-        tooltipText[base] = showsAnimationLanes ? "Drag spans to move; selected edges resize and tall bars adjust ramps. Option-drag pushes neighbors. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        tooltipText[base] = showsAnimationLanes ? "Drag the playhead to scrub; Shift-drag the ruler to select a cut range. Drag spans to move; selected edges and tall bars adjust timing. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        for row in trackLayout.rows {
+            let frame = rowFrame(row.id)
+            tooltipText[addToolTip(CGRect(x: 4, y: frame.minY, width: railOrigin - 22, height: frame.height), owner: self, userData: nil)] = row.help
+        }
+        for (layer, frame) in videoVolumeDisclosureFrames() {
+            let title = trackLayout.rows.first { $0.id == .media(layer) }?.title ?? "this layer"
+            let verb = trackLayout.rows.contains { $0.id == .volume(layer) } ? "Hide" : "Show"
+            tooltipText[addToolTip(frame.insetBy(dx: -3, dy: -3), owner: self, userData: nil)] = "\(verb) the audio volume envelope for \(title)."
+        }
         for (layer, clip, frame) in videoClipFrames() {
             if let row = videoRows.first(where: { $0.layerID == layer && $0.clip.id == clip }) {
-                tooltipText[addToolTip(frame.intersection(bounds), owner: self, userData: nil)] = row.label + (row.editable ? ": drag to move; selected edges trim. Delete removes this occurrence." : ": split by cuts or a crossfade. Use Source to adjust this clip's timing.")
+                tooltipText[addToolTip(frame.intersection(bounds), owner: self, userData: nil)] = row.label + ": drag this visible clip to move its occurrence; real source edges trim. Delete removes this occurrence."
             }
         }
         for (_, _, frame) in videoDeleteFrames() {
@@ -885,7 +1051,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let start = drag?.start ?? trimStart
         let end = drag?.end ?? trimEnd
         let current = scrubTime ?? playhead
-        drawConflictReview(keptStart: start, keptEnd: end)
+        if !showsAnimationLanes { drawConflictReview(keptStart: start, keptEnd: end) }
         let rail = CGRect(x: railOrigin, y: 21, width: railWidth, height: 6)
         NSColor.quaternaryLabelColor.setFill()
         NSBezierPath(roundedRect: rail, xRadius: 3, yRadius: 3).fill()
@@ -898,6 +1064,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             NSBezierPath(roundedRect: handle, xRadius: 3, yRadius: 3).fill()
             NSColor.white.setFill()
             NSBezierPath(roundedRect: handle.insetBy(dx: 4, dy: 6), xRadius: 1, yRadius: 1).fill()
+        }
+        if !trackLayout.rows.contains(where: { $0.id == .cuts }), let range = clipRange ?? selectedRange {
+            let selection = CGRect(x: x(for: range.lowerBound), y: 12, width: max(1, x(for: range.upperBound) - x(for: range.lowerBound)), height: 21)
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(0.3).setFill(); NSBezierPath(rect: selection).fill()
         }
         let cursorX = x(for: current)
         if markerIsVisible(current) {
@@ -969,21 +1139,18 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     func animationLanes() -> [AnimationLaneGeometry] {
-        TimelineAnimationLane.allCases.filter { lane in
-            if lane == .cameraOpacity { return showsCameraOpacityLane }
-            if lane == .audioMicrophone || lane == .audioSystem { return animationSpans.contains { $0.lane == lane } }
-            return true
-        }.enumerated().map { index, lane in
-            let y = CGFloat(40 + index * 30) + laneOffset
-            let title: String = switch lane { case .screen: "Screen"; case .camera: "Camera"; case .cameraOpacity: "Opacity"; case .speed: "Speed"; case .pointer: "Pointer"; case .audioMicrophone: "Mic"; case .audioSystem: "System" }
-            return AnimationLaneGeometry(lane: lane, title: title,
-                frame: CGRect(x: railOrigin, y: y, width: railWidth, height: 26),
-                labelFrame: CGRect(x: 8, y: y + 5, width: 52, height: 16))
+        trackLayout.rows.compactMap { row in
+            guard case .animation(let lane) = row.id else { return nil }
+            let frame = rowFrame(row.id)
+            return AnimationLaneGeometry(lane: lane, title: row.title, frame: frame,
+                labelFrame: CGRect(x: 8 + CGFloat(row.depth) * 10, y: frame.minY + 5,
+                    width: railOrigin - 22 - CGFloat(row.depth) * 10, height: 16))
         }
     }
 
     func pointerClickGeometry() -> [PointerClickGeometry] {
-        let y = (animationLanes().first { $0.lane == .pointer }?.frame.maxY ?? 156 + laneOffset) - 3
+        guard let lane = animationLanes().first(where: { $0.lane == .pointer }) else { return [] }
+        let y = lane.frame.maxY - 3
         return pointerClickTimes.filter { $0.isFinite && $0 >= 0 && $0 <= duration && markerIsVisible($0) }.map {
             PointerClickGeometry(time: $0, frame: CGRect(x: x(for: $0) - 1, y: y, width: 2, height: 3))
         }
@@ -1011,16 +1178,16 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
                 y: body.minY + 5, width: textWidth, height: 11)
             let timing = editable && !animation.isReference
             let wide = width >= 80 && !animation.isInstant
-            let start = timing ? CGRect(x: left - 4, y: lane.frame.minY + (wide ? 15 : 0), width: 8, height: wide ? 10 : 8) : nil
-            let end = timing && !animation.isInstant ? CGRect(x: right - 4, y: lane.frame.minY + (wide ? 15 : 18), width: 8, height: wide ? 10 : 8) : nil
+            let start = timing && animation.showsStartHandle ? CGRect(x: left - 4, y: lane.frame.minY + (wide ? 15 : 0), width: 8, height: wide ? 10 : 8) : nil
+            let end = timing && !animation.isInstant && animation.showsEndHandle ? CGRect(x: right - 4, y: lane.frame.minY + (wide ? 15 : 18), width: 8, height: wide ? 10 : 8) : nil
             var incomingX = x(for: animation.start + animation.easeIn)
             var outgoingX = x(for: animation.end - animation.easeOut)
             if outgoingX - incomingX < 14 {
                 let middle = (incomingX + outgoingX) / 2
                 incomingX = middle - 7; outgoingX = middle + 7
             }
-            let easeIn = timing && wide ? CGRect(x: incomingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
-            let easeOut = timing && wide ? CGRect(x: outgoingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
+            let easeIn = timing && wide && animation.showsEaseInHandle ? CGRect(x: incomingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
+            let easeOut = timing && wide && animation.showsEaseOutHandle ? CGRect(x: outgoingX - 6, y: lane.frame.minY - 4, width: 12, height: 16) : nil
             let deletion = editable ? CGRect(x: min(body.maxX + 4, bounds.width - 24), y: lane.frame.minY + 14, width: 10, height: 10) : nil
             return AnimationGeometry(animation: animation, body: body, labelFrame: label, startHandle: start,
                 endHandle: end, easeInHandle: easeIn, easeOutHandle: easeOut, deleteButton: deletion)
@@ -1072,7 +1239,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard markerIsVisible(time) else { return path }
         let position = x(for: time)
         path.move(to: CGPoint(x: position, y: 8))
-        path.line(to: CGPoint(x: position, y: showsAnimationLanes ? max(animationLanes().last?.frame.maxY ?? 126, videoRowsTop + videoRowsHeight - 3) : 34))
+        path.line(to: CGPoint(x: position, y: showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer - 3 : 34))
         return path
     }
 
@@ -1125,15 +1292,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             NSBezierPath(roundedRect: lane.frame, xRadius: 3, yRadius: 3).fill()
             (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
                 .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
-            if lane.lane != .screen, !displayedAnimations.contains(where: { $0.lane == lane.lane }) {
-                ((lane.lane == .speed ? "1×" : "Not recorded") as NSString).draw(at: CGPoint(x: railOrigin + 5, y: lane.frame.minY + 8), withAttributes: [
-                    .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.tertiaryLabelColor])
-            }
+
         }
         drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
         NSGraphicsContext.saveGraphicsState()
-        let top = 38 + laneOffset
-        let bottom = animationLanes().map(\.frame.maxY).max() ?? top
+        let top = TimelineTrackLayout.top
+        let bottom = trackLayout.contentHeight - TimelineTrackLayout.footer
         NSBezierPath(rect: CGRect(x: railOrigin, y: top, width: railWidth, height: max(0, bottom - top))).addClip()
         if let lane = animationLanes().first(where: { $0.lane == .speed }) {
             NSColor.systemOrange.withAlphaComponent(0.8).setStroke()
@@ -1220,14 +1384,24 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         return bodies.isEmpty ? geometry.filter { $0.labelFrame.contains(point) } : bodies
     }
 
+    private func controlHitFrame(_ frame: CGRect, for animation: TimelineAnimation) -> CGRect {
+        let lane = rowFrame(.animation(animation.lane))
+        let width = max(18, frame.width + 10), height = max(18, frame.height + 8)
+        return CGRect(x: frame.midX - width / 2, y: max(lane.minY - 4, frame.midY - height / 2), width: width, height: height)
+    }
+
     private func beginAnimationInteraction(at point: CGPoint) {
         animationPointerOrigin = point
         let geometry = animationGeometry()
         if let selected = geometry.first(where: { $0.animation.id == selectedAnimationID }) {
-            if selected.deleteButton?.contains(point) == true { animationDeleteID = selected.animation.id; return }
-            let handles: [(CGRect?, TimelineAnimationHandle)] = [(selected.easeInHandle, .easeIn), (selected.easeOutHandle, .easeOut),
-                (selected.startHandle, .start), (selected.endHandle, .end)]
-            for (frame, handle) in handles where frame?.contains(point) == true {
+            let controls: [(CGRect?, TimelineAnimationHandle?)] = [(selected.easeInHandle, .easeIn), (selected.easeOutHandle, .easeOut),
+                (selected.startHandle, .start), (selected.endHandle, .end), (selected.deleteButton, nil)]
+            let hits = controls.compactMap { frame, handle -> (CGRect, TimelineAnimationHandle?)? in
+                guard let frame, controlHitFrame(frame, for: selected.animation).contains(point) else { return nil }
+                return (frame, handle)
+            }
+            if let target = hits.min(by: { hypot($0.0.midX - point.x, $0.0.midY - point.y) < hypot($1.0.midX - point.x, $1.0.midY - point.y) }) {
+                guard let handle = target.1 else { animationDeleteID = selected.animation.id; return }
                 animationPointerOrigin = point
                 animationGesture = AnimationGesture(id: selected.animation.id, handle: handle, origin: point, base: animationSpans,
                     visibleDuration: visibleDuration, railWidth: railWidth); return
@@ -1309,8 +1483,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         blockedAnimation = nil; blockedAnimationIDs.removeAll()
         gesture.valid = true; gesture.lastRequest = request
         let changes = Dictionary(uniqueKeysWithValues: changed.map { ($0.id, $0) })
-        animationPreview = gesture.base.map { changes[$0.id] ?? $0 }
-        if var wanted = gesture.base.first(where: { $0.id == gesture.id }),
+        animationPreview = animationDragProjection != nil ? changed : gesture.base.map { changes[$0.id] ?? $0 }
+        if animationDragProjection == nil, var wanted = gesture.base.first(where: { $0.id == gesture.id }),
            let projected = animationPreview?.first(where: { $0.id == gesture.id }) {
             switch gesture.handle {
             case .move: wanted.start += delta; wanted.end += delta
@@ -1436,7 +1610,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func conflictBands() -> [ConflictBand] {
         conflictSpans.compactMap { span in
             guard let frame = conflictFrame(start: span.start, end: span.end,
-                y: showsAnimationLanes ? (span.side == .existing ? 41 : 63) + laneOffset : (span.side == .existing ? 2 : 8), height: 3) else { return nil }
+                y: showsAnimationLanes ? rowFrame(.animation(.screen)).minY + (span.side == .existing ? 2 : 22) : (span.side == .existing ? 2 : 8), height: 3) else { return nil }
             return ConflictBand(span: span, frame: frame)
         }
     }
@@ -1453,7 +1627,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func drawConflictReview(keptStart: Double, keptEnd: Double) {
-        let lane = CGRect(x: railOrigin, y: showsAnimationLanes ? 40 + laneOffset : 0, width: railWidth, height: showsAnimationLanes ? 26 : 12)
+        let lane = showsAnimationLanes ? rowFrame(.animation(.screen)) : CGRect(x: railOrigin, y: 0, width: railWidth, height: 12)
+        guard !lane.isNull else { return }
         func draw(alpha: CGFloat) {
             for interval in conflictOverlaps {
                 guard let frame = conflictFrame(start: interval.lowerBound, end: interval.upperBound, y: lane.minY, height: lane.height) else { continue }
@@ -1709,7 +1884,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         while tick <= last + step * 0.000_001 {
             let position = x(for: tick)
             let path = NSBezierPath()
-            let tickY: CGFloat = showsAnimationLanes ? CGFloat(40 + animationLanes().count * 30) + laneOffset + videoRowsHeight : 57
+            let tickY: CGFloat = showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer : 57
             path.move(to: CGPoint(x: position, y: tickY))
             path.line(to: CGPoint(x: position, y: tickY + 3))
             NSColor.tertiaryLabelColor.setStroke()
@@ -1717,7 +1892,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             let text = String(format: "%.*f s", decimals, tick) as NSString
             let width = text.size(withAttributes: attributes).width
             let labelX = min(max(position - width / 2, 0), bounds.width - width)
-            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? CGFloat(44 + animationLanes().count * 30) + laneOffset + videoRowsHeight : 61), withAttributes: attributes)
+            text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer + 5 : 61), withAttributes: attributes)
             tick += step
         }
     }
@@ -1805,16 +1980,21 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         keyboardFocus = false
         needsDisplay = true
         window?.makeFirstResponder(self)
+        if showsAnimationLanes { freezeRows() }
         onInteractionBegan?()
+        if showsAnimationLanes, event.modifierFlags.contains(.shift), point.x >= railOrigin, point.y <= 34 {
+            rangeSelectionOnly = true; clipOrigin = point; clipRange = nil; return
+        }
         if showsAnimationLanes, beginVideo(at: point) { return }
         if showsClipLane, clipLaneFrame.contains(point) {
-            clipOrigin = point; clipRange = nil
+            rangeSelectionOnly = false; clipOrigin = point; clipRange = nil
             return
         }
-        let rampHit = showsAnimationLanes && animationGeometry().contains {
-            $0.easeInHandle?.contains(point) == true || $0.easeOutHandle?.contains(point) == true
+        let rampHit = showsAnimationLanes && animationGeometry().contains { geometry in
+            [geometry.startHandle, geometry.endHandle, geometry.easeInHandle, geometry.easeOutHandle, geometry.deleteButton]
+                .compactMap { $0 }.contains { controlHitFrame($0, for: geometry.animation).contains(point) }
         }
-        if showsAnimationLanes, point.y >= 38 + laneOffset || rampHit {
+        if showsAnimationLanes, point.y >= TimelineTrackLayout.top || rampHit {
             beginAnimationInteraction(at: point)
             return
         }
@@ -1913,12 +2093,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseUp(with event: NSEvent) {
+        defer { thawRows(); rangeSelectionOnly = false }
         if videoEmptyClick { videoEmptyClick = false; onSelectVideo?(nil, nil, nil); return }
         if videoGesture != nil { updateVideo(at: convert(event.locationInWindow, from: nil), final: true); return }
         if clipOrigin != nil {
             let point = convert(event.locationInWindow, from: nil)
             clipOrigin = nil
             if let range = clipRange { onRangeSelection?(range) }
+            else if rangeSelectionOnly { onRangeSelection?(nil) }
             else if let (cut, _) = cutMarkerFrames().first(where: { $0.1.contains(point) }) { onRangeSelection?(nil); onSelectCut?(cut.id) }
             else { onRangeSelection?(nil); onScrubBegan?(); seek(time(for: point.x)); onScrubEnded?(); scrubTime = nil }
             clipRange = nil; needsDisplay = true; return
@@ -1949,6 +2131,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        defer { thawRows() }
         if videoGesture != nil { videoGesture = nil; onVideoCancel?(); return }
         if selectedVideoClipID != nil { onSelectVideo?(nil, nil, nil); return }
         if clipOrigin != nil || selectedRange != nil {
@@ -1994,7 +2177,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard event.keyCode == 123 || event.keyCode == 124 else { super.keyDown(with: event); return }
         keyboardFocus = true
         onInteractionBegan?()
-        let step = event.modifierFlags.contains(.shift) ? 1.0 : 0.1
+        let step = event.modifierFlags.contains(.shift) ? 1.0 : (frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30)
         onScrubBegan?()
         seek(playhead + (event.keyCode == 123 ? -step : step))
         onScrubEnded?()
@@ -2003,8 +2186,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     override func accessibilityValue() -> Any? { NSNumber(value: playhead) }
-    override func accessibilityPerformIncrement() -> Bool { accessibleSeek(0.1) }
-    override func accessibilityPerformDecrement() -> Bool { accessibleSeek(-0.1) }
+    override func accessibilityPerformIncrement() -> Bool { accessibleSeek(frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30) }
+    override func accessibilityPerformDecrement() -> Bool { accessibleSeek(-(frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30)) }
 
     private func accessibleSeek(_ delta: Double) -> Bool {
         keyboardFocus = true

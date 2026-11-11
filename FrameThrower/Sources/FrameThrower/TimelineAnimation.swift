@@ -22,6 +22,13 @@ struct TimelineAnimation: Identifiable, Equatable, Sendable {
     var isReference: Bool = false
     var gainStart: Double? = nil
     var gainEnd: Double? = nil
+    /// A cut can reveal only a fragment of an edit. Its cut edges are not
+    /// animation endpoints and must never become misleading resize handles.
+    var showsStartHandle = true
+    var showsEndHandle = true
+    var showsEaseInHandle = true
+    var showsEaseOutHandle = true
+    var isPlaceholder = false
 
     var lane: TimelineAnimationLane { id.lane }
     var componentID: UUID { id.componentID }
@@ -46,6 +53,46 @@ struct AnimationDrag: Equatable, Sendable {
 }
 
 enum TimelineAnimationSolver {
+    /// Translate one projected fragment gesture into the original authoring
+    /// clock. Inside a crossfade the selected branch wins; beyond that branch
+    /// the drag crosses the cut into the next retained section.
+    static func sourceDrag(_ request: AnimationDrag, original: TimelineAnimation,
+                           map: RecordingTimeMap, branchIndex: Int,
+                           moveAnchor: Double) -> AnimationDrag? {
+        guard map.clips.indices.contains(branchIndex), request.deltaSeconds.isFinite,
+              request.snapTolerance.isFinite, request.snapTolerance >= 0 else { return nil }
+        let anchor: Double
+        switch request.handle {
+        case .move: anchor = moveAnchor
+        case .start: anchor = original.start
+        case .end: anchor = original.end
+        case .easeIn: anchor = original.start + original.easeIn
+        case .easeOut: anchor = original.end - original.easeOut
+        }
+        let selected = map.clips[branchIndex]
+        guard anchor.isFinite, anchor >= selected.sourceStart - 0.000000001,
+              anchor <= selected.sourceEnd + 0.000000001 else { return nil }
+        let outputAnchor = selected.outputTime(for: anchor)
+        func source(at output: Double, direction: Double) -> Double {
+            let bounded = min(map.outputDuration, max(0, output))
+            if bounded >= selected.outputStart && bounded <= selected.outputEnd {
+                return selected.sourceTime(at: bounded)
+            }
+            let samples = map.samples(at: bounded)
+            let sample = direction >= 0
+                ? samples.max(by: { $0.clipIndex < $1.clipIndex })
+                : samples.min(by: { $0.clipIndex < $1.clipIndex })
+            return sample?.sourceTime ?? anchor
+        }
+        let destination = outputAnchor + request.deltaSeconds
+        let translated = source(at: destination, direction: request.deltaSeconds) - anchor
+        let tolerance = request.snapTolerance == 0 ? 0
+            : abs(source(at: destination + request.snapTolerance, direction: 1)
+                  - source(at: destination, direction: request.deltaSeconds))
+        return AnimationDrag(id: original.id, handle: request.handle,
+                             deltaSeconds: translated, push: request.push, snapTolerance: tolerance)
+    }
+
     static let minimumSeparation = 0.000001
     static let snapTolerance = 0.04
     /// Returns changed spans only. A rejected/invalid base has no projection.

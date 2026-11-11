@@ -16,7 +16,8 @@ struct EditorAnimationEditingChecks {
         try coincidentReference()
         try clippedFollowersStayPut()
         try reorderedMetadata()
-        print("Animation editing checks passed (lane-independent stop/snap/reorder/ripple, recording bounds, duration/ramp preservation, shared identities, clipped followers, atomic durable Undo/Redo/Escape and failed-save draft retention; no media).")
+        try outputFragmentDrag()
+        print("Animation editing checks passed (lane-independent stop/snap/reorder/ripple, recording bounds, duration/ramp preservation, shared identities, clipped followers, output-fragment branch/cut/speed mapping, atomic durable Undo/Redo/Escape and failed-save draft retention; no media).")
     }
     static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
         guard try condition() else { throw AnimationCheckFailure.failed(message) }
@@ -52,6 +53,32 @@ struct EditorAnimationEditingChecks {
             }
         }
     }
+    static func outputFragmentDrag() throws {
+        let cut = RecordingCut(start: 3, end: 7, crossfade: 1)
+        let map = try RecordingTimeMap(duration: 14, trimStart: 0, trimEnd: 14, cuts: [cut])
+        let original = span(.screen, 1, 9)
+        let display = TimelineAnimationID(lane: .screen, componentID: UUID())
+        func drag(_ delta: Double, _ branch: Int, _ anchor: Double, _ handle: TimelineAnimationHandle = .move) throws -> AnimationDrag {
+            guard let value = EditorAnimationEditing.sourceDrag(.init(id: display, handle: handle,
+                deltaSeconds: delta, snapTolerance: 0), original: original, map: map,
+                branchIndex: branch, moveAnchor: anchor) else { throw AnimationCheckFailure.failed("Projected drag was rejected") }
+            try require(value.id == original.id, "Fragment gesture targets the original component, not its display identity")
+            return value
+        }
+        try near(try drag(0.25, 0, 2.5).deltaSeconds, 0.25, "Outgoing crossfade branch stays outgoing")
+        try near(try drag(-0.25, 1, 7.5).deltaSeconds, -0.25, "Incoming crossfade branch stays incoming")
+        try near(try drag(1, 0, 2.5).deltaSeconds, 6, "Moving beyond a branch crosses removed footage")
+        try near(try drag(-1, 1, 7.5).deltaSeconds, -6, "Reverse drag crosses back to prior retained branch")
+        try require(EditorAnimationEditing.sourceDrag(.init(id: display, handle: .end, deltaSeconds: 0.1),
+            original: original, map: map, branchIndex: 0, moveAnchor: 2) == nil,
+            "A clipped fragment boundary must not impersonate a hidden original endpoint")
+        let speed = try RecordingTimeMap(duration: 14, trimStart: 0, trimEnd: 14, cuts: [],
+            speedKeyframes: [.init(time: 0, rate: 2)])
+        let mapped = EditorAnimationEditing.sourceDrag(.init(id: display, handle: .move,
+            deltaSeconds: 0.5, snapTolerance: 0), original: original, map: speed, branchIndex: 0, moveAnchor: 2)!
+        try near(mapped.deltaSeconds, 1, "Output drag uses retimed source clock")
+    }
+
     static func stopSnapAndRipple() throws {
         let a = span(.screen, 1, 3), b = span(.screen, 4, 5), c = span(.screen, 6, 8)
         let camera = span(.camera, 2, 7), pointer = span(.pointer, 0, 10, editable: false)

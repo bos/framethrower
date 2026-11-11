@@ -60,6 +60,7 @@ enum EditorAnimationEditing {
                     previous: previous, transition: point.transition, duration: point.duration,
                     easeIn: point.easeIn, easeOut: point.easeOut,
                     label: label, help: help, editable: index != 0))
+                if index == 0 { result[result.count - 1].isPlaceholder = true }
                 previous = point.time
             }
         }
@@ -86,7 +87,7 @@ enum EditorAnimationEditing {
                 result.append(TimelineAnimation(id: .init(lane: channel.role.lane, componentID: id), editID: id,
                     start: 0, end: duration, easeIn: 0, easeOut: 0, label: channel.role.title,
                     help: "Select to change \(channel.role.title.lowercased()) level or add a source-timed volume change.", editable: false,
-                    gainStart: 1, gainEnd: 1))
+                    gainStart: 1, gainEnd: 1, isPlaceholder: true))
             }
             for point in channel.points {
                 var span = animation(id: point.id, editID: point.id, lane: channel.role.lane, end: point.time,
@@ -111,6 +112,7 @@ enum EditorAnimationEditing {
                     end: point.time, previous: previous, transition: point.transition, duration: point.duration,
                     easeIn: point.easeIn, easeOut: point.easeOut,
                     label: label, help: label + ". Camera opacity is independent of camera movement.", editable: ownIDs.contains(point.id)))
+                if index == 0 && !ownIDs.contains(point.id) { result[result.count - 1].isPlaceholder = true }
                 previous = point.time; previousAlpha = point.opacity
             }
         }
@@ -127,8 +129,15 @@ enum EditorAnimationEditing {
         }
         result.append(TimelineAnimation(id: TimelineAnimationID(lane: .pointer, componentID: pointerID),
             editID: pointerID, start: 0, end: duration, easeIn: 0, easeOut: 0,
-            label: "Pointer", help: "Pointer style applies to the entire recording.", editable: false))
+            label: "Pointer", help: "Pointer style applies to the entire recording.", editable: false, isPlaceholder: true))
         return result
+    }
+
+    static func sourceDrag(_ request: AnimationDrag, original: TimelineAnimation,
+                           map: RecordingTimeMap, branchIndex: Int,
+                           moveAnchor: Double) -> AnimationDrag? {
+        TimelineAnimationSolver.sourceDrag(request, original: original, map: map,
+                                           branchIndex: branchIndex, moveAnchor: moveAnchor)
     }
 
     /// Allocate once at gesture begin, then reuse for every preview and commit.

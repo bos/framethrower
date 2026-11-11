@@ -29,7 +29,7 @@ private final class FinishedTimingMagnify: NSEvent {
         try boundaryAndRipple()
         try preciseRateCurve()
         try await productionEditor()
-        print("Finished timing editing checks passed (nonlinear handle inverses, retained-span eligibility, bounds/ripple, actual-rate precision, native selection/drag, pinned clocks/viewport, Escape/late-up, saved Undo/Redo, failed save, no media).")
+        print("Finished timing editing checks passed (nonlinear handle inverses, editable cut fragments, original endpoint handles, full-project ripple, actual-rate precision, native selection/drag, pinned clocks/viewport, Escape/late-up, saved Undo/Redo, failed save, no media).")
     }
     static func span(_ lane: TimelineAnimationLane = .screen, start: Double, end: Double,
                      easeIn: Double = 0.2, easeOut: Double = 0.3) -> TimelineAnimation {
@@ -43,11 +43,14 @@ private final class FinishedTimingMagnify: NSEvent {
     }
     static func inverseHandlesAndEligibility() throws {
         let clock = try map(), target = span(start: 3, end: 5), clip = clock.clips[0]
-        let binding = FinishedTimelineBinding.make(animation: target, map: clock)!
+        let projection = TimelineOutputProjection(animations: [target], map: clock)
+        let displayed = projection.animations[0].id
+        let binding = projection.editableBindings[displayed]!
         for (handle, anchor) in [(TimelineAnimationHandle.move, target.start), (.start, target.start),
             (.end, target.end), (.easeIn, target.start + target.easeIn), (.easeOut, target.end - target.easeOut)] {
-            let request = AnimationDrag(id: target.id, handle: handle, deltaSeconds: 0.15)
-            let source = binding.sourceDrag(request)
+            let request = AnimationDrag(id: displayed, handle: handle, deltaSeconds: 0.15, snapTolerance: 0)
+            let source = TimelineAnimationSolver.sourceDrag(request, original: target, map: clock,
+                branchIndex: binding.branchIndex, moveAnchor: binding.visibleSourceStart)!
             try near(source.deltaSeconds, clip.sourceTime(at: clip.outputTime(for: anchor) + 0.15) - anchor,
                      "Each output handle uses its own frozen source anchor")
             let changed = FinishedTimelineEditing.changes(request, animations: [target], map: clock, sourceDuration: 14)!.first!
@@ -56,7 +59,10 @@ private final class FinishedTimingMagnify: NSEvent {
             if handle == .easeOut { try near(changed.easeOut, target.easeOut - source.deltaSeconds, "Deceleration handle inverse") }
         }
         let projected = TimelineOutputProjection(animations: [target], map: clock).animations[0]
-        try require(projected.id == target.id && projected.editable, "A complete unblended span retains its editable component identity")
+        try require(projected.id != target.id && projected.editable && projection.sourceIDs[projected.id] == target.id,
+                    "A visible fragment has a stable display identity resolving to its editable source component")
+        try require(TimelineOutputProjection(animations: [target], map: clock).animations[0].id == projected.id,
+                    "Repeated projection preserves visible fragment identity")
         try near(projected.easeIn, clip.outputTime(for: target.start + target.easeIn) - projected.start,
                  "Acceleration grip uses nonlinear output distance")
         try near(projected.easeOut, projected.end - clip.outputTime(for: target.end - target.easeOut),
@@ -64,12 +70,25 @@ private final class FinishedTimingMagnify: NSEvent {
         let cut = try map(cuts: [.init(start: 4, end: 6, crossfade: 1)])
         let crossing = span(start: 3, end: 8)
         let fragments = TimelineOutputProjection(animations: [crossing], map: cut)
-        try require(fragments.animations.count == 2 && fragments.animations.allSatisfy { !$0.editable } &&
-                    fragments.editableBindings.isEmpty, "Split and blended fragments remain Source-only rather than moving an arbitrary branch")
+        try require(fragments.animations.count == 2 && fragments.animations.allSatisfy(\.editable) &&
+                    fragments.editableBindings.count == 2 && Set(fragments.animations.map(\.id)).count == 2,
+                    "Both cut/crossfade fragments remain editable with distinct branch bindings")
+        try require(fragments.animations.allSatisfy { fragments.sourceIDs[$0.id] == crossing.id },
+                    "Every visible fragment resolves to the original edit for deletion and selection")
+        let outgoing = fragments.animations[0], incoming = fragments.animations[1]
+        try require(outgoing.showsStartHandle && !outgoing.showsEndHandle &&
+                    !incoming.showsStartHandle && incoming.showsEndHandle,
+                    "Only original animation endpoints get resize handles; cut edges do not")
+        let moved = FinishedTimelineEditing.changes(.init(id: incoming.id, handle: .move,
+            deltaSeconds: 0.1, snapTolerance: 0), animations: [crossing], map: cut, sourceDuration: 14)
+        try require(moved?.first?.id == crossing.id && (moved?.first?.start ?? 0) > crossing.start,
+                    "Dragging the incoming visible fragment edits the shared source animation")
         let clipped = span(start: 0, end: 3)
         let trimmed = try map(trimStart: 1)
-        try require(FinishedTimelineBinding.make(animation: clipped, map: trimmed) == nil,
-                    "Trimmed animation fragments remain readonly")
+        let trimmedProjection = TimelineOutputProjection(animations: [clipped], map: trimmed)
+        try require(trimmedProjection.animations.count == 1 && trimmedProjection.animations[0].editable &&
+                    !trimmedProjection.animations[0].showsStartHandle && trimmedProjection.animations[0].showsEndHandle,
+                    "A trimmed fragment remains editable without a false trim-edge animation handle")
         let removed = span(start: 5, end: 5, easeIn: 0, easeOut: 0)
         try require(TimelineOutputProjection(animations: [removed], map: cut).animations.isEmpty,
                     "A removed jump cannot masquerade as an editable visible target")
@@ -77,17 +96,20 @@ private final class FinishedTimingMagnify: NSEvent {
     static func boundaryAndRipple() throws {
         let clock = try map(cuts: [.init(start: 7, end: 9)])
         let target = span(start: 2, end: 4), next = span(start: 5, end: 6.5)
-        let drag = AnimationDrag(id: target.id, handle: .move, deltaSeconds: 20, push: true, snapTolerance: 0)
+        let displayed = TimelineOutputProjection(animations: [target, next], map: clock).animations.first {
+            $0.editID == target.editID
+        }!.id
+        let drag = AnimationDrag(id: displayed, handle: .move, deltaSeconds: 20, push: true, snapTolerance: 0)
         let changed = FinishedTimelineEditing.changes(drag, animations: [target, next], map: clock, sourceDuration: 14)!
         let indexed = Dictionary(uniqueKeysWithValues: changed.map { ($0.id, $0) })
-        try near(indexed[next.id]!.end, 7, "Ripple stops at retained clip boundary")
-        try require(indexed[target.id]!.end <= indexed[next.id]!.start && changed.allSatisfy { $0.end <= 7 },
-                    "Finished ripple remains in the same retained unblended clip")
+        try near(indexed[next.id]!.end, 14, "Ripple can cross a cut and stops at the full recording boundary")
+        try require(indexed[target.id]!.end <= indexed[next.id]!.start && changed.allSatisfy { $0.end <= 14 },
+                    "Finished ripple preserves same-lane ordering across retained branches")
         try near(indexed[next.id]!.duration, next.duration, "Ripple preserves neighbor source duration")
         let locked = span(start: 6, end: 10)
         let limited = FinishedTimelineEditing.changes(drag, animations: [target, locked], map: clock, sourceDuration: 14)!
-        try require(!limited.contains { $0.id == locked.id } && (limited.first?.end ?? target.end) <= locked.start,
-                    "Option never moves an ambiguous split fragment implicitly")
+        try require(limited.contains { $0.id == locked.id } && limited.allSatisfy { $0.end <= 14 },
+                    "Option push includes editable split neighbors instead of locking them behind a removed source mode")
     }
     static func preciseRateCurve() throws {
         let point = RecordingSpeedKeyframe(time: 500, rate: 2, duration: 3, easeIn: 0.4, easeOut: 0.6)
@@ -125,21 +147,24 @@ private final class FinishedTimingMagnify: NSEvent {
               let clock = playback.timingMap else { throw Failure.failed("Production timeline/clock missing") }
         let id = TimelineAnimationID(lane: .speed, componentID: original.state.speedKeyframes[0].id)
         let target = EditorAnimationEditing.animations(in: original.state, references: editor.references, duration: 14).first { $0.id == id }!
-        try require(timeline.animationDragProjection != nil && timeline.animationSpans.first { $0.id == id }?.editable == true,
-                    "Production Finished view offers complete speed span editing with original IDs")
+        guard let displayID = TimelineOutputProjection(animations: [target], map: clock).animations.first?.id else {
+            throw Failure.failed("Projected speed fragment missing")
+        }
+        try require(timeline.animationDragProjection != nil && timeline.animationSpans.first { $0.id == displayID }?.editable == true,
+                    "Production finished view offers speed timing with a projected fragment identity")
         let outputPosition = clock.clips[0].outputTime(for: 10)
         playback.seekOutput(outputPosition); try await settle(host)
         let oldTime = playback.time, oldPose = canvas.testPattern?.screenViewport
-        let body = timeline.animationGeometry().first { $0.animation.id == id }!.body
+        let body = timeline.animationGeometry().first { $0.animation.id == displayID }!.body
         let middle = CGPoint(x: body.midX, y: body.midY)
         timeline.mouseDown(with: event(.leftMouseDown, middle, view: timeline))
         timeline.mouseUp(with: event(.leftMouseUp, middle, view: timeline)); try await settle(host)
-        try require(timeline.selectedAnimationID == id && playback.time == oldTime && playback.outputTime == outputPosition &&
+        try require(timeline.selectedAnimationID == displayID && playback.time == oldTime && playback.outputTime == outputPosition &&
                     canvas.testPattern?.screenViewport == oldPose && editor.project == original,
                     "Selecting Finished speed does not seek, alter displayed pixels, or save metadata")
         let beforeDuration = timeline.duration, beforeViewport = (timeline.visibleStart, timeline.visibleDuration)
         let beforeFrame = timeline.frame, beforeCanvas = canvas.frame
-        let handle = timeline.animationGeometry().first { $0.animation.id == id }!.endHandle!
+        let handle = timeline.animationGeometry().first { $0.animation.id == displayID }!.endHandle!
         let start = CGPoint(x: handle.midX, y: handle.midY), end = CGPoint(x: start.x + 45, y: start.y)
         timeline.mouseDown(with: event(.leftMouseDown, start, view: timeline))
         timeline.mouseDragged(with: event(.leftMouseDragged, end, view: timeline)); try await settle(host)
@@ -147,8 +172,8 @@ private final class FinishedTimingMagnify: NSEvent {
         let arrival = draft.speedKeyframes[0].time
         try require(arrival > target.end && draft.zoomKeyframes == original.state.zoomKeyframes && draft.pipKeyframes == original.state.pipKeyframes,
                     "Native Finished timing changes only source-anchored speed arrival")
-        try near(playback.outputTime, clock.clips[0].outputTime(for: arrival), "Dragged playhead uses frozen output mapping")
-        try near(playback.time, arrival, "Frozen output seek displays the actual manipulated source instant")
+        try near(playback.outputTime, outputPosition, "Editing an animation does not move the output playhead")
+        try near(playback.time, oldTime, "Timing adjustment preserves the inspected source pose on the frozen clock")
         try require(timeline.duration == beforeDuration && timeline.visibleStart == beforeViewport.0 && timeline.visibleDuration == beforeViewport.1 &&
                     timeline.frame == beforeFrame && canvas.frame == beforeCanvas && playback.timingMap?.outputDuration == clock.outputDuration,
                     "Map, viewport, ruler, and layout remain pinned during a speed draft")
@@ -156,7 +181,7 @@ private final class FinishedTimingMagnify: NSEvent {
         timeline.magnify(with: pinch)
         try require(timeline.visibleDuration == beforeViewport.1, "Concurrent pinch cannot change an active timing drag's clock")
         timeline.cancelOperation(nil); timeline.mouseUp(with: event(.leftMouseUp, end, view: timeline)); try await settle(host)
-        try require(editor.project == original && editor.draftState == nil && timeline.selectedAnimationID == id,
+        try require(editor.project == original && editor.draftState == nil && timeline.selectedAnimationID == displayID,
                     "Escape and a late mouse-up restore metadata and original selection without saving")
         try near(playback.outputTime, outputPosition, "Escape restores the exact original output playhead")
         try near(playback.time, oldTime, "Escape restores the original source pose")
@@ -172,8 +197,8 @@ private final class FinishedTimingMagnify: NSEvent {
         try require(editor.redo() && editor.project.state == committed.state, "One Redo restores the whole Finished gesture")
         try await settle(host)
         // Existing baseline protection makes release fail without discarding the gesture.
-        timeline.onSelectAnimation?(id); try await settle(host)
-        guard let currentHandle = timeline.animationGeometry().first(where: { $0.animation.id == id })?.endHandle else {
+        timeline.onSelectAnimation?(displayID); try await settle(host)
+        guard let currentHandle = timeline.animationGeometry().first(where: { $0.animation.id == displayID })?.endHandle else {
             throw Failure.failed("Reselected speed end handle missing: selected=\(String(describing: timeline.selectedAnimationID)), spans=\(timeline.animationSpans)")
         }
         let retryStart = CGPoint(x: currentHandle.midX, y: currentHandle.midY), retryEnd = CGPoint(x: currentHandle.midX + 30, y: currentHandle.midY)

@@ -77,7 +77,8 @@ struct MultiVideoWindowChecks {
         var split = project.state; split.cuts = [.init(start: 2, end: 3)]
         let map = try RecordingTimeMap(duration: project.duration, trimStart: split.trimStart, trimEnd: split.trimEnd, cuts: split.cuts, speedKeyframes: split.speedKeyframes)
         let splitRow = TimelineVideoRow.make(project: project, state: split, map: map).first { $0.clip.id == clip.id }!
-        try require(splitRow.parts.count == 2 && !splitRow.editable, "cut fragments must not retime hidden source intervals")
+        try require(splitRow.parts.count == 2 && splitRow.editable,
+            "Visible cut fragments remain editable through their explicit project-clock mapping")
 
         let editor = ProjectEditor(project: project, url: directory.appendingPathComponent("Multi.framethrower"))
         try require(editor.save(), "metadata save")
@@ -85,17 +86,63 @@ struct MultiVideoWindowChecks {
         let assistant = EditorAssistantSession(transport: { _ in throw MultiVideoWindowFailure(message: "Unexpected model call") }, persistsConversation: false)
         let host = NSHostingView(rootView: ProjectEditorView(editor: editor, playback: playback, assistant: assistant))
         let window = NSWindow(contentRect: CGRect(x: -20000, y: -20000, width: 1140, height: 1050), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false; window.contentView = host; window.orderBack(nil)
+        window.isReleasedWhenClosed = false; window.alphaValue = 0
+        window.contentView = host; window.orderBack(nil)
         defer { window.close(); playback.close() }
         try await settle(host) { playback.canPlay && !all(RecordingTimelineView.self, in: host).isEmpty }
         let timeline = all(RecordingTimelineView.self, in: host).first!
         let canvas = all(EditorCanvasView.self, in: host).first!
-        try require(timeline.videoRows.count == 3, "each clip must have a timeline row")
+        try require(timeline.videoRows.count == 3, "Clip occurrence DTOs remain individually addressable")
+        let mediaTracks = timeline.trackLayout.rows.filter { row in if case .media = row.id { return true }; return false }
+        try require(mediaTracks.count == project.effectiveVideoLayers().count, "One visual media track per layer, not per occurrence")
+        var sequential = project.state
+        let secondClip = VideoClip(sourceID: audio.id, start: 6, end: 10, sourceStart: 6)
+        let audioIndex = sequential.videoLayers!.firstIndex { $0.id == audioLayer.id }!
+        sequential.videoLayers![audioIndex].clips.append(secondClip)
+        let occurrences = TimelineVideoRow.make(project: project, state: sequential, map: nil)
+        let sequentialLayout = TimelineTrackLayout.make(videoRows: occurrences, animations: [])
+        let sequentialMedia = sequentialLayout.rows.filter { row in if case .media = row.id { return true }; return false }
+        try require(occurrences.count == 4 && sequentialMedia.count == mediaTracks.count,
+            "Sequential clips share their layer's existing track instead of growing another row")
+        try require(sequentialLayout.rows.filter { $0.id == .media(audioLayer.id) }.count == 1,
+            "The audio/video layer has one named track for both occurrences")
+        let defaults = EditorAnimationEditing.animations(in: project.state, references: editor.references,
+            duration: project.duration, includeCamera: false)
+        let sparse = TimelineTrackLayout.make(videoRows: occurrences, animations: defaults)
+        try require(!sparse.rows.contains(where: { if case .animation = $0.id { return true }; return false }),
+            "Unchanged initial/default settings must not manufacture empty animation tracks")
+        var authored = defaults.first { $0.lane == .pointer }!
+        authored.id = .init(lane: .cameraOpacity, componentID: UUID())
+        authored.start = 2; authored.end = 4; authored.label = "Fade"; authored.isPlaceholder = false
+        authored.editable = false
+        let readonly = TimelineTrackLayout.make(videoRows: [], animations: [authored])
+        try require(readonly.rows.contains(where: { $0.id == .animation(.cameraOpacity) }),
+            "A meaningful read-only projected edit must remain visible")
+        let withPointer = TimelineTrackLayout.make(videoRows: occurrences, animations: defaults, hasPointerRecording: true)
+        try require(withPointer.rows.contains(where: { $0.id == .animation(.pointer) }),
+            "Recorded pointer information remains visible even with unchanged pointer styling")
         try require(!playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer, "UI allocated media")
         playback.seekOutput(2)
         try await settle(host) { canvas.testPattern?.videoSnapshots.count == 3 }
         let frames = [window.frame, canvas.frame, timeline.frame]
         let playhead = playback.time
+        _ = try EditorUIProbe.propertyTarget(in: host)
+        guard let screenClip = project.effectiveVideoLayers().flatMap(\.clips).first(where: { $0.layout == .screen }),
+              let screenStrip = timeline.videoClipFrames().first(where: { $0.1 == screenClip.id })?.2 else {
+            throw MultiVideoWindowFailure(message: "Native screen clip and contextual properties")
+        }
+        try await EditorUIProbe.selectInspector("Pointer", editor: editor)
+        try await Task.sleep(for: .milliseconds(60)); host.layoutSubtreeIfNeeded()
+        let screenClick = CGPoint(x: screenStrip.midX, y: screenStrip.midY)
+        timeline.mouseDown(with: try event(.leftMouseDown, at: screenClick, in: timeline))
+        timeline.mouseUp(with: try event(.leftMouseUp, at: screenClick, in: timeline))
+        try await settle(host) { timeline.selectedVideoClipID == screenClip.id }
+        let nativeContext = try await EditorUIProbe.context(editor: editor)
+        try require(nativeContext["inspector"] as? String == "Zoom", "Screen footage reveals related framing properties")
+        try require(timeline.selectedVideoClipID == screenClip.id,
+            "Selecting native footage must retain its clip selection when it reveals related framing properties")
+        try require(playback.time == playhead && editor.project.undoHistory.isEmpty,
+            "Selecting native footage changed the playhead or history")
         guard let strip = timeline.videoClipFrames().first(where: { $0.1 == clip.id })?.2 else { throw MultiVideoWindowFailure(message: "clip strip") }
         let click = CGPoint(x: strip.midX, y: strip.midY)
         timeline.mouseDown(with: try event(.leftMouseDown, at: click, in: timeline))
@@ -130,21 +177,18 @@ struct MultiVideoWindowChecks {
         try require(editor.undo(), "Undo volume change")
         try await settle(host) { editor.draftState == nil }
         // Inspectors keep the preview/timeline fixed while switching tools.
-        let tabs = all(NSSegmentedControl.self, in: host).first { control in
-            (0..<control.segmentCount).contains { control.label(forSegment: $0) == "Videos" }
-        }!
-        for label in ["Zoom", "Pointer", "Videos", "Layers"] {
-            let index = (0..<tabs.segmentCount).first { tabs.label(forSegment: $0) == label }!
-            tabs.selectedSegment = index; _ = tabs.sendAction(tabs.action!, to: tabs.target)
+        for raw in ["Zoom", "Pointer", "Videos", "Layers"] {
+            try await EditorUIProbe.selectInspector(raw, editor: editor)
             try await Task.sleep(for: .milliseconds(60)); host.layoutSubtreeIfNeeded()
-            try require([window.frame, canvas.frame, timeline.frame] == frames, "tab \(label) resized preview")
-            if label == "Videos", let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            _ = try EditorUIProbe.propertyTarget(in: host)
+            try EditorUIProbe.checkSliderWidths(in: host)
+            try require([window.frame, canvas.frame, timeline.frame] == frames, "Property target \(raw) resized preview")
+            if raw == "Videos", let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
                 host.cacheDisplay(in: host.bounds, to: bitmap)
                 if let data = bitmap.representation(using: .png, properties: [:]) { try data.write(to: URL(fileURLWithPath: "/tmp/framethrower-multi-video-ui.png")) }
             }
         }
-        let videoTab = (0..<tabs.segmentCount).first { tabs.label(forSegment: $0) == "Videos" }!
-        tabs.selectedSegment = videoTab; _ = tabs.sendAction(tabs.action!, to: tabs.target)
+        try await EditorUIProbe.selectInspector("Videos", editor: editor)
         playback.seekOutput(2)
         timeline.onSelectVideo?(audioLayer.id, clip.id, nil)
         try await settle(host) { all(VideoClipOverlayView.self, in: host).first?.selection == clip.id && all(VideoClipOverlayView.self, in: host).first?.time == 2 }
@@ -174,6 +218,31 @@ struct MultiVideoWindowChecks {
         try require(editor.undo(), "Undo combined framing")
         try await settle(host) { editor.draftState == nil }
         try require(editor.project.state.videoLayers!.first { $0.id == audioLayer.id }!.clips[0] == clip, "combined framing Undo lost original clip")
+        // A surviving clip fragment can be moved on the single project ruler;
+        // the local gesture translates its selected cut branch into the clip's
+        // authoring clock and leaves the output playhead/other clips alone.
+        var cutState = editor.project.state
+        cutState.cuts = [.init(start: 2, end: 3)]
+        try require(editor.commit(cutState, name: "Cut branch fixture"), "save cut branch fixture")
+        try await settle(host) { playback.outputDuration == 11 && timeline.videoRows.first(where: { $0.clip.id == clip.id })?.parts.count == 2 }
+        let fragmentPlayhead = playback.outputTime
+        let fragmentParts = timeline.videoClipFrames().filter { $0.1 == clip.id }.sorted { $0.2.minX < $1.2.minX }
+        try require(fragmentParts.count == 2, "Cut clip visible fragments")
+        let incoming = fragmentParts[1].2
+        let fragmentStart = CGPoint(x: incoming.midX, y: incoming.midY)
+        let halfSecond = timeline.x(for: 0.5) - timeline.x(for: 0)
+        try drag(timeline, from: fragmentStart, to: CGPoint(x: fragmentStart.x + halfSecond, y: fragmentStart.y))
+        try await settle(host) { editor.draftState == nil && editor.project.undoHistory.count == 2 }
+        let fragmentMoved = editor.project.state.videoLayers!.first { $0.id == audioLayer.id }!.clips[0]
+        try require(abs(fragmentMoved.start - 1.5) < 0.000001 && abs(fragmentMoved.end - 5.5) < 0.000001,
+            "Dragging a surviving fragment changed the wrong clip interval")
+        try require(fragmentMoved.sourceStart == clip.sourceStart && fragmentMoved.volumeKeyframes == clip.volumeKeyframes,
+            "Fragment movement rewrote original source in-point or audio automation")
+        try require(playback.outputTime == fragmentPlayhead && !playback.isInspectingSource,
+            "Fragment movement moved the project playhead or switched clock")
+        try require(editor.undo() && editor.project.state == cutState, "Fragment movement is one complete Undo")
+        try require(editor.undo(), "Undo cut branch fixture")
+        try await settle(host) { playback.outputDuration == 12 }
         // At the paused endpoint, display and handles use the final retained
         // frame rather than the half-open instant just beyond all footage.
         playback.seekOutput(12)

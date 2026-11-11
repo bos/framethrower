@@ -59,7 +59,7 @@ struct ContentLayersInspector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
+            EditorControlFlow(spacing: 10) {
                 Menu {
                     ForEach(ContentLayerKind.allCases, id: \.self) { kind in
                         Button(kind == .image ? "Image…" : kind.title) { add(kind) }
@@ -424,9 +424,17 @@ struct VideoLayersInspector: View {
     private var volumePoint: VideoVolumeKeyframe? { clip?.volumeKeyframes.first { $0.id == volumeID } }
     private var source: VideoSource? { editor.project.videoSources.first { $0.id == clip?.sourceID } }
 
+    private var usesEditedClock: Bool {
+        let state = editor.editingState
+        return !state.cuts.isEmpty || !state.speedKeyframes.isEmpty || state.trimStart != 0 || state.trimEnd != editor.project.duration
+    }
+    private var clipTimingHelp: String {
+        "Original timeline seconds, after this clip's playback rate but before project cuts and speed changes. The timeline handles use the finished project ruler."
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            EditorControlFlow(spacing: 8) {
                 Menu {
                     Button("Import video…") { importVideo() }.disabled(MediaProcessing.isSuspended || importing)
                     Divider()
@@ -459,9 +467,9 @@ struct VideoLayersInspector: View {
                 }
                 Spacer(minLength: 0)
                 if importing { ProgressView().controlSize(.small) }
-            }.frame(height: 24)
+            }
             if let layer {
-                HStack(spacing: 8) {
+                EditorControlFlow(spacing: 8) {
                     Picker("Clip", selection: Binding(get: { clipID }, set: { prepare(); volumeID = nil; clipID = $0 })) {
                         Text("Choose clip").tag(Optional<UUID>.none)
                         ForEach(layer.clips.sorted { $0.start < $1.start }) { value in
@@ -476,18 +484,19 @@ struct VideoLayersInspector: View {
                             .help("Reuse this source in a new layer")
                         Button { apply(.removeVideoClip(layerID: layer.id, clipID: clip.id), "Remove video clip"); clipID = nil; volumeID = nil } label: { Image(systemName: "xmark") }
                             .help("Remove this occurrence. Keep the source file and every other occurrence.")
-                        VideoNumberField(title: "Start", value: clip.start) { number in update(clip) { value in let length = value.end - value.start; value.start = number; value.end = number + length } }
-                        VideoNumberField(title: "In", value: clip.sourceStart) { number in update(clip) { $0.sourceStart = number } }
-                        VideoNumberField(title: "Length", value: clip.end - clip.start) { number in update(clip) { $0.end = $0.start + number } }
+                        VideoNumberField(title: usesEditedClock ? "Start (original)" : "Start", value: clip.start) { number in update(clip) { value in let length = value.end - value.start; value.start = number; value.end = number + length } }.help(clipTimingHelp)
+                        VideoNumberField(title: "Clip in", value: clip.sourceStart) { number in update(clip) { $0.sourceStart = number } }
+                            .help("Starting position in this clip’s original media file; independent of its position on the project timeline.")
+                        VideoNumberField(title: usesEditedClock ? "Length (original)" : "Length", value: clip.end - clip.start) { number in update(clip) { $0.end = $0.start + number } }.help(clipTimingHelp)
                         VideoNumberField(title: "Rate", value: clip.rate, suffix: "×") { number in update(clip) { value in
                             if number > 0 { value.end = value.start + (value.sourceEnd - value.sourceStart) / number; value.rate = number }
                         } }.help("Change clip speed while keeping its source in and out points. The clip length changes.")
                     }
                     Spacer(minLength: 0)
-                }.frame(height: 24)
+                }
             }
             if let clip {
-                HStack(spacing: 10) {
+                EditorControlFlow(spacing: 10) {
                     Picker("Fit", selection: Binding(get: { clip.geometry(atSourceTime: VideoClipEditing.editingSourceTime(clip, projectTime: sourceTime)).fit }, set: { fit in
                         update(clip) { value in
                             let time = VideoClipEditing.editingSourceTime(value, projectTime: sourceTime)
@@ -515,24 +524,24 @@ struct VideoLayersInspector: View {
                         Text("Cut").tag(VideoClipTransition.cut); Text("Crossfade").tag(VideoClipTransition.crossfade)
                     }.frame(maxWidth: 200).help("How this incoming clip replaces the preceding clip when their footage overlaps.")
                     Spacer(minLength: 0)
-                }.frame(height: 24)
-                HStack(spacing: 10) {
+                }
+                EditorControlFlow(spacing: 10) {
                     if let point = volumePoint {
                         Picker("Volume change", selection: Binding(get: { point.transition }, set: { mode in updateVolume(point) { $0.transition = mode } })) {
                             Text("Jump").tag(PIPTransition.jump); Text("Smooth").tag(PIPTransition.smooth)
                         }.frame(width: 205)
-                        VideoNumberField(title: "Duration", value: point.duration / clip.rate) { number in updateVolume(point) { $0.duration = number * clip.rate } }
-                        VideoNumberField(title: "Accelerate", value: (point.easeIn ?? point.duration / 4) / clip.rate) { number in updateVolume(point) { $0.easeIn = number * clip.rate } }
-                        VideoNumberField(title: "Decelerate", value: (point.easeOut ?? point.duration / 4) / clip.rate) { number in updateVolume(point) { $0.easeOut = number * clip.rate } }
+                        VideoNumberField(title: usesEditedClock ? "Duration (original)" : "Duration", value: point.duration / clip.rate) { number in updateVolume(point) { $0.duration = number * clip.rate } }
+                        VideoNumberField(title: usesEditedClock ? "Accelerate (original)" : "Accelerate", value: (point.easeIn ?? point.duration / 4) / clip.rate) { number in updateVolume(point) { $0.easeIn = number * clip.rate } }
+                        VideoNumberField(title: usesEditedClock ? "Decelerate (original)" : "Decelerate", value: (point.easeOut ?? point.duration / 4) / clip.rate) { number in updateVolume(point) { $0.easeOut = number * clip.rate } }
                         Button { removeVolume(point) } label: { Image(systemName: "xmark") }.help("Remove this clip's volume change")
                     } else {
-                    VideoNumberField(title: "Fade in", value: clip.fadeIn) { number in update(clip) { $0.fadeIn = number } }
-                    VideoNumberField(title: "Fade out", value: clip.fadeOut) { number in update(clip) { $0.fadeOut = number } }
+                    VideoNumberField(title: usesEditedClock ? "Fade in (original)" : "Fade in", value: clip.fadeIn) { number in update(clip) { $0.fadeIn = number } }
+                    VideoNumberField(title: usesEditedClock ? "Fade out (original)" : "Fade out", value: clip.fadeOut) { number in update(clip) { $0.fadeOut = number } }
                     if clip.layout != .custom { Text(clip.layout == .screen ? "Framing: Zoom controls" : "Framing: Camera controls").font(.caption).foregroundStyle(.secondary) }
                     Spacer(minLength: 0)
                     if let source { Text(source.name).font(.caption).foregroundStyle(.secondary).lineLimit(1).help(source.kind == .testPattern ? "Silent vector test pattern" : source.relativePath ?? source.name) }
                     }
-                }.frame(height: 24)
+                }
             }
         }.controlSize(.small)
         .alert("Could not add video", isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })) {

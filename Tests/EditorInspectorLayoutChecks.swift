@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+@testable import FrameThrower
 
 /// Uses the production editor with metadata only. No source files, device
 /// discovery, image buffers, capture, or video decoder are constructed.
@@ -8,65 +9,134 @@ import SwiftUI
 struct EditorInspectorLayoutChecks {
     enum Failure: Error { case failed(String) }
 
-    static func main() async throws {
+    static func main() async {
+        do { try await run() }
+        catch { FileHandle.standardError.write(Data("Editor inspector layout failed: \(error)\n".utf8)); Darwin.exit(1) }
+    }
+    private static func run() async throws {
         guard MediaProcessing.isSuspended else { throw Failure.failed("This check requires the media interlock") }
         _ = NSApplication.shared
         NSApplication.shared.setActivationPolicy(.accessory)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 45) {
-            FileHandle.standardError.write(Data("Inspector layout check exceeded 45 seconds\n".utf8))
-            Darwin.exit(1)
+        Task {
+            do { try await SuspendingClock().sleep(for: .seconds(120)) } catch { return }
+            FileHandle.standardError.write(Data("Inspector layout check exceeded 120 awake seconds\n".utf8)); Darwin.exit(1)
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         try cancelledSliderGesture(in: directory)
 
-        for size in [CGSize(width: 820, height: 760), CGSize(width: 1100, height: 900)] {
+        for size in [CGSize(width: 720, height: 540), CGSize(width: 1024, height: 760), CGSize(width: 1280, height: 900)] {
             var project = RecordingProject(screenFilename: "missing-screen.mov", cameraFilename: "missing-camera.mov", duration: 12)
             let zoom = ZoomKeyframe(time: 3, scale: 2, transition: .smooth, duration: 1)
             project.state.zoomKeyframes = [zoom]
             project.state.pipKeyframes.append(PIPKeyframe(time: 3, placement: PIPPlacement(), transition: .smooth, duration: 1))
-            // Exercise the extra effective-fade state row inside the same fixed
-            // inspector allocation used by ordinary recording controls.
-            project.state.trimStart = 2
-            project.state.trimEnd = 2.5
-            project.state.audio = RecordingAudio(volume: 0.7, fadeIn: 1, fadeOut: 3)
             let editor = ProjectEditor(project: project, url: directory.appendingPathComponent(UUID().uuidString + ".framethrower"))
             guard editor.save() else { throw Failure.failed("Save metadata-only fixture") }
-            let host = NSHostingView(rootView: ProjectEditorView(editor: editor, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() })))
-            let window = NSWindow(contentRect: CGRect(origin: CGPoint(x: -10000, y: -10000), size: size),
+            let playback = EditorPlayback()
+            let host = NSHostingView(rootView: ProjectEditorView(editor: editor, playback: playback,
+                assistant: EditorAssistantSession(transport: { _ in throw CancellationError() }, persistsConversation: false)))
+            let window = NSWindow(contentRect: CGRect(origin: CGPoint(x: -20000, y: -20000), size: size),
                                   styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
-            window.contentView = host
-            window.orderFront(nil)
+            window.isReleasedWhenClosed = false; window.alphaValue = 0
+            window.contentView = host; window.orderBack(nil)
             try await settle(host)
-            guard let canvas: EditorCanvasView = find(in: host), let timeline: RecordingTimelineView = find(in: host),
-                  let picker = all(NSSegmentedControl.self, in: host).first(where: {
-                      labels($0) == ["Zoom", "Pointer", "Camera", "Canvas", "Audio"]
-                  }), let action = picker.action else { throw Failure.failed("Production editor controls missing") }
-
+            guard let canvas: EditorCanvasView = find(in: host), let timeline: RecordingTimelineView = find(in: host) else { throw Failure.failed("Production editor views missing") }
+            _ = try EditorUIProbe.propertyTarget(in: host)
+            let targets = [("Zoom", "Main video"), ("Camera", "PIP camera"), ("Pointer", "Mouse pointer"), ("Speed", "Playback speed"), ("Canvas", "Project canvas"), ("Audio", "Audio mix"), ("Videos", "Video clips"), ("Layers", "Graphics & text")]
             let baseline = frames(window, host, canvas, timeline)
-            for selected in [false, true, false] {
-                if selected { timeline.onSelectEdit?(zoom.id) }
-                else { timeline.onDeselectEdit?() }
+            let unchanged = editor.project
+            for (raw, target) in targets + [("Camera", "PIP camera"), ("Zoom", "Main video")] {
+                try await EditorUIProbe.selectInspector(raw, editor: editor)
                 try await settle(host)
-                for segment in [2, 1, 4, 3, 4, 0, 2, 0] {
-                    picker.selectedSegment = segment
-                    guard picker.sendAction(action, to: picker.target) else { throw Failure.failed("Tool selection failed") }
-                    try await settle(host)
-                    let cameraVisible = all(NSSegmentedControl.self, in: host).contains { labels($0).contains("Original") && labels($0).contains("Circle") }
-                    guard cameraVisible == (segment == 2) else { throw Failure.failed("Tool controls did not switch") }
-                    try same(frames(window, host, canvas, timeline), baseline,
-                             "tab \(segment), selected edit \(selected), size \(size)")
-                    guard canvas.playerLayer.player == nil, canvas.stillLayer.contents == nil else {
-                        throw Failure.failed("Suspended view accessed video")
+                _ = try EditorUIProbe.propertyTarget(in: host)
+                try same(frames(window, host, canvas, timeline), baseline, "Target \(target), size \(size)")
+                try controlsFit(host)
+                try EditorUIProbe.checkSliderWidths(in: host)
+                if size.width == 720 { try await checkPropertyScrollWidths(host) }
+                guard let tools = all(NSSegmentedControl.self, in: host).first(where: { labels($0).contains("Draw box") }) else { throw Failure.failed("Discoverable preview tools missing") }
+                guard tools.isEnabled == (target != "Video clips") else { throw Failure.failed("Preview tool availability does not match its actual target") }
+                guard !playback.isInspectingSource && editor.project == unchanged else {
+                    throw Failure.failed("Target \(target) changed recording (state=\(editor.project.state != unchanged.state), history=\(editor.project.undoHistory.count)) or clock (source=\(playback.isInspectingSource))")
+                }
+                if target == "PIP camera", let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                    host.cacheDisplay(in: host.bounds, to: bitmap)
+                    if let data = bitmap.representation(using: .png, properties: [:]) {
+                        try data.write(to: URL(fileURLWithPath: "/tmp/framethrower-pip-properties-\(Int(size.width))x\(Int(size.height)).png"))
                     }
                 }
             }
-            guard editor.project.state == project.state else { throw Failure.failed("Tool switching changed project edits") }
-            window.close()
+            for (layout, title) in [(VideoClipLayout.screen, "Main video"), (.camera, "PIP camera")] {
+                try await EditorUIProbe.selectInspector("Pointer", editor: editor)
+                try await settle(host)
+                guard let layer = editor.project.effectiveVideoLayers().first(where: { $0.clips.contains(where: { $0.layout == layout }) }),
+                      let clip = layer.clips.first(where: { $0.layout == layout }) else { throw Failure.failed("Native clip fixture missing") }
+                timeline.onSelectVideo?(layer.id, clip.id, nil); try await settle(host)
+                let raw = layout == .screen ? "Zoom" : "Camera"
+                guard try await EditorUIProbe.context(editor: editor)["inspector"] as? String == raw,
+                      timeline.selectedVideoClipID == clip.id,
+                      playback.outputTime == 0 && !playback.isInspectingSource else {
+                    throw Failure.failed("Selecting \(title) footage lost its clip highlight or moved the playhead")
+                }
+                try await EditorUIProbe.selectInspector("Pointer", editor: editor)
+                try await settle(host)
+                guard timeline.selectedVideoClipID == nil else { throw Failure.failed("Unrelated target kept a stale destructive clip selection") }
+            }
+            timeline.onSelectEdit?(zoom.id)
+            try await settle(host)
+            guard playback.outputTime == 0 && !playback.isInspectingSource else { throw Failure.failed("Selecting an edit warped the playhead or changed clock") }
+            timeline.onDeselectEdit?(); try await settle(host)
+            guard !playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer else { throw Failure.failed("Vector view allocated media") }
+            playback.close(); window.close()
         }
-        FileHandle.standardOutput.write(Data("Editor inspector layout checks passed (slider Escape/release/next-drag rollback, all five tabs, selected/deselected edits, minimum/default widths, fixed preview/timeline/window geometry, metadata-only media interlock).\n".utf8))
+        FileHandle.standardOutput.write(Data("Editor inspector layout checks passed (contextual targets, contained controls, stable preview/timeline/window allocation, project clock and selection, one-step slider rollback/Undo; vector-only and no app focus).\n".utf8))
+    }
+
+    private static func controlsFit(_ host: NSView) throws {
+        for control in all(NSControl.self, in: host) where !control.isHiddenOrHasHiddenAncestor && control.alphaValue > 0 && control.bounds.width > 1 && control.bounds.height > 1 {
+            let rect = control.convert(control.bounds, to: host)
+            var parent = control.superview
+            var clips: [NSClipView] = []
+            while let view = parent { if let clip = view as? NSClipView { clips.append(clip) }; parent = view.superview }
+            guard rect.intersects(host.bounds), clips.allSatisfy({ clip in
+                let viewport = clip.convert(clip.bounds, to: host)
+                return rect.maxY > viewport.minY && rect.minY < viewport.maxY
+            }) else { continue }
+            let constraints = [host.bounds] + clips.filter { $0.enclosingScrollView?.hasHorizontalScroller != true }.map { $0.convert($0.bounds, to: host) }
+            for available in constraints {
+                guard rect.minX >= available.minX - 2 && rect.maxX <= available.maxX + 2 else { throw Failure.failed("Visible \(type(of: control)) escapes inspector/viewport width: \(rect), viewport \(available)") }
+            }
+        }
+    }
+
+    private static func checkPropertyScrollWidths(_ host: NSView) async throws {
+        // Test the controls below the initial fold too. They become visible
+        // through local scrolling, rather than by growing the whole window.
+        let targetFrame = try EditorUIProbe.propertyTarget(in: host).accessibilityFrame()
+        let scrollers = all(NSScrollView.self, in: host).filter { scroll in
+            let rect = scroll.convert(scroll.bounds, to: host)
+            return rect.width <= 340 && rect.minX >= host.bounds.maxX - 360
+                && (scroll.documentView?.bounds.height ?? 0) > scroll.contentView.bounds.height + 2
+        }
+        for scroll in scrollers {
+            guard let document = scroll.documentView else { continue }
+            let clip = scroll.contentView, original = clip.bounds.origin
+            let maximum = max(document.bounds.minY, document.bounds.maxY - clip.bounds.height)
+            var position = document.bounds.minY
+            while position < maximum {
+                clip.scroll(to: CGPoint(x: original.x, y: position)); scroll.reflectScrolledClipView(clip)
+                try await settle(host); try controlsFit(host)
+                try EditorUIProbe.checkSliderWidths(in: host)
+                guard try EditorUIProbe.propertyTarget(in: host).accessibilityFrame() == targetFrame else { throw Failure.failed("Property target scrolled out of its persistent header") }
+                position += max(40, clip.bounds.height * 0.7)
+            }
+            clip.scroll(to: CGPoint(x: original.x, y: maximum)); scroll.reflectScrolledClipView(clip)
+            try await settle(host); try controlsFit(host)
+            try EditorUIProbe.checkSliderWidths(in: host)
+            guard try EditorUIProbe.propertyTarget(in: host).accessibilityFrame() == targetFrame else { throw Failure.failed("Property target moved when its controls scrolled") }
+            clip.scroll(to: original); scroll.reflectScrolledClipView(clip)
+            try await settle(host)
+        }
     }
 
     private static func cancelledSliderGesture(in directory: URL) throws {

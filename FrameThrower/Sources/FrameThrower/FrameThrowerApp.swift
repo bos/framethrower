@@ -34,7 +34,7 @@ struct FrameThrowerApp: App {
                 .frame(minWidth: 420, minHeight: 240)
             }
         }
-        .defaultSize(width: 940, height: 780)
+        .defaultSize(width: 1100, height: 780)
         .windowStyle(.titleBar)
         .windowResizability(.contentMinSize)
 

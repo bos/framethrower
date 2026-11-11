@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		08C2B82D4D941ACBF40B1C8B /* EditorWorkspaceLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 584A8AD859D1502D75EC2135 /* EditorWorkspaceLayout.swift */; };
 		FE44A93CD350D655D7AA3911 /* RecordingMetadataAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 264631E352C7A579D9E83E8E /* RecordingMetadataAccess.swift */; };
 		681F3BC129EB95E0C57466FE /* DirectorMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86E73F87CA676C4E23020041 /* DirectorMarkdown.swift */; };
 		05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */; };
@@ -95,6 +96,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		584A8AD859D1502D75EC2135 /* EditorWorkspaceLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorWorkspaceLayout.swift; sourceTree = "<group>"; };
 		264631E352C7A579D9E83E8E /* RecordingMetadataAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingMetadataAccess.swift; sourceTree = "<group>"; };
 		86E73F87CA676C4E23020041 /* DirectorMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorMarkdown.swift; sourceTree = "<group>"; };
 		010F10320038E81B6F92F45A /* WindowSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowSelection.swift; sourceTree = "<group>"; };
@@ -219,6 +221,7 @@
 				1F2E0EE832567FBADB1CFF41 /* DirectorInspection.swift */,
 				E5E3A1DFC05ED285256E4C24 /* DirectorModelTransport.swift */,
 				47E23EF76E1A4209A70059B8 /* DirectorTranscript.swift */,
+				584A8AD859D1502D75EC2135 /* EditorWorkspaceLayout.swift */,
 				264631E352C7A579D9E83E8E /* RecordingMetadataAccess.swift */,
 				86E73F87CA676C4E23020041 /* DirectorMarkdown.swift */,
 				576C7E1DB025530CEFC06FD2 /* DisplayCarousel.swift */,
@@ -452,6 +455,7 @@
 				8C0CA5410A9554534CF879D4 /* DirectorInspection.swift in Sources */,
 				C6606809CFCA43D035AF1DAD /* DirectorModelTransport.swift in Sources */,
 				6C3AA9668BF0F913052F3382 /* DirectorTranscript.swift in Sources */,
+				08C2B82D4D941ACBF40B1C8B /* EditorWorkspaceLayout.swift in Sources */,
 				FE44A93CD350D655D7AA3911 /* RecordingMetadataAccess.swift in Sources */,
 				681F3BC129EB95E0C57466FE /* DirectorMarkdown.swift in Sources */,
 				D9D3E9F4ADA65D5739663177 /* DisplayCarousel.swift in Sources */,

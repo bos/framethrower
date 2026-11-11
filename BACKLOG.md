@@ -15,3 +15,16 @@
 
   Implemented in the editor, Director tools and shared timing/render plans.
   Runtime capture/export validation remains blocked by the video-driver interlock.
+
+- [ ] **Preserve audio metadata for the primary imported clip.** Retain the
+  importer's audio-presence result so silent footage does not advertise an
+  audio-envelope disclosure. Handle older projects with unknown audio metadata
+  without assuming that a track is present.
+- [ ] **Restore baseline audio controls in older projects.** When a decoded
+  project identifies microphone or system-audio sources but has no corresponding
+  volume-channel state, show a selectable baseline on that track. Opening a
+  project should not create an edit or change its ordinary Undo stack.
+- [ ] **Edit animation durations numerically on the finished project clock.**
+  Define how one value applies when cuts split a movement into several visible
+  spans, including crossfades and speed ramps. Until then, numeric fields identify
+  original timing explicitly; dragging timeline handles uses the project ruler.

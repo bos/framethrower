@@ -29,10 +29,10 @@ struct PresentationControls: View {
                 Text("9:16").tag(CanvasAspect.portrait)
                 Text("Square").tag(CanvasAspect.square)
             }
-            .pickerStyle(.segmented)
-            .frame(width: 390, height: 24)
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity).frame(height: 24)
             .help("Choose the exported frame shape. The whole recording fits inside it without cropping or stretching.")
-            HStack(spacing: 24) {
+            VStack(alignment: .leading, spacing: 12) {
                 PresentationSlider(title: "Padding", value: presentation.padding * 100, range: 0...20,
                     begin: onBegin, preview: { value in
                         var next = presentation; next.padding = value / 100; onPreview(next)
@@ -50,7 +50,7 @@ struct PresentationControls: View {
                     })
                     .help("Round the recording's corners. Camera shape is controlled separately.")
             }
-            .frame(width: 550, height: 24)
+            .frame(maxWidth: .infinity)
             Picker("Background", selection: Binding(get: {
                 Self.backgrounds.first { $0.color == presentation.background }?.name ?? "Custom"
             }, set: { name in
@@ -70,7 +70,7 @@ struct PresentationControls: View {
                     Text("Custom").tag("Custom")
                 }
             }
-            .frame(width: 230, height: 24)
+            .frame(maxWidth: .infinity).frame(height: 24)
             .help("Fill the space around the recording with a solid color.")
         }
     }

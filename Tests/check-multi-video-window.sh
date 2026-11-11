@@ -13,6 +13,6 @@ check_dir=$(mktemp -d -t framethrower-multi-video-window)
 trap 'rm -rf "$check_dir"' EXIT
 taskpolicy -b swiftc -j 1 -parse-as-library -warnings-as-errors -strict-concurrency=complete \
   -enable-upcoming-feature ExistentialAny -target "$(uname -m)-apple-macos15.0" \
-  -I "$products" "$repo_dir/Tests/MultiVideoWindowChecks.swift" "$dylibs/FrameThrower.debug.dylib" \
+  -I "$products" "$repo_dir/Tests/EditorUIProbe.swift" "$repo_dir/Tests/MultiVideoWindowChecks.swift" "$dylibs/FrameThrower.debug.dylib" \
   -Xlinker -rpath -Xlinker "$dylibs" -o "$check_dir/check-multi-video-window"
 taskpolicy -b "$check_dir/check-multi-video-window"

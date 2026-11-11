@@ -27,6 +27,7 @@ final class EditorPlayback: ObservableObject {
     @Published private(set) var outputTime = 0.0
     @Published private(set) var isInspectingSource = false
     private(set) var timingMap: RecordingTimeMap?
+    private var editingBranchAnchor: Double?
     var outputDuration: Double { timingMap?.outputDuration ?? max(0, bounds.upperBound - bounds.lowerBound) }
     var outputSamples: [RecordingTimeMap.Sample] {
         if isInspectingSource || (auditionRange != nil && !auditionUsesOutputTime) { return [] }
@@ -252,9 +253,14 @@ final class EditorPlayback: ObservableObject {
             errorMessage = error.localizedDescription
             return
         }
-        time = bounded(time, to: sourceBounds)
-        outputTime = outputPosition(for: time)
-        if !isInspectingSource { time = sourcePosition(at: outputTime) }
+        if isInspectingSource {
+            time = bounded(time, to: sourceBounds)
+            outputTime = outputPosition(for: time)
+        } else {
+            // The ruler is the finished project clock. A framing edit, Undo,
+            // or rebuild must not round-trip it through a crossfade branch.
+            updateSimulationPosition(bounded(outputTime, to: 0...outputDuration))
+        }
         mediaPlayer?.pause()
         isPlaying = false
         // A successful gesture commits this exact draft next. Keep its last
@@ -303,7 +309,7 @@ final class EditorPlayback: ObservableObject {
             // attached, before a zero-distance seek asks it to render again.
             let initialFrame = rendered.supportsDirectSourcePreview
                 ? Self.frameTime(at: position, bounds: sourceBounds)
-                : Self.frameTime(at: outputPosition(for: position), bounds: 0...outputDuration)
+                : Self.frameTime(at: outputTime, bounds: 0...outputDuration)
             rendered.previewFrames.request(at: initialFrame)
             player.replaceCurrentItem(with: item)
             screenSize = rendered.screenSize
@@ -314,8 +320,8 @@ final class EditorPlayback: ObservableObject {
             editFrameDuration = rendered.videoComposition.frameDuration.seconds
             committedState = snapshot.state
             isLoading = false
-            if isInspectingSource { seek(position) }
-            else { seekOutput(outputPosition(for: position)) }
+            if isInspectingSource && supportsSourceAudition { seek(position) }
+            else { seekOutput(outputTime) }
         } catch {
             guard request == generation, !Task.isCancelled else { return }
             invalidateStillFrames()
@@ -378,6 +384,7 @@ final class EditorPlayback: ObservableObject {
         pause(); clearAudition(); scrubGestureActive = false
         isInspectingSource = false
         let requested = bounded(position, to: 0...outputDuration)
+        updateSimulationPosition(requested)
         if MediaProcessing.isSuspended {
             isScrubbing = false
             seekOutputSimulation(requested)
@@ -395,7 +402,13 @@ final class EditorPlayback: ObservableObject {
         else if mediaUsesOutputTime {
             if !scrubGestureActive { beginScrubbing() }
             requestCompositionSeek(bounded(position, to: 0...outputDuration))
-        } else { scrub(to: sourcePosition(at: bounded(position, to: 0...outputDuration))) }
+        } else {
+            let requested = bounded(position, to: 0...outputDuration)
+            updateSimulationPosition(requested)
+            guard !isLoading, renderedProject != nil else { return }
+            if !scrubGestureActive { beginScrubbing() }
+            requestSeek(sourcePosition(at: requested))
+        }
     }
 
     private func seekSource(_ position: Double) {
@@ -599,7 +612,7 @@ final class EditorPlayback: ObservableObject {
         let requested = position.isFinite ? bounded(position, to: sourceBounds) : time
         let target = Self.frameTime(at: requested, bounds: sourceBounds)
         let request = generation
-        if renderedProject.previewFrames.sources(at: target) == nil { seek(requested) }
+        if renderedProject.previewFrames.sources(at: target) == nil { seekSource(requested) }
         let seekRequest = seekGeneration
         let source = try await nativeSource(at: target, generation: request, seekGeneration: seekRequest)
         let image = try await source.cameraImage()
@@ -873,8 +886,51 @@ final class EditorPlayback: ObservableObject {
         return timingMap.clips.first(where: { $0.sourceStart > sourceTime })?.outputStart ?? timingMap.outputDuration
     }
 
+    /// Intentional navigation to an authoring mark stays on the project ruler.
+    /// Marks in removed footage resolve to the nearest retained boundary.
+    func seekProjectTime(_ position: Double) {
+        guard position.isFinite else { return }
+        seekOutput(outputPosition(forProjectTime: position))
+    }
+
+    /// Selecting an animation chooses the authoring side of a blend without
+    /// seeking, pausing, changing the ruler, or changing the rendered pixels.
+    /// Passing nil restores the dominant authoring sample at that same cursor.
+    func selectEditingBranch(nearProjectTime position: Double?) {
+        editingBranchAnchor = position.flatMap { $0.isFinite ? $0 : nil }
+        if !isInspectingSource { time = sourcePosition(at: outputTime) }
+    }
+
+    var selectedProjectBranch: Int? {
+        guard let editingBranchAnchor, let timingMap else { return nil }
+        return timingMap.clips.indices.min { lhs, rhs in
+            let a = timingMap.clips[lhs], b = timingMap.clips[rhs]
+            let da = max(a.sourceStart - editingBranchAnchor, editingBranchAnchor - a.sourceEnd, 0)
+            let db = max(b.sourceStart - editingBranchAnchor, editingBranchAnchor - b.sourceEnd, 0)
+            return da < db
+        }
+    }
+
+    func outputPosition(forProjectTime position: Double) -> Double {
+        guard position.isFinite else { return outputTime }
+        guard let timingMap else { return outputPosition(for: position) }
+        if let exact = timingMap.outputTime(for: position) { return exact }
+        let boundaries = timingMap.clips.flatMap { [($0.sourceStart, $0.outputStart), ($0.sourceEnd, $0.outputEnd)] }
+        return boundaries.min { lhs, rhs in
+            let a = abs(lhs.0 - position), b = abs(rhs.0 - position)
+            return abs(a - b) < 0.000000001 ? abs(lhs.1 - outputTime) < abs(rhs.1 - outputTime) : a < b
+        }?.1 ?? 0
+    }
+
     private func sourcePosition(at outputTime: Double) -> Double {
-        timingMap?.samples(at: outputTime).max(by: { $0.weight < $1.weight })?.sourceTime ?? bounds.lowerBound
+        guard let timingMap else { return bounds.lowerBound }
+        if let branch = selectedProjectBranch {
+            let clip = timingMap.clips[branch]
+            if outputTime >= clip.outputStart && outputTime <= clip.outputEnd {
+                return clip.sourceTime(at: outputTime)
+            }
+        }
+        return timingMap.samples(at: outputTime).max(by: { $0.weight < $1.weight })?.sourceTime ?? bounds.lowerBound
     }
 
     private func updateSimulationPosition(_ position: Double) {

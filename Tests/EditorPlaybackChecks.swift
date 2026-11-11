@@ -52,6 +52,13 @@ struct EditorPlaybackChecks {
 
     @MainActor
     static func main() async throws {
+        if CommandLine.arguments.contains("--composed-clock") {
+            try require(!MediaProcessing.isSuspended && MediaProcessing.isCaptureSuspended,
+                        "Use recorded fixtures with live capture disabled")
+            try await composedDraftPreviewChecks()
+            print("Native composed clock checks passed (cut/crossfade, speed, video layers, branch selection, paused draft/commit/Undo/Redo and original bytes; recorded fixtures only).")
+            return
+        }
         let queue = LatestStillFrameQueue<Int>()
         let decoder = DecoderProbe()
         decoder.submit(1, to: queue)
@@ -330,7 +337,23 @@ struct EditorPlaybackChecks {
             let display = HeadlessPlayerDisplay(player: playback.player)
             await playback.rebuild(editor: editor)
             playback.seekOutput(mode == "cut" ? 0.65 : 0.25)
-            _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            let initial = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            if mode == "cut" {
+                let ruler = playback.outputTime, dominant = playback.time
+                playback.selectEditingBranch(nearProjectTime: 1.05)
+                try require(abs(playback.time - 1.05) < 0.000001 && playback.outputTime == ruler,
+                            "Native selection chooses incoming blend without seeking ruler")
+                playback.pause()
+                try require(playback.outputSamples.count == 2 && !playback.isInspectingSource,
+                            "Native pause retains both finished-frame branches")
+                let selected = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+                try require((initial.dataProvider!.data! as Data) == (selected.dataProvider!.data! as Data),
+                            "Selecting authoring branch must not replace composed paused pixels")
+                playback.selectEditingBranch(nearProjectTime: nil)
+                try require(playback.time == dominant && playback.outputTime == ruler,
+                            "Clearing branch restores dominant authoring sample without changing ruler")
+                playback.selectEditingBranch(nearProjectTime: 1.05)
+            }
             let item = playback.player.currentItem, sourceTime = playback.time, outputTime = playback.outputTime
             let size = playback.screenSize
             var draft = project.state
@@ -360,9 +383,18 @@ struct EditorPlaybackChecks {
             try require(editor.commit(draft, name: "Move camera"), "\(mode): commit gesture once")
             await playback.rebuild(editor: editor)
             _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+            try require(playback.outputTime == outputTime && abs(playback.time - sourceTime) < 0.000001 && !playback.isInspectingSource,
+                        "\(mode): commit rebuild preserves finished ruler and selected authoring branch")
             try require(editor.project.undoHistory.count == 1 && editor.undo(), "\(mode): one Undo restores the gesture")
             await playback.rebuild(editor: editor)
             _ = try await waitForFrame(playback, expected: CGRect(x: 0, y: 0, width: 40, height: 20))
+            try require(playback.outputTime == outputTime && abs(playback.time - sourceTime) < 0.000001 && !playback.isInspectingSource,
+                        "\(mode): Undo rebuild preserves finished ruler and selected authoring branch")
+            try require(editor.redo(), "\(mode): Redo the same gesture")
+            await playback.rebuild(editor: editor)
+            _ = try await waitForFrame(playback, expected: CGRect(x: 120, y: 100, width: 40, height: 20))
+            try require(playback.outputTime == outputTime && !playback.isInspectingSource,
+                        "\(mode): Redo stays on the same finished clock")
             playback.preview(draft); playback.close(); display.close()
         }
         let unchanged = [try Data(contentsOf: screen), try Data(contentsOf: camera)]

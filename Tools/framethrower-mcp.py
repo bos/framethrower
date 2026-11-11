@@ -103,10 +103,14 @@ class DocumentScope:
                 name, args = params.get("name"), params.get("arguments", {})
                 if not isinstance(args, dict): raise ProxyError("MCP tool arguments must be an object.")
                 if name != "list_recordings" and args.get("document_id") != self.document_id:
-                    reason = "This Director session controls only its bound recording. Use its current document_id."
+                    reason = ("This recording was reopened or the supplied document_id is outside this session. "
+                              f"Retry with the current document_id={self.document_id}. "
+                              "The conversation is still valid; do not start a new session.")
             elif method == "resources/read":
                 if not str(params.get("uri", "")).startswith("framethrower://recordings/" + self.document_id + "/"):
-                    reason = "This Director session can read only its bound recording."
+                    reason = ("This resource is outside the current recording connection. "
+                              f"Use resources/list for framethrower://recordings/{self.document_id}/. "
+                              "The conversation is still valid after reopening.")
             if reason:
                 if identifier is not None:
                     replies.append({"jsonrpc": "2.0", "id": identifier, "error": {"code": -32602, "message": reason}})
@@ -134,7 +138,14 @@ class DocumentScope:
                 if method == "tools/list":
                     for tool in result.get("tools", []):
                         field = tool.get("inputSchema", {}).get("properties", {}).get("document_id")
-                        if isinstance(field, dict): field["enum"] = [self.document_id]
+                        if isinstance(field, dict):
+                            # Open-editor handles change on reopen. Native agents
+                            # cache schemas across resumed turns, so binding an
+                            # ephemeral handle into the schema strands a valid
+                            # persistent conversation. Enforce scope in client().
+                            field.pop("enum", None)
+                            field.pop("const", None)
+                            field["description"] = "The current document_id from editor context or list_recordings. It can change when the same recording is reopened."
                 elif method == "resources/list":
                     prefix = "framethrower://recordings/" + self.document_id + "/"
                     result["resources"] = [r for r in result.get("resources", []) if r.get("uri", "").startswith(prefix)]

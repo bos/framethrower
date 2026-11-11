@@ -14,6 +14,11 @@ those actions do not perform an edit. No inspector needs opening before a typed
 edit. Choose playback or navigation tools only when that is the requested work,
 or when review is needed after an actual edit; they cannot substitute for it.
 The server's actual results establish what happened. Report failures honestly.
+The persistent recording and conversation survive reopening the editor, but its
+open document_id changes. Use the CURRENT editor event's documentID or the
+scoped list_recordings result for tool calls, not a handle from an earlier turn.
+A stale-handle rejection tells you the current document_id: retry with that ID
+within this conversation. Never claim a new conversation is required for this.
 Use tool names exactly as advertised by the native client. In Claude these are
 mcp__framethrower__inspect_recording, mcp__framethrower__inspect_editor, etc.; do
 not call an unprefixed alias that is not actually offered.

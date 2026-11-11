@@ -131,13 +131,36 @@ class ProxyChecks(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["omitted"], 0)
         self.assertNotIn("doc-b", result["content"][0]["text"])
 
+    def test_reopen_changes_handle_without_changing_schema_or_allowing_other_documents(self):
+        def catalog(scope):
+            scope.client(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]))
+            return json.loads(scope.server(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 1,
+                "result": {"tools": [{"name": "inspect_recording", "inputSchema": {"properties": {
+                    "document_id": {"type": "string", "enum": ["old-cached-handle"], "const": "old-cached-handle"}}}}]}}])))
+        old, reopened = proxy.DocumentScope("old-handle"), proxy.DocumentScope("new-handle")
+        self.assertEqual(catalog(old), catalog(reopened), "Resumable tool schema must not capture an open-editor identity")
+        def call(document):
+            return reopened.client(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 2,
+                "method": "tools/call", "params": {"name": "inspect_recording",
+                    "arguments": {"document_id": document, "detail": "frame"}}}]))
+        for wrong in ["old-handle", "another-recording"]:
+            forwarded, denied = call(wrong)
+            self.assertEqual(forwarded, b"")
+            self.assertIn("current document_id=new-handle", json.loads(denied)["error"]["message"])
+        forwarded, denied = call("new-handle")
+        self.assertEqual(denied, b"")
+        self.assertEqual(json.loads(forwarded)["params"]["arguments"]["document_id"], "new-handle")
+
     def test_scoped_resources_catalog_and_cancellation(self):
         scope = proxy.DocumentScope("doc-a")
         def send(message): return scope.client(proxy.DocumentScope.encode([message]))
         send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         response = scope.server(proxy.DocumentScope.encode([{"jsonrpc": "2.0", "id": 1, "result": {"tools": [
             {"name": "inspect_editor", "inputSchema": {"properties": {"document_id": {"type": "string"}}}}]}}]))
-        self.assertEqual(json.loads(response)["result"]["tools"][0]["inputSchema"]["properties"]["document_id"]["enum"], ["doc-a"])
+        field = json.loads(response)["result"]["tools"][0]["inputSchema"]["properties"]["document_id"]
+        self.assertNotIn("enum", field)
+        self.assertNotIn("const", field)
+        self.assertIn("reopened", field["description"])
         forwarded, denied = send({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": "framethrower://recordings/doc-ab/state"}})
         self.assertEqual(forwarded, b"")
         self.assertIn("error", json.loads(denied))

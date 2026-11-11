@@ -102,8 +102,9 @@ struct RecordedFrameInspectionChecks {
         try require(editor.cancelDraft(), "Cancel inspection fixture draft")
         try require(editor.project == before && Data(contentsOf: folder.appendingPathComponent("fixture.mov")) == original,
             "Frame requests preserve document/history and original media bytes")
-        EditorAutomationRegistry.shared.register(host)
-        defer { EditorAutomationRegistry.shared.unregister(host) }
+        var activeEditor = editor, activePlayback = playback, activeHost = host
+        EditorAutomationRegistry.shared.register(activeHost)
+        defer { EditorAutomationRegistry.shared.unregister(activeHost); activePlayback.close() }
         let backend = FrameThrowerMCPBackend(
             listTools: { try JSONSerialization.data(withJSONObject: EditorAutomationAPI.tools) },
             callTool: { name, arguments in try await EditorAutomationRegistry.shared.call(name, arguments: arguments) },
@@ -113,13 +114,29 @@ struct RecordedFrameInspectionChecks {
         let server = FrameThrowerMCPServer(directory: socketDirectory)
         try await server.start(backend: backend)
         defer { server.stop() }
-        let ready: [String: Any] = ["document_id": host.documentID, "recording_id": editor.automationID.uuidString,
-            "socket": server.socketPath, "project": editor.url.path]
-        try JSONSerialization.data(withJSONObject: ready).write(to: folder.appendingPathComponent("ready.json"))
+        func publish(_ filename: String) throws {
+            let ready: [String: Any] = ["document_id": activeHost.documentID, "recording_id": activeEditor.automationID.uuidString,
+                "socket": server.socketPath, "project": activeEditor.url.path]
+            try JSONSerialization.data(withJSONObject: ready).write(to: folder.appendingPathComponent(filename), options: .atomic)
+        }
+        try publish("ready.json")
         print("Recorded frame extraction checks passed; isolated MCP fixture ready.")
         if CommandLine.arguments.contains("--serve") {
-            let deadline = ContinuousClock.now.advanced(by: .seconds(180))
-            while ContinuousClock.now < deadline && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("stop").path) {
+            let deadline = SuspendingClock.now.advanced(by: .seconds(600))
+            var reopened = false
+            while SuspendingClock.now < deadline && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("stop").path) {
+                if !reopened && FileManager.default.fileExists(atPath: folder.appendingPathComponent("reopen").path) {
+                    let oldDocument = activeHost.documentID, oldRecording = activeEditor.automationID
+                    EditorAutomationRegistry.shared.unregister(activeHost)
+                    activePlayback.close()
+                    activeEditor = try ProjectEditor.open(url: editor.url)
+                    activePlayback = EditorPlayback()
+                    activeHost = EditorAutomationHost(editor: activeEditor, playback: activePlayback)
+                    try require(activeHost.documentID != oldDocument && activeEditor.automationID == oldRecording,
+                        "Reopening changes only the transient endpoint, preserving the saved recording identity")
+                    EditorAutomationRegistry.shared.register(activeHost)
+                    try publish("reopened.json"); reopened = true
+                }
                 try await Task.sleep(for: .milliseconds(100))
             }
         }

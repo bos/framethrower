@@ -491,7 +491,7 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
     private func previewCommand(_ args: [String: Any], editor: ProjectEditor) throws -> EditorPreviewCommand {
         guard let playback, let operation = args["operation"] as? String else { throw EditorPreviewError.unavailable }
         if let base = args["time_base"], !(base is String) { throw EditorAutomationError.invalid("Choose source or output time.") }
-        let timeBase = args["time_base"] as? String ?? "source"
+        let timeBase = args["time_base"] as? String ?? "output"
         guard ["source", "output"].contains(timeBase) else { throw EditorAutomationError.invalid("Choose source or output time.") }
         let fields: Set<String>
         let command: EditorPreviewCommand
@@ -539,27 +539,23 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             } else { throw EditorAutomationError.invalid("Identify one animation, including its lane when an edit changes more than one lane.") }
             guard matches.count == 1, let animation = matches.first else { throw EditorAutomationError.invalid("Choose one nonempty animation range from inspect_editor edits.") }
             let state = editor.editingState
-            if state.cuts.isEmpty {
-                command = .playRange(start: animation.start, end: animation.end)
-            } else {
-                let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
-                    trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
-                // A source interval can project to overlapping output branches.
-                // Project each retained intersection; never reverse endpoint
-                // mappings or choose just the dominant branch of a crossfade.
-                let intervals = map.clips.compactMap { clip -> ClosedRange<Double>? in
-                    let start = max(animation.start, clip.sourceStart), end = min(animation.end, clip.sourceEnd)
-                    guard start < end else { return nil }
-                    let outputStart = clip.outputTime(for: start)
-                    let outputEnd = clip.outputTime(for: end)
-                    guard outputStart < outputEnd else { return nil }
-                    return outputStart...outputEnd
-                }
-                guard let start = intervals.map(\.lowerBound).min(), let end = intervals.map(\.upperBound).max(), start < end else {
-                    throw EditorAutomationError.invalid("That animation has no retained footage in the finished recording. Restore its cut or inspect the original source.")
-                }
-                command = .playOutputRange(start: start, end: end)
+            let map = try RecordingTimeMap(duration: editor.project.duration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, cuts: state.cuts, speedKeyframes: state.speedKeyframes)
+            // A source interval can project to overlapping output branches.
+            // Project each retained intersection; never reverse endpoint
+            // mappings or choose just the dominant branch of a crossfade.
+            let intervals = map.clips.compactMap { clip -> ClosedRange<Double>? in
+                let start = max(animation.start, clip.sourceStart), end = min(animation.end, clip.sourceEnd)
+                guard start < end else { return nil }
+                let outputStart = clip.outputTime(for: start)
+                let outputEnd = clip.outputTime(for: end)
+                guard outputStart < outputEnd else { return nil }
+                return outputStart...outputEnd
             }
+            guard let start = intervals.map(\.lowerBound).min(), let end = intervals.map(\.upperBound).max(), start < end else {
+                throw EditorAutomationError.invalid("That animation has no retained footage in the finished recording. Restore its cut or inspect the original source.")
+            }
+            command = .playOutputRange(start: start, end: end)
         default: throw EditorAutomationError.invalid("Unknown playback action.")
         }
         try EditorAutomationAPI.keys(args, allowed: fields.union(["document_id", "operation"]))

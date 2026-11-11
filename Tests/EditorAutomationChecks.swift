@@ -207,7 +207,7 @@ struct EditorAutomationChecks {
     static func previewDraftAndNavigation() async throws {
         let f = try AutomationFixture(); defer { f.close() }; await f.ready()
         let original = f.editor.project
-        _ = try await f.call("control_preview", ["operation": "seek", "time": 1.5])
+        _ = try await f.call("control_preview", ["operation": "seek", "time_base": "source", "time": 1.5])
         _ = try await f.call("control_preview", ["operation": "set_rate", "rate": 2])
         _ = try await f.call("navigate_editor", ["operation": "select_box", "target_id": f.box.id.uuidString])
         try require(f.boxID == f.box.id && f.playback.time == 1.5, "Selection does not seek")
@@ -222,18 +222,18 @@ struct EditorAutomationChecks {
         try await reject { _ = try await f.call("control_preview", ["operation": "seek", "time": true]) }
         try await reject { _ = try await f.call("control_preview", ["operation": "play_range", "start": 4, "end": 3]) }
         try require(f.editor.draftState == draft && f.editor.project == original, "Pause/rate and malformed navigation preserve unfinished draft")
-        _ = try await f.call("control_preview", ["operation": "seek", "time": 1])
+        _ = try await f.call("control_preview", ["operation": "seek", "time_base": "source", "time": 1])
         try require(f.editor.draftState == nil && f.editor.project.state == draft && f.editor.project.undoHistory.count == 1 && f.playback.time == 1,
                     "Valid source seek finishes manual draft once, not a separate transport edit")
         _ = try await f.call("control_preview", ["operation": "play_animation", "animation_id": "screen:\(f.anchor.id.uuidString)"])
-        try require(f.playback.auditionRange == .init(start: 3, end: 5) && f.playback.isPlaying, "Audition uses effective animation start/end, not its target endpoint")
+        try require(f.playback.auditionRange == .init(start: 1, end: 3) && f.playback.isPlaying, "Audition projects effective animation start/end into the finished trim clock")
         await f.host.rebuildPreview()
-        try require(f.playback.isPlaying && f.playback.auditionRange == .init(start: 3, end: 5), "Late same-visual rebuild does not cancel requested autoplay")
+        try require(f.playback.isPlaying && f.playback.auditionRange == .init(start: 1, end: 3), "Late same-visual rebuild does not cancel requested autoplay")
         _ = try await f.call("control_preview", ["operation": "pause"])
         try require(f.editor.project.undoHistory.count == 1 && !f.playback.hasMediaPlayer && f.playback.canvasPlayer == nil,
                     "Transient navigation/audition never creates AV objects or another Undo entry")
         let beforeCancel = f.playback.previewSnapshot
-        let canceled = Task { @MainActor in _ = try await f.call("control_preview", ["operation": "seek", "time": 9]) }; canceled.cancel()
+        let canceled = Task { @MainActor in _ = try await f.call("control_preview", ["operation": "seek", "time_base": "source", "time": 9]) }; canceled.cancel()
         try await reject { _ = try await canceled.value }
         try require(f.playback.previewSnapshot == beforeCancel, "Canceled host call cannot seek")
     }

@@ -1,5 +1,7 @@
 import Combine
 import Foundation
+@preconcurrency import AVFoundation
+import CryptoKit
 
 /// A host-owned proposal, frozen to the exact document revision and prepared
 /// component identities used by both the visual comparison and its commit.
@@ -105,7 +107,8 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
                 selectedAnimationID: selected.2, inspector: selected.3, recordingID: editor.automationID,
                 timelineTimeBase: timelineTimeBase, selectedVideoLayerID: layer?.id,
                 selectedVideoClipID: clip?.id, selectedVideoVolumeID: volume?.id,
-                liveCaptureSuspended: MediaProcessing.isCaptureSuspended, mediaProcessingSuspended: MediaProcessing.isSuspended)
+                liveCaptureSuspended: MediaProcessing.isCaptureSuspended, mediaProcessingSuspended: MediaProcessing.isSuspended,
+                recordedFrameInspectionAvailable: !MediaProcessing.isSuspended)
         }
     }
     var automationEvents: AnyPublisher<EditorAutomationEvent, Never> { events.eraseToAnyPublisher() }
@@ -163,10 +166,11 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
             try EditorAutomationAPI.keys(args, allowed: ["document_id", "section", "offset", "limit", "component", "time", "time_base", "layer_id", "clip_id"])
             value = try inspect(args, editor: editor)
         case "inspect_recording":
-            try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "query", "window_id", "kind", "limit"])
+            try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "query", "window_id", "kind", "limit", "time_base", "frame_view"])
+            if args["detail"] as? String == "frame" { return try await inspectRecordedFrame(args, editor: editor, playback: playback) }
+            guard args["time_base"] == nil && args["frame_view"] == nil else { throw EditorAutomationError.invalid("Frame view/time_base are available only for detail=frame. Recorded scene metadata uses source seconds.") }
             let time = try EditorAutomationAPI.number(args["time"])
             guard time >= 0, time <= editor.project.duration else { throw EditorPreviewError.invalidTime }
-            guard args["detail"] as? String != "frame" else { throw DirectorInspectionError.frameUnavailable }
             guard let raw = args["detail"] as? String, let detail = DirectorSceneInspectionRequest.Detail(rawValue: raw) else { throw EditorAutomationError.invalid("Choose windows, controls, search or frame.") }
             let limit = try args["limit"].map { try EditorAutomationAPI.integer($0) } ?? 8
             let windowID: UInt32?
@@ -568,6 +572,41 @@ final class EditorAutomationHost: ObservableObject, EditorAutomationEndpoint {
         return command
     }
 
+    private func inspectRecordedFrame(_ args: [String: Any], editor: ProjectEditor, playback: EditorPlayback) async throws -> Data {
+        try MediaProcessing.requireEnabled()
+        try EditorAutomationAPI.keys(args, allowed: ["document_id", "detail", "time", "time_base", "frame_view"])
+        let rawView = args["frame_view"] as? String ?? "preview"
+        guard let view = DirectorRecordedFrameView(rawValue: rawView), args["frame_view"] == nil || args["frame_view"] is String else {
+            throw EditorAutomationError.invalid("Choose preview or source for frame_view.")
+        }
+        let rawBase = args["time_base"] as? String ?? (view == .source ? "source" : playback.previewSnapshot.inspectionTimeBase ?? "output")
+        guard let base = EditorCutTimeBase(rawValue: rawBase), args["time_base"] == nil || args["time_base"] is String else {
+            throw EditorAutomationError.invalid("Choose source or output time_base.")
+        }
+        let time = try args["time"].map { try EditorAutomationAPI.number($0) } ?? (base == .source ? playback.time : playback.outputTime)
+        let revision = try EditorCommandDispatcher.revision(for: editor.project)
+        var snapshot = editor.project; snapshot.state = editor.editingState
+        let frame = try await DirectorRecordedPreviewReader.image(project: snapshot, directory: editor.url.deletingLastPathComponent(),
+            time: time, timeBase: base, view: view)
+        try Task.checkCancellation()
+        guard revision == (try EditorCommandDispatcher.revision(for: editor.project)), snapshot.state == editor.editingState else { throw EditorCommandError.stale }
+        let encoded = try DirectorRecordedFrameReader.jpeg(frame.image)
+        let id = UUID().uuidString
+        let metadata: [String: Any] = ["frame_id": id, "kind": "recorded_frame", "frame_view": rawView,
+            "time_base": rawBase, "requested_time": time, "actual_time": frame.actualTime,
+            "pixel_width": encoded.width, "pixel_height": encoded.height,
+            "original_pixel_width": Int(frame.originalSize.width.rounded()), "original_pixel_height": Int(frame.originalSize.height.rounded()),
+            "coordinates": view == .preview ? "edited_final_canvas" : "original_recorded_source",
+            "evidence": "recorded_file", "live_desktop": false, "image_attached": true,
+            "expected_revision": revision, "document_id": documentID,
+            "sha256": SHA256.hash(data: encoded.data).map { String(format: "%02x", $0) }.joined()]
+        let result: [String: Any] = ["ok": true, "result": metadata,
+            "_mcp_image": ["mimeType": "image/jpeg", "data": encoded.data.base64EncodedString()]]
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        guard data.count <= 900_000 else { throw DirectorInspectionError.invalid("The recorded-frame response exceeded its transport limit.") }
+        return data
+    }
+
     private func inspect(_ args: [String: Any], editor: ProjectEditor) throws -> Any {
         if let base = args["time_base"], !(base is String) { throw EditorAutomationError.invalid("Choose source or output time.") }
         let section = args["section"] as? String
@@ -850,5 +889,63 @@ final class EditorAutomationRegistry {
             readResource: { uri in try await EditorAutomationRegistry.shared.read(uri) })
         do { try await FrameThrowerMCPServer.shared.start(backend: backend) }
         catch { NSLog("FrameThrower automation unavailable: %@", error.localizedDescription) }
+    }
+}
+
+
+private enum DirectorRecordedFrameView: String { case preview, source }
+
+@MainActor
+private enum DirectorRecordedPreviewReader {
+    static func image(project: RecordingProject, directory: URL, time: Double, timeBase: EditorCutTimeBase,
+                      view: DirectorRecordedFrameView) async throws -> DirectorRecordedFrameImage {
+        try MediaProcessing.requireEnabled()
+        try Task.checkCancellation()
+        let map = try RecordingTimeMap(duration: project.duration, trimStart: project.state.trimStart,
+            trimEnd: project.state.trimEnd, cuts: project.state.cuts, speedKeyframes: project.state.speedKeyframes)
+        let duration = timeBase == .output ? map.outputDuration : project.duration
+        guard time.isFinite, time >= 0, time <= duration else { throw EditorPreviewError.invalidTime }
+        if view == .source {
+            let sourceTime: Double
+            if timeBase == .source { sourceTime = time }
+            else {
+                let samples = map.samples(at: time)
+                guard samples.count == 1, let sample = samples.first else {
+                    throw EditorAutomationError.invalid("That finished frame blends two source moments. Request the preview, or choose an explicit source time.")
+                }
+                sourceTime = sample.sourceTime
+            }
+            return try await DirectorRecordedFrameReader.sourceImage(project: project, directory: directory, at: sourceTime)
+        }
+        var snapshot = project
+        // Authoring/source inspection shows the edited scene at that source
+        // instant, independently of global trim/cuts/retiming.
+        if timeBase == .source {
+            snapshot.state.trimStart = 0; snapshot.state.trimEnd = snapshot.duration
+            snapshot.state.cuts = []; snapshot.state.speedKeyframes = []
+        }
+        let rendered = try await ProjectRenderer.makePreview(project: snapshot, directory: directory)
+        let assetTime: Double
+        if timeBase == .output, rendered.timingMap == nil {
+            guard let sample = map.samples(at: time).first else { throw EditorPreviewError.invalidTime }
+            assetTime = sample.sourceTime
+        } else { assetTime = time }
+        let assetDuration = try await rendered.asset.load(.duration).seconds
+        guard assetDuration.isFinite, assetDuration > 0 else { throw DirectorInspectionError.frameUnavailable }
+        let last = max(0, assetDuration - min(1.0 / 600, assetDuration / 2))
+        let target = min(assetTime, last)
+        let generator = AVAssetImageGenerator(asset: rendered.asset)
+        generator.videoComposition = rendered.videoComposition
+        generator.maximumSize = CGSize(width: 1920, height: 1920)
+        generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
+        let cancellation = DirectorFrameGeneration(generator)
+        return try await withTaskCancellationHandler {
+            defer { cancellation.cancel() }
+            let result = try await generator.image(at: CMTime(seconds: target, preferredTimescale: 600))
+            try Task.checkCancellation()
+            let actual = timeBase == .output && rendered.timingMap == nil
+                ? map.outputTime(for: result.actualTime.seconds) ?? time : result.actualTime.seconds
+            return DirectorRecordedFrameImage(image: result.image, actualTime: actual, originalSize: rendered.screenSize)
+        } onCancel: { cancellation.cancel() }
     }
 }

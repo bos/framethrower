@@ -245,10 +245,23 @@ actor FrameThrowerMCPProtocol {
                 do {
                     try Task.checkCancellation()
                     let data = try await backend.callTool(name, arguments)
-                    guard let object = try MCPJSON.object(data) as? [String: Any] else {
+                    guard var object = try MCPJSON.object(data) as? [String: Any] else {
                         throw FrameThrowerMCPError(code: -32603, message: "Tool backend must return a JSON object.")
                     }
-                    result = ["content": [["type": "text", "text": String(decoding: try MCPJSON.data(object), as: UTF8.self)]],
+                    var content: [[String: Any]] = []
+                    if let raw = object.removeValue(forKey: "_mcp_image") {
+                        guard name == "inspect_recording", let image = raw as? [String: Any], Set(image.keys) == ["mimeType", "data"],
+                              image["mimeType"] as? String == "image/jpeg", let encoded = image["data"] as? String,
+                              let bytes = Data(base64Encoded: encoded), bytes.count <= 550 * 1024,
+                              bytes.starts(with: [0xff, 0xd8]), bytes.suffix(2).elementsEqual([0xff, 0xd9]) else {
+                            throw FrameThrowerMCPError(code: -32603, message: "Invalid recorded-frame image result.")
+                        }
+                        content.append(["type": "image", "data": encoded, "mimeType": "image/jpeg"])
+                    }
+                    // Pixels belong to a native MCP image block, never a
+                    // duplicate base64 string in text or structuredContent.
+                    content.insert(["type": "text", "text": String(decoding: try MCPJSON.data(object), as: UTF8.self)], at: 0)
+                    result = ["content": content,
                               "structuredContent": object,
                               "isError": object["ok"] as? Bool == false || object["isError"] as? Bool == true || object["status"] as? String == "error" || (object["error"] != nil && !(object["error"] is NSNull))]
                 } catch {

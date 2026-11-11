@@ -34,7 +34,7 @@ final class DirectorDiagnostics {
                 "sequence": next,
                 "session_id": sessionID.uuidString,
                 "event": String(event.prefix(128)),
-                "details": Self.withoutImagePixels(details)
+                "details": Self.redactingImagePixels(details)
             ]
             if event.count > 128 { entry["event_truncated"] = true }
             if let requestID { entry["request_id"] = requestID.uuidString }
@@ -59,16 +59,23 @@ final class DirectorDiagnostics {
 
     /// Keep requests debuggable without copying image pixels into interaction
     /// logs. The corresponding inspection result retains its ID and geometry.
-    private static func withoutImagePixels(_ value: Any) -> Any {
-        if let values = value as? [Any] { return values.map(withoutImagePixels) }
+    static func redactingImagePixels(_ value: Any) -> Any {
+        if let values = value as? [Any] { return values.map(redactingImagePixels) }
         guard let dictionary = value as? [String: Any] else { return value }
+        let nativeSource = dictionary["source"] as? [String: Any]
+        if dictionary["type"] as? String == "image" || (dictionary["mimeType"] as? String)?.hasPrefix("image/") == true {
+            let encoded = dictionary["data"] as? String ?? nativeSource?["data"] as? String ?? ""
+            return ["type": "image_attachment", "encoded_bytes": encoded.utf8.count,
+                "mime_type": dictionary["mimeType"] as? String ?? nativeSource?["media_type"] as? String ?? "image/unknown",
+                "sha256": SHA256.hash(data: Data(encoded.utf8)).map { String(format: "%02x", $0) }.joined()]
+        }
         if dictionary["type"] as? String == "image_url" {
             let image = dictionary["image_url"] as? [String: Any]
             let url = image?["url"] as? String ?? ""
             let digest = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
             return ["type": "image_attachment", "encoded_bytes": url.utf8.count, "sha256": digest]
         }
-        return dictionary.mapValues(withoutImagePixels)
+        return dictionary.mapValues(redactingImagePixels)
     }
 
     private func boundedLine(_ original: [String: Any]) throws -> Data {

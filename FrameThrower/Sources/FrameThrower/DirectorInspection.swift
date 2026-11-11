@@ -1,6 +1,9 @@
 import CoreFoundation
 import CryptoKit
 import Foundation
+@preconcurrency import AVFoundation
+import ImageIO
+import UniformTypeIdentifiers
 
 struct DirectorInspectionCapabilities: Codable, Equatable, Sendable {
     var scene: Bool
@@ -84,11 +87,12 @@ struct DirectorInspectionObservation: Equatable, Sendable {
 
     func imageMessage(toolCallID: String) -> [String: Any]? {
         guard let imagePNG, let imageSHA256, !toolCallID.isEmpty else { return nil }
+        let facts = (try? JSONSerialization.jsonObject(with: result)) as? [String: Any]
         let metadata: [String: Any] = ["frame_id": id.uuidString, "project_id": projectID.uuidString,
             "expected_revision": revision, "source_time": sourceTime,
             "source_width": pixelWidth, "source_height": pixelHeight,
             "sha256": imageSHA256, "originating_tool_call_id": toolCallID,
-            "evidence": "synthetic_fixture"]
+            "evidence": facts?["evidence"] as? String ?? "recorded_frame"]
         guard let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else { return nil }
         return ["role": "user", "content": [["type": "text", "text": text],
@@ -106,7 +110,7 @@ enum DirectorInspectionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .sceneUnavailable: "Recorded scene metadata is unavailable at that source time. Identify an existing box instead."
-        case .frameUnavailable: "Recorded source frames are unavailable while video processing is suspended. No frame was opened."
+        case .frameUnavailable: "The recorded frame is unavailable. Check that the source file exists and recorded-video processing is enabled; no live desktop was accessed."
         case .imagesUnsupported: "This model accepts text only. Choose an image-capable model to inspect a source frame."
         case .expiredObservation: "That observation expired or belongs to another recording revision. Inspect the recording again."
         case .unknownTarget: "The target was not included in that recorded observation. Inspect it again before framing it."
@@ -261,7 +265,9 @@ final class DirectorInspectionCache {
     typealias FrameProvider = @Sendable (Double) async throws -> DirectorInspectionFrame
     private var scene: RecordedScene?
     private let sceneURL: URL?
+    typealias RecordedFrameProvider = @Sendable (RecordingProject, Double) async throws -> DirectorInspectionFrame
     private let syntheticFrameProvider: FrameProvider?
+    private let recordedFrameProvider: RecordedFrameProvider?
     private var sceneTask: Task<RecordedScene, any Error>?
     private var sceneValidated = false
     private struct Stored {
@@ -273,17 +279,17 @@ final class DirectorInspectionCache {
     private var scope: String?
 
     init(scene: RecordedScene? = nil) {
-        self.scene = scene; sceneURL = nil; syntheticFrameProvider = nil
+        self.scene = scene; sceneURL = nil; syntheticFrameProvider = nil; recordedFrameProvider = nil
     }
     init(scene: RecordedScene? = nil, syntheticFrameProvider: @escaping FrameProvider) {
-        self.scene = scene; sceneURL = nil; self.syntheticFrameProvider = syntheticFrameProvider
+        self.scene = scene; sceneURL = nil; self.syntheticFrameProvider = syntheticFrameProvider; recordedFrameProvider = nil
     }
-    init(recordedSceneURL: URL?, syntheticFrameProvider: FrameProvider? = nil) {
-        scene = nil; sceneURL = recordedSceneURL; self.syntheticFrameProvider = syntheticFrameProvider
+    init(recordedSceneURL: URL?, syntheticFrameProvider: FrameProvider? = nil, recordedFrameProvider: RecordedFrameProvider? = nil) {
+        scene = nil; sceneURL = recordedSceneURL; self.syntheticFrameProvider = syntheticFrameProvider; self.recordedFrameProvider = recordedFrameProvider
     }
 
     func capabilities(supportsImages: Bool) -> DirectorInspectionCapabilities {
-        .init(scene: scene != nil || sceneURL != nil, frame: supportsImages && syntheticFrameProvider != nil)
+        .init(scene: scene != nil || sceneURL != nil, frame: supportsImages && (syntheticFrameProvider != nil || (!MediaProcessing.isSuspended && recordedFrameProvider != nil)))
     }
 
     var hasObservations: Bool { !observations.isEmpty }
@@ -330,9 +336,15 @@ final class DirectorInspectionCache {
         case let .frame(request):
             try validate(time: request.sourceTime, duration: project.duration)
             guard supportsImages else { throw DirectorInspectionError.imagesUnsupported }
-            guard let syntheticFrameProvider else { throw DirectorInspectionError.frameUnavailable }
             let frame: DirectorInspectionFrame
-            do { frame = try await syntheticFrameProvider(request.sourceTime) }
+            let synthetic: Bool
+            do {
+                if let syntheticFrameProvider { frame = try await syntheticFrameProvider(request.sourceTime); synthetic = true }
+                else if let recordedFrameProvider {
+                    try MediaProcessing.requireEnabled()
+                    frame = try await recordedFrameProvider(project, request.sourceTime); synthetic = false
+                } else { throw DirectorInspectionError.frameUnavailable }
+            }
             catch is CancellationError { throw CancellationError() }
             catch { throw DirectorInspectionError.frameUnavailable }
             try Task.checkCancellation()
@@ -344,7 +356,7 @@ final class DirectorInspectionCache {
                 "project_id": projectID.uuidString, "expected_revision": revision, "kind": "frame",
                 "requested_time": request.sourceTime, "source_time": frame.sourceTime,
                 "pixel_width": frame.pixelWidth, "pixel_height": frame.pixelHeight, "sha256": hash,
-                "evidence": "synthetic_fixture", "image_attached": true]
+                "evidence": synthetic ? "synthetic_fixture" : "recorded_source", "image_attached": true]
             let observation = DirectorInspectionObservation(id: id, projectID: projectID, revision: revision,
                 sourceTime: frame.sourceTime, pixelWidth: frame.pixelWidth, pixelHeight: frame.pixelHeight,
                 result: try json(result), imagePNG: frame.png, imageSHA256: hash)
@@ -582,7 +594,7 @@ final class DirectorInspectionCache {
               Array(bytes[8..<16]) == [0, 0, 0, 13, 73, 72, 68, 82],
               frame.pixelWidth > 0, frame.pixelWidth <= 8000, frame.pixelHeight > 0, frame.pixelHeight <= 8000,
               frame.pixelWidth * frame.pixelHeight <= 32_000_000 else {
-            throw DirectorInspectionError.invalid("The synthetic fixture must be a bounded, original-size PNG.")
+            throw DirectorInspectionError.invalid("The frame must be a bounded PNG with matching pixel dimensions.")
         }
         func integer(_ offset: Int) -> Int { bytes[offset..<offset + 4].reduce(0) { ($0 << 8) | Int($1) } }
         guard integer(16) == frame.pixelWidth, integer(20) == frame.pixelHeight else {
@@ -597,4 +609,84 @@ final class DirectorInspectionCache {
         }
     }
     deinit { sceneTask?.cancel() }
+}
+
+
+/// Immutable, bounded pixels from recorded files. This helper never queries
+/// screen capture, cameras, accessibility, windows or the live desktop.
+struct DirectorRecordedFrameImage: @unchecked Sendable {
+    let image: CGImage
+    let actualTime: Double
+    let originalSize: CGSize
+}
+
+enum DirectorRecordedFrameReader {
+    static let maximumJPEGBytes = 550 * 1024
+    static func sourceImage(project: RecordingProject, directory: URL, at requested: Double, maximumDimension: Int = 1920) async throws -> DirectorRecordedFrameImage {
+        try MediaProcessing.requireEnabled()
+        try Task.checkCancellation()
+        try project.validate()
+        guard requested.isFinite, requested >= 0, requested <= project.duration,
+              let source = project.videoSources.first(where: { $0.id == VideoSource.legacyScreenID }) else {
+            throw DirectorInspectionError.invalid("Choose a time inside the original recorded source.")
+        }
+        let url = try source.resolvedURL(in: directory)
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { throw DirectorInspectionError.frameUnavailable }
+        let natural = try await track.load(.naturalSize), transform = try await track.load(.preferredTransform)
+        let bounds = CGRect(origin: .zero, size: natural).applying(transform).standardized
+        guard bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 else { throw DirectorInspectionError.frameUnavailable }
+        let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0 else { throw DirectorInspectionError.frameUnavailable }
+        let time = min(requested, max(0, min(duration, project.duration) - min(1.0 / 600, duration / 2)))
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        if maximumDimension > 0 { generator.maximumSize = CGSize(width: maximumDimension, height: maximumDimension) }
+        else if bounds.width > 8000 || bounds.height > 8000 || bounds.width * bounds.height > 32_000_000 { throw DirectorInspectionError.frameUnavailable }
+        generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
+        let cancellation = DirectorFrameGeneration(generator)
+        return try await withTaskCancellationHandler {
+            defer { cancellation.cancel() }
+            let value = try await generator.image(at: CMTime(seconds: time, preferredTimescale: 600))
+            try Task.checkCancellation()
+            return DirectorRecordedFrameImage(image: value.image, actualTime: value.actualTime.seconds, originalSize: bounds.size)
+        } onCancel: { cancellation.cancel() }
+    }
+    static func sourceFrame(project: RecordingProject, directory: URL, at time: Double) async throws -> DirectorInspectionFrame {
+        let value = try await sourceImage(project: project, directory: directory, at: time, maximumDimension: 0)
+        return DirectorInspectionFrame(sourceTime: value.actualTime, pixelWidth: value.image.width,
+            pixelHeight: value.image.height, png: try encode(value.image, type: UTType.png.identifier, quality: nil))
+    }
+    static func jpeg(_ source: CGImage) throws -> (data: Data, width: Int, height: Int) {
+        var image = source
+        for _ in 0..<6 {
+            for quality in [0.85, 0.65, 0.45] {
+                let data = try encode(image, type: UTType.jpeg.identifier, quality: quality)
+                if data.count <= maximumJPEGBytes { return (data, image.width, image.height) }
+            }
+            let width = max(1, Int(Double(image.width) * 0.7)), height = max(1, Int(Double(image.height) * 0.7))
+            guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { throw DirectorInspectionError.frameUnavailable }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            guard let resized = context.makeImage() else { throw DirectorInspectionError.frameUnavailable }; image = resized
+        }
+        throw DirectorInspectionError.invalid("The recorded frame could not fit the image transport limit.")
+    }
+    private static func encode(_ image: CGImage, type: String, quality: Double?) throws -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, type as CFString, 1, nil) else { throw DirectorInspectionError.frameUnavailable }
+        let properties: CFDictionary? = quality.map { [kCGImageDestinationLossyCompressionQuality as String: $0] as CFDictionary }
+        CGImageDestinationAddImage(destination, image, properties)
+        guard CGImageDestinationFinalize(destination) else { throw DirectorInspectionError.frameUnavailable }
+        return data as Data
+    }
+}
+
+/// AVAssetImageGenerator cancellation is thread-safe; keep only this native
+/// handle across the cancellation callback rather than sharing mutable state.
+final class DirectorFrameGeneration: @unchecked Sendable {
+    private let generator: AVAssetImageGenerator
+    init(_ generator: AVAssetImageGenerator) { self.generator = generator }
+    func cancel() { generator.cancelAllCGImageGeneration() }
 }

@@ -586,18 +586,25 @@ normal conflict review and one Undo. Aspect fitting and source edges can change
 the effective border. Metadata and image observations are bound to a project
 revision; stale observations cannot apply edits.
 
-Scene projections are capped at 6 KiB and reduced to fit the remaining 20 KB
-Director text budget; omissions stay explicit. Each instruction allows at most
-four scene/frame lookups. The runtime retains bounded observation IDs and only
-the most recent paired image in model context. Inspection alone creates no Undo
-entry. A read-only question can finish with an observation report.
+Scene queries return bounded pages with explicit omissions. Inspection alone
+creates no Undo entry. Native provider sessions retain their conversation and
+manage their own context capacity; the app does not truncate that conversation.
+A read-only question can finish with an observation report.
 
-Recorded-file rendering and export are enabled; live capture stays disabled.
-Director does not yet have a real recorded-frame inspection provider. The
-image-capable CLI paths can accept explicitly requested PNG attachments;
-inspection tests currently use static synthetic fixtures only.
-Local Qwen3-8B is text-only. Image pixels are excluded from interaction logs;
-only attachment identities, dimensions and hashes are retained there.
+Director can inspect recorded frames on request, independently of Accessibility
+permission. Native MCP replies carry a bounded image of the edited preview;
+original source pixels are available explicitly when a framing operation needs
+source coordinates. Images are never captured from the live desktop during
+editing or attached automatically to every instruction. Local Qwen3-8B remains
+text-only. Image pixels are excluded from app interaction logs; attachment
+identities, dimensions and hashes are retained instead.
+
+The main page’s Accessibility control opens the macOS permission flow only when
+clicked. Director’s metadata control distinguishes saved window/control data
+from current Accessibility permission. Granting access applies to future
+recordings; it cannot reconstruct controls or menus in earlier footage.
+Assistant replies render Markdown using native text, including headings, lists,
+links, code and tables. Typed or dictated user messages remain literal text.
 
 `Tests/check-director-integrations.sh` compiles shared Director code once and
 reuses a source-fingerprinted binary across six integration suites. The
@@ -876,8 +883,14 @@ Use `list_recordings` to obtain an open editor's `documentID`. This opaque handl
 identifies that open endpoint, even when two files contain the same persisted
 recording identity. `inspect_editor` provides bounded pages of animations,
 boxes, ordinary Undo/Redo history, and recent events. `inspect_recording` queries
-recorded window/control metadata on demand. Source-frame inspection remains
-unavailable while the video-driver interlock is enabled.
+recorded window/control metadata on demand. With `detail=frame`, it returns a
+native MCP image of the current recorded preview when time is omitted. Use
+`frame_view=source` for original primary-source pixels, and `time_base=source`
+or `output` to make explicit times unambiguous. The result identifies its clock,
+actual time, original/encoded dimensions and coordinate space. Preview pixels
+are final-canvas coordinates; use source pixels or semantic target geometry for
+original-source framing operations. Frame inspection is disabled only by the
+recorded-media/vector interlock, independently of live capture and Accessibility.
 
 `control_preview` handles play, pause, seek, playback speed, frame stepping, and
 animation/range audition. `navigate_editor` distinguishes selection from seeking.

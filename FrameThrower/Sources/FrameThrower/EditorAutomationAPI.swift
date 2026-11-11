@@ -24,11 +24,13 @@ struct EditorAutomationContext: Codable, Equatable, Sendable {
     /// screen/camera/microphone capture remains disabled.
     var liveCaptureSuspended: Bool? = nil
     var mediaProcessingSuspended: Bool? = nil
+    var recordedFrameInspectionAvailable: Bool? = nil
     private enum CodingKeys: String, CodingKey {
         case documentID, name, revision, hasDraft, preview, selectedEditID, selectedBoxID, selectedAnimationID, inspector,
              recordingID, timelineTimeBase, selectedVideoLayerID, selectedVideoClipID, selectedVideoVolumeID
         case liveCaptureSuspended = "live_capture_suspended"
         case mediaProcessingSuspended = "media_processing_suspended"
+        case recordedFrameInspectionAvailable = "recorded_frame_inspection_available"
     }
 }
 
@@ -87,12 +89,14 @@ enum EditorAutomationAPI {
                 "layer_id": ["type": "string", "format": "uuid"], "clip_id": ["type": "string", "format": "uuid"],
                 "offset": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 16]
             ]) { _, b in b }, required: ["document_id", "section"]), readOnly: true),
-            tool("inspect_recording", "Query bounded recorded semantic metadata on demand, never the live desktop. Search a visible label before asking for all controls. Real source frames remain unavailable while video processing is suspended.", object(doc.merging([
+            tool("inspect_recording", "Inspect the RECORDING, never the live desktop. detail=frame returns a native image of the edited recorded preview on request, independent of accessibility/AX availability. Omit time to inspect the current playhead; frame_view defaults preview, following the current source/output inspection clock. Choose frame_view=source for original primary-source pixels; output crossfades require explicit source time for raw pixels. Metadata includes actual time, original/encoded pixel dimensions and coordinate space. For visual questions such as what can you see on screen, request this recorded frame before describing visible contents. windows/controls/search query optional recorded semantic metadata at an explicit source time; no frame is sent unless requested. Frame inspection is available when recorded_frame_inspection_available=true; earlier conversation claims of unavailable frames may be stale.", object(doc.merging([
                 "detail": ["type": "string", "enum": ["windows", "controls", "search", "frame"]],
+                "frame_view": ["type": "string", "enum": ["preview", "source"]],
+                "time_base": ["type": "string", "enum": ["source", "output"]],
                 "time": number, "query": text, "window_id": ["type": "integer", "minimum": 1, "maximum": UInt32.max],
                 "kind": ["type": "string", "enum": ["menu", "window", "tab", "control", "any"]],
                 "limit": ["type": "integer", "minimum": 1, "maximum": 16]
-            ]) { _, b in b }, required: ["document_id", "detail", "time"]), readOnly: true),
+            ]) { _, b in b }, required: ["document_id", "detail"]), readOnly: true),
             tool("describe_editor_actions", "Read units and schemas for a category. Editing returns a compact operation catalog; name one operation for its exact schema, or explicitly request * for all schemas. The domain API is richer than any voice adapter.", object(doc.merging([
                 "category": ["type": "string", "enum": ["preview", "navigation", "document", "editing"]], "operation": text
             ]) { _, b in b }, required: ["document_id", "category"]), readOnly: true),

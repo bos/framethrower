@@ -121,8 +121,11 @@ final class EditorAssistantSession: ObservableObject {
         inspectionImageCallID = nil
         inspectedFrames = [:]; inspectedFrameOrder = []
         if !injectedInspections {
+            let directory = editor.url.deletingLastPathComponent()
             inspections = DirectorInspectionCache(recordedSceneURL: editor.project.sceneFilename.map {
-                editor.url.deletingLastPathComponent().appendingPathComponent($0)
+                directory.appendingPathComponent($0)
+            }, recordedFrameProvider: { project, time in
+                try await DirectorRecordedFrameReader.sourceFrame(project: project, directory: directory, at: time)
             })
         }
         let history = DirectorConversation(storageURL: persistsConversation ? (conversationStorageURL ?? DirectorConversation.storageURL(for: editor.url)) : nil,
@@ -747,7 +750,7 @@ final class EditorAssistantSession: ObservableObject {
                             : (self.errorMessage ?? response)),
                         "native_reply": response,
                         "native_session_id": result["native_session_id"] ?? NSNull(),
-                        "native_events": result["events"] ?? [], "native_usage": result["usage"] ?? [:],
+                        "native_events": DirectorDiagnostics.redactingImagePixels(result["events"] ?? []), "native_usage": result["usage"] ?? [:],
                         "history": DirectorConversation.object(editor.historyState)])
                 } catch is CancellationError {
                     if self.generation == token {

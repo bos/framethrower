@@ -6,8 +6,12 @@ private actor NativeTurnRecorder {
     var requests: [Data] = []
     func turn(_ input: Data, url: URL, provider: DirectorProvider) throws -> Data {
         requests.append(input)
+        let image: [String: Any] = ["type": "image", "source": [
+            "type": "base64", "media_type": "image/jpeg", "data": "PRIVATE_NATIVE_FRAME_PIXELS"]]
+        let result: [String: Any] = ["type": "tool_result", "content": [image]]
+        let event: [String: Any] = ["message": ["content": [result]]]
         return try JSONSerialization.data(withJSONObject: ["ok": true, "native_session_id": "native-fixture",
-            "text": "Native reply \(requests.count)", "usage": [:], "events": []])
+            "text": "Native reply \(requests.count)", "usage": [:], "events": [event]])
     }
     func values() -> [Data] { requests }
 }
@@ -92,6 +96,9 @@ struct NativeDirectorSessionChecks {
         try require(editor.draftState == draft && editor.project.undoHistory.count == history, "conversation submission does not save or alter an unfinished edit")
         let page = try session.conversationPage(offset: 0, limit: 2)
         try require((page["exchanges"] as? [Any])?.count == 2, "prior dialogue is queryable as complete exchanges")
+        let archived = String(decoding: try JSONSerialization.data(withJSONObject: page), as: UTF8.self)
+        try require(!archived.contains("PRIVATE_NATIVE_FRAME_PIXELS") && archived.contains("image_attachment"),
+            "App conversation archive must retain image identity, not native tool-result pixels; provider conversation is untouched")
         _ = editor.cancelDraft()
         var framed = editor.project.state
         let existing = ZoomKeyframe(time: 5, scale: 2, transition: .smooth, duration: 3)

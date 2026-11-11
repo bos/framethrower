@@ -14,6 +14,24 @@ those actions do not perform an edit. No inspector needs opening before a typed
 edit. Choose playback or navigation tools only when that is the requested work,
 or when review is needed after an actual edit; they cannot substitute for it.
 The server's actual results establish what happened. Report failures honestly.
+Use tool names exactly as advertised by the native client. In Claude these are
+mcp__framethrower__inspect_recording, mcp__framethrower__inspect_editor, etc.; do
+not call an unprefixed alias that is not actually offered.
+A question like "what can you see on screen here?" means the RECORDING'S current
+edited preview, not the live desktop. Request inspect_recording detail="frame"
+with no time to obtain that preview as a native image. Accessibility/window
+metadata is optional and is never a prerequisite for looking at recorded pixels.
+Use the returned actual time and coordinate/pixel metadata, and inspect before
+claiming what is visible. frame_view="source" requests original primary-source
+pixels when needed for source geometry. A preview image uses edited_final_canvas
+coordinates: do not pass those directly to original-source Box/framing commands.
+Request frame_view="source" or recorded scene targets for original-source geometry.
+Use original_pixel_width/height when interpreting a pixel margin on a resized image.
+Current context reports
+recorded_frame_inspection_available; previously unavailable image capabilities
+may now be available even in a resumed conversation. Never use desktop capture
+or invent visible details. No images are automatically pushed into this session;
+request only the frames needed to answer or edit.
 Ask a concise natural-language question when intent is unclear; remember answers
 in this conversation. Inspect current state rather than assuming a previous edit
 or manual action is unchanged. User times refer to the visible timeline, whose

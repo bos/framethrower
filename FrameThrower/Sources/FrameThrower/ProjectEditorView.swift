@@ -74,7 +74,11 @@ struct ProjectEditorView: View {
     @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
     @State private var propertiesVisible = true
+    @State private var propertyScrollRequest = UUID()
     @State private var timelineViewportHeight: CGFloat?
+    @State private var timelineInitialHeight: CGFloat?
+    @State private var timelineInitialAllocation: CGFloat?
+    @State private var timelineHeightFraction: CGFloat?
     @State private var timelineResizeStart: CGFloat?
     @State private var expandedVideoVolumeLayerIDs: Set<UUID> = []
     @State private var originalPreviewURL: URL?
@@ -102,7 +106,7 @@ struct ProjectEditorView: View {
     }
     private var conflictReview: EditorConflictReview? { assistant.conflictReview }
     private var canvasPresentation: CanvasPresentation { presentationDraft ?? state.presentation }
-    private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil) }
+    private var edits: [TimedEdit] { state.timedEdits(includeCamera: editor.project.cameraFilename != nil).filter { state.showsTimedEdit($0) } }
     private var selectedEdit: TimedEdit? { edits.first { $0.id == selectedEditID } }
     private var editTime: Double { selectedAnimationTime ?? selectedEdit?.time ?? editor.draftTime ?? playback.editingTime }
     private var selectedAnimationTime: Double? {
@@ -267,20 +271,28 @@ struct ProjectEditorView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let timelineHeight = min(timelineViewportHeight ?? min(220, videoTimelineHeight + 36), max(100, geometry.size.height - 180))
+            let timelineHeight = EditorWorkspaceAllocation.timeline(height: geometry.size.height,
+                content: videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36),
+                initialHeight: timelineInitialHeight ?? geometry.size.height,
+                initialTimeline: timelineInitialAllocation ?? min(220, videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36)),
+                fraction: timelineHeightFraction, dragHeight: timelineViewportHeight)
             HStack(alignment: .top, spacing: 12) {
                 VStack(spacing: 8) {
-                    player.accessibilityIdentifier("editor-preview")
+                    previewWorkspace.accessibilityIdentifier("editor-preview")
                         .frame(maxWidth: .infinity, maxHeight: .infinity).layoutPriority(1)
-                    Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.65)).frame(height: 1)
-                        .frame(height: 8).contentShape(Rectangle())
-                        .overlay(EditorTimelineDivider().allowsHitTesting(false))
-                        .gesture(DragGesture(minimumDistance: 1).onChanged { value in
-                            if timelineResizeStart == nil { timelineResizeStart = timelineHeight }
-                            timelineViewportHeight = min(max(100, (timelineResizeStart ?? timelineHeight) - value.translation.height), max(100, geometry.size.height - 180))
-                        }.onEnded { _ in timelineResizeStart = nil })
+                    EditorTimelineDivider(onBegin: {
+                        timelineResizeStart = timelineHeight
+                    }, onDrag: { delta in
+                        timelineViewportHeight = min(max(100, (timelineResizeStart ?? timelineHeight) + delta), max(100, geometry.size.height - 186))
+                    }, onEnd: { cancelled in
+                        if !cancelled, let height = timelineViewportHeight {
+                            timelineHeightFraction = height / max(1, geometry.size.height)
+                        }
+                        timelineViewportHeight = nil; timelineResizeStart = nil
+                    })
+                        .frame(height: 10)
                         .accessibilityLabel("Resize timeline")
-                        .help("Drag to give more space to the preview or timeline.")
+                        .help("Drag up to reveal more tracks, or down to give the preview more space.")
                     timeline.frame(height: timelineHeight).accessibilityIdentifier("editor-timeline")
                     if let message = timelineError ?? timeMapError ?? editor.errorMessage ?? playback.errorMessage ?? automation.errorMessage {
                         Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -297,6 +309,12 @@ struct ProjectEditorView: View {
                         }
                     }
                     .frame(width: min(320, max(280, geometry.size.width * 0.27))).frame(maxHeight: .infinity)
+                }
+            }
+            .onAppear {
+                if timelineInitialHeight == nil {
+                    timelineInitialHeight = geometry.size.height
+                    timelineInitialAllocation = min(220, videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36))
                 }
             }
         }
@@ -403,6 +421,7 @@ struct ProjectEditorView: View {
             if let selectedCutID, !state.cuts.contains(where: { $0.id == selectedCutID }) { self.selectedCutID = nil }
         }
         .onChange(of: selectedInspector) { _, next in
+            propertyScrollRequest = UUID()
             if next != .videos {
                 let clip = editor.project.effectiveVideoLayers(in: state).flatMap(\.clips).first { $0.id == selectedVideoClipID }
                 let keepsClip = (clip?.layout == .screen && next == .zoom) || (clip?.layout == .camera && next == .camera)
@@ -413,7 +432,6 @@ struct ProjectEditorView: View {
             else if animationGesture == nil { synchronizeAnimationSelection() }
         }
         .onAppear {
-            if timelineViewportHeight == nil { timelineViewportHeight = min(220, videoTimelineHeight + 36) }
             assistant.attach(to: editor)
             configureAutomation()
             assistant.attachAutomation(automation)
@@ -572,6 +590,17 @@ struct ProjectEditorView: View {
             .frame(minWidth: 140, idealWidth: 240, maxWidth: 320, minHeight: 28, maxHeight: 28)
     }
 
+    private var previewWorkspace: some View {
+        GeometryReader { geometry in
+            let output = PresentationGeometry(sourceSize: playback.sourceSize, presentation: canvasPresentation)
+            let rect = output.outputRect(in: CGRect(origin: .zero, size: geometry.size))
+            player.frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        }
+        .frame(minHeight: 160)
+        .background(EditorPreviewRegionMarker())
+    }
+
     private var player: some View {
         EditorCanvas(player: playback.canvasPlayer, frames: playback.frameStore,
             sourceSize: playback.screenSize, cameraAspect: playback.cameraAspect,
@@ -624,7 +653,6 @@ struct ProjectEditorView: View {
             onDeleteRegion: { removeRegion($0) },
             conflictOutlines: conflictReview?.outlines(at: playback.time), outputSamples: canvasOutputSamples,
             videoProject: editor.project, videoState: state, videoTime: playback.time)
-            .frame(minHeight: 160, maxHeight: .infinity)
             .overlay {
                 ContentLayersOverlay(layers: state.contentLayers, sourceSize: playback.sourceSize,
                     presentation: canvasPresentation, time: playback.time, samples: canvasOutputSamples,
@@ -695,7 +723,6 @@ struct ProjectEditorView: View {
                         .padding(10).allowsHitTesting(false)
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private var previewTools: some View {
@@ -1195,6 +1222,7 @@ struct ProjectEditorView: View {
                         Text("\(playback.outputPosition(forProjectTime: selectedEdit.time), specifier: "%.2f") s").monospacedDigit()
                     }.font(.caption).foregroundStyle(.secondary)
                 }
+            ScrollViewReader { scroll in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 16) {
                 switch selectedInspector {
@@ -1205,6 +1233,13 @@ struct ProjectEditorView: View {
                 case .camera:
                     cameraControls.disabled(hasAmbiguousFramingTarget)
                         .help(hasAmbiguousFramingTarget ? "Choose the outgoing or incoming clip above before editing this crossfade." : "Adjust the camera overlay.")
+                    if hasRecordedMicrophone {
+                        Divider()
+                        VStack(alignment: .leading, spacing: 8) {
+                            microphoneControls
+                            if selectedAnimationID?.lane == .audioMicrophone { audioEnvelopeControls }
+                        }.id("microphone-properties")
+                    }
                 case .audio: audioControls
                 case .speed: speedControls
                 case .videos:
@@ -1232,6 +1267,14 @@ struct ProjectEditorView: View {
                 }
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+                .id("properties-top")
+            }
+            .task(id: propertyScrollRequest) {
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                scroll.scrollTo(selectedInspector == .camera && selectedAnimationID?.lane == .audioMicrophone
+                    ? "microphone-properties" : "properties-top", anchor: .top)
+            }
             }
         }
         .controlSize(.small)
@@ -1393,7 +1436,8 @@ struct ProjectEditorView: View {
     }
 
     private var activeAudioRole: RecordingAudioRole {
-        editor.project.audioSources.contains(where: { $0.role == audioRole }) ? audioRole : editor.project.audioSources.first?.role ?? .microphone
+        if selectedInspector == .camera && hasRecordedMicrophone { return .microphone }
+        return editor.project.audioSources.contains(where: { $0.role == audioRole }) ? audioRole : editor.project.audioSources.first?.role ?? .microphone
     }
     private var selectedAudioPoint: RecordingAudioGainPoint? {
         guard let id = selectedAnimationID, id.lane.audioRole == activeAudioRole else { return nil }
@@ -1438,11 +1482,13 @@ struct ProjectEditorView: View {
             })) { Text("Jump").tag(PIPTransition.jump); Text("Smooth").tag(PIPTransition.smooth) }
                 .frame(width: 160).help("Jump changes volume at arrival. Smooth uses the duration and timeline ramps.")
             if mode == .smooth {
-                Text(timelineIsIdentity ? "Duration" : "Duration (original)").font(.caption)
-                MotionDurationField(value: point?.duration ?? audioDuration, maximum: max(editor.project.duration, point?.duration ?? audioDuration), change: { value in
-                    audioDuration = value; updateAudioTiming { $0.duration = value }
-                }, cancel: { cancelDraft() }).frame(width: 64, height: 24).help(originalTimingHelp)
-                Text("s").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(timelineIsIdentity ? "Duration" : "Duration (original)").font(.caption)
+                    MotionDurationField(value: point?.duration ?? audioDuration, maximum: max(editor.project.duration, point?.duration ?? audioDuration), change: { value in
+                        audioDuration = value; updateAudioTiming { $0.duration = value }
+                    }, cancel: { cancelDraft() }).frame(width: 64, height: 24).help(originalTimingHelp)
+                    Text("s").font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -1585,6 +1631,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectEdit(_ id: UUID) {
+        propertyScrollRequest = UUID()
         selectedVideoClipID = nil; selectedVideoVolumeID = nil
         cutSelection = nil; selectedCutID = nil
         if id == selectedEditID { playback.pause(); return }
@@ -1605,6 +1652,7 @@ struct ProjectEditorView: View {
     }
 
     private func synchronizeAnimationSelection() {
+        if selectedInspector == .camera, selectedAnimationID?.lane == .audioMicrophone { selectedEditID = nil; return }
         if selectedInspector == .audio {
             if let id = selectedAnimationID, let role = id.lane.audioRole,
                timelineAnimations.contains(where: { $0.id == id }) {
@@ -1640,6 +1688,7 @@ struct ProjectEditorView: View {
     }
 
     private func selectAnimation(_ id: TimelineAnimationID) {
+        propertyScrollRequest = UUID()
         selectedVideoClipID = nil; selectedVideoVolumeID = nil
         cutSelection = nil; selectedCutID = nil
         playback.pause()
@@ -1647,7 +1696,10 @@ struct ProjectEditorView: View {
         guard editor.finishDraft(), let span = timelineAnimations.first(where: { $0.id == id }) else { return }
         selectedAnimationID = id
         if id.lane == .pointer { selectedInspector = .pointer; selectedEditID = nil; return }
-        if let role = id.lane.audioRole { selectedInspector = .audio; audioRole = role; selectedEditID = nil; return }
+        if let role = id.lane.audioRole {
+            selectedInspector = role == .microphone && editor.project.cameraFilename != nil ? .camera : .audio
+            audioRole = role; selectedEditID = nil; return
+        }
         selectedEditID = edits.first(where: { edit in
             span.isReference ? edit.anchorID == id.componentID : id.lane == .screen ? edit.zoomID == id.componentID :
                 id.lane == .speed ? edit.speedID == id.componentID : id.lane == .cameraOpacity ? edit.cameraOpacityID == id.componentID : edit.cameraID == id.componentID
@@ -2036,6 +2088,24 @@ struct ProjectEditorView: View {
             }
             cameraVisibility.disabled(hasAmbiguousFramingTarget)
             transitionControls(camera: true)
+        }
+    }
+
+    private var hasRecordedMicrophone: Bool { editor.project.audioSources.contains { $0.role == .microphone } }
+    private var microphoneControls: some View {
+        HStack(spacing: 8) {
+            CommitSlider(title: "Microphone", value: state.audio.channel(.microphone).volume * 100, range: 0...100,
+                valueSuffix: "%", valueFormat: "%.0f", begin: beginAudioGesture,
+                preview: { value in previewAudio { audio in audio.updateChannel(.microphone) { $0.volume = value / 100 } } }) { value in
+                    finishAudioGesture(name: "Change microphone level") { audio in audio.updateChannel(.microphone) { $0.volume = value / 100 } }
+                }
+                .help("Recorded microphone level. Camera visibility and opacity leave this audio unchanged. Select the Microphone lane to edit timed volume changes.")
+            Button {
+                let muted = !state.audio.channel(.microphone).isMuted
+                commitAudio(name: muted ? "Mute microphone" : "Unmute microphone") { audio in audio.updateChannel(.microphone) { $0.isMuted = muted } }
+            } label: { Image(systemName: state.audio.channel(.microphone).isMuted ? "mic.slash" : "mic") }
+                .accessibilityLabel(state.audio.channel(.microphone).isMuted ? "Unmute microphone" : "Mute microphone")
+                .help(state.audio.channel(.microphone).isMuted ? "Unmute the recorded microphone." : "Mute the recorded microphone.")
         }
     }
 

@@ -298,11 +298,12 @@ final class EditorCanvasView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         stillLayer.contentsGravity = .resizeAspect
         // Preview-only bounds distinguish a black output canvas from the
         // surrounding viewer, especially with portrait and square outputs.
-        canvasBorder.borderColor = NSColor.white.withAlphaComponent(0.3).cgColor
+        canvasBorder.name = "output-canvas-border"
+        canvasBorder.borderColor = NSColor(white: 0.5, alpha: 1).cgColor
         canvasBorder.borderWidth = 1
         outline.fillColor = nil
         outline.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor

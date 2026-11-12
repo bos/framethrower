@@ -93,6 +93,7 @@ struct EditorWorkspaceLayoutChecks: App {
     }
     private func run(_ window: NSWindow) async throws {
         guard let host = window.contentView, let canvas = first(EditorCanvasView.self, in: host),
+              let previewRegion = first(EditorPreviewRegionMarker.MarkerView.self, in: host),
               let timeline = first(RecordingTimelineView.self, in: host), let editor else { throw Failure.failed("Missing production editor views") }
         let unchanged = editor.project
         let nativeToolbarHeight = window.contentRect(forFrameRect: window.frame).height - window.contentLayoutRect.height
@@ -109,6 +110,12 @@ struct EditorWorkspaceLayoutChecks: App {
             let preview = canvas.convert(canvas.bounds, to: host)
             try require(preview.width > 300 && preview.height >= 160 && host.bounds.insetBy(dx: -2, dy: -2).contains(preview),
                 "Compact preview clipped or unusable: \(preview), host \(host.bounds)")
+            // AppKit rounds the fitted native view to backing pixels. Its
+            // actual output rectangle retains the exact video aspect ratio.
+            try require(abs(canvas.bounds.height - canvas.bounds.width * 9 / 16) <= 1 / max(1, window.backingScaleFactor),
+                "The production canvas view does not fit its actual output aspect ratio: \(canvas.bounds)")
+            try require(abs(canvas.canvasRect.width / canvas.canvasRect.height - 16.0 / 9) < 0.000001,
+                "Native pixel rounding stretched the actual output canvas")
             try controlsFit(host)
             try EditorUIProbe.checkSliderWidths(in: host)
             if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
@@ -123,12 +130,12 @@ struct EditorWorkspaceLayoutChecks: App {
         // With the same width and tools, added height should go to the preview,
         // not into blank property-panel background or unused timeline rows.
         window.setContentSize(CGSize(width: 1100, height: 700 + nativeToolbarHeight)); try await settle(host)
-        let before = canvas.bounds.height
+        let before = previewRegion.bounds.height
         window.setContentSize(CGSize(width: 1100, height: 900 + nativeToolbarHeight)); try await settle(host)
-        try require(canvas.bounds.height - before >= 160,
-            "Preview received only \(canvas.bounds.height - before) of 200 extra points")
+        try require(previewRegion.bounds.height - before >= 160,
+            "Preview workspace received only \(previewRegion.bounds.height - before) of 200 extra points")
         try require(editor.project == unchanged, "Resizing changed recording/history")
-        let baseline = [canvas.frame, timeline.frame]
+        let baseline = [previewRegion.frame, canvas.frame, timeline.frame]
         let position = playback.outputTime
         if let animation = timeline.animationSpans.first(where: { $0.lane == .screen }) {
             timeline.onSelectAnimation?(animation.id); try await settle(host)
@@ -137,7 +144,7 @@ struct EditorWorkspaceLayoutChecks: App {
             try require(window.contentMinSize.width <= sizes[0].width + 2 && window.contentMinSize.height - nativeToolbarHeight <= sizes[0].height + 2,
                 "Selection enlarged native minimum")
             timeline.onDeselectEdit?(); try await settle(host)
-            try require([canvas.frame, timeline.frame] == baseline, "Deselecting unexpectedly changed the workspace allocation")
+            try require([previewRegion.frame, canvas.frame, timeline.frame] == baseline, "Deselecting unexpectedly changed the workspace allocation")
         }
         print("Editor workspace WindowGroup checks passed: Director=\(director), reachable compact sizes, contained controls, preview receives resize height, stable selection/project clock; no focus, devices or media.")
     }

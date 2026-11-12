@@ -37,10 +37,63 @@ struct EditorControlFlow: Layout {
 /// Native cursor rectangles end with the divider's lifetime; no pushed cursor
 /// can remain behind when a property panel or recording closes.
 struct EditorTimelineDivider: NSViewRepresentable {
+    var onBegin: () -> Void
+    var onDrag: (CGFloat) -> Void
+    var onEnd: (Bool) -> Void
     func makeNSView(context: Context) -> DividerView { DividerView() }
-    func updateNSView(_ view: DividerView, context: Context) {}
+    func updateNSView(_ view: DividerView, context: Context) {
+        view.onBegin = onBegin; view.onDrag = onDrag; view.onEnd = onEnd
+    }
     final class DividerView: NSView {
+        var onBegin: (() -> Void)?
+        var onDrag: ((CGFloat) -> Void)?
+        var onEnd: ((Bool) -> Void)?
+        private var originY: CGFloat?
+        override var acceptsFirstResponder: Bool { true }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeUpDown) }
+        override func draw(_ dirtyRect: NSRect) {
+            NSColor.separatorColor.setFill()
+            NSBezierPath(rect: CGRect(x: 0, y: bounds.midY, width: bounds.width, height: 1)).fill()
+            NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: CGRect(x: bounds.midX - 16, y: bounds.midY - 1, width: 32, height: 3), xRadius: 1.5, yRadius: 1.5).fill()
+        }
+        override func mouseDown(with event: NSEvent) {
+            window?.makeFirstResponder(self)
+            originY = event.locationInWindow.y
+            onBegin?()
+        }
+        override func mouseDragged(with event: NSEvent) {
+            guard let originY else { return }
+            onDrag?(event.locationInWindow.y - originY)
+        }
+        override func mouseUp(with event: NSEvent) {
+            guard let originY else { return }
+            onDrag?(event.locationInWindow.y - originY)
+            self.originY = nil; onEnd?(false)
+        }
+        override func cancelOperation(_ sender: Any?) {
+            guard originY != nil else { return }
+            originY = nil; onEnd?(true)
+        }
+    }
+}
+
+/// Allocated workspace, distinct from the aspect-fitted video inside it.
+struct EditorPreviewRegionMarker: NSViewRepresentable {
+    func makeNSView(context: Context) -> MarkerView { MarkerView() }
+    func updateNSView(_ view: MarkerView, context: Context) {}
+    final class MarkerView: NSView {
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+enum EditorWorkspaceAllocation {
+    static func timeline(height: CGFloat, content: CGFloat, initialHeight: CGFloat, initialTimeline: CGFloat,
+                         fraction: CGFloat?, dragHeight: CGFloat?) -> CGFloat {
+        let upper = max(100, height - 186)
+        if let dragHeight { return min(upper, max(100, dragHeight)) }
+        if let fraction { return min(upper, max(100, height * fraction)) }
+        return min(upper, max(100, min(content, initialTimeline + max(0, height - initialHeight))))
     }
 }

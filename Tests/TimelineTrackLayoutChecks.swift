@@ -1,5 +1,24 @@
 import AppKit
 
+private final class NavigationEvent: NSEvent {
+    var amount: CGFloat = 0
+    var dx: CGFloat = 0
+    var dy: CGFloat = 0
+    var position = CGPoint.zero
+    override var magnification: CGFloat { amount }
+    override var scrollingDeltaX: CGFloat { dx }
+    override var scrollingDeltaY: CGFloat { dy }
+    override var hasPreciseScrollingDeltas: Bool { true }
+    override var locationInWindow: CGPoint { position }
+    override var phase: NSEvent.Phase { [] }
+    override var momentumPhase: NSEvent.Phase { [] }
+    override var modifierFlags: NSEvent.ModifierFlags { [] }
+}
+@MainActor private final class ScrollParent: NSView {
+    var verticalEvents = 0
+    override func scrollWheel(with event: NSEvent) { verticalEvents += 1 }
+}
+
 @main @MainActor
 struct TimelineTrackLayoutChecks {
     enum Failure: Error { case failed(String) }
@@ -20,9 +39,16 @@ struct TimelineTrackLayoutChecks {
         let quiet = TimelineTrackLayout.make(videoRows: legacy, animations: [camera, pointer])
         try require(quiet.rows.count == 2, "default-only properties must not produce empty tracks")
         try require(quiet.rows.contains { $0.title.contains("PIP") }, "camera track identifies PIP")
-        try near(quiet.contentHeight, 124, "compact height is derived from actual two media rows")
+        try near(quiet.contentHeight, 138, "compact height is derived from actual two media rows")
         let roleLayout = TimelineTrackLayout.make(videoRows: legacy, animations: [camera, pointer], recordedAudioRoles: [.microphone])
         try require(roleLayout.rows.contains { $0.id == .animation(.audioMicrophone) }, "actual microphone is a recorded track even without automation")
+        let microphoneIndex = roleLayout.rows.firstIndex { $0.id == .animation(.audioMicrophone) }!
+        try require(microphoneIndex > 0 && roleLayout.rows[microphoneIndex - 1].title.contains("PIP") && roleLayout.rows[microphoneIndex].depth == 1,
+            "microphone belongs immediately below PIP, rather than a remote global lane")
+        let roleAware = TimelineTrackLayout.make(videoRows: legacy, animations: [], expandedVideoVolumeLayerIDs: Set(legacy.map(\.layerID)), recordedAudioRoles: [.microphone, .systemAudio])
+        let systemIndex = roleAware.rows.firstIndex { $0.id == .animation(.audioSystem) }!
+        try require(roleAware.rows[systemIndex].depth == 1 && roleAware.rows[systemIndex - 1].id == .media(legacy[0].layerID), "system audio belongs below the screen")
+        try require(!roleAware.rows.contains { $0.id == .volume(legacy[0].layerID) }, "role-aware recordings do not expose duplicate generic screen audio")
         try require(!roleLayout.rows.contains { $0.id == .animation(.audioSystem) }, "absent system audio does not create an empty row")
         let readonly = TimelineAnimation(id: .init(lane: .speed, componentID: UUID()), editID: UUID(), start: 1, end: 2,
             easeIn: 0, easeOut: 0, label: "Authored", help: "", editable: false)
@@ -110,7 +136,78 @@ struct TimelineTrackLayoutChecks {
             "visible fragments have unique identities")
         try require(projection.animations.allSatisfy(\.editable) && !projection.animations[0].showsEndHandle && !projection.animations[1].showsStartHandle,
             "fragments are draggable without treating cut edges as animation endpoints")
+        try navigationAndLabels()
         print("Timeline hierarchy checks passed: named grouped clips, real/default/read-only channels, shared content height, frozen gestures, stable selection, audio disclosure, ruler ranges, frame nudges and branch-aware cut fragments; no media or focus.")
+    }
+    static func navigationAndLabels() throws {
+        let parent = ScrollParent(frame: CGRect(x: 0, y: 0, width: 1000, height: 300))
+        let view = RecordingTimelineView(frame: parent.bounds)
+        parent.addSubview(view)
+        view.showsAnimationLanes = true; view.frameDuration = 1.0 / 60
+        view.setClock("twenty-minutes", duration: 1200)
+        try near(view.visibleDuration, 30, "long recordings begin at a readable thirty-second scale")
+        try require(!view.rangeScroller.isHidden && view.rangeScroller.frame.width > view.rangeScroller.frame.height, "horizontal navigation is visible and correctly oriented")
+        let event = NavigationEvent(); event.position = CGPoint(x: view.x(for: 15), y: 24)
+        event.amount = -0.99; view.magnify(with: event)
+        try near(view.visibleDuration, 1200, "pinching out reaches the entire twenty-minute project")
+        event.position = CGPoint(x: (view.x(for: 0) + view.x(for: 1200)) / 2, y: 24)
+        event.amount = 100000; view.magnify(with: event)
+        try near(view.visibleDuration, 4.0 / 60, "frame-scale pinch limit is independent of recording duration")
+        try near(view.visibleStart + view.visibleDuration / 2, 600, "pinch remains anchored at the pointer")
+        let before = view.visibleStart
+        event.amount = 0; event.dx = -30; event.dy = 0; view.scrollWheel(with: event)
+        try require(view.visibleStart > before && parent.verticalEvents == 0, "horizontal natural scroll moves time only")
+        let afterHorizontal = view.visibleStart
+        event.dx = 0; event.dy = -30; view.scrollWheel(with: event)
+        try near(view.visibleStart, afterHorizontal, "vertical track scroll does not pan time")
+        try require(parent.verticalEvents == 1, "vertical scroll reaches track container")
+        event.dx = -15; event.dy = -15; view.scrollWheel(with: event)
+        try require(view.visibleStart > afterHorizontal && parent.verticalEvents == 2, "diagonal gestures navigate tracks and time together")
+        let start = view.visibleStart, span = view.visibleDuration
+        let marker = RecordingTimelineMarker(id: UUID(), time: 1000, help: "Outside viewport", label: "Outside viewport")
+        view.edits = [marker]; view.selectedEditID = marker.id
+        try near(view.visibleStart, start, "selecting an offscreen edit preserves the viewport")
+        try near(view.visibleDuration, span, "selecting preserves timeline scale")
+        view.fit(request: UUID()); view.duration = 10; view.trimEnd = 10
+        let baseline = TimelineAnimation(id: .init(lane: .screen, componentID: UUID()), editID: UUID(), start: 0, end: 0,
+            easeIn: 0, easeOut: 0, label: "Full frame", help: "Baseline", editable: false)
+        let zoom = TimelineAnimation(id: .init(lane: .screen, componentID: UUID()), editID: UUID(), start: 0, end: 5,
+            easeIn: 1, easeOut: 1, label: "Zoom into browser", help: "Zoom", editable: true)
+        view.animationSpans = [baseline, zoom]
+        view.rowLayout = TimelineTrackLayout.make(videoRows: [], animations: view.animationSpans)
+        view.selectedAnimationID = zoom.id
+        let geometry = view.animationGeometry(), crowds = view.animationCrowds()
+        try require(geometry.count == 2 && geometry.allSatisfy { $0.labelFrame.isNull }, "coincident baseline and zoom labels never overpaint")
+        try require(crowds.count == 1 && Set(crowds[0].ids) == Set([baseline.id, zoom.id]), "one chooser retains access to each overlapping item")
+        try require(geometry.allSatisfy { !crowds[0].frame.intersects($0.body) && ![$0.startHandle, $0.endHandle, $0.easeInHandle, $0.easeOutHandle].compactMap { $0 }.contains { crowds[0].frame.intersects($0) } },
+            "chooser never obscures a curve or control point")
+        var choices = 0
+        view.presentAnimationMenu = { menu, _ in choices = menu.items.filter { !$0.isSeparatorItem }.count }
+        click(view, at: CGPoint(x: crowds[0].frame.midX, y: crowds[0].frame.midY))
+        try require(choices == 2, "clicking gutter chooser exposes both individual changes")
+        let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: 1000, height: 130))
+        view.frame = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        scroll.documentView = view
+        let window = NSWindow(contentRect: scroll.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = scroll
+        defer { window.close() }
+        view.installPinnedTimeRuler(); scroll.tile()
+        try require(scroll.hasHorizontalRuler && scroll.rulersVisible && view.pinnedTimeRuler != nil,
+            "numeric ruler is installed above the vertically scrolling tracks")
+        let ruler = view.pinnedTimeRuler!
+        try near(ruler.ruleThickness, 20, "pinned numeric ruler has compact fixed height")
+        let rulerFrame = ruler.frame
+        scroll.contentView.scroll(to: CGPoint(x: 0, y: 200)); scroll.reflectScrolledClipView(scroll.contentView)
+        try require(scroll.contentView.bounds.minY > 0 && ruler.frame == rulerFrame && !ruler.isHidden,
+            "numeric ruler stays visible after scrolling down through track lanes")
+        let labelsBefore = view.timeRulerTicks().map(\.label)
+        ruler.needsDisplay = false
+        event.position = view.convert(CGPoint(x: view.bounds.midX, y: 224), to: nil)
+        event.amount = 1; view.magnify(with: event)
+        try require(view.timeRulerTicks().map(\.label) != labelsBefore && ruler.needsDisplay,
+            "pinch updates pinned ruler labels with the new visible time range")
+        try require(!view.timeRulerTicks().isEmpty, "compact scrolled timeline retains numeric time labels")
+
     }
     static func event(_ type: NSEvent.EventType, _ view: NSView, _ point: CGPoint, modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
         NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: modifiers, timestamp: 0,

@@ -184,9 +184,9 @@ struct RecordingTimelineChecks {
 
         reset()
         key(124)
-        near(seeks.last, 4.1, "Right arrow steps by 0.1 second")
+        near(seeks.last, 4 + 1.0 / 30, "Right arrow steps by one frame")
         key(124, shift: true)
-        near(seeks.last, 5.1, "Shift-right steps by one second")
+        near(seeks.last, 5 + 1.0 / 30, "Shift-right steps by one second")
         key(123)
         near(seeks.last, 5, "Left arrow steps backward")
         key(123, shift: true)
@@ -252,7 +252,7 @@ struct RecordingTimelineChecks {
             abs($0.x - timeline.x(for: 4)) <= 8 && $0.y >= 34 && $0.y <= 38
         }, "Keyboard focus gets only a small cue below the playhead, never a whole-timeline border")
         key(124)
-        near(seeks.last, 4.1, "The keyboard-focused timeline remains arrow-key operable")
+        near(seeks.last, 4 + 1.0 / 30, "The keyboard-focused timeline remains arrow-key operable")
         down(CGPoint(x: timeline.x(for: 4.1), y: 6)); up(CGPoint(x: timeline.x(for: 4.1), y: 6))
         let afterMouse = rendering()
         window.makeFirstResponder(nil)
@@ -427,9 +427,9 @@ struct RecordingTimelineChecks {
         scroll(-60)
         near(timeline.visibleStart, 1.75, "Precise horizontal scrolling navigates the visible time interval")
         scroll(0, -120)
-        near(timeline.visibleStart, 2.75, "Vertical scrolling provides a fallback for time navigation")
+        near(timeline.visibleStart, 1.75, "Vertical scrolling belongs to the track viewport")
         scroll(-60, momentum: .changed)
-        near(timeline.visibleStart, 3.25, "Trackpad momentum continues timeline navigation")
+        near(timeline.visibleStart, 2.25, "Trackpad momentum continues timeline navigation")
         scroll(-10000)
         near(timeline.visibleStart, 5, "Timeline navigation clamps at the recording end")
         scroll(10000)
@@ -491,7 +491,7 @@ struct RecordingTimelineChecks {
         timeline.duration = 10000
         near(timeline.visibleDuration, 10000, "Overview follows a changed source duration")
         pinch(1e9)
-        near(timeline.visibleDuration, 10, "Long recordings cap timeline magnification at one thousand times")
+        near(timeline.visibleDuration, 4.0 / 30, "Long recordings retain frame-level magnification")
         timeline.duration = 10
         pinch(-0.999)
         timeline.edits = [RecordingTimelineMarker(id: UUID(), time: 1, help: "Outside viewport"), edit]
@@ -542,7 +542,7 @@ struct RecordingTimelineChecks {
         let late = RecordingTimelineMarker(id: UUID(), time: 9, help: "Late edit")
         timeline.edits = [early, late]
         timeline.selectedEditID = late.id
-        near(timeline.visibleStart, 5, "Selecting an offscreen edit reveals its diamond")
+        near(timeline.visibleStart, beforeInvalid.0, "Selecting an offscreen edit preserves the viewport")
         near(timeline.visibleDuration, 5, "Revealing a selected edit preserves timeline magnification")
         scroll(1000)
         near(timeline.visibleStart, 0, "The user can navigate away from a selected diamond")
@@ -550,7 +550,7 @@ struct RecordingTimelineChecks {
         near(timeline.visibleStart, 0, "Unchanged selection cannot pull the viewport back during ordinary updates")
         timeline.selectedEditID = early.id
         timeline.selectedEditID = late.id
-        near(timeline.visibleStart, 5, "A fresh selection reveals the edit again")
+        near(timeline.visibleStart, 0, "A fresh selection also preserves the viewport")
 
         timeline.duration = 10
         timeline.fit(request: UUID())

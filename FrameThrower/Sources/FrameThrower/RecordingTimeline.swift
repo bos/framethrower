@@ -97,7 +97,7 @@ struct TimelineTrackLayout: Equatable {
         var height: CGFloat = 30
     }
     var rows: [Row]
-    static let top: CGFloat = 40
+    static let top: CGFloat = 54
     static let footer: CGFloat = 24
     var contentHeight: CGFloat { Self.top + rows.reduce(0) { $0 + $1.height } + Self.footer }
     func offset(of id: RowID) -> CGFloat? {
@@ -154,12 +154,15 @@ struct TimelineTrackLayout: Equatable {
             let title = camera && !name.localizedCaseInsensitiveContains("PIP") ? name + " / PIP" : name
             rows.append(.init(id: .media(layerID), title: title,
                 help: title + ". Clips in this layer play in sequence; overlapping clips crossfade. Drag a clip to move it; select it to trim or edit it."))
-            if clips.contains(where: { $0.clip.layout == .screen }) { animation(.screen, parent: title) }
-            if camera { animation(.camera, parent: title); animation(.cameraOpacity, parent: title) }
+            if clips.contains(where: { $0.clip.layout == .screen }) {
+                animation(.screen, parent: title); animation(.audioSystem, parent: title)
+            }
+            if camera { animation(.camera, parent: title); animation(.cameraOpacity, parent: title); animation(.audioMicrophone, parent: title) }
             let hasEnvelope = clips.contains { !$0.clip.volumeKeyframes.isEmpty }
             let selectedVolume = selectedVideoVolumeID.map { selected in clips.contains { $0.clip.volumeKeyframes.contains { $0.id == selected } } } ?? false
-            if clips.contains(where: \.hasAudio) && (hasEnvelope || selectedVolume || expandedVideoVolumeLayerIDs.contains(layerID)) {
-                rows.append(.init(id: .volume(layerID), title: "Volume", help: "\(title) source-volume envelope. Click the curve to add a point; drag points to adjust level and time.", depth: 1, height: 26))
+            let roleAwareScreen = !recordedAudioRoles.isEmpty && clips.contains { $0.clip.sourceID == VideoSource.legacyScreenID }
+            if clips.contains(where: \.hasAudio) && (hasEnvelope || selectedVolume || (!roleAwareScreen && expandedVideoVolumeLayerIDs.contains(layerID))) {
+                rows.append(.init(id: .volume(layerID), title: "Clip audio", help: "\(title) source-volume envelope. Click the curve to add a point; drag points to adjust level and time.", depth: 1, height: 26))
             }
         }
         for lane in TimelineAnimationLane.allCases { animation(lane) }
@@ -439,11 +442,43 @@ struct RecordingTimeline: NSViewRepresentable {
         view.onAnimationCancel = onAnimationCancel
         view.onDeleteAnimation = onDeleteAnimation
         view.fit(request: fitRequest)
+        view.installPinnedTimeRuler()
     }
 }
 
 /// A single source-time axis for the playhead and both trim boundaries. Native
 /// mouse events keep hit-testing explicit when the playhead meets a trim handle.
+/// NSScrollView keeps this numeric ruler visible while its document tracks scroll.
+@MainActor
+final class TimelineTimeRulerView: NSRulerView {
+    weak var timeline: RecordingTimelineView?
+    override var isFlipped: Bool { true }
+    init(scrollView: NSScrollView, timeline: RecordingTimelineView) {
+        self.timeline = timeline
+        super.init(scrollView: scrollView, orientation: .horizontalRuler)
+        ruleThickness = 20
+        reservedThicknessForMarkers = 0
+        clientView = timeline
+        setAccessibilityElement(true)
+        setAccessibilityLabel("Timeline time ruler")
+    }
+    required init(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    override func drawHashMarksAndLabels(in rect: NSRect) {
+        guard let timeline else { return }
+        NSColor.windowBackgroundColor.setFill(); NSBezierPath(rect: bounds).fill()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor]
+        for tick in timeline.timeRulerTicks() {
+            let position = convert(CGPoint(x: timeline.x(for: tick.time), y: 0), from: timeline).x
+            let text = tick.label as NSString, width = text.size(withAttributes: attributes).width
+            text.draw(at: CGPoint(x: min(max(position - width / 2, 0), bounds.width - width), y: 2), withAttributes: attributes)
+            let path = NSBezierPath(); path.move(to: CGPoint(x: position, y: 15)); path.line(to: CGPoint(x: position, y: 20))
+            NSColor.tertiaryLabelColor.setStroke(); path.stroke()
+        }
+    }
+}
+
 @MainActor
 final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     struct MarkerLabel: Equatable {
@@ -473,6 +508,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let ids: [TimelineAnimationID]
         let frame: CGRect
         let sourceX: CGFloat
+        let title: String
     }
     struct PointerClickGeometry: Equatable {
         let time: Double
@@ -481,7 +517,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     struct AnimationGeometry: Equatable {
         let animation: TimelineAnimation
         let body: CGRect
-        let labelFrame: CGRect
+        var labelFrame: CGRect
         let startHandle: CGRect?
         let endHandle: CGRect?
         let easeInHandle: CGRect?
@@ -491,11 +527,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     var showsAnimationLanes = false {
         didSet {
             guard showsAnimationLanes != oldValue else { return }
+            updateRangeScroller()
             cancelAnimationGesture()
             invalidateIntrinsicContentSize()
             needsDisplay = true; updateTooltips()
             setAccessibilityHelp(showsAnimationLanes
-                ? "Screen, Camera and Pointer use one source-time axis. Drag a span to move it; selected edge handles resize it and tall bars change its ramps. Option-drag pushes same-lane neighbors. Delete removes the selected animation. Escape cancels a preview. Pinch to reveal fine controls."
+                ? "All tracks share the project timeline. Drag a span to move it; selected edge handles resize it and tall bars change its ramps. Option-drag pushes same-lane neighbors. Delete removes the selected animation. Escape cancels a preview. Pinch to reveal fine controls."
                 : "Drag the playhead to scrub or the blue handles to trim. Click an edit to select it, or drag to move its time. Pinch to separate nearby edits; scroll to navigate time.")
         }
     }
@@ -643,10 +680,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func videoVolumeDisclosureFrames() -> [(UUID, CGRect)] {
         var seen = Set<UUID>()
         return videoRows.compactMap { row in
-            guard row.hasAudio, !videoRows.contains(where: { $0.layerID == row.layerID && !$0.clip.volumeKeyframes.isEmpty }),
+            guard row.hasAudio, !(row.clip.sourceID == VideoSource.legacyScreenID && !recordedAudioRoles.isEmpty), !videoRows.contains(where: { $0.layerID == row.layerID && !$0.clip.volumeKeyframes.isEmpty }),
                   seen.insert(row.layerID).inserted else { return nil }
             let frame = rowFrame(.media(row.layerID))
-            return (row.layerID, CGRect(x: railOrigin - 40, y: frame.midY - 10, width: 36, height: 20))
+            return (row.layerID, CGRect(x: railOrigin - 62, y: frame.midY - 10, width: 58, height: 20))
         }
     }
     private func volumeFrame(_ rowIndex: Int, part: TimelineVideoPart) -> CGRect {
@@ -679,7 +716,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             NSColor.black.withAlphaComponent(0.13).setFill(); NSBezierPath(roundedRect: frame, xRadius: 3, yRadius: 3).fill()
             let hasDisclosure = videoVolumeDisclosureFrames().contains { row.id == .media($0.0) }
             (row.title as NSString).draw(in: CGRect(x: 8 + CGFloat(row.depth) * 10, y: frame.minY + 7,
-                width: railOrigin - (hasDisclosure ? 54 : 22) - CGFloat(row.depth) * 10, height: 15), withAttributes: [
+                width: railOrigin - (hasDisclosure ? 76 : 22) - CGFloat(row.depth) * 10, height: 15), withAttributes: [
                 .font: NSFont.systemFont(ofSize: row.depth == 0 ? 10 : 9, weight: row.depth == 0 ? .medium : .regular),
                 .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
         }
@@ -718,7 +755,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
         for (layer, frame) in videoVolumeDisclosureFrames() {
             let expanded = trackLayout.rows.contains { $0.id == .volume(layer) }
-            ("Audio" as NSString).draw(at: CGPoint(x: frame.minX, y: frame.midY - 5), withAttributes: [
+            ("Clip audio" as NSString).draw(at: CGPoint(x: frame.minX, y: frame.midY - 5), withAttributes: [
                 .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor])
             let x = frame.maxX - 7, y = frame.midY - 3
             let chevron = NSBezierPath(); chevron.lineWidth = 1.2
@@ -815,7 +852,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func setClock(_ id: String, duration value: Double) {
         if !hasClock {
             hasClock = true; clockID = id; duration = value
-            setViewport(start: 0, span: value); return
+            setViewport(start: 0, span: min(value, 30)); return
         }
         if id != clockID {
             frozenRowLayout = nil; frozenVideoRows = nil
@@ -899,11 +936,6 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         didSet {
             needsDisplay = true
             if selectedEditID != oldValue { updateTooltips() }
-            if selectedEditID != oldValue,
-               let selected = edits.first(where: { $0.id == selectedEditID }),
-               !markerIsVisible(selected.time) {
-                setViewport(start: selected.time - visibleDuration / 2, span: visibleDuration)
-            }
         }
     }
     var onSelectEdit: ((UUID) -> Void)?
@@ -939,7 +971,9 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     private var scrubTime: Double?
     private var keyboardFocus = false
     private var lastFitRequest: UUID?
-    private var railOrigin: CGFloat { showsAnimationLanes ? 132 : 12 }
+    private(set) weak var pinnedTimeRuler: TimelineTimeRulerView?
+    let rangeScroller = NSScroller(frame: CGRect(x: 0, y: 0, width: 100, height: 12))
+    private var railOrigin: CGFloat { showsAnimationLanes ? 154 : 12 }
     private var railWidth: CGFloat { max(1, bounds.width - railOrigin - 12) }
     private var minimumLength: Double { min(0.1, duration) }
     override var isFlipped: Bool { true }
@@ -949,12 +983,55 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         focusRingType = .none
+        rangeScroller.scrollerStyle = .legacy
+        rangeScroller.controlSize = .small
+        rangeScroller.target = self; rangeScroller.action = #selector(scrollVisibleRange(_:))
+        rangeScroller.setAccessibilityLabel("Visible timeline range")
+        rangeScroller.toolTip = "Drag to navigate the visible timeline. Pinch the timeline to change its scale."
+        addSubview(rangeScroller)
+        updateRangeScroller()
         setAccessibilityElement(true)
         setAccessibilityRole(.slider)
         setAccessibilityLabel("Recording timeline")
         setAccessibilityHelp("Drag the top playhead to scrub or the blue handles to trim. Click an individual edit to select it, or drag to move its time. Count badges contain nearby edits; click to choose one. Dragging a badge moves only its selected edit. Click empty space below the track to clear selection. Escape cancels an unfinished move. Pinch to separate nearby edits; scroll to navigate time.")
     }
     required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow(); installPinnedTimeRuler()
+    }
+    override func layout() {
+        super.layout(); installPinnedTimeRuler()
+    }
+    func installPinnedTimeRuler() {
+        guard showsAnimationLanes, let scroll = enclosingScrollView else { return }
+        if let ruler = pinnedTimeRuler, scroll.horizontalRulerView === ruler { return }
+        let ruler = TimelineTimeRulerView(scrollView: scroll, timeline: self)
+        pinnedTimeRuler = ruler
+        scroll.horizontalRulerView = ruler
+        scroll.hasHorizontalRuler = true
+        scroll.rulersVisible = true
+        needsDisplay = true
+    }
+    private func updateRangeScroller() {
+        pinnedTimeRuler?.needsDisplay = true
+        rangeScroller.isHidden = !showsAnimationLanes
+        rangeScroller.frame = CGRect(x: railOrigin, y: 38, width: railWidth, height: 12)
+        rangeScroller.knobProportion = min(1, visibleDuration / max(duration, .leastNonzeroMagnitude))
+        rangeScroller.doubleValue = visibleStart / max(duration - visibleDuration, .leastNonzeroMagnitude)
+    }
+    @objc private func scrollVisibleRange(_ sender: NSScroller) {
+        guard drag == nil, videoGesture == nil, animationGesture == nil else { return }
+        let delta: Double = switch sender.hitPart {
+        case .decrementLine: -visibleDuration * 0.1
+        case .incrementLine: visibleDuration * 0.1
+        case .decrementPage: -visibleDuration * 0.9
+        case .incrementPage: visibleDuration * 0.9
+        default: 0
+        }
+        let start = delta == 0 ? sender.doubleValue * max(0, duration - visibleDuration) : visibleStart + delta
+        setViewport(start: start, span: visibleDuration)
+    }
 
     func fit(request: UUID?) {
         guard let request, request != lastFitRequest else { return }
@@ -972,6 +1049,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        updateRangeScroller()
         updateTooltips()
     }
 
@@ -1018,7 +1096,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
         if showsAnimationLanes {
             for crowd in animationCrowds() {
-                tooltipText[addToolTip(crowd.frame, owner: self, userData: nil)] = "\(crowd.ids.count) crowded animations or reference marks. Click to choose by name and source interval."
+                tooltipText[addToolTip(crowd.frame, owner: self, userData: nil)] = "\(crowd.ids.count) changes in this track. Click to choose by name and time."
             }
             for click in pointerClickGeometry() {
                 tooltipText[addToolTip(click.frame.insetBy(dx: -2, dy: -2), owner: self, userData: nil)] = String(format: "Recorded click at %.3f seconds.", click.time)
@@ -1161,7 +1239,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         return animationSpans
     }
 
-    func animationGeometry() -> [AnimationGeometry] {
+    private func rawAnimationGeometry() -> [AnimationGeometry] {
         let selected = animationGesture?.id ?? selectedAnimationID
         return displayedAnimations.compactMap { animation in
             guard animation.start.isFinite, animation.end.isFinite, animation.start <= animation.end,
@@ -1194,39 +1272,45 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         }
     }
 
-    /// External labels can cover a very short neighboring Hold/Zoom. Keep
-    /// every body visible and expose each crowded group in a native chooser.
-    func animationCrowds() -> [AnimationCrowdGeometry] {
-        let geometry = animationGeometry()
-        let handles = geometry.flatMap { [$0.startHandle, $0.endHandle, $0.easeInHandle, $0.easeOutHandle].compactMap { $0 } }
-        var result: [AnimationCrowdGeometry] = []
+    /// Colliding labels are replaced by a chooser in the label gutter, never
+    /// over a neighboring curve, its grips, or the following track.
+    private func crowdedAnimationIDs(_ geometry: [AnimationGeometry]) -> Set<TimelineAnimationID> {
+        var crowded = Set<TimelineAnimationID>()
         for lane in animationLanes() {
             let ordered = geometry.filter { $0.animation.lane == lane.lane }.sorted {
-                $0.animation.start == $1.animation.start ? $0.animation.end < $1.animation.end : $0.animation.start < $1.animation.start
+                $0.body.union($0.labelFrame).minX < $1.body.union($1.labelFrame).minX
             }
-            var groups: [[AnimationGeometry]] = []
+            var group: [AnimationGeometry] = []
+            var right = -CGFloat.infinity
             for item in ordered {
-                var members = [item]
-                while let previous = groups.last,
-                      previous.contains(where: { first in members.contains { second in
-                          first.body.union(first.labelFrame).intersects(second.body.union(second.labelFrame))
-                      } }) {
-                    members = groups.removeLast() + members
+                let frame = item.body.union(item.labelFrame)
+                if frame.minX >= right {
+                    if group.count > 1 { crowded.formUnion(group.map { $0.animation.id }) }
+                    group = []; right = -CGFloat.infinity
                 }
-                groups.append(members)
+                group.append(item); right = max(right, frame.maxX)
             }
-            for group in groups where group.count > 1 {
-                let anchor = group.reduce(CGFloat.zero) { $0 + x(for: $1.animation.end) } / CGFloat(group.count)
-                let width = max(18, CGFloat(String(group.count).count * 6 + 10))
-                let candidates = [anchor - width / 2, anchor + 6, anchor - width - 6].map {
-                    CGRect(x: min(max(railOrigin, $0), bounds.width - 12 - width), y: lane.frame.maxY, width: width, height: 11)
-                }
-                let frame = candidates.first { candidate in !handles.contains { $0.intersects(candidate) } &&
-                    !result.contains { $0.frame.intersects(candidate) } } ?? candidates[0]
-                result.append(AnimationCrowdGeometry(ids: group.map { $0.animation.id }, frame: frame, sourceX: anchor))
-            }
+            if group.count > 1 { crowded.formUnion(group.map { $0.animation.id }) }
         }
-        return result
+        return crowded
+    }
+    func animationGeometry() -> [AnimationGeometry] {
+        let raw = rawAnimationGeometry(), crowded = crowdedAnimationIDs(raw)
+        return raw.map { item in
+            var result = item
+            if crowded.contains(item.animation.id) { result.labelFrame = .null }
+            return result
+        }
+    }
+    func animationCrowds() -> [AnimationCrowdGeometry] {
+        let geometry = rawAnimationGeometry(), crowded = crowdedAnimationIDs(geometry)
+        return animationLanes().compactMap { lane in
+            let members = geometry.filter { $0.animation.lane == lane.lane }
+            guard members.contains(where: { crowded.contains($0.animation.id) }) else { return nil }
+            return AnimationCrowdGeometry(ids: members.map { $0.animation.id },
+                frame: lane.labelFrame.insetBy(dx: -2, dy: -3), sourceX: lane.labelFrame.midX,
+                title: "\(lane.title) · \(members.count) ▾")
+        }
     }
 
     private func animationColor(_ lane: TimelineAnimationLane) -> NSColor {
@@ -1290,8 +1374,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         for lane in animationLanes() {
             NSColor.black.withAlphaComponent(0.13).setFill()
             NSBezierPath(roundedRect: lane.frame, xRadius: 3, yRadius: 3).fill()
-            (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+            if !animationCrowds().contains(where: { $0.frame.intersects(lane.labelFrame) }) {
+                (lane.title as NSString).draw(in: lane.labelFrame, withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+            }
 
         }
         drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
@@ -1321,8 +1407,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             color.withAlphaComponent(selected ? 1 : 0.85).setStroke()
             envelope.lineWidth = selected ? 1.5 : 1
             envelope.stroke()
-            (animation.label as NSString).draw(in: item.labelFrame, withAttributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.labelColor])
+            if !item.labelFrame.isNull {
+                (animation.label as NSString).draw(in: item.labelFrame, withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.labelColor])
+            }
             for handle in [item.startHandle, item.endHandle].compactMap({ $0 }) {
                 // Preserve the generous hit regions while painting quiet grips.
                 color.setFill()
@@ -1365,16 +1453,12 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             }
         }
         for crowd in animationCrowds() {
-            NSColor.secondaryLabelColor.setStroke()
-            let leader = NSBezierPath()
-            leader.move(to: CGPoint(x: crowd.sourceX, y: crowd.frame.minY - 2))
-            leader.line(to: CGPoint(x: crowd.frame.midX, y: crowd.frame.minY + 1)); leader.stroke()
-            NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+            NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
             NSBezierPath(roundedRect: crowd.frame, xRadius: 4, yRadius: 4).fill()
-            let text = String(crowd.ids.count) as NSString
-            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold), .foregroundColor: NSColor.white]
-            let width = text.size(withAttributes: attributes).width
-            text.draw(at: CGPoint(x: crowd.frame.midX - width / 2, y: crowd.frame.minY), withAttributes: attributes)
+            let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
+            (crowd.title as NSString).draw(in: crowd.frame.insetBy(dx: 3, dy: 3), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.labelColor, .paragraphStyle: style])
         }
     }
 
@@ -1795,7 +1879,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     private var minimumVisibleDuration: Double {
         let frame = frameDuration.isFinite && frameDuration > 0 ? frameDuration : 1.0 / 30
-        return min(max(duration, .leastNonzeroMagnitude), max(frame * 4, duration / 1000))
+        return min(max(duration, .leastNonzeroMagnitude), frame * 4)
     }
 
     private func markerIsVisible(_ time: Double) -> Bool {
@@ -1812,6 +1896,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard start.isFinite, span.isFinite, duration.isFinite, duration > 0 else { return }
         visibleDuration = min(duration, max(minimumVisibleDuration, span))
         visibleStart = min(max(start, 0), max(0, duration - visibleDuration))
+        updateRangeScroller()
         needsDisplay = true
         updateTooltips()
     }
@@ -1829,13 +1914,18 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override func scrollWheel(with event: NSEvent) {
         guard videoGesture == nil else { return }
-        if !videoRows.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), !event.modifierFlags.contains(.shift) { super.scrollWheel(with: event); return }
         guard drag == nil, animationGesture == nil, duration.isFinite, duration > 0,
               !event.phase.contains(.cancelled), !event.momentumPhase.contains(.cancelled) else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) || !event.momentumPhase.isEmpty else { return }
-        let delta = event.scrollingDeltaX == 0 ? event.scrollingDeltaY : event.scrollingDeltaX
-        guard delta.isFinite else { return }
+        let shifted = event.modifierFlags.contains(.shift)
+        let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+        guard dx.isFinite, dy.isFinite else { return }
+        // A vertical scroll belongs to the enclosing track viewport. Genuine
+        // diagonal gestures can scroll tracks and time together.
+        if !shifted, abs(dy) > abs(dx) * 0.5 { super.scrollWheel(with: event) }
+        let delta = shifted && dx == 0 ? dy : (abs(dx) >= abs(dy) * 0.5 ? dx : 0)
+        guard delta != 0 else { return }
         // AppKit already applies the user's natural-scroll preference. Move
         // the time content with the fingers, including inertial scrolling.
         let units = event.hasPreciseScrollingDeltas ? 1.0 : 10.0
@@ -1870,30 +1960,38 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         NSGraphicsContext.restoreGraphicsState()
     }
 
-    private func drawTimeTicks() {
+    func timeRulerTicks() -> [(time: Double, label: String)] {
         let targetStep = visibleDuration / max(1, Double(railWidth / 90))
         let magnitude = pow(10, floor(log10(max(targetStep, .leastNonzeroMagnitude))))
         let step = ([1.0, 2, 5, 10].first { $0 * magnitude >= targetStep } ?? 10) * magnitude
         let decimals = min(3, max(0, Int(-floor(log10(step)))))
+        var ticks: [(time: Double, label: String)] = []
+        let last = visibleStart + visibleDuration
+        var tick = ceil(visibleStart / step) * step
+        while tick <= last + step * 0.000_001 {
+            ticks.append((tick, String(format: "%.*f s", decimals, tick)))
+            tick += step
+        }
+        return ticks
+    }
+    private func drawTimeTicks() {
+        if showsAnimationLanes, pinnedTimeRuler != nil { return }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
-        let last = visibleStart + visibleDuration
-        var tick = ceil(visibleStart / step) * step
-        while tick <= last + step * 0.000_001 {
-            let position = x(for: tick)
+        for tick in timeRulerTicks() {
+            let position = x(for: tick.time)
             let path = NSBezierPath()
             let tickY: CGFloat = showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer : 57
             path.move(to: CGPoint(x: position, y: tickY))
             path.line(to: CGPoint(x: position, y: tickY + 3))
             NSColor.tertiaryLabelColor.setStroke()
             path.stroke()
-            let text = String(format: "%.*f s", decimals, tick) as NSString
+            let text = tick.label as NSString
             let width = text.size(withAttributes: attributes).width
             let labelX = min(max(position - width / 2, 0), bounds.width - width)
             text.draw(at: CGPoint(x: labelX, y: showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer + 5 : 61), withAttributes: attributes)
-            tick += step
         }
     }
 

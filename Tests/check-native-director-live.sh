@@ -12,7 +12,7 @@ case "${1:-}" in
     cat <<'HELP'
 Native Director live fixture (signed-in official CLI, synthetic metadata only).
 RUN_NATIVE_DIRECTOR_LIVE=1 Tests/check-native-director-live.sh [--run-only] [options]
-  --provider claude|codex|qwen  Default claude; qwen explicitly loads local Metal.
+  --provider claude|codex|qwen|apple  Default claude; apple evaluates the system model without a CLI/account.
   --model MODEL            Defaults claude-sonnet-5-5, gpt-6.1-sol, or verified local Qwen.
   --cli ABSOLUTE_PATH      Defaults /opt/homebrew/bin/<provider>; Qwen uses its pinned cache CLI.
   --effort on|off         Qwen diagnostic toggle; default off (cloud default medium).
@@ -45,6 +45,7 @@ if [ "$mode" != run ]; then
     cp "$sources/$name.swift" "$snapshot/$name.swift"
   done
   cp "$repo_dir/Tests/NativeDirectorLiveChecks.swift" "$snapshot/NativeDirectorLiveChecks.swift"
+  cp "$repo_dir/Tools/AppleDirectorPrototype.swift" "$snapshot/AppleDirectorPrototype.swift"
   sources="$snapshot"
   taskpolicy -b swiftc -whole-module-optimization -Onone -num-threads 1 -parse-as-library \
     -warnings-as-errors -strict-concurrency=complete -enable-upcoming-feature ExistentialAny \
@@ -58,10 +59,10 @@ if [ "$mode" != run ]; then
     "$sources/CursorRecording.swift" "$sources/ProjectRenderer.swift" "$sources/PIPVideoCompositor.swift" \
     "$sources/EditorPlayback.swift" "$sources/RecordedScene.swift" "$sources/DirectorInspection.swift" \
     "$sources/FrameThrowerMCPServer.swift" "$sources/EditorAutomationAPI.swift" "$sources/EditorAutomationHost.swift" \
-    "$snapshot/NativeDirectorLiveChecks.swift" -o "$binary"
+    "$snapshot/AppleDirectorPrototype.swift" "$snapshot/NativeDirectorLiveChecks.swift" -o "$binary"
   shasum -a 256 "$snapshot"/*.swift \
     "$repo_dir/Tools/director-agent-client.py" "$repo_dir/Tools/framethrower-mcp.py" \
-    "$repo_dir/Tools/DirectorAgents/claude.py" "$repo_dir/Tools/DirectorAgents/codex.py" "$repo_dir/Tools/DirectorAgents/qwen.py" "$repo_dir/Tools/DirectorAgents/instructions.py" > "$build_dir/compiled-source-manifest.sha256"
+    "$repo_dir/Tools/DirectorAgents/claude.py" "$repo_dir/Tools/DirectorAgents/codex.py" "$repo_dir/Tools/DirectorAgents/qwen.py" "$repo_dir/Tools/DirectorAgents/instructions.py" "$repo_dir/Tools/DirectorAgents/instructions.txt" > "$build_dir/compiled-source-manifest.sha256"
 fi
 if [ "$mode" = compile ]; then
   echo "Compiled native Director fixture: $binary"

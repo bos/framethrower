@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import FoundationModels
 
 private struct LiveFailure: Error, LocalizedError {
     let message: String
@@ -172,7 +173,7 @@ struct NativeDirectorLiveChecks {
     }
     private static func run() async throws {
         if CommandLine.arguments.contains("--help") {
-            print("Native Director live fixture: --provider claude|codex|qwen --model MODEL --cli ABSOLUTE_PATH --effort off|on --artifacts DIRECTORY. Defaults: Claude claude-sonnet-5-5 and Codex gpt-6.1-sol at medium effort; verified local Qwen at effort off. RUN_NATIVE_DIRECTOR_LIVE=1 required; --capabilities adds pointer/rename/preview/Undo/Redo; --self-test uses no provider.")
+            print("Native Director live fixture: --provider claude|codex|qwen|apple --model MODEL --cli ABSOLUTE_PATH --effort off|on --artifacts DIRECTORY. Apple uses the system model without a CLI/account; --narrow tests one typed rename tool. Defaults: Claude claude-sonnet-5-5 and Codex gpt-6.1-sol at medium effort; verified local Qwen at effort off. RUN_NATIVE_DIRECTOR_LIVE=1 required; --capabilities adds pointer/rename/preview/Undo/Redo; --self-test uses no provider.")
             return
         }
         let selfTest = CommandLine.arguments.contains("--self-test")
@@ -219,6 +220,9 @@ struct NativeDirectorLiveChecks {
                 try await navigationCheck()
                 try await secretIOCheck(artifacts: artifacts)
                 print("Native Director fixture self-test passed: actual private MCP→Host→durable camera edit, exact9→11, main framing preserved, oneUndo/Redo; no provider/media.")
+            } else if option("--provider") == "apple" {
+                guard #available(macOS 27.0, *) else { throw LiveFailure(message: "This Foundation Models evaluation needs macOS 27.") }
+                try await appleLive(fixture, artifacts: artifacts)
             } else {
                 try await live(fixture, repo: repo, artifacts: artifacts)
             }
@@ -232,6 +236,96 @@ struct NativeDirectorLiveChecks {
             print("Native Director failed; artifacts: \(artifacts.path)")
             throw error
         }
+    }
+
+    @available(macOS 27.0, *)
+    private static func appleLive(_ fixture: LiveFixture, artifacts: URL) async throws {
+        guard SystemLanguageModel.default.isAvailable else { throw LiveFailure(message: "Apple Intelligence is unavailable: \(SystemLanguageModel.default.availability)") }
+        if CommandLine.arguments.contains("--narrow") { try await appleNarrow(fixture, artifacts: artifacts); return }
+        let directory = artifacts.appendingPathComponent("apple-session")
+        var adapter = try AppleDirectorPrototype(directory: directory) { name, arguments in
+            try await fixture.call(name, arguments: arguments)
+        }
+        var number = 0
+        func send(_ text: String) async throws -> [String: Any] {
+            number += 1
+            print("Apple Foundation Models turn\(number): \(text)"); fflush(stdout)
+            do {
+                let result = try await adapter.turn(text, context: fixture.host.automationContext)
+                try adapter.persist()
+                try json(result).write(to: artifacts.appendingPathComponent("apple-turn-\(number).json"))
+                try JSONEncoder().encode(fixture.editor.project).write(to: artifacts.appendingPathComponent("apple-turn-\(number)-state.json"))
+                print("Apple turn\(number): \(result["text"] ?? ""), context=\(result["context_tokens_after"] ?? "?")/\(SystemLanguageModel.default.contextSize)"); fflush(stdout)
+                return result
+            } catch {
+                try adapter.persist()
+                try json(["error": error.localizedDescription, "context_tokens": try await SystemLanguageModel.default.tokenCount(for: adapter.session.transcript)])
+                    .write(to: artifacts.appendingPathComponent("apple-turn-\(number)-failure.json"))
+                throw error
+            }
+        }
+        let initial = try await SystemLanguageModel.default.tokenCount(for: adapter.session.transcript)
+        let budget: [String: Any] = ["context_capacity": SystemLanguageModel.default.contextSize, "initial_context_tokens": initial,
+            "tool_definition_tokens": try await SystemLanguageModel.default.tokenCount(for: adapter.tools),
+            "instructions_tokens": try await SystemLanguageModel.default.tokenCount(for: Instructions(adapter.instructions)),
+            "model": String(describing: SystemLanguageModel.default.variant), "tool_names": adapter.tools.map(\.name)]
+        try json(budget).write(to: artifacts.appendingPathComponent("apple-context-budget.json"))
+        print("Apple context budget: \(initial)/\(SystemLanguageModel.default.contextSize) tokens before the first user prompt."); fflush(stdout)
+        _ = try await send("Zoom the camera to full screen over two seconds.")
+        if fixture.editor.project.state == fixture.initial.state {
+            _ = try await send("Yes, the picture-in-picture camera. Start at the current playhead.")
+        }
+        try fixture.assertOutcome(checkHistoryRoundtrip: false)
+        let edited = fixture.editor.project
+        let recalled = try await send("What did I ask you to change, and over what duration? Do not change anything.")
+        try require(fixture.editor.project == edited, "Read-only Apple recall changed the recording.")
+        let reply = (recalled["text"] as? String ?? "").lowercased()
+        try require((reply.contains("2") || reply.contains("two")) && reply.contains("camera"), "Apple recall did not retain the original requested target and duration.")
+        // Rehydrate the framework's actual transcript, without reconstruction or summaries.
+        adapter = try AppleDirectorPrototype(directory: directory) { name, arguments in try await fixture.call(name, arguments: arguments) }
+        _ = try await send("Remind me what camera change you just made. Do not edit anything.")
+        try require(fixture.editor.project == edited, "Rehydrated Apple recall changed the recording.")
+        if CommandLine.arguments.contains("--capabilities") {
+            try await capabilityChecks(fixture) { text, _ in _ = try await send(text) }
+        }
+        try fixture.assertOutcome()
+        print("Apple Director camera, read-only recall, persisted transcript and ordinary Undo/Redo checks passed.")
+    }
+
+    @available(macOS 27.0, *)
+    private static func appleNarrow(_ fixture: LiveFixture, artifacts: URL) async throws {
+        let tool = AppleDirectorRenameTool { name in
+            let current = try fixture.host.automationContext
+            let result = try await fixture.call("control_document", arguments: json(["document_id": current.documentID,
+                "expected_revision": current.revision, "operation": "rename", "name": name]))
+            return String(decoding: result, as: UTF8.self)
+        }
+        var session = LanguageModelSession(tools: [tool], instructions: "Use the provided tool to carry out a requested rename. Do not ask for confirmation again. Answer read-only questions from the conversation without editing.")
+        let initialTokens = try await SystemLanguageModel.default.tokenCount(for: session.transcript)
+        let began = Date()
+        let response = try await session.respond(to: "Rename this recording to Quarterly demo.", options: .init(samplingMode: .greedy, maximumResponseTokens: 256))
+        let passed = fixture.editor.project.title == "Quarterly demo" && fixture.editor.project.state == fixture.initial.state && fixture.editor.project.undoHistory.count == 1
+        var results: [[String: Any]] = [["case": "typed_rename", "passed": passed, "text": response.content,
+            "seconds": Date().timeIntervalSince(began), "context_tokens_before": initialTokens,
+            "context_tokens_after": try await SystemLanguageModel.default.tokenCount(for: session.transcript),
+            "input_tokens": response.usage.input.totalTokenCount, "output_tokens": response.usage.output.totalTokenCount]]
+        try json(results).write(to: artifacts.appendingPathComponent("apple-narrow-results.json"))
+        try require(passed, "Apple's purpose-built rename tool did not perform the exact requested rename with one Undo.")
+        let transcriptData = try JSONEncoder().encode(session.transcript)
+        try transcriptData.write(to: artifacts.appendingPathComponent("apple-narrow-transcript.json"))
+        let restored = try JSONDecoder().decode(Transcript.self, from: transcriptData)
+        session = LanguageModelSession(model: SystemLanguageModel.default, tools: [tool], transcript: restored)
+        let beforeRecall = fixture.editor.project
+        let callsBeforeRecall = fixture.calls.count
+        let recall = try await session.respond(to: "What is the recording called now? Do not change anything.", options: .init(samplingMode: .greedy, maximumResponseTokens: 128))
+        let recalled = recall.content.lowercased().contains("quarterly demo") && fixture.editor.project == beforeRecall && fixture.calls.count == callsBeforeRecall
+        results.append(["case": "persisted_typed_tool_recall", "passed": recalled, "text": recall.content,
+            "context_tokens_after": try await SystemLanguageModel.default.tokenCount(for: session.transcript)])
+        try json(results).write(to: artifacts.appendingPathComponent("apple-narrow-results.json"))
+        try require(recalled, "Apple's restored transcript did not preserve the rename result without another edit.")
+        try require(fixture.editor.undo() && fixture.editor.project.title == fixture.initial.title, "Apple rename Undo failed")
+        try require(fixture.editor.redo() && fixture.editor.project.title == "Quarterly demo", "Apple rename Redo failed")
+        print("Apple typed rename, persisted framework transcript, read-only recall and ordinary Undo/Redo passed: \(results)")
     }
     private static func live(_ fixture: LiveFixture, repo: URL, artifacts: URL) async throws {
         let python = option("--python") ?? "/opt/homebrew/bin/python3"

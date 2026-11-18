@@ -27,7 +27,7 @@ swiftc -whole-module-optimization -Onone -num-threads 2 -parse-as-library -warni
   "$repo_dir/FrameThrower/Sources/FrameThrower/WhisperSpeechSession.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorDiagnostics.swift" \
   "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConversation.swift" \
-  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorModelTransport.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorAgentRuntime.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
+  "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorModelTransport.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorAgentRuntime.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConnection.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorConnectionView.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorChatGPT.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/DirectorRemoteAgent.swift" "$repo_dir/FrameThrower/Sources/FrameThrower/EditorAssistantPanel.swift" \
   "$repo_dir/Tests/AssistantPanelLayoutChecks.swift" \
   -o "$check_dir/check-assistant-panel"
 "$check_dir/check-assistant-panel"

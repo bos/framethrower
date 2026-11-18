@@ -95,6 +95,10 @@
 		FBE0100CC7393DD56C3313B1 /* EditorAgentControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC79B38B140B8C1AE5A79FB1 /* EditorAgentControls.swift */; };
 		FE5454804B382FF94725ED6D /* RecordingTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D9D58433C5C2899A8DE0AB9 /* RecordingTimeline.swift */; };
 		FE7F22F290D9756FD5EAA0DF /* VideoExportUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB5EED1427B6C2376610BCB1 /* VideoExportUI.swift */; };
+		E08A756DBD704381B7F6D449 /* DirectorConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A84CD7DB46F44DC9229BF46 /* DirectorConnection.swift */; };
+		BB3952EC7BFC4FDFB44D990E /* DirectorConnectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F64F3FC539DA4C3DA4F730C9 /* DirectorConnectionView.swift */; };
+		386B267C0A6C4730AF787BD0 /* DirectorChatGPT.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90018C15ED1D400197608612 /* DirectorChatGPT.swift */; };
+		ACF0E07D8B304A6C8098432C /* DirectorRemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCB36734A31D4F259A9056E5 /* DirectorRemoteAgent.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -187,6 +191,10 @@
 		F905EC803998351752697F83 /* CursorRecording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CursorRecording.swift; sourceTree = "<group>"; };
 		F9CAECA8A94FD573C4001A79 /* EditorPreviewCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorPreviewCommand.swift; sourceTree = "<group>"; };
 		FBB3F3EEE50A46C2A0B92BE1 /* framethrower-mcp.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "framethrower-mcp.py"; sourceTree = "<group>"; };
+		3A84CD7DB46F44DC9229BF46 /* DirectorConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorConnection.swift; sourceTree = "<group>"; };
+		F64F3FC539DA4C3DA4F730C9 /* DirectorConnectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorConnectionView.swift; sourceTree = "<group>"; };
+		90018C15ED1D400197608612 /* DirectorChatGPT.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorChatGPT.swift; sourceTree = "<group>"; };
+		FCB36734A31D4F259A9056E5 /* DirectorRemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectorRemoteAgent.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -233,6 +241,10 @@
 				1D84BA30F37DAD6298774122 /* EditorActionDescription.swift */,
 				DC79B38B140B8C1AE5A79FB1 /* EditorAgentControls.swift */,
 				9AB619FA62E1F37CBFBAAA23 /* EditorAnimationEditing.swift */,
+				3A84CD7DB46F44DC9229BF46 /* DirectorConnection.swift */,
+				F64F3FC539DA4C3DA4F730C9 /* DirectorConnectionView.swift */,
+				90018C15ED1D400197608612 /* DirectorChatGPT.swift */,
+				FCB36734A31D4F259A9056E5 /* DirectorRemoteAgent.swift */,
 				25140E53F9721D6FCF5C0BA5 /* EditorAssistantPanel.swift */,
 				4CD85A6E0CFE4E038E29F8E1 /* EditorAutomationAPI.swift */,
 				A35BF45A90404565D6EE974D /* EditorAutomationHost.swift */,
@@ -469,6 +481,10 @@
 				6857EE2857541D2A35B023D7 /* EditorActionDescription.swift in Sources */,
 				FBE0100CC7393DD56C3313B1 /* EditorAgentControls.swift in Sources */,
 				C738DF19A6E066CCF40C36F9 /* EditorAnimationEditing.swift in Sources */,
+				E08A756DBD704381B7F6D449 /* DirectorConnection.swift in Sources */,
+				BB3952EC7BFC4FDFB44D990E /* DirectorConnectionView.swift in Sources */,
+				386B267C0A6C4730AF787BD0 /* DirectorChatGPT.swift in Sources */,
+				ACF0E07D8B304A6C8098432C /* DirectorRemoteAgent.swift in Sources */,
 				06C6B97302EC176D7B91C1BB /* EditorAssistantPanel.swift in Sources */,
 				0C8B16BDCFD354F435BCB640 /* EditorAutomationAPI.swift in Sources */,
 				A354EB33B712B69BFB5E2762 /* EditorAutomationHost.swift in Sources */,

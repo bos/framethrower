@@ -493,7 +493,10 @@ There is one instruction field and one microphone. **Add note… / Edit note…*
 in a box's context menu edits its optional sidebar note; Return saves, Escape
 or dismissing cancels. Numbered box labels stay fixed. Notes do not become
 visible graphics. The microphone starts dictation; pressing it again finishes
-recognition and submits the instruction. Escape cancels. Typed instructions use
+recognition and submits the instruction. While listening, **Silence** selects
+Off (the initial default), 1 s, 2 s, or 5 s. A delay automatically finishes and
+submits after that much silence following speech; the last choice is remembered
+across launches. Off requires pressing the microphone again. Escape cancels. Typed instructions use
 Return or the send icon. The Apple SpeechAnalyzer fallback runs on-device on supported macOS26+
 hardware/locales. It may download Apple speech assets on first use; audio is
 never sent to a transcription service. There is no cloud speech fallback.
@@ -572,24 +575,50 @@ or footage. Conversation archives live in
 `~/Library/Application Support/FrameThrower/Director`. Automated checks use
 temporary directories and synthetic PCM without opening a microphone or speaker.
 
-The model menu beside the microphone selects local Qwen, Claude Haiku 5.5,
-Claude Sonnet 5.5, GPT-6 Luna, or GPT-6.1 Sol. Changing models preserves the
-conversation and pending question. Cloud choices require Python 3 and the
-provider's unmodified installed CLI, signed in using `claude auth login` or
-`codex login`. The app invokes that CLI with the user's own credentials and
-billing; it never reads or copies subscription tokens or requires an API key.
-Instructions and requested editing context go to the selected provider. Speech
-recognition remains on this Mac. No provider silently falls back to another.
+Director discovers connections only when its pane is opened. App launch and
+ordinary editing never check provider installations, authentication, or model
+availability, contact a provider, or start a model. An existing compatible,
+authenticated Claude Code or Codex installation is offered as **Use Claude** or
+**Use ChatGPT**. A compatible runtime already inside the installed ChatGPT app
+can also be used. Installed Qwen is offered only when the existing native bridge,
+model file, and local server are present; its Metal model starts on first use.
+Nothing installs or downloads an agent runtime.
 
-The CLI bridge uses an empty private directory, disables project customizations
-and major coding/browser/MCP capabilities, bounds input/output and execution time,
-and validates every proposed function against the offered schema. Codex does
-not expose a universal tools-off switch: its read-only sandbox and disabled
-capabilities remain necessary; unexpected execution events reject the request.
-Cancellation terminates only the bridge's owned process group.
-Organization-managed CLI policies still apply. Authentication and embedding
-follow the providers' documented [Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance)
-and [Codex authentication](https://learn.chatgpt.com/docs/auth) paths.
+If no connection is ready, **Continue with ChatGPT** opens OpenAI's official
+browser authorization flow. This direct connection uses Swift HTTPS, requires no
+Python, CLI, desktop app, or API key, and uses an eligible ChatGPT plan. Model
+choices come from that account's catalog. Connecting never sends the pending
+instruction: the user returns to the preserved composer and presses Send.
+Instructions, editing metadata, and explicitly requested frame images go to the
+chosen provider. Voice recognition stays on this Mac. Provider changes are
+explicit; failed turns never silently switch providers or replay completed edits.
+
+ChatGPT credentials belong to Framethrower's own OAuth registration and are kept
+in the login Keychain; other apps' credentials are never read or copied. Browser
+sign-in uses PKCE, state and nonce, an IPv4 loopback callback, and signature,
+issuer, audience and expiry validation. Access renewal is serialized. The direct
+HTTPS tool loop retains complete conversation/tool results in owner-only files
+under `~/Library/Application Support/FrameThrower/Director/RemoteSessions` and
+executes only the editor's scoped tools. Existing revision validation, conflict
+review, recorded-media policy, and Undo apply unchanged.
+
+**Change provider…** shows existing connections and allows another ChatGPT
+account. Right-click a saved ChatGPT connection for **Sign in again**. Closing
+Director cancels setup; reopening rechecks the remembered choice. Expired or
+unavailable connections leave the draft and conversation intact. Anthropic does
+not offer third-party Claude subscription sign-in for this direct client; Claude
+uses an already-authenticated official installation. Local native connections
+still use the existing Python bridge and the provider's own authentication,
+transcripts, tool loop and managed policies.
+
+ChatGPT plan sign-in follows OpenAI's documented
+[local/open-source integration](https://developers.openai.com/siwc/token-sharing-open-source),
+including its [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+Paid distribution requires the separate participation path described there.
+Claude integration follows [Claude Code's embedding and authentication conditions](https://code.claude.com/docs/en/legal-and-compliance).
+Offline onboarding, identity, scope, cancellation, stream-failure and resumption
+checks run with `Tests/check-director-connections.sh`; they do not log into a real
+account, contact a provider, load a model, or open capture devices.
 
 Recorded scene metadata is an optional adjacent JSON sidecar. Its utility queue
 uses coalesced change notifications and a slow fallback, outside media callbacks.

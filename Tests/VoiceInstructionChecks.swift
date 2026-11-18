@@ -8,7 +8,8 @@ private enum VoiceFixtureError: LocalizedError {
 }
 
 @MainActor
-private final class FixtureSpeechSession: LocalSpeechSession {
+private final class FixtureSpeechSession: LocalSpeechSession, LocalSpeechActivityReporting {
+    var onAudioActivity: (@MainActor (SpeechAudioActivity) -> Void)?
     var result: (@MainActor (SpeechTranscript.Segment) -> Void)?
     var startAction: (@MainActor () async -> Void)?
     var finishAction: (@MainActor () async throws -> Void)?
@@ -59,14 +60,36 @@ struct VoiceInstructionChecks {
         do {
             guard MediaProcessing.isSuspended else { throw VoiceCheckFailure.failed("Requires media interlock") }
             try await checkFinalInstruction()
+            try await checkSilenceInstruction()
             try await checkPartialOnly()
             try await checkFailure()
             try await checkCancellation()
-            print("Voice instruction checks passed (controller → finalized transcript → draft → assistant → transport; one submission, typed-draft preservation, partial/error/cancel suppression; UI button activation unverified, no microphone/model/media).")
+            print("Voice instruction checks passed (manual/silence finish → finalized transcript → draft → assistant → transport; one submission, typed-draft preservation, partial/error/cancel suppression; UI button activation unverified, no microphone/model/media).")
         } catch {
             FileHandle.standardError.write(Data("Voice instruction check failed: \(error)\n".utf8))
             Darwin.exit(1)
         }
+    }
+
+    private static func checkSilenceInstruction() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        fixture.session.instruction = "At Edit A,"
+        fixture.speech.silenceDelay = .oneSecond
+        await fixture.speech.start(onAutomaticTranscript: { fixture.apply($0) })
+        fixture.mock.finishAction = { [mock = fixture.mock] in mock.emit("zoom into Box 1.", final: true) }
+        fixture.mock.onAudioActivity?(.init(hasSpeech: true, silenceDuration: 0.98))
+        try await Task.sleep(for: .milliseconds(10))
+        try require(fixture.mock.finishes == 0, "silence must wait for the selected period")
+        fixture.mock.onAudioActivity?(.init(hasSpeech: true, silenceDuration: 1))
+        fixture.mock.onAudioActivity?(.init(hasSpeech: true, silenceDuration: 1.02))
+        try await wait { fixture.state.deliveries == 1 && !fixture.session.isBusy }
+        let payloads = await fixture.transport.payloads
+        try require(fixture.mock.finishes == 1 && payloads.count == 1, "silence must submit exactly once through the assistant")
+        let object = try JSONSerialization.jsonObject(with: payloads[0]) as! [String: Any]
+        let messages = object["messages"] as! [[String: String]]
+        try require(messages.last?["content"]?.contains("At Edit A, zoom into Box 1.") == true,
+                    "automatic silence submission lost the typed draft")
     }
 
     private static func checkFinalInstruction() async throws {
@@ -182,6 +205,10 @@ struct VoiceInstructionChecks {
 
         func finishAndApply() async {
             guard let text = await speech.finish() else { return }
+            apply(text)
+        }
+
+        func apply(_ text: String) {
             state.deliveries += 1
             state.delivered.append(text)
             if session.appendDictation(text) {

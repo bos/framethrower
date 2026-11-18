@@ -21,7 +21,7 @@ actor DirectorAgentRuntime {
 
     func turn(request: Data, projectURL: URL, provider: DirectorProvider,
               helperURL: URL? = nil, proxyURL: URL? = nil,
-              sessionRoot: URL? = nil, timeout: TimeInterval = 240) async throws -> Data {
+              sessionRoot: URL? = nil, timeout: TimeInterval = 240, executable: String? = nil) async throws -> Data {
         guard let input = try JSONSerialization.jsonObject(with: request) as? [String: Any],
               let document = input["document_id"] as? String,
               let recording = input["recording_id"] as? String, UUID(uuidString: recording) != nil else {
@@ -46,6 +46,7 @@ actor DirectorAgentRuntime {
             "effort": provider.effort, "cwd": directory.path, "mcp_proxy": proxy.path,
             "mcp_socket": "/tmp/framethrower-\(getuid())/control.sock", "document_id": document,
             "recording_id": recording, "timeout": timeout]
+        if let executable { configuration["cli"] = executable }
         let lease: LocalModelEndpointLease?
         if provider == .localQwen {
             configuration["effort"] = "off"

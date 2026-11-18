@@ -33,12 +33,14 @@ final class EditorAssistantSession: ObservableObject {
     @Published private(set) var inspectedFrames: [UUID: Data] = [:]
     private var inspectedFrameOrder: [UUID] = []
     @Published private(set) var modelProvider: DirectorProvider
+    let connections: DirectorConnections?
     private let diagnostics: DirectorDiagnostics?
     private let persistsConversation: Bool
     private let conversationStorageURL: URL?
     @Published private(set) var conversation = DirectorConversation()
     private weak var observedEditor: ProjectEditor?
     private var projectObservation: AnyCancellable?
+    private var connectionObservation: AnyCancellable?
     private weak var automation: (any EditorAutomationEndpoint)?
     private var automationObservation: AnyCancellable?
     private var performingAutomation = false
@@ -58,15 +60,18 @@ final class EditorAssistantSession: ObservableObject {
          diagnostics: DirectorDiagnostics? = nil, persistsConversation: Bool? = nil,
          conversationStorageURL: URL? = nil, provider: DirectorProvider? = nil,
          inspectionCache: DirectorInspectionCache? = nil,
-         nativeTransport: (@Sendable (Data, URL, DirectorProvider) async throws -> Data)? = nil) {
+         nativeTransport: (@Sendable (Data, URL, DirectorProvider) async throws -> Data)? = nil,
+         connections: DirectorConnections? = nil) {
         self.transport = transport
         self.nativeTransport = nativeTransport
+        self.connections = connections ?? (transport == nil && nativeTransport == nil ? DirectorConnections() : nil)
         self.inspections = inspectionCache ?? DirectorInspectionCache()
         self.injectedInspections = inspectionCache != nil
         self.modelProvider = provider ?? (transport == nil ? .preferred : .localQwen)
         self.diagnostics = diagnostics ?? (transport == nil && nativeTransport == nil ? .shared : nil)
         self.persistsConversation = persistsConversation ?? ((transport == nil && nativeTransport == nil) || conversationStorageURL != nil)
         self.conversationStorageURL = conversationStorageURL
+        connectionObservation = self.connections?.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
     }
     deinit { task?.cancel(); draftSaveTask?.cancel() }
 
@@ -75,6 +80,17 @@ final class EditorAssistantSession: ObservableObject {
         modelProvider = provider
         if transport == nil { UserDefaults.standard.set(provider.rawValue, forKey: DirectorProvider.preferenceKey) }
         record("model_provider_changed", details: ["provider": provider.rawValue, "model": provider.modelID])
+    }
+
+    func openDirector() async {
+        await connections?.open()
+        synchronizeConnectionProvider()
+    }
+
+    func synchronizeConnectionProvider() {
+        if let connection = connections?.selected, !connection.providers.contains(modelProvider) {
+            selectProvider(connection.defaultProvider)
+        }
     }
 
     func attachAutomation(_ endpoint: (any EditorAutomationEndpoint)?) {
@@ -254,6 +270,11 @@ final class EditorAssistantSession: ObservableObject {
 
     func submit(editor: ProjectEditor, playhead: Double, regionID: UUID?, editID: UUID?) {
         guard !isBusy else { return }
+        if let connections, !connections.isOpen || connections.selected == nil || connections.isConnecting || connections.isChecking {
+            connections.showsChooser = true
+            return
+        }
+        synchronizeConnectionProvider()
         attach(to: editor)
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -694,7 +715,10 @@ final class EditorAssistantSession: ObservableObject {
         pendingSpeechID = nil
         do {
             let current = try automation.automationContext
-            let provider = modelProvider, family = provider.cliProvider ?? "qwen"
+            let provider = modelProvider
+            let connection = connections?.selected
+            let remoteModel = connections?.modelID ?? ""
+            let family = connection?.id ?? provider.cliProvider ?? "qwen"
             let end = nativeEventLog.count
             let start = min(end, nativeDeliveredEvents[family] ?? 0)
             var events = Array(nativeEventLog.dropFirst(start))
@@ -710,6 +734,8 @@ final class EditorAssistantSession: ObservableObject {
                     "prior_conversation_query": "inspect_editor section conversation returns complete exchanges, latest page first; request earlier pages when needed."]]
             let data = try JSONSerialization.data(withJSONObject: input)
             record("native_agent_request", requestID: token, details: ["provider": provider.rawValue,
+                "model": connection?.kind == .chatGPT ? remoteModel : provider.modelID,
+                "connection": connection?.id ?? family,
                 "text": text, "document_id": current.documentID, "editor_events": events])
             conversation.begin(text, requestID: token)
             clarification = nil; framingConflict = nil
@@ -717,8 +743,22 @@ final class EditorAssistantSession: ObservableObject {
             isBusy = true; errorMessage = nil; notice = nil
             nativeGeneration = token; performingAutomation = true
             persist()
-            let send = nativeTransport ?? { request, url, provider in
-                try await DirectorAgentRuntime.shared.turn(request: request, projectURL: url, provider: provider)
+            let send = nativeTransport ?? { [weak self] request, url, provider in
+                if let connection, connection.kind == .chatGPT, let accountID = connection.accountID {
+                    let access = try await DirectorChatGPTAccounts.shared.accessToken(accountID: accountID)
+                    guard let resource = Bundle.main.url(forResource: "instructions", withExtension: "txt", subdirectory: "DirectorAgents") else {
+                        throw DirectorConnectionError.message("Director's instructions are missing from this build.")
+                    }
+                    let instructions = try String(contentsOf: resource, encoding: .utf8)
+                    let tools = try JSONSerialization.data(withJSONObject: EditorAutomationAPI.tools)
+                    return try await DirectorRemoteAgent.shared.turn(request: request, projectURL: url,
+                        accountID: accountID, model: remoteModel, token: access, instructions: instructions, tools: tools) { [weak self] name, arguments in
+                            guard let endpoint = self?.automation else { throw EditorAutomationError.unavailable }
+                            return try await endpoint.performAutomation(name, arguments: arguments)
+                        }
+                }
+                return try await DirectorAgentRuntime.shared.turn(request: request, projectURL: url, provider: provider,
+                    executable: connection?.executable)
             }
             task = Task { @MainActor [weak self, weak editor] in
                 guard let self, let editor else { return }
@@ -760,6 +800,7 @@ final class EditorAssistantSession: ObservableObject {
                 } catch {
                     guard self.generation == token else { return }
                     self.errorMessage = error.localizedDescription
+                    self.connections?.reportFailure(error.localizedDescription)
                     self.finish(token, response: nil, outcome: ["status": "rejected", "error": error.localizedDescription])
                 }
             }
@@ -985,6 +1026,7 @@ final class EditorAssistantSession: ObservableObject {
     /// Closing a window or restarting must not discard the conversation's
     /// pending question. Explicit Cancel/Dismiss still uses cancel().
     func suspend() {
+        connections?.close()
         if let id = currentRequestID {
             finish(id, response: nil, outcome: ["status": "interrupted", "summary": "Director stopped. Any completed edits remain in Undo."])
         }
@@ -1069,6 +1111,7 @@ struct EditorAssistantPanel: View {
     var onVoiceBegin: () -> Void = {}
     var onCancel: () -> Void = {}
     @StateObject private var instructionSpeech = LocalSpeechInput()
+    @AppStorage("voiceSilenceDelay") private var voiceSilenceDelay = SpeechSilenceDelay.off
     @State private var namingRegionID: UUID?
     @State private var nameDraft = ""
     @FocusState private var nameFocused: Bool
@@ -1078,6 +1121,9 @@ struct EditorAssistantPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let connections = session.connections {
+                DirectorConnectionView(connections: connections, isBusy: session.isBusy)
+            }
             RecordingMetadataAccessView(mode: .recording(sceneURL: editor.project.sceneFilename.map {
                 editor.url.deletingLastPathComponent().appendingPathComponent($0)
             }, time: nil))
@@ -1123,7 +1169,7 @@ struct EditorAssistantPanel: View {
                 .accessibilityLabel("Editing instruction")
                 .help("For example: At Edit A, zoom into Box 1. Then smoothly zoom out and into Box 2 at Edit B.")
             HStack {
-                LocalVoiceButton(speech: instructionSpeech, finishPurpose: "Finish and apply instruction", onBegin: {
+                LocalVoiceButton(speech: instructionSpeech, finishPurpose: "Finish and apply instruction", silenceDelay: voiceSilenceDelay, onBegin: {
                     session.beginVoiceInstruction()
                     instructionSpeech.contextualStrings = editor.editingState.regions.compactMap {
                         editor.references.boxLabel(for: $0.id)
@@ -1141,25 +1187,35 @@ struct EditorAssistantPanel: View {
                         Text("Listening…")
                     }
                     .font(.callout).accessibilityElement(children: .combine)
+                    Picker("Silence", selection: $voiceSilenceDelay) {
+                        ForEach(SpeechSilenceDelay.allCases, id: \.self) { delay in
+                            Text(delay.title).tag(delay)
+                        }
+                    }
+                    .pickerStyle(.menu).controlSize(.small).fixedSize()
+                    .accessibilityLabel("Send after silence")
+                    .help("Automatically send after this much silence. Off requires clicking Finish.")
                 } else if instructionSpeech.phase == .preparing || instructionSpeech.phase == .finishing {
                     ProgressView().controlSize(.small)
                     Text(instructionSpeech.phase == .preparing ? "Starting microphone…" : "Recognizing…")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Picker("Director model", selection: Binding(get: { session.modelProvider }, set: { session.selectProvider($0) })) {
-                        Section("On this Mac") { Text(DirectorProvider.localQwen.title).tag(DirectorProvider.localQwen) }
-                        Section("Claude Code") {
-                            Text(DirectorProvider.claudeHaiku.title).tag(DirectorProvider.claudeHaiku)
-                            Text(DirectorProvider.claudeSonnet.title).tag(DirectorProvider.claudeSonnet)
+                    if let connections = session.connections, connections.selected?.kind == .chatGPT {
+                        Picker("Director model", selection: Binding(get: { connections.modelID }, set: {
+                            connections.modelID = $0; connections.saveModelPreference()
+                        })) {
+                            ForEach(connections.models) { model in Text(model.title).tag(model.id) }
                         }
-                        Section("Codex") {
-                            Text(DirectorProvider.openAIFast.title).tag(DirectorProvider.openAIFast)
-                            Text(DirectorProvider.openAIBalanced.title).tag(DirectorProvider.openAIBalanced)
+                        .labelsHidden().pickerStyle(.menu).controlSize(.small).disabled(session.isBusy)
+                    } else if session.connections == nil || session.connections?.selected != nil {
+                        Picker("Director model", selection: Binding(get: { session.modelProvider }, set: { session.selectProvider($0) })) {
+                            ForEach(session.connections?.selected?.providers ?? DirectorProvider.allCases) { provider in
+                                Text(provider.title).tag(provider)
+                            }
                         }
+                        .labelsHidden().pickerStyle(.menu).controlSize(.small)
+                        .disabled(session.isBusy).help(session.modelProvider.help)
                     }
-                    .labelsHidden().pickerStyle(.menu).controlSize(.small)
-                    .disabled(session.isBusy)
-                    .help(session.modelProvider.help)
                 }
                 Spacer()
                 if session.isBusy {
@@ -1170,6 +1226,7 @@ struct EditorAssistantPanel: View {
                     Button(action: onSubmit) { Image(systemName: "arrow.up.circle.fill") }
                         .buttonStyle(.borderless).font(.title2)
                         .disabled(session.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || instructionSpeech.phase != .idle)
+                        .disabled(session.connections.map { $0.selected == nil || $0.isChecking || $0.isConnecting } ?? false)
                         .help("Apply this instruction. Undo reverses the whole request.")
                         .accessibilityLabel("Apply edit instruction")
                 }
@@ -1181,6 +1238,8 @@ struct EditorAssistantPanel: View {
             }
         }
         .padding(16)
+        .task { await session.openDirector() }
+        .onChange(of: session.connections?.selected?.id) { _, _ in session.synchronizeConnectionProvider() }
         .onChange(of: instructionSpeech.transcript) { _, text in
             session.recordSpeechHypothesis(text, phase: String(describing: instructionSpeech.phase))
         }

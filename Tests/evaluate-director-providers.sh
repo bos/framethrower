@@ -27,6 +27,10 @@ $sources/DirectorAgentRuntime.swift
 $sources/LocalSpeechInput.swift
 $sources/DirectorDiagnostics.swift
 $sources/DirectorConversation.swift
+$sources/DirectorConnection.swift
+$sources/DirectorConnectionView.swift
+$sources/DirectorChatGPT.swift
+$sources/DirectorRemoteAgent.swift
 $sources/EditorAssistantPanel.swift
 $sources/WhisperSpeechRuntime.swift
 $sources/WhisperSpeechSession.swift

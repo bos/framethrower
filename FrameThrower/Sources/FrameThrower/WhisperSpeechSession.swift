@@ -81,9 +81,10 @@ final class PreferredLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendI
 /// Capture starts independently of decoder preparation. The same bounded PCM
 /// is retained if Whisper preparation or inference needs Apple's local fallback.
 @MainActor
-final class BufferedLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendIdentifying, LocalSpeechCaptureReadinessReporting {
+final class BufferedLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendIdentifying, LocalSpeechCaptureReadinessReporting, LocalSpeechActivityReporting {
     var recognizerIdentifier: String { recognizer.recognizerIdentifier }
     var onCaptureReady: (@MainActor () -> Void)?
+    var onAudioActivity: (@MainActor (SpeechAudioActivity) -> Void)?
     private enum State { case idle, capturing, finishing, finished, cancelled }
     private var state = State.idle
     private let recognizer: any BufferedSpeechRecognizer
@@ -107,7 +108,13 @@ final class BufferedLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendId
                onFailure: @escaping @MainActor (String) -> Void) async throws {
         guard state == .idle else { throw WhisperSpeechError.busy }
         state = .capturing; self.onResult = onResult; self.onFailure = onFailure
-        let collector = PendingSpeechPCM { [weak self] message in
+        let collector = PendingSpeechPCM(onAudioActivity: { [weak self] activity in
+            Task { @MainActor in
+                guard let self, self.state == .capturing else { return }
+                self.capturedFirstBuffer()
+                self.onAudioActivity?(activity)
+            }
+        }) { [weak self] message in
             Task { @MainActor in await self?.failed(message) }
         }
         self.collector = collector
@@ -155,7 +162,7 @@ final class BufferedLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendId
         let text = try await recognizer.transcribe(samples)
         guard state == .finishing else { throw CancellationError() }
         onResult?(.init(start: 0, duration: Double(samples.count) / 16000, text: text, isFinal: true))
-        state = .finished; onResult = nil; onFailure = nil; onCaptureReady = nil
+        state = .finished; onResult = nil; onFailure = nil; onCaptureReady = nil; onAudioActivity = nil
         preparationWatch?.cancel(); preparationWatch = nil; self.preparation = nil
         await recognizer.cancel()
     }
@@ -163,7 +170,7 @@ final class BufferedLocalSpeechSession: LocalSpeechSession, LocalSpeechBackendId
         state = .cancelled; source.stop(); captureStart?.cancel(); captureStart = nil
         collector?.cancel(); collector = nil
         preparationWatch?.cancel(); preparationWatch = nil; preparation?.cancel(); preparation = nil
-        onResult = nil; onFailure = nil; onCaptureReady = nil
+        onResult = nil; onFailure = nil; onCaptureReady = nil; onAudioActivity = nil
         await recognizer.cancel()
     }
     private func capturedFirstBuffer() {
@@ -294,14 +301,18 @@ private final class PendingSpeechPCM: @unchecked Sendable {
     private var ended = false
     private var failure: (any Error)?
     private var reportedReady = false
-    init(onFailure: @escaping @Sendable (String) -> Void) { self.onFailure = onFailure }
+    private let onAudioActivity: @Sendable (SpeechAudioActivity) -> Void
+    init(onAudioActivity: @escaping @Sendable (SpeechAudioActivity) -> Void,
+         onFailure: @escaping @Sendable (String) -> Void) {
+        self.onAudioActivity = onAudioActivity; self.onFailure = onFailure
+    }
     var hasOwnedSamples: Bool { lock.lock(); defer { lock.unlock() }; return !ended && failure == nil && (accumulator?.sampleCount ?? 0) > 0 }
     func receive(_ buffer: AVAudioPCMBuffer) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !ended, failure == nil else { return false }
         do {
             if accumulator == nil {
-                accumulator = try WhisperPCMAccumulator(format: buffer.format, onFailure: onFailure); format = buffer.format
+                accumulator = try WhisperPCMAccumulator(format: buffer.format, onAudioActivity: onAudioActivity, onFailure: onFailure); format = buffer.format
             }
             guard buffer.format == format else { throw LocalSpeechError.invalidAudio }
             accumulator?.receive(buffer)
@@ -396,10 +407,13 @@ final class WhisperPCMAccumulator: @unchecked Sendable {
     private var values = [Float]()
     private var ended = false
     private var failure: (any Error)?
-    init(format: AVAudioFormat, onFailure: @escaping @Sendable (String) -> Void) throws {
+    private var silenceDetector = SpeechSilenceDetector()
+    private let onAudioActivity: (@Sendable (SpeechAudioActivity) -> Void)?
+    init(format: AVAudioFormat, onAudioActivity: (@Sendable (SpeechAudioActivity) -> Void)? = nil,
+         onFailure: @escaping @Sendable (String) -> Void) throws {
         guard let output = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
               let converter = AVAudioConverter(from: format, to: output) else { throw LocalSpeechError.invalidAudio }
-        self.converter = converter; outputFormat = output; self.onFailure = onFailure
+        self.converter = converter; outputFormat = output; self.onFailure = onFailure; self.onAudioActivity = onAudioActivity
     }
     var sampleCount: Int { lock.lock(); defer { lock.unlock() }; return values.count }
     func receive(_ buffer: AVAudioPCMBuffer) {
@@ -436,6 +450,10 @@ final class WhisperPCMAccumulator: @unchecked Sendable {
             let samples = UnsafeBufferPointer(start: channels[0], count: Int(buffer.frameLength))
             guard samples.allSatisfy(\.isFinite) else { fail(LocalSpeechError.invalidAudio); return }
             values.append(contentsOf: samples)
+            if !ended, onAudioActivity != nil {
+                silenceDetector.receive(samples)
+                onAudioActivity?(silenceDetector.activity)
+            }
         }
     }
     private func fail(_ error: any Error) { if failure == nil { failure = error; onFailure(error.localizedDescription) } }

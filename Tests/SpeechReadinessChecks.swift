@@ -90,9 +90,77 @@ struct SpeechReadinessChecks {
             try await oldUtteranceCannotReturn()
             try await boundedCapture()
             try await sourceFailureAndFormatChange()
+            try await silenceDelays()
+            try await silenceSettingChangesAndCancellation()
             if let helper = CommandLine.arguments.dropFirst().first { try await nativeOpeningSpeech(URL(fileURLWithPath: helper)) }
-            print("PASS: readiness tracks owned PCM; opening audio survives slow preparation, early Stop and Apple fallback; cancellation/generation/cap checks (synthetic RAM only; no microphone/playback/audio file/video)")
+            print("PASS: readiness tracks owned PCM; opening audio survives slow preparation, early Stop and Apple fallback; silence Off/1/2/5 s, resumed speech, cancellation/generation/cap checks (synthetic RAM only; no microphone/playback/audio file/video)")
         } catch { print("FAIL: \(error)"); Darwin.exit(1) }
+    }
+    static func silenceDelays() async throws {
+        for delay in SpeechSilenceDelay.allCases {
+            let decoder = DelayedRecognizer(); let source = ManualPCMSource()
+            let speech = LocalSpeechInput(makeSession: { BufferedLocalSpeechSession(recognizer: decoder, source: source) })
+            try require(speech.silenceDelay == .off, "silence must default to Off")
+            speech.silenceDelay = delay
+            var deliveries = [String]()
+            await speech.start(onAutomaticTranscript: { deliveries.append($0) })
+            try await until { decoder.preparationGate != nil }
+            source.send(0, count: 6 * 16000)
+            try await until { speech.phase == .listening }
+            try await Task.sleep(for: .milliseconds(10))
+            try require(!source.stopped && deliveries.isEmpty, "initial silence submitted an empty command")
+            source.send(0.125, count: 320) // An isolated click is too short to arm sending.
+            source.send(0, count: 6 * 16000)
+            try await Task.sleep(for: .milliseconds(10))
+            try require(!source.stopped, "an isolated click armed automatic sending")
+            source.send(0.125, count: 3200)
+            let seconds = delay == .off ? 5 : delay.rawValue
+            source.send(0.001, count: seconds * 16000 - 320)
+            try await Task.sleep(for: .milliseconds(10))
+            try require(!source.stopped, "silence finished before the selected delay")
+            source.send(0.125, count: 3200) // Resuming speech resets the quiet interval.
+            source.send(0, count: seconds * 16000 - 320)
+            try await Task.sleep(for: .milliseconds(10))
+            try require(!source.stopped, "silence was accumulated across a speech interruption")
+            source.send(0, count: 320)
+            if delay == .off {
+                try await Task.sleep(for: .milliseconds(10))
+                try require(!source.stopped && deliveries.isEmpty, "Off automatically finished an utterance")
+                decoder.releasePreparation()
+                let final = await speech.finish()
+                try require(final == decoder.text && deliveries.isEmpty, "Off did not retain manual Finish")
+            } else {
+                try await until { source.stopped }
+                try require(speech.phase == .finishing && deliveries.isEmpty, "automatic Finish must freeze capture and wait for final recognition")
+                decoder.releasePreparation()
+                try await until { deliveries.count == 1 }
+                source.send(0, count: 6 * 16000)
+                let repeated = await speech.finish()
+                try require(deliveries == [decoder.text] && decoder.received.count == 1 && repeated == nil,
+                            "silence delivered anything other than one finalized transcript")
+            }
+        }
+    }
+    static func silenceSettingChangesAndCancellation() async throws {
+        let decoder = DelayedRecognizer(); let source = ManualPCMSource()
+        let speech = LocalSpeechInput(makeSession: { BufferedLocalSpeechSession(recognizer: decoder, source: source) })
+        speech.silenceDelay = .fiveSeconds
+        var deliveries = [String]()
+        await speech.start(onAutomaticTranscript: { deliveries.append($0) })
+        source.send(0.125, count: 3200)
+        try await until { speech.phase == .listening && decoder.preparationGate != nil }
+        source.send(0, count: 2 * 16000)
+        try await Task.sleep(for: .milliseconds(10))
+        speech.silenceDelay = .oneSecond
+        speech.silenceDelay = .off // Revoke a queued automatic finish before it begins.
+        try await Task.sleep(for: .milliseconds(10))
+        try require(!source.stopped, "switching Off did not revoke queued automatic sending")
+        speech.silenceDelay = .twoSeconds
+        try await until { source.stopped }
+        await speech.cancel()
+        source.send(0, count: 16000)
+        try await Task.sleep(for: .milliseconds(10))
+        try require(deliveries.isEmpty && speech.phase == .idle, "cancellation allowed an automatic transcript to escape")
     }
     static func earlyPrefixAndStop() async throws {
         let decoder = DelayedRecognizer(); let source = ManualPCMSource()

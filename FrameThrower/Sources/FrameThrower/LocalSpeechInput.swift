@@ -46,6 +46,52 @@ protocol LocalSpeechSession: AnyObject, Sendable {
     func cancel() async
 }
 
+enum SpeechSilenceDelay: Int, CaseIterable {
+    case off = 0, oneSecond = 1, twoSeconds = 2, fiveSeconds = 5
+
+    var title: String { self == .off ? "Off" : "\(rawValue) s" }
+}
+
+struct SpeechAudioActivity: Sendable {
+    var hasSpeech = false
+    var silenceDuration: Double = 0
+}
+
+@MainActor
+protocol LocalSpeechActivityReporting: AnyObject {
+    var onAudioActivity: (@MainActor (SpeechAudioActivity) -> Void)? { get set }
+}
+
+/// Measures owned mono 16 kHz PCM in 20 ms windows. Require 100 ms of
+/// speech-level audio before silence can finish an utterance; initial quiet
+/// and isolated clicks must never submit a command.
+struct SpeechSilenceDetector {
+    private var windowEnergy: Double = 0
+    private var windowSamples = 0
+    private var speechWindows = 0
+    private var silentWindows = 0
+    private(set) var activity = SpeechAudioActivity()
+
+    mutating func receive(_ samples: UnsafeBufferPointer<Float>) {
+        for sample in samples {
+            windowEnergy += Double(sample) * Double(sample)
+            windowSamples += 1
+            guard windowSamples == 320 else { continue }
+            if windowEnergy / 320 >= 0.0001 { // RMS >= -40 dBFS
+                speechWindows += 1
+                silentWindows = 0
+                if speechWindows >= 5 { activity.hasSpeech = true }
+            } else {
+                speechWindows = 0
+                if activity.hasSpeech { silentWindows += 1 }
+            }
+            activity.silenceDuration = Double(silentWindows) / 50
+            windowEnergy = 0
+            windowSamples = 0
+        }
+    }
+}
+
 enum LocalSpeechError: LocalizedError {
     case unavailable, unsupportedLocale, microphoneDenied, noMicrophone, assetsPreparing, unsupportedConfiguration, invalidAudio
 
@@ -169,7 +215,13 @@ final class LocalSpeechInput: ObservableObject {
     @Published private(set) var recognizerIdentifier = "unselected"
     @Published private(set) var errorMessage: String?
     @Published private(set) var statusMessage: String?
+    var silenceDelay: SpeechSilenceDelay = .off {
+        didSet { finishIfSilent() }
+    }
     var contextualStrings: [String] = []
+    private var audioActivity = SpeechAudioActivity()
+    private var onAutomaticTranscript: (@MainActor (String) -> Void)?
+    private var automaticFinishPending = false
     private var hypothesis = SpeechTranscript()
     private var session: (any LocalSpeechSession)?
     private var generation = UUID()
@@ -186,8 +238,11 @@ final class LocalSpeechInput: ObservableObject {
 
     var isActive: Bool { phase != .idle }
 
-    func start() async {
+    func start(onAutomaticTranscript: (@MainActor (String) -> Void)? = nil) async {
         guard phase == .idle else { return }
+        self.onAutomaticTranscript = onAutomaticTranscript
+        audioActivity = SpeechAudioActivity()
+        automaticFinishPending = false
         generation = UUID()
         let current = generation
         hypothesis = SpeechTranscript()
@@ -202,12 +257,21 @@ final class LocalSpeechInput: ObservableObject {
                 next = try LocalSpeechBackendFactory.make(contextualStrings: contextualStrings)
             }
             session = next
+            if let reporting = next as? any LocalSpeechActivityReporting {
+                reporting.onAudioActivity = { [weak self] activity in
+                    guard let self, self.generation == current,
+                          self.phase == .preparing || self.phase == .listening else { return }
+                    self.audioActivity = activity
+                    self.finishIfSilent()
+                }
+            }
             if let reporting = next as? any LocalSpeechCaptureReadinessReporting {
                 reporting.onCaptureReady = { [weak self] in
                     guard let self, self.generation == current, self.phase == .preparing else { return }
                     self.recognizerIdentifier = (self.session as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
                     self.statusMessage = nil
                     self.phase = .listening
+                    self.finishIfSilent()
                 }
             }
             recognizerIdentifier = (next as? any LocalSpeechBackendIdentifying)?.recognizerIdentifier ?? "custom"
@@ -225,6 +289,7 @@ final class LocalSpeechInput: ObservableObject {
                     self.statusMessage = nil
                     self.phase = .idle
                     self.session = nil
+                    self.onAutomaticTranscript = nil
                 })
             } catch {
                 await next.cancel()
@@ -236,6 +301,7 @@ final class LocalSpeechInput: ObservableObject {
             if !(next is any LocalSpeechCaptureReadinessReporting) {
                 statusMessage = nil
                 phase = .listening
+                finishIfSilent()
             }
         } catch {
             guard generation == current else { return }
@@ -246,6 +312,24 @@ final class LocalSpeechInput: ObservableObject {
             phase = .idle
             statusMessage = nil
             errorMessage = error.localizedDescription
+            self.onAutomaticTranscript = nil
+        }
+    }
+
+    private var shouldFinishForSilence: Bool {
+        phase == .listening && silenceDelay != .off && audioActivity.hasSpeech &&
+            audioActivity.silenceDuration >= Double(silenceDelay.rawValue)
+    }
+
+    private func finishIfSilent() {
+        guard shouldFinishForSilence, !automaticFinishPending, let onAutomaticTranscript else { return }
+        automaticFinishPending = true
+        let current = generation
+        Task { [weak self] in
+            guard let self, self.generation == current else { return }
+            self.automaticFinishPending = false
+            guard self.shouldFinishForSilence else { return }
+            if let text = await self.finish() { onAutomaticTranscript(text) }
         }
     }
 
@@ -255,6 +339,7 @@ final class LocalSpeechInput: ObservableObject {
         guard phase == .listening || phase == .preparing, let session else { return nil }
         let current = generation
         phase = .finishing
+        onAutomaticTranscript = nil
         statusMessage = "Finishing dictation…"
         do {
             try await session.finish()
@@ -285,6 +370,9 @@ final class LocalSpeechInput: ObservableObject {
         phase = .idle
         transcript = ""
         hypothesis = SpeechTranscript()
+        onAutomaticTranscript = nil
+        audioActivity = SpeechAudioActivity()
+        automaticFinishPending = false
         statusMessage = nil
         await previous?.cancel()
     }
@@ -298,6 +386,7 @@ struct LocalVoiceButton: View {
     @ObservedObject var speech: LocalSpeechInput
     var purpose = "Dictate an edit"
     var finishPurpose = "Finish dictation"
+    var silenceDelay: SpeechSilenceDelay = .off
     var onBegin: () -> Void = {}
     let onTranscript: (String) -> Void
 
@@ -308,7 +397,8 @@ struct LocalVoiceButton: View {
                     if let text = await speech.finish() { onTranscript(text) }
                 } else if speech.phase == .idle {
                     onBegin()
-                    await speech.start()
+                    speech.silenceDelay = silenceDelay
+                    await speech.start(onAutomaticTranscript: onTranscript)
                 } else {
                     await speech.cancel()
                 }
@@ -320,6 +410,7 @@ struct LocalVoiceButton: View {
         }
         .help(speech.phase == .listening ? finishPurpose : speech.phase == .idle ? purpose + " using on-device speech recognition" : "Cancel dictation")
         .accessibilityLabel(speech.phase == .listening ? finishPurpose : speech.phase == .idle ? purpose : "Cancel dictation")
+        .onChange(of: silenceDelay) { _, delay in speech.silenceDelay = delay }
     }
 }
 

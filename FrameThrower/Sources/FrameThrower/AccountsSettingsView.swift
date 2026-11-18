@@ -20,6 +20,18 @@ struct AccountsSettingsView: View {
                     }
                 }
                 Divider().padding(.leading, 64)
+                account("YouTube", symbol: "play.rectangle", color: .red,
+                        connected: model.isYouTubeAuthorized) {
+                    if model.isYouTubeAuthorized {
+                        Button("Disconnect") { model.disconnectYouTube() }
+                            .disabled(model.isYouTubeUploading)
+                    } else {
+                        Button(model.isYouTubeConnecting ? "Connecting…" : "Connect") {
+                            Task { await model.connectYouTube() }
+                        }.disabled(model.isYouTubeConnecting)
+                    }
+                }
+                Divider().padding(.leading, 64)
                 account(
                     "Slack", symbol: "number", color: Color(red: 0.45, green: 0.30, blue: 0.53),
                     connected: model.isSlackAuthorized
@@ -44,6 +56,7 @@ struct AccountsSettingsView: View {
         .tint(RecorderStyle.accent)
         .onAppear {
             model.loadTokens()
+            model.loadYouTubeTokens()
             model.loadSlackTokens()
         }
     }

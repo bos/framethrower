@@ -2,7 +2,7 @@
 
 A native macOS screen recorder built with SwiftUI and ScreenCaptureKit. Record a
 window, a display, or an area selected by dragging, then optionally upload the
-recording to Google Drive or a Slack person/channel.
+recording to Google Drive, YouTube, or a Slack person/channel.
 
 ## Live capture restriction
 
@@ -168,7 +168,7 @@ Camera video is saved separately beside the screen original as `.camera.mov`. Ne
 mouse motion and clicks in an immutable `.cursor.json` sidecar. A `.framethrower`
 project stores edits and undo history. Keep these files together. The legacy
 filename prefix is retained for compatibility with the upload helper. Local
-recording and editing do not require connecting Google Drive or Slack.
+recording and editing do not require connecting upload accounts.
 
 ## Importing video
 
@@ -697,11 +697,19 @@ use metadata, vector test patterns, and guides while video remains suspended.
 
 ## Accounts and sharing
 
-Open **Accounts** to connect Google Drive or Slack in your browser. After recording,
+Open **Accounts** to connect Google Drive, YouTube, or Slack in your browser. After recording,
 use the recording’s Share icon and choose **Upload…**, then select a Slack person or channel and click **Send**, or
 click **Upload** beside Google Drive. Uploads are manual and show progress; successful
 uploads copy their link to the clipboard. Drive uploads create a file in the
 root of your Drive and do not change its sharing permissions.
+
+For YouTube, click **Upload…** beside YouTube, enter a title and optional description,
+choose visibility and whether the video is made for kids, then click **Upload to YouTube**.
+Visibility starts at **Private** for every recording. Uploads use the current edited
+snapshot and stream the MP4 from disk; the app reports API errors and copies the video
+link after YouTube accepts it. YouTube may still be processing the video at that point.
+Interrupted transfers report an error; automatic resumption across attempts is not implemented.
+YouTube uploads remain disabled while the media-processing interlock is enabled.
 
 Copy `.env.example` to the gitignored `.env` at the repository root and fill in
 `GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET`, `SLACK_CLIENT_ID`, and
@@ -714,7 +722,13 @@ readable in the built app. Builds without credentials still support local work;
 account connections report that the integration is not configured. The app has
 no client-ID entry fields. Run `python3 Tests/OAuthConfigurationChecks.py` to
 check the configuration pipeline without signing in or opening media.
-Google sign-in uses a loopback HTTP callback and requests the `drive` scope.
+Google sign-in uses a loopback HTTP callback. Drive requests the `drive` scope;
+YouTube connects separately with only `youtube.upload` and separate saved tokens.
+YouTube reuses `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET`; enable **YouTube Data API v3**
+and allow the YouTube upload scope in that Google Cloud project's OAuth consent configuration.
+See Google's [upload API](https://developers.google.com/youtube/data/reference/rest/v3/videos/insert)
+and [upload protocol](https://developers.google.com/youtube/data/guides/using_resumable_upload_protocol).
+Run `Tests/check-youtube-upload.sh` for metadata and mocked upload checks without media processing.
 Slack sign-in uses the existing hosted callback at
 `https://screencast-auth.bosullivan.workers.dev/slack/oauth`, which redirects to
 the app's `screencast-slack` URL scheme. A separate Slack deployment needs its

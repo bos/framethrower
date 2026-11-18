@@ -71,12 +71,13 @@ struct ContentView: View {
                     .help("Open a recording project (⌘O)")
                 SettingsLink { Label("Accounts", systemImage: "person.crop.circle") }
                     .labelStyle(.iconOnly)
-                    .help("Manage Google Drive and Slack accounts")
+                    .help("Manage upload accounts")
             }
         }
         .onAppear {
             model.restoreLastProject()
             model.loadTokens()
+            model.loadYouTubeTokens()
             model.loadSlackTokens()
             model.loadAudioSettings()
             model.loadAreaSettings()
@@ -447,6 +448,8 @@ struct ContentView: View {
             driveShareRow
             Divider().opacity(0.4)
             slackShareRow
+            Divider().opacity(0.4)
+            YouTubeUploadControls(model: model, isLocked: captureLocked)
             if model.isUploadProgressVisible {
                 HStack(spacing: 10) {
                     ProgressView(value: model.uploadProgressFraction)

@@ -72,6 +72,20 @@ final class CaptureViewModel: ObservableObject {
     @Published private(set) var hasRecordingToUpload = false
     @Published var lastDriveFileURL: URL?
     @Published var lastSlackFileURL: URL?
+    @Published private(set) var lastYouTubeURL: URL?
+    @Published private(set) var isYouTubeUploading = false
+    @Published private(set) var youTubeUploadError: String?
+    @Published private var youTubeTokens: OAuthTokens? {
+        didSet {
+            if let youTubeTokens, let data = try? JSONEncoder().encode(youTubeTokens) {
+                userDefaults.set(data, forKey: "youtube.tokens")
+            } else {
+                userDefaults.removeObject(forKey: "youtube.tokens")
+            }
+        }
+    }
+    @Published private(set) var isYouTubeConnecting = false
+    var isYouTubeAuthorized: Bool { youTubeTokens != nil }
 
     @Published var slackTargetKind: SlackTargetKind = .person {
         didSet { persistSlackSelection() }
@@ -287,7 +301,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     var isAnyUploadActive: Bool {
-        isUploading || isSlackUploading || isExporting
+        isUploading || isSlackUploading || isYouTubeUploading || isExporting
     }
 
     var latestLogEntry: LogEntry? {
@@ -1102,6 +1116,7 @@ final class CaptureViewModel: ObservableObject {
             if let cameraStart { activeCameraOffset = cameraStart - screenStart }
             lastDriveFileURL = nil
             lastSlackFileURL = nil
+            lastYouTubeURL = nil
             projectEditor = nil
             exportedState = nil
             exportedURL = nil
@@ -1346,6 +1361,8 @@ final class CaptureViewModel: ObservableObject {
             lastRecordingURL = screenURL
             lastDriveFileURL = nil
             lastSlackFileURL = nil
+            lastYouTubeURL = nil
+            youTubeUploadError = nil
             userDefaults.set(editor.url.path, forKey: "editor.lastProject")
             if present { requestProjectEditor() }
             return editor
@@ -1355,7 +1372,7 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    /// Both destinations use this exact snapshot, never the unedited screen file.
+    /// All destinations use this exact snapshot, never the unedited screen file.
     private func recordingForSharing() async throws -> URL {
         try MediaProcessing.requireEnabled()
         guard let editor = projectEditor else {
@@ -1436,6 +1453,82 @@ final class CaptureViewModel: ObservableObject {
             return false
         }
         return true
+    }
+
+    func loadYouTubeTokens() {
+        guard let data = userDefaults.data(forKey: "youtube.tokens") else { youTubeTokens = nil; return }
+        youTubeTokens = try? JSONDecoder().decode(OAuthTokens.self, from: data)
+    }
+
+    private func youTubeOAuthConfig() throws -> OAuthConfig {
+        guard !clientID.isEmpty, !clientSecret.isEmpty else {
+            throw YouTubeUploadError(message: "YouTube is not configured in this build.")
+        }
+        return OAuthConfig(clientID: clientID, redirectURI: "http://127.0.0.1:0/oauth",
+            scopes: ["https://www.googleapis.com/auth/youtube.upload"], clientSecret: clientSecret)
+    }
+
+    func connectYouTube() async {
+        guard !isYouTubeConnecting else { return }
+        isYouTubeConnecting = true
+        defer { isYouTubeConnecting = false }
+        do {
+            let client = OAuthClient(config: try youTubeOAuthConfig())
+            let (tokens, _) = try await client.authorize()
+            youTubeTokens = tokens
+            log("Connected to YouTube.")
+        } catch {
+            log("YouTube connection failed: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    func disconnectYouTube() {
+        guard !isYouTubeUploading else { return }
+        youTubeTokens = nil
+        userDefaults.removeObject(forKey: "youtube.tokens")
+        lastYouTubeURL = nil
+        youTubeUploadError = nil
+    }
+
+    func uploadLastRecordingToYouTube(metadata: YouTubeUploadMetadata) async {
+        guard !isAnyUploadActive, !isRecording, !isCountdownActive, !isCaptureBusy else { return }
+        guard !MediaProcessing.isSuspended else {
+            log(MediaProcessing.statusMessage, level: .error)
+            return
+        }
+        guard var current = youTubeTokens else {
+            log("Connect YouTube first.", level: .error)
+            return
+        }
+        if let message = metadata.validationMessage { log(message, level: .error); return }
+        isYouTubeUploading = true
+        youTubeUploadError = nil
+        lastYouTubeURL = nil
+        beginUploadProgress()
+        defer { isYouTubeUploading = false; endUploadProgress() }
+        do {
+            let fileURL = try await recordingForSharing()
+            if current.isExpired {
+                current = try await OAuthClient(config: try youTubeOAuthConfig()).refresh(tokens: current)
+                youTubeTokens = current
+            }
+            let result = try await YouTubeUploader().upload(fileURL: fileURL, metadata: metadata,
+                accessToken: current.accessToken) { [weak self] progress in
+                    Task { @MainActor [weak self] in self?.updateUploadProgress(progress) }
+                }
+            lastYouTubeURL = result.url
+            copyTextToPasteboard(result.url.absoluteString)
+            log("Uploaded to YouTube. YouTube may still be processing the video. Link copied to clipboard.")
+        } catch {
+            youTubeUploadError = error.localizedDescription
+            log("YouTube upload failed: \(error.localizedDescription)", level: .error)
+        }
+    }
+
+    func copyLastYouTubeURLToPasteboard() {
+        guard let lastYouTubeURL else { return }
+        copyTextToPasteboard(lastYouTubeURL.absoluteString)
+        log("Copied YouTube URL to clipboard.")
     }
 
     func uploadLastRecording() async {

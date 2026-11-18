@@ -10,6 +10,7 @@
 		08C2B82D4D941ACBF40B1C8B /* EditorWorkspaceLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 584A8AD859D1502D75EC2135 /* EditorWorkspaceLayout.swift */; };
 		FE44A93CD350D655D7AA3911 /* RecordingMetadataAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 264631E352C7A579D9E83E8E /* RecordingMetadataAccess.swift */; };
 		681F3BC129EB95E0C57466FE /* DirectorMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86E73F87CA676C4E23020041 /* DirectorMarkdown.swift */; };
+		000C8811E20D8D41B22FA1C8 /* YouTubeUploader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81FA7E00C00F4414881FF0BF /* YouTubeUploader.swift */; };
 		05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */; };
 		06C6B97302EC176D7B91C1BB /* EditorAssistantPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25140E53F9721D6FCF5C0BA5 /* EditorAssistantPanel.swift */; };
 		0AE832E39C98A7D8263107B5 /* EditorConflictGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC0DF41C52E2521FD8A2AAA7 /* EditorConflictGeometry.swift */; };
@@ -86,6 +87,7 @@
 		E6975D26AD6B54D22F58D32B /* AreaPreviewEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3C013F5884A583103ED27CE /* AreaPreviewEditor.swift */; };
 		E9D1C38430BA19C5DE799205 /* CaptureViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DD2537A645D90E8DF5E74A8 /* CaptureViewModel.swift */; };
 		ED08F0E2A56B7951D1EE2FE5 /* EditorTestPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16017AA0307A971C84F857D2 /* EditorTestPattern.swift */; };
+		ED1D38BCA7562BF61E02BAB7 /* YouTubeUploadControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D574675A504D8DADBFF35 /* YouTubeUploadControls.swift */; };
 		F0CDBB4310397472FEF6A5E6 /* framethrower-mcp.py in Resources */ = {isa = PBXBuildFile; fileRef = FBB3F3EEE50A46C2A0B92BE1 /* framethrower-mcp.py */; };
 		F2CA573041A897343614C972 /* EditorPreviewCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9CAECA8A94FD573C4001A79 /* EditorPreviewCommand.swift */; };
 		F6E55078295474683AFD2ECA /* EditorMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37026AF37314A8301AF7AD6E /* EditorMutation.swift */; };
@@ -143,6 +145,7 @@
 		7B9A54B3BD8A1E232A6B025A /* CaptureRecordingSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureRecordingSetup.swift; sourceTree = "<group>"; };
 		7D0D5DF68A6B41945C3E8916 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		7DD2537A645D90E8DF5E74A8 /* CaptureViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureViewModel.swift; sourceTree = "<group>"; };
+		81FA7E00C00F4414881FF0BF /* YouTubeUploader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeUploader.swift; sourceTree = "<group>"; };
 		83C307FF6A8F2001BBD2CCD8 /* RecordingLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingLibrary.swift; sourceTree = "<group>"; };
 		874ED1384A1E3469A6D83D5F /* CameraRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraRecorder.swift; sourceTree = "<group>"; };
 		8D9D58433C5C2899A8DE0AB9 /* RecordingTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingTimeline.swift; sourceTree = "<group>"; };
@@ -156,6 +159,7 @@
 		A72294BC27EC8CEFBCBB3746 /* director-cli-client.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "director-cli-client.py"; sourceTree = "<group>"; };
 		A8C364114FB81E44BB9B569C /* EditorSimulationClock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorSimulationClock.swift; sourceTree = "<group>"; };
 		AF2037E0803CD62EBF4D1835 /* EditorCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorCommand.swift; sourceTree = "<group>"; };
+		B00D574675A504D8DADBFF35 /* YouTubeUploadControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeUploadControls.swift; sourceTree = "<group>"; };
 		B24ECC967558913130770853 /* PIPVideoCompositor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PIPVideoCompositor.swift; sourceTree = "<group>"; };
 		B3B0FD9E3B359AFCC12A9730 /* RecordingQuality.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingQuality.swift; sourceTree = "<group>"; };
 		BD5A7848536A44F91C389E05 /* RecorderStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderStyle.swift; sourceTree = "<group>"; };
@@ -281,6 +285,8 @@
 				0F9A8568F6B874FDDB628D32 /* WhisperSpeechRuntime.swift */,
 				DD66500B084BED17F521CDBA /* WhisperSpeechSession.swift */,
 				010F10320038E81B6F92F45A /* WindowSelection.swift */,
+				B00D574675A504D8DADBFF35 /* YouTubeUploadControls.swift */,
+				81FA7E00C00F4414881FF0BF /* YouTubeUploader.swift */,
 			);
 			path = FrameThrower;
 			sourceTree = "<group>";
@@ -515,6 +521,8 @@
 				05145F3EED2F4018EEE1DC9F /* WhisperSpeechRuntime.swift in Sources */,
 				9AFD8FED94BF5747ADCFF2F0 /* WhisperSpeechSession.swift in Sources */,
 				5DE6C50872135C1523F17FB9 /* WindowSelection.swift in Sources */,
+				ED1D38BCA7562BF61E02BAB7 /* YouTubeUploadControls.swift in Sources */,
+				000C8811E20D8D41B22FA1C8 /* YouTubeUploader.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

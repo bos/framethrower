@@ -134,6 +134,28 @@ enum VideoExportPreset: String, CaseIterable, Sendable {
     }
 }
 
+enum VideoExportFormat: String, CaseIterable, Sendable {
+    case mp4, mov
+    var title: String { self == .mp4 ? "MP4" : "QuickTime MOV" }
+    var fileType: AVFileType { self == .mp4 ? .mp4 : .mov }
+}
+
+enum VideoExportDimensions {
+    /// Both fields control one scale. Round to codec-safe even pixels without
+    /// changing the canvas aspect ratio by more than a pixel per dimension.
+    static func size(for source: CGSize, width: Double? = nil, height: Double? = nil) -> CGSize {
+        guard source.width.isFinite, source.height.isFinite, source.width > 0, source.height > 0 else {
+            return CGSize(width: 2, height: 2)
+        }
+        let requested = width.map { $0 / source.width } ?? height.map { $0 / source.height } ?? 1
+        let lower = 2 / min(source.width, source.height)
+        let upper = 8192 / max(source.width, source.height)
+        let scale = min(upper, max(lower, requested.isFinite ? requested : 1))
+        func even(_ value: Double) -> Double { max(2, (value / 2).rounded() * 2) }
+        return CGSize(width: even(source.width * scale), height: even(source.height * scale))
+    }
+}
+
 /// Both the editor's AVPlayerItem and exported movie use this exact composition.
 /// Legacy compositions retain source seconds. Cut compositions expose an explicit
 /// output timing map shared by preview/export, rather than rewriting source edits.
@@ -198,6 +220,8 @@ enum ProjectRenderer {
         case invalidVideo(String)
         case invalidTrim
         case destinationExists
+        case destinationNotWritable
+        case invalidExportSize
         case cannotExport
         case unidentifiedAudio(String)
 
@@ -206,6 +230,8 @@ enum ProjectRenderer {
             case let .invalidVideo(name): return "The recording has no usable video: \(name)."
             case .invalidTrim: return "Choose a trim range inside the recording."
             case .destinationExists: return "Choose a different destination. An original recording or a file changed during export cannot be replaced."
+            case .destinationNotWritable: return "The export folder isn’t writable. Choose a folder such as Downloads."
+            case .invalidExportSize: return "Choose dimensions from 2 to 8192 pixels that preserve the canvas aspect ratio."
             case .cannotExport: return "This recording could not be prepared for export."
             case let .unidentifiedAudio(role): return "The source has no verified \(role) track. Restore the original audio metadata or reset that track’s controls before exporting."
             }
@@ -812,8 +838,42 @@ enum ProjectRenderer {
         return try await generator.image(at: time(cameraTime)).image
     }
 
+    /// Reads only prerecorded media; never starts a capture session.
+    static func cropFrame(source: VideoSource, directory: URL, at seconds: Double) async throws -> (image: CGImage, size: CGSize) {
+        try MediaProcessing.requireEnabled()
+        guard let path = source.relativePath, VideoSource.isSafeRelativePath(path), seconds.isFinite else {
+            throw RenderError.invalidVideo(source.name)
+        }
+        let asset = AVURLAsset(url: directory.appendingPathComponent(path))
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw RenderError.invalidVideo(source.name)
+        }
+        let size = try await geometry(of: track).size
+        let duration = try await asset.load(.duration).seconds
+        let generator = AVAssetImageGenerator(asset: asset)
+        defer { generator.cancelAllCGImageGeneration() }
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1440, height: 1000)
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        let frame = try await generator.image(at: time(min(max(0, seconds), max(0, duration - 1 / 600))))
+        return (frame.image, size)
+    }
+
+    static func exportCanvasSize(project: RecordingProject, directory: URL) async throws -> CGSize {
+        try MediaProcessing.requireEnabled()
+        let asset = AVURLAsset(url: directory.appendingPathComponent(project.screenFilename))
+        defer { withExtendedLifetime(asset) {} }
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw RenderError.invalidVideo(project.screenFilename)
+        }
+        let source = try await geometry(of: track).size
+        return PresentationGeometry(sourceSize: source, presentation: project.state.presentation).outputSize
+    }
+
     static func export(project: RecordingProject, directory: URL, to destination: URL,
                        preset: VideoExportPreset = .fullResolution,
+                       customSize: CGSize? = nil, format: VideoExportFormat = .mp4,
                        replaceExisting: Bool = false,
                        progress: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) async throws {
         try MediaProcessing.requireEnabled()
@@ -831,8 +891,12 @@ enum ProjectRenderer {
               !originalURLs.contains(destination.standardizedFileURL.resolvingSymlinksInPath()) else {
             throw RenderError.destinationExists
         }
+        var isDirectory: ObjCBool = false
+        let folder = destination.deletingLastPathComponent().path
+        guard files.fileExists(atPath: folder, isDirectory: &isDirectory), isDirectory.boolValue,
+              files.isWritableFile(atPath: folder) else { throw RenderError.destinationNotWritable }
         let staged = destination.deletingLastPathComponent()
-            .appendingPathComponent(".framethrower-export-" + UUID().uuidString + ".mp4")
+            .appendingPathComponent(".framethrower-export-" + UUID().uuidString + "." + format.rawValue)
         defer { try? files.removeItem(at: staged) }
         let rendered = try await makePreview(project: project, directory: directory)
         let end = rendered.timingMap?.outputDuration ?? min(project.state.trimEnd, rendered.asset.duration.seconds)
@@ -842,7 +906,14 @@ enum ProjectRenderer {
         // AVFoundation's named presets treat square output as a long-edge
         // limit (1920² for "1080p"). Render explicitly at the requested bounds
         // instead, preserving presentation geometry and smaller originals.
-        let outputSize = preset.outputSize(for: rendered.screenSize)
+        let outputSize = customSize ?? preset.outputSize(for: rendered.screenSize)
+        if let customSize {
+            let fitted = VideoExportDimensions.size(for: rendered.screenSize, width: customSize.width)
+            guard customSize.width.isFinite, customSize.height.isFinite,
+                  (2...8192).contains(customSize.width), (2...8192).contains(customSize.height),
+                  Int(customSize.width).isMultiple(of: 2), Int(customSize.height).isMultiple(of: 2),
+                  fitted == customSize else { throw RenderError.invalidExportSize }
+        }
         let videoComposition = rendered.videoComposition.mutableCopy() as! AVMutableVideoComposition
         videoComposition.renderSize = outputSize
         videoComposition.instructions = rendered.videoComposition.instructions.map { instruction in
@@ -868,7 +939,7 @@ enum ProjectRenderer {
         defer { progressTask.cancel() }
         do {
             try await withTaskCancellationHandler {
-                try await exporter.export(to: staged, as: .mp4)
+                try await exporter.export(to: staged, as: format.fileType)
                 try Task.checkCancellation()
             } onCancel: { exporter.cancelExport() }
             if existed {

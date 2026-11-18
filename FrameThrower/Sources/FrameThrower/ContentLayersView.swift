@@ -418,6 +418,7 @@ struct VideoLayersInspector: View {
     @State private var importError: String?
     @State private var importing = false
     @State private var editingLayerName = false
+    @State private var cropRequest: VideoCropRequest?
     private var layers: [VideoLayer] { editor.project.effectiveVideoLayers(in: editor.editingState) }
     private var layer: VideoLayer? { layers.first { $0.id == layerID } }
     private var clip: VideoClip? { layer?.clips.first { $0.id == clipID } }
@@ -507,6 +508,8 @@ struct VideoLayersInspector: View {
                         Text("Fit").tag(VideoFit.fit); Text("Fill").tag(VideoFit.fill)
                     }.pickerStyle(.segmented).frame(width: 100).disabled(clip.layout != .custom)
                         .help(clip.layout == .custom ? "Fit keeps all cropped footage visible. Fill covers the clip frame." : "Use Zoom or Camera controls for this recorded source, or choose a custom Layout first.")
+                    Button("Crop…") { openCrop(clip) }
+                        .help("Draw a source crop for this clip. The output canvas stays the same.")
                     Menu("Layout") {
                         Button("Full frame") { frame(clip, .init(x: 0, y: 0, width: 1, height: 1)) }
                         Button("Left half") { frame(clip, .init(x: 0, y: 0, width: 0.5, height: 1)) }
@@ -544,6 +547,7 @@ struct VideoLayersInspector: View {
                 }
             }
         }.controlSize(.small)
+        .sheet(item: $cropRequest) { request in VideoCropEditor(request: request, directory: editor.url.deletingLastPathComponent()) }
         .alert("Could not add video", isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })) {
             Button("OK") { importError = nil }
         } message: { Text(importError ?? "") }
@@ -551,6 +555,23 @@ struct VideoLayersInspector: View {
             guard !urls.isEmpty, !MediaProcessing.isSuspended else { return false }
             beginImport(urls); return true
         }
+    }
+
+    private func openCrop(_ clip: VideoClip) {
+        prepare(); guard editor.finishDraft(), let source, let layerID else { return }
+        let time = VideoClipEditing.editingSourceTime(clip, projectTime: sourceTime)
+        let geometry = clip.geometry(atSourceTime: time)
+        let bounds = source.id == VideoSource.legacyScreenID ? (editor.editingState.presentation.sourceCrop ?? CropGeometry.full) : CropGeometry.full
+        let size = CropGeometry.pixels(bounds, in: source.pixelSize ?? CGSize(width: 1920, height: 1080)).size
+        cropRequest = VideoCropRequest(title: "Crop video", source: source, time: time,
+            sourceSize: size, crop: geometry.crop, sourceBounds: bounds) { rect, _ in
+                guard var next = editor.project.effectiveVideoLayers(in: editor.editingState)
+                    .first(where: { $0.id == layerID })?.clips.first(where: { $0.id == clip.id }), next.sourceID == source.id else { return }
+                var target = next.geometry(atSourceTime: time); target.crop = rect
+                next.layout = .custom
+                next = VideoClipEditing.framing(next, target: target, at: time)
+                _ = editor.commit(VideoClipEditing.replacing(next, layerID: layerID, in: editor.editingState, project: editor.project), name: "Crop video")
+            }
     }
 
     private func updateVolume(_ point: VideoVolumeKeyframe, _ change: (inout VideoVolumeKeyframe) -> Void) {

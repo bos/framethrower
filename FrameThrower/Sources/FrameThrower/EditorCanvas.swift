@@ -413,7 +413,7 @@ final class EditorCanvasView: NSView {
         updateConflictGuides()
     }
 
-    private var scribbleGeometry: ScribbleGeometry { ScribbleGeometry(contentRect: contentRect, zoom: zoom) }
+    private var scribbleGeometry: ScribbleGeometry { ScribbleGeometry(contentRect: contentRect, zoom: zoom, presentation: presentation) }
 
     private func updateGuides() {
         guides.frame = bounds

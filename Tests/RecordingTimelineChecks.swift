@@ -759,6 +759,30 @@ struct RecordingTimelineChecks {
         precondition(timeline.conflictBands().isEmpty && timeline.intrinsicContentSize == beforeReviewSize,
                      "Dismissing comparison clears its visuals without changing timeline geometry")
 
+        // A finished/output timeline has a shorter, differently scaled clock.
+        // Its source trim rail must still reveal AND restore both removed ends.
+        reset(duration: 3, start: 2, end: 8, playhead: 1)
+        timeline.showsAnimationLanes = true
+        timeline.sourceTrimDuration = 10
+        let startX = timeline.trimX(for: 2), endX = timeline.trimX(for: 8)
+        gesture(from: CGPoint(x: startX + 3, y: 24),
+                to: CGPoint(x: timeline.trimX(for: 0) + 3, y: 24))
+        near(trims.last?.0, 0, "Output trim can recover footage before the retained start")
+        near(trims.last?.1, 8, "Recovering the start preserves the source end")
+        gesture(from: CGPoint(x: endX - 3, y: 24),
+                to: CGPoint(x: timeline.trimX(for: 10) - 3, y: 24))
+        near(trims.last?.1, 10, "Output trim recovers source beyond output duration")
+        precondition(trims.count == 2 && seeks.isEmpty && trimPlayheads.isEmpty,
+                     "Source trim commits once per release without seeking on the output clock")
+        down(CGPoint(x: timeline.trimX(for: 10), y: 24))
+        drag(CGPoint(x: timeline.trimX(for: 7), y: 24))
+        timeline.cancelOperation(nil)
+        up(CGPoint(x: timeline.trimX(for: 7), y: 24))
+        precondition(trims.count == 2, "Escape and late release cancel source trim")
+        timeline.trimStart = 2; timeline.trimEnd = 8
+        gesture(from: CGPoint(x: timeline.x(for: 1), y: 3), to: CGPoint(x: timeline.x(for: 1), y: 3))
+        near(seeks.last, 1, "Output scrubbing does not clamp against source trim values")
+
         window.close()
         print("Recording timeline checks passed: scrub/trim independence, crowded-edit chooser identity/cancellation, selected group moves, pinch separation, accessible labels, fixed geometry, and Existing/Proposed conflict strokes, overlap hatching, source clipping, trim dimming and review-only clicks.")
     }

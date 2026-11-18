@@ -186,6 +186,8 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     var aspectRatio: Double = 16.0 / 9.0
     var crop: PIPCrop = PIPCrop()
     var sourceZoom: Double = 1
+    /// Optional rectangle in the full, oriented source. Nil preserves legacy framing.
+    var sourceCrop: EditorRegionRect? = nil
     /// nil/0 retains normal overlay geometry; 1 fills the final output canvas.
     /// Normal placement/shape remain intact so returning to zero restores them.
     var fullscreen: Double? = nil
@@ -193,7 +195,7 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     var renderedOpacity: Double { visible && opacity.isFinite ? min(1, max(0, opacity)) : 0 }
 
     init(x: Double = 0.95, y: Double = 0.95, scale: Double = 0.25, visible: Bool = true,
-         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1, fullscreen: Double? = nil, opacity: Double = 1) {
+         shape: PIPShape = .original, aspectRatio: Double = 16.0 / 9.0, crop: PIPCrop = PIPCrop(), sourceZoom: Double = 1, sourceCrop: EditorRegionRect? = nil, fullscreen: Double? = nil, opacity: Double = 1) {
         self.x = x
         self.y = y
         self.scale = scale
@@ -202,12 +204,13 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         self.aspectRatio = aspectRatio
         self.crop = crop
         self.sourceZoom = sourceZoom
+        self.sourceCrop = sourceCrop
         self.fullscreen = fullscreen
         self.opacity = opacity
     }
 
     private enum CodingKeys: String, CodingKey {
-        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom, fullscreen, opacity
+        case x, y, scale, visible, shape, aspectRatio, crop, sourceZoom, sourceCrop, fullscreen, opacity
     }
 
     /// Decode defaults on each placement so old projects and every old undo/redo
@@ -222,6 +225,7 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         aspectRatio = try values.decodeIfPresent(Double.self, forKey: .aspectRatio) ?? 16.0 / 9.0
         crop = try values.decodeIfPresent(PIPCrop.self, forKey: .crop) ?? PIPCrop()
         sourceZoom = try values.decodeIfPresent(Double.self, forKey: .sourceZoom) ?? 1
+        sourceCrop = try values.decodeIfPresent(EditorRegionRect.self, forKey: .sourceCrop)
         fullscreen = try values.decodeIfPresent(Double.self, forKey: .fullscreen)
         opacity = try values.decodeIfPresent(Double.self, forKey: .opacity) ?? 1
     }
@@ -232,6 +236,7 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         try values.encode(scale, forKey: .scale); try values.encode(visible, forKey: .visible)
         try values.encode(shape, forKey: .shape); try values.encode(aspectRatio, forKey: .aspectRatio)
         try values.encode(crop, forKey: .crop); try values.encode(sourceZoom, forKey: .sourceZoom)
+        try values.encodeIfPresent(sourceCrop, forKey: .sourceCrop)
         try values.encodeIfPresent(fullscreen, forKey: .fullscreen)
         try values.encode(opacity, forKey: .opacity)
     }
@@ -247,9 +252,9 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         let originalAspect = cameraAspect.isFinite && cameraAspect > 0 ? cameraAspect : 16.0 / 9.0
         let aspect: Double
         switch shape {
-        case .original: aspect = originalAspect
+        case .original: aspect = originalAspect * (sourceCrop.map { $0.width / $0.height } ?? 1)
         case .square, .circle: aspect = 1
-        case .rectangle: aspect = aspectRatio.isFinite ? min(5, max(0.2, aspectRatio)) : 16.0 / 9.0
+        case .rectangle: aspect = aspectRatio.isFinite && aspectRatio > 0 ? (sourceCrop == nil ? min(5, max(0.2, aspectRatio)) : aspectRatio) : 16.0 / 9.0
         }
         let scaleFraction = scale.isFinite ? min(0.5, max(0.12, scale)) : 0.25
         let width = min(canvas.width * scaleFraction, canvas.height * 0.8 * aspect)
@@ -269,6 +274,14 @@ struct PIPPlacement: Codable, Equatable, Sendable {
     /// Aspect-fill the actual interpolated outline, without stretching the
     /// camera image. Crop focus/source zoom remain independent of overlay size.
     func sourceViewport(in source: CGSize, canvas: CGSize) -> CGRect {
+        if let sourceCrop {
+            let base = CropGeometry.pixels(sourceCrop, in: source)
+            let output = frame(in: canvas, cameraAspect: source.width / max(1, source.height))
+            let local = crop.rect(in: base.size, shape: fullscreenFraction > 0 ? .rectangle : shape,
+                aspectRatio: fullscreenFraction > 0 ? output.width / max(0.000001, output.height) : aspectRatio,
+                zoom: sourceZoom)
+            return local.offsetBy(dx: base.minX, dy: base.minY)
+        }
         guard fullscreenFraction > 0 else {
             return crop.rect(in: source, shape: shape, aspectRatio: aspectRatio, zoom: sourceZoom)
         }
@@ -316,7 +329,7 @@ struct PIPPlacement: Codable, Equatable, Sendable {
         next.scale = proposedWidth / canvas.width
         if shape == .rectangle {
             let proposedHeight = max(1, min(availableHeight, canvas.height * 0.8, original.height + verticalDelta))
-            next.aspectRatio = min(5, max(0.2, proposedWidth / proposedHeight))
+            next.aspectRatio = sourceCrop == nil ? min(5, max(0.2, proposedWidth / proposedHeight)) : proposedWidth / proposedHeight
         }
         var resized = next.frame(in: canvas, cameraAspect: cameraAspect)
         let fit = min(1, availableWidth / resized.width, availableHeight / resized.height)
@@ -413,6 +426,28 @@ struct CanvasColor: Codable, Equatable, Sendable {
     static let black = CanvasColor(red: 0, green: 0, blue: 0)
 }
 
+struct CanvasResolution: Codable, Equatable, Sendable {
+    var width: Int
+    var height: Int
+    var size: CGSize { CGSize(width: width, height: height) }
+    var isValid: Bool { (2...8192).contains(width) && (2...8192).contains(height) && width % 2 == 0 && height % 2 == 0 }
+
+    static func matching(aspect: Double, shortEdge: Double) -> Self {
+        let ratio = aspect.isFinite && aspect > 0 ? aspect : 1
+        let source = CGSize(width: ratio >= 1 ? shortEdge * ratio : shortEdge,
+                            height: ratio >= 1 ? shortEdge : shortEdge / ratio)
+        return native(source)
+    }
+
+    static func native(_ source: CGSize) -> Self {
+        let longest = max(source.width, source.height), shortest = min(source.width, source.height)
+        guard longest.isFinite, shortest.isFinite, shortest > 0 else { return Self(width: 2, height: 2) }
+        let scale = min(8192 / longest, max(1, 2 / shortest))
+        func even(_ value: Double) -> Int { min(8192, max(2, Int((value / 2).rounded()) * 2)) }
+        return Self(width: even(source.width * scale), height: even(source.height * scale))
+    }
+}
+
 /// Presentation applies to the whole recording. Source-time edits keep their
 /// existing screen and camera coordinates when the output canvas changes.
 struct CanvasPresentation: Codable, Equatable, Sendable {
@@ -422,25 +457,44 @@ struct CanvasPresentation: Codable, Equatable, Sendable {
     /// Screen corner radius as a fraction of the fitted screen's shorter edge.
     var cornerRadius: Double = 0
     var background: CanvasColor = .black
+    /// Whole-recording crop, in normalized oriented main-source coordinates.
+    var sourceCrop: EditorRegionRect? = nil
+    var outputResolution: CanvasResolution? = nil
+
+    func viewport(in source: CGSize, zoom: ZoomPlacement = ZoomPlacement()) -> CGRect {
+        let base = CropGeometry.pixels(sourceCrop ?? CropGeometry.full, in: source)
+        return zoom.viewport(in: base.size).offsetBy(dx: base.minX, dy: base.minY)
+    }
 }
 
 /// The common top-left coordinate mapping for rendering and native gestures.
-/// The recording always fits in full; aspect changes never crop or stretch it.
+/// The selected source crop fits in full; aspect choices never stretch it.
 struct PresentationGeometry: Equatable, Sendable {
     let outputSize: CGSize
     let contentRect: CGRect
     let cornerRadius: CGFloat
 
     init(sourceSize: CGSize, presentation: CanvasPresentation) {
-        let source = CGSize(width: sourceSize.width.isFinite && sourceSize.width > 0 ? sourceSize.width : 16,
+        let original = CGSize(width: sourceSize.width.isFinite && sourceSize.width > 0 ? sourceSize.width : 16,
                             height: sourceSize.height.isFinite && sourceSize.height > 0 ? sourceSize.height : 9)
+        let source = CropGeometry.pixels(presentation.sourceCrop ?? CropGeometry.full, in: original).size
         func even(_ value: CGFloat) -> CGFloat { max(2, (value / 2).rounded() * 2) }
         let edge = max(source.width, source.height)
-        switch presentation.aspect {
-        case .source: outputSize = CGSize(width: even(source.width), height: even(source.height))
-        case .wide: outputSize = CGSize(width: even(edge), height: even(edge * 9 / 16))
-        case .portrait: outputSize = CGSize(width: even(edge * 9 / 16), height: even(edge))
-        case .square: outputSize = CGSize(width: even(edge), height: even(edge))
+        if let resolution = presentation.outputResolution {
+            let short = Double(min(resolution.width, resolution.height))
+            switch presentation.aspect {
+            case .source: outputSize = resolution.size
+            case .wide: outputSize = CanvasResolution.matching(aspect: 16.0 / 9, shortEdge: short).size
+            case .portrait: outputSize = CanvasResolution.matching(aspect: 9.0 / 16, shortEdge: short).size
+            case .square: outputSize = CanvasResolution.matching(aspect: 1, shortEdge: short).size
+            }
+        } else {
+            switch presentation.aspect {
+            case .source: outputSize = CGSize(width: even(source.width), height: even(source.height))
+            case .wide: outputSize = CGSize(width: even(edge), height: even(edge * 9 / 16))
+            case .portrait: outputSize = CGSize(width: even(edge * 9 / 16), height: even(edge))
+            case .square: outputSize = CGSize(width: even(edge), height: even(edge))
+            }
         }
         let padding = presentation.padding.isFinite ? min(0.2, max(0, presentation.padding)) : 0
         let inset = min(outputSize.width, outputSize.height) * padding
@@ -1686,6 +1740,7 @@ struct EditState: Codable, Equatable, Sendable {
                                 crop: PIPCrop(x: blend(previous.placement.crop.x, point.placement.crop.x),
                                               y: blend(previous.placement.crop.y, point.placement.crop.y)),
                                 sourceZoom: blend(previous.placement.sourceZoom, point.placement.sourceZoom),
+                                sourceCrop: CropGeometry.interpolate(previous.placement.sourceCrop, point.placement.sourceCrop, progress: progress),
                                 fullscreen: previous.placement.fullscreen == nil && point.placement.fullscreen == nil ? nil :
                                     blend(previous.placement.fullscreen ?? 0, point.placement.fullscreen ?? 0),
                                 opacity: blend(previous.placement.opacity, point.placement.opacity))
@@ -2347,6 +2402,8 @@ struct RecordingProject: Codable, Equatable, Sendable {
         for region in state.regions { try region.validate(duration: duration) }
         let regionIDs = Set(state.regions.map(\.id))
         let presentation = state.presentation
+        guard presentation.outputResolution.map(\.isValid) ?? true else { throw ProjectError.invalid("Output dimensions must be even numbers from 2 to 8192 pixels.") }
+        guard presentation.sourceCrop.map(\.isValid) ?? true else { throw ProjectError.invalid("The main crop must be a nonempty rectangle inside the source.") }
         guard presentation.padding.isFinite, (0...0.2).contains(presentation.padding),
               presentation.cornerRadius.isFinite, (0...0.2).contains(presentation.cornerRadius),
               [presentation.background.red, presentation.background.green, presentation.background.blue]
@@ -2376,7 +2433,9 @@ struct RecordingProject: Codable, Equatable, Sendable {
                   placement.x.isFinite, (0...1).contains(placement.x),
                   placement.y.isFinite, (0...1).contains(placement.y),
                   placement.scale.isFinite, (0.12...0.5).contains(placement.scale),
-                  placement.aspectRatio.isFinite, (0.2...5).contains(placement.aspectRatio),
+                  placement.aspectRatio.isFinite, placement.aspectRatio > 0,
+                  (placement.sourceCrop != nil || (0.2...5).contains(placement.aspectRatio)),
+                  placement.sourceCrop.map(\.isValid) ?? true,
                   placement.crop.x.isFinite, (0...1).contains(placement.crop.x),
                   placement.crop.y.isFinite, (0...1).contains(placement.crop.y),
                   placement.sourceZoom.isFinite, (1...3).contains(placement.sourceZoom),
@@ -3025,5 +3084,110 @@ final class ProjectEditor: ObservableObject {
             if (try? FileManager.default.attributesOfItem(atPath: url.path)) != nil { throw ProjectCreationError.destinationExists }
             throw error
         }
+    }
+}
+
+/// Shared source-space geometry for drawing and applying video crops.
+enum CropGeometry {
+    static let full = EditorRegionRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// Crop editing uses whole source pixels. Keep normalized storage, but snap
+    /// both the size and position before displaying or applying an authored crop.
+    static func pixelAligned(_ rect: EditorRegionRect, in size: CGSize) -> EditorRegionRect {
+        guard rect.isValid, size.width.isFinite, size.height.isFinite,
+              size.width >= 2, size.height >= 2 else { return full }
+        let r = pixels(rect, in: size)
+        let width = min(size.width.rounded(.down), max(2, r.width.rounded()))
+        let height = min(size.height.rounded(.down), max(2, r.height.rounded()))
+        return normalized(CGRect(x: min(size.width.rounded(.down) - width, max(0, r.minX.rounded())),
+                                 y: min(size.height.rounded(.down) - height, max(0, r.minY.rounded())),
+                                 width: width, height: height), in: size)
+    }
+
+    static func pixels(_ rect: EditorRegionRect, in size: CGSize) -> CGRect {
+        CGRect(x: rect.x * size.width, y: rect.y * size.height,
+               width: rect.width * size.width, height: rect.height * size.height)
+    }
+
+    static func normalized(_ rect: CGRect, in size: CGSize) -> EditorRegionRect {
+        guard size.width > 0, size.height > 0 else { return full }
+        let r = rect.standardized.intersection(CGRect(origin: .zero, size: size))
+        guard !r.isNull, r.width > 0, r.height > 0 else { return full }
+        let x = max(0, min(1, r.minX / size.width)), y = max(0, min(1, r.minY / size.height))
+        return EditorRegionRect(x: x, y: y, width: min(1 - x, r.width / size.width),
+                                height: min(1 - y, r.height / size.height))
+    }
+
+    static func fitted(_ rect: EditorRegionRect, ratio: Double?, source: CGSize) -> EditorRegionRect {
+        guard let ratio, ratio.isFinite, ratio > 0 else { return rect }
+        let r = pixels(rect, in: source)
+        let w = min(r.width, r.height * ratio), h = min(r.height, r.width / ratio)
+        return normalized(CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h), in: source)
+    }
+
+    /// The second point is clamped to the source before locking the aspect.
+    static func drawn(from start: CGPoint, to end: CGPoint, source: CGSize, ratio: Double?) -> EditorRegionRect? {
+        guard source.width > 0, source.height > 0 else { return nil }
+        let a = CGPoint(x: min(source.width, max(0, start.x)), y: min(source.height, max(0, start.y)))
+        let b = CGPoint(x: min(source.width, max(0, end.x)), y: min(source.height, max(0, end.y)))
+        var w = abs(b.x - a.x), h = abs(b.y - a.y)
+        if let ratio, ratio.isFinite, ratio > 0 {
+            let maxW = b.x >= a.x ? source.width - a.x : a.x
+            let maxH = b.y >= a.y ? source.height - a.y : a.y
+            w = min(max(w, h * ratio), maxW, maxH * ratio); h = w / ratio
+        }
+        guard w >= 2, h >= 2 else { return nil }
+        return normalized(CGRect(x: b.x >= a.x ? a.x : a.x - w,
+                                 y: b.y >= a.y ? a.y : a.y - h, width: w, height: h), in: source)
+    }
+
+    /// Handles run clockwise from the top-left; odd handles are edge centers.
+    static func resized(_ rect: EditorRegionRect, handle: Int, to point: CGPoint, source: CGSize, ratio: Double?) -> EditorRegionRect? {
+        let r = pixels(rect, in: source)
+        if handle % 2 == 0 {
+            let opposite = CGPoint(x: handle == 0 || handle == 6 ? r.maxX : r.minX,
+                                   y: handle == 0 || handle == 2 ? r.maxY : r.minY)
+            return drawn(from: opposite, to: point, source: source, ratio: ratio)
+        }
+        var target = r
+        if handle == 1 || handle == 5 {
+            let anchor = handle == 1 ? r.maxY : r.minY
+            var h = min(source.height, max(0, point.y)) - anchor
+            let sign = h < 0 ? -1.0 : 1.0
+            h = abs(h)
+            if let ratio, ratio.isFinite, ratio > 0 {
+                h = min(h, 2 * min(r.midX, source.width - r.midX) / ratio)
+                target.size.width = h * ratio; target.origin.x = r.midX - target.width / 2
+            }
+            target.origin.y = sign < 0 ? anchor - h : anchor; target.size.height = h
+        } else {
+            let anchor = handle == 7 ? r.maxX : r.minX
+            var w = min(source.width, max(0, point.x)) - anchor
+            let sign = w < 0 ? -1.0 : 1.0
+            w = abs(w)
+            if let ratio, ratio.isFinite, ratio > 0 {
+                w = min(w, 2 * min(r.midY, source.height - r.midY) * ratio)
+                target.size.height = w / ratio; target.origin.y = r.midY - target.height / 2
+            }
+            target.origin.x = sign < 0 ? anchor - w : anchor; target.size.width = w
+        }
+        guard target.width >= 2, target.height >= 2 else { return nil }
+        return normalized(target, in: source)
+    }
+
+    static func moved(_ rect: EditorRegionRect, by delta: CGSize) -> EditorRegionRect {
+        var r = rect
+        r.x = min(1 - r.width, max(0, r.x + delta.width))
+        r.y = min(1 - r.height, max(0, r.y + delta.height))
+        return r
+    }
+
+    static func interpolate(_ a: EditorRegionRect?, _ b: EditorRegionRect?, progress: Double) -> EditorRegionRect? {
+        guard a != nil || b != nil else { return nil }
+        let first = a ?? full, last = b ?? full
+        func blend(_ x: Double, _ y: Double) -> Double { x + (y - x) * progress }
+        let x = blend(first.x, last.x), y = blend(first.y, last.y)
+        return EditorRegionRect(x: x, y: y, width: min(1 - x, blend(first.width, last.width)),
+                                height: min(1 - y, blend(first.height, last.height)))
     }
 }

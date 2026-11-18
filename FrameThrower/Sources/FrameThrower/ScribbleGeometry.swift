@@ -5,17 +5,18 @@ import Foundation
 struct ScribbleGeometry {
     var contentRect: CGRect
     var zoom: ZoomPlacement
+    var presentation = CanvasPresentation()
 
     func sourcePoint(_ point: CGPoint) -> CGPoint? {
         guard contentRect.width > 0, contentRect.height > 0, contentRect.contains(point) else { return nil }
-        let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+        let viewport = presentation.viewport(in: CGSize(width: 1, height: 1), zoom: zoom)
         return CGPoint(x: viewport.minX + (point.x - contentRect.minX) / contentRect.width * viewport.width,
                        y: viewport.minY + (point.y - contentRect.minY) / contentRect.height * viewport.height)
     }
 
     func region(from start: CGPoint, to end: CGPoint) -> EditorRegionRect? {
         guard let a = sourcePoint(start), end.x.isFinite, end.y.isFinite else { return nil }
-        let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+        let viewport = presentation.viewport(in: CGSize(width: 1, height: 1), zoom: zoom)
         let dx = (end.x - start.x) / contentRect.width * viewport.width
         let dy = (end.y - start.y) / contentRect.height * viewport.height
         guard dx.isFinite, dy.isFinite else { return nil }
@@ -43,7 +44,7 @@ struct ScribbleGeometry {
     }
 
     func viewRect(_ region: EditorRegionRect) -> CGRect {
-        let viewport = zoom.viewport(in: CGSize(width: 1, height: 1))
+        let viewport = presentation.viewport(in: CGSize(width: 1, height: 1), zoom: zoom)
         return CGRect(x: contentRect.minX + (region.x - viewport.minX) / viewport.width * contentRect.width,
                       y: contentRect.minY + (region.y - viewport.minY) / viewport.height * contentRect.height,
                       width: region.width / viewport.width * contentRect.width,

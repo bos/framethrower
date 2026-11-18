@@ -53,7 +53,7 @@ final class EditorTestPattern {
         let geometry = PresentationGeometry(sourceSize: sourceSize, presentation: presentation)
         let output = geometry.outputRect(in: bounds)
         screenFrame = geometry.contentRect(in: bounds)
-        screenViewport = zoom.viewport(in: sourceSize)
+        screenViewport = presentation.viewport(in: sourceSize, zoom: zoom)
         layer.backgroundColor = NSColor(calibratedRed: presentation.background.red,
             green: presentation.background.green, blue: presentation.background.blue, alpha: 1).cgColor
         layer.frame = output

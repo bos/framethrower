@@ -89,11 +89,12 @@ struct EditorPreviewRegionMarker: NSViewRepresentable {
 }
 
 enum EditorWorkspaceAllocation {
-    static func timeline(height: CGFloat, content: CGFloat, initialHeight: CGFloat, initialTimeline: CGFloat,
-                         fraction: CGFloat?, dragHeight: CGFloat?) -> CGFloat {
+    static func timeline(height: CGFloat, content: CGFloat, fraction: CGFloat?, dragHeight: CGFloat?) -> CGFloat {
         let upper = max(100, height - 186)
         if let dragHeight { return min(upper, max(100, dragHeight)) }
         if let fraction { return min(upper, max(100, height * fraction)) }
-        return min(upper, max(100, min(content, initialTimeline + max(0, height - initialHeight))))
+        // Fit the actual tracks on every layout, including the first layout of
+        // an already-large window. Only an explicit divider drag overrides this.
+        return min(upper, max(100, content))
     }
 }

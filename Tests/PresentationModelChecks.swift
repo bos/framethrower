@@ -7,6 +7,7 @@ struct PresentationModelChecks {
     enum Failure: Error { case failed(String) }
 
     static func main() throws {
+        try checkCrops()
         let source = CGSize(width: 1920, height: 1080)
         let identity = PresentationGeometry(sourceSize: source, presentation: CanvasPresentation())
         try require(identity.outputSize == source && identity.contentRect == CGRect(origin: .zero, size: source),
@@ -90,6 +91,81 @@ struct PresentationModelChecks {
                     Data(contentsOf: directory.appendingPathComponent("screen.mov")) == original,
                     "saved presentation survives reopening and never rewrites original media")
         print("Presentation model checks passed (legacy identity, source fit, output aspects, preview/PIP mapping, persistence, and validation).")
+    }
+
+    private static func checkCrops() throws {
+        let size = CGSize(width: 1920, height: 1080)
+        for ratio in [nil, 9.0 / 16, 16.0 / 9, 1, 23.0 / 10] as [Double?] {
+            for end in [CGPoint(x: 1800, y: 1000), CGPoint(x: 0, y: 0), CGPoint(x: 0, y: 1080), CGPoint(x: 1920, y: 0)] {
+                guard let crop = CropGeometry.drawn(from: CGPoint(x: 800, y: 500), to: end, source: size, ratio: ratio) else { throw Failure.failed("draw crop") }
+                try require(crop.isValid, "drawing in every direction remains inside the source")
+                let pixels = CropGeometry.pixels(crop, in: size)
+                if let ratio { try near(pixels.width / pixels.height, ratio, "drawing locks the pixel aspect, including arbitrary ratios") }
+            }
+        }
+        let crop = CropGeometry.normalized(CGRect(x: 200, y: 40, width: 540, height: 960), in: size)
+        let presentation = CanvasPresentation(sourceCrop: crop)
+        let output = PresentationGeometry(sourceSize: size, presentation: presentation)
+        try require(output.outputSize == CGSize(width: 540, height: 960), "the selected rectangle becomes the native output frame")
+        try require(output.contentRect == CGRect(origin: .zero, size: output.outputSize), "the crop fills its output without letterboxing")
+        try require(presentation.viewport(in: size) == CropGeometry.pixels(crop, in: size), "full-frame crop uses the original source coordinates")
+        let zoom = presentation.viewport(in: size, zoom: ZoomPlacement(scale: 2, x: 0.25, y: 0.75))
+        try near(zoom.minX, 200, "zoom remains inside the main crop")
+        try near(zoom.maxY, 1000, "zoom reaches the crop bottom")
+        let resolutionCases: [(Double, CGSize)] = [(9.0 / 16, CGSize(width: 1080, height: 1920)), (16.0 / 9, CGSize(width: 1920, height: 1080)),
+                                   (1, CGSize(width: 1080, height: 1080)), (4.0 / 5, CGSize(width: 1080, height: 1350)),
+                                   (4.0 / 3, CGSize(width: 1440, height: 1080)), (3.0 / 2, CGSize(width: 1620, height: 1080))]
+        for (aspect, expected) in resolutionCases {
+            try require(CanvasResolution.matching(aspect: aspect, shortEdge: 1080).size == expected, "1080p defaults follow the selected aspect")
+        }
+        try require(CanvasResolution.matching(aspect: 9.0 / 16, shortEdge: 720).size == CGSize(width: 720, height: 1280), "portrait 720p default")
+        var sized = presentation; sized.outputResolution = CanvasResolution(width: 1080, height: 1920)
+        try require(PresentationGeometry(sourceSize: size, presentation: sized).outputSize == CGSize(width: 1080, height: 1920), "output resolution scales independently of the source crop")
+        sized.aspect = .square
+        try require(PresentationGeometry(sourceSize: size, presentation: sized).outputSize == CGSize(width: 1080, height: 1080), "canvas shape changes retain the selected resolution level")
+        let moved = CropGeometry.moved(crop, by: CGSize(width: 10, height: -10))
+        try require(moved.isValid && moved.y == 0 && moved.x == 1 - crop.width, "crop movement clamps without changing size")
+        let square = CropGeometry.normalized(CGRect(x: 400, y: 300, width: 200, height: 200), in: size)
+        for handle in 0..<8 {
+            let target = CGPoint(x: [420.0, 500, 580, 580, 580, 500, 420, 420][handle],
+                                 y: [320.0, 320, 320, 400, 480, 480, 480, 400][handle])
+            guard let resized = CropGeometry.resized(square, handle: handle, to: target, source: size, ratio: 1) else { throw Failure.failed("resize crop") }
+            let pixels = CropGeometry.pixels(resized, in: size)
+            try near(pixels.width / pixels.height, 1, "all eight handles preserve a locked aspect")
+            try require(pixels.width < 200, "each handle can shrink a locked rectangle")
+        }
+        var project = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 3)
+        project.state.presentation = presentation
+        project.state.presentation.outputResolution = CanvasResolution(width: 1080, height: 1920)
+        let cameraCrop = EditorRegionRect(x: 0.1, y: 0.2, width: 0.8, height: 0.1)
+        let camera = PIPPlacement(shape: .rectangle, aspectRatio: 128.0 / 9, sourceCrop: cameraCrop)
+        project.state.pipKeyframes[0].placement = camera
+        try project.validate()
+        try require(camera.sourceViewport(in: size, canvas: size) == CropGeometry.pixels(cameraCrop, in: size), "camera uses the exact arbitrary source rectangle")
+        let cameraFrame = camera.frame(in: size, cameraAspect: 16.0 / 9)
+        try near(cameraFrame.width / cameraFrame.height, 128.0 / 9, "camera crop ratios are not limited by legacy shape bounds")
+        let encoded = try JSONEncoder().encode(project)
+        try require(try JSONDecoder().decode(RecordingProject.self, from: encoded) == project, "main and camera rectangles round-trip")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("crop-history-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let initial = RecordingProject(screenFilename: "screen.mov", cameraFilename: "camera.mov", duration: 3)
+        let editor = ProjectEditor(project: initial, url: directory.appendingPathComponent("Crop.framethrower"))
+        try require(editor.save() && editor.commit(project.state, name: "Crop video"), "crop metadata saves")
+        try require(editor.project.undoHistory.count == 1, "one applied crop makes one Undo step")
+        try require(editor.undo() && editor.project.state == initial.state, "Undo restores full-frame main and camera")
+        try require(editor.redo() && editor.project.state == project.state, "Redo restores both exact crop rectangles")
+        try require(try ProjectEditor.open(url: editor.url).project.state == project.state, "crops survive reopening")
+        for resolution in [CanvasResolution(width: 1, height: 1080), .init(width: 1081, height: 1920), .init(width: 8194, height: 2)] {
+            var invalid = project; invalid.state.presentation.outputResolution = resolution
+            do { try invalid.validate(); throw Failure.failed("invalid output resolution accepted") } catch is ProjectError { }
+        }
+        for bad in [EditorRegionRect(x: -0.1, y: 0, width: 1, height: 1), .init(x: 0.5, y: 0, width: 1, height: 1), .init(x: 0, y: 0, width: 0, height: 1)] {
+            var invalid = project; invalid.state.presentation.sourceCrop = bad
+            do { try invalid.validate(); throw Failure.failed("invalid main crop accepted") } catch is ProjectError { }
+            invalid = project; invalid.state.pipKeyframes[0].placement.sourceCrop = bad
+            do { try invalid.validate(); throw Failure.failed("invalid camera crop accepted") } catch is ProjectError { }
+        }
     }
 
     private static func near(_ actual: Double, _ expected: Double, _ message: String) throws {

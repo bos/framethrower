@@ -78,6 +78,70 @@ struct PresentationRendererChecks {
         let differences = zip(try rgba(preview), try rgba(exported)).map { abs(Int($0) - Int($1)) }
         let average = Double(differences.reduce(0, +)) / Double(differences.count)
         try require(average < 6, "compressed export matches preview framing, background, corners, and PIP (mean pixel difference \(average))")
+        // Portrait and arbitrary output crops use raw source pixels in every renderer.
+        for rect in [CGRect(x: 40, y: 10, width: 90, height: 160), CGRect(x: 20, y: 20, width: 200, height: 70)] {
+            var cropped = project
+            cropped.state.presentation = CanvasPresentation(sourceCrop: CropGeometry.normalized(rect, in: base.sourceSize))
+            cropped.state.pipKeyframes[0].placement.visible = false
+            if rect.height > 100 { cropped.state.presentation.outputResolution = CanvasResolution(width: 180, height: 320) }
+            let expected = PresentationGeometry(sourceSize: base.sourceSize, presentation: cropped.state.presentation).outputSize
+            let liveCrop = try await ProjectRenderer.renderLivePreview(sources, applying: cropped.state, maximumSize: CGSize(width: 1000, height: 1000))
+            try require(liveCrop.width == Int(expected.width) && liveCrop.height == Int(expected.height), "crop chooses native output dimensions")
+            let saved = try await ProjectRenderer.makePreview(project: cropped, directory: directory)
+            let cropConsumer = Consumer(saved)
+            let savedCrop = try await cropConsumer.image(at: 0.5); cropConsumer.close()
+            try require(try maximumDifference(liveCrop, savedCrop) <= 2, "live and saved main crops match")
+            try pixel(liveCrop, x: 10, y: 10, equals: [255, 0, 0], context: "crop starts inside the original top-left quadrant")
+            if rect.height > 100 { try pixel(liveCrop, x: 10, y: liveCrop.height - 10, equals: [0, 0, 255], context: "portrait crop retains source orientation") }
+            let cropURL = directory.appendingPathComponent("crop-\(Int(rect.width)).mp4")
+            try await ProjectRenderer.export(project: cropped, directory: directory, to: cropURL)
+            let cropAsset = AVURLAsset(url: cropURL)
+            let cropTrack = try await cropAsset.loadTracks(withMediaType: .video).first!
+            let cropSize = try await cropTrack.load(.naturalSize)
+            try require(cropSize == expected, "crop export uses the selected frame size")
+            let cropGenerator = AVAssetImageGenerator(asset: cropAsset); defer { cropGenerator.cancelAllCGImageGeneration() }
+            let exportedCrop = try await cropGenerator.image(at: CMTime(seconds: 0.5, preferredTimescale: 600)).image
+            try pixel(exportedCrop, x: 10, y: 10, equals: [255, 0, 0], context: "export keeps the selected source area")
+        }
+        // The shared crop rectangle also drives camera and imported-video rendering.
+        let greenCrop = EditorRegionRect(x: 0.55, y: 0.1, width: 0.4, height: 0.3)
+        try FileManager.default.copyItem(at: screen, to: directory.appendingPathComponent("patterned-camera.mov"))
+        var pipProject = RecordingProject(screenFilename: "screen.mov", cameraFilename: "patterned-camera.mov", duration: 2)
+        pipProject.state.pipKeyframes[0].placement = PIPPlacement(x: 0, y: 1, scale: 0.5, shape: .rectangle,
+            aspectRatio: greenCrop.width / greenCrop.height * 16 / 9, sourceCrop: greenCrop)
+        let pipRender = try await ProjectRenderer.makePreview(project: pipProject, directory: directory)
+        let pipConsumer = Consumer(pipRender)
+        let pipImage = try await pipConsumer.image(at: 0.5); pipConsumer.close()
+        let pipFrame = pipProject.state.placement(at: 0.5).frame(in: pipRender.screenSize, cameraAspect: 16.0 / 9)
+        try pixel(pipImage, x: Int(pipFrame.midX), y: Int(pipFrame.midY), equals: [0, 255, 0], context: "PIP draws the selected source rectangle")
+        let footage = VideoSource(name: "Imported", kind: .file, relativePath: "screen.mov", duration: 2,
+            pixelWidth: 320, pixelHeight: 180, hasAudio: false)
+        var multi = RecordingProject(screenFilename: "screen.mov", duration: 2)
+        multi.videoAssets = [footage]
+        multi.state.presentation.sourceCrop = CropGeometry.normalized(CGRect(x: 40, y: 10, width: 90, height: 160), in: base.sourceSize)
+        let extra = VideoClip(sourceID: footage.id, start: 0, end: 2,
+            geometry: VideoGeometry(rect: .init(x: 0, y: 0, width: 0.5, height: 0.5), crop: greenCrop))
+        multi.state.videoLayers = multi.effectiveVideoLayers() + [VideoLayer(name: "Imported crop", clips: [extra])]
+        let multiRender = try await ProjectRenderer.makePreview(project: multi, directory: directory)
+        let multiConsumer = Consumer(multiRender)
+        let multiImage = try await multiConsumer.image(at: 0.5)
+        multiConsumer.close()
+        var uncroppedMulti = multi
+        uncroppedMulti.state.presentation.sourceCrop = nil
+        let multiBase = try await ProjectRenderer.makePreview(project: uncroppedMulti, directory: directory)
+        let multiDraft = ProjectRenderer.preview(multiBase, applying: multi.state)
+        try require(multiDraft.asset === multiBase.asset, "multi-video crop draft reuses its source media")
+        let draftConsumer = Consumer(multiDraft)
+        let draftImage = try await draftConsumer.image(at: 0.5); draftConsumer.close()
+        try require(try maximumDifference(multiImage, draftImage) <= 2, "multi-video draft and saved crop compositions match")
+        try pixel(multiImage, x: 22, y: 40, equals: [0, 255, 0], context: "imported clip uses its independent crop")
+        try pixel(multiImage, x: 70, y: 145, equals: [0, 0, 255], context: "multi-video main layer retains the portrait output crop")
+        var placedMain = multi
+        placedMain.state.videoLayers![0].clips[0].layout = .custom
+        let placedRender = try await ProjectRenderer.makePreview(project: placedMain, directory: directory)
+        let placedConsumer = Consumer(placedRender)
+        let placedImage = try await placedConsumer.image(at: 0.5); placedConsumer.close()
+        try require(try maximumDifference(placedImage, multiImage) <= 2, "the main crop remains effective after switching its clip to a custom placement")
         try require(try Data(contentsOf: screen) == screenBytes && Data(contentsOf: camera) == cameraBytes,
                     "presentation edits and export preserve original video bytes")
         print("Presentation renderer checks passed (source fit, rounded corners, background, PIP output coordinates, source zoom/pan, live/saved/export parity, native resolution, and original preservation).")

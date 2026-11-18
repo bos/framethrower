@@ -66,7 +66,7 @@ struct EditorWorkspaceInteractionChecks {
         let playback = EditorPlayback()
         let host = NSHostingView(rootView: ProjectEditorView(editor: editor, directorModeInitiallyEnabled: director,
             playback: playback, assistant: EditorAssistantSession(transport: { _ in throw CancellationError() }, persistsConversation: false)))
-        let window = NSWindow(contentRect: CGRect(x: -20000, y: -20000, width: 1100, height: 540),
+        let window = NSWindow(contentRect: CGRect(x: -20000, y: -20000, width: 1100, height: 900),
             styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false; window.alphaValue = 0; window.contentView = host; window.orderBack(nil)
         defer { playback.close(); window.close() }
@@ -79,12 +79,23 @@ struct EditorWorkspaceInteractionChecks {
         guard let canvas = all(EditorCanvasView.self, in: host).first,
               let timeline = all(RecordingTimelineView.self, in: host).first,
               let divider = all(EditorTimelineDivider.DividerView.self, in: host).first else { throw Failure.failed("Production workspace views missing") }
+        try await settle(host)
+        try require(timeline.enclosingScrollView!.contentView.bounds.height >= timeline.bounds.height - 2,
+            "Opening an already-roomy window still clips tracks")
+        try require(timeline.showsTrimHandles && timeline.sourceTrimDuration == project.duration,
+            "Output timeline must expose full-source trim handles")
+        try require(timeline.enclosingScrollView!.contentView.bounds.minY <= 1,
+            "Installing the ruler scrolled the playhead and trim handles out of view")
+        window.setContentSize(CGSize(width: 1100, height: 540)); try await settle(host)
         guard let ruler = timeline.pinnedTimeRuler, let trackScroll = timeline.enclosingScrollView else {
             throw Failure.failed("Numeric timeline ruler missing")
         }
         try require(trackScroll.hasHorizontalRuler && trackScroll.rulersVisible && !ruler.isHiddenOrHasHiddenAncestor,
             "Numeric ruler is not visible in a compact populated timeline")
         let rulerFrame = ruler.convert(ruler.bounds, to: host)
+        let trimHandle = timeline.convert(CGRect(x: timeline.trimX(for: project.state.trimStart) - 5,
+            y: 14, width: 10, height: 20), to: host)
+        try require(!rulerFrame.intersects(trimHandle), "Pinned ruler covers part of a trim handle: \(rulerFrame), \(trimHandle)")
         try require(host.bounds.insetBy(dx: -1, dy: -1).contains(rulerFrame) && rulerFrame.height >= 18,
             "Pinned time ruler is clipped")
         let visibleTicks = timeline.timeRulerTicks().filter { tick in
@@ -237,6 +248,21 @@ struct EditorWorkspaceInteractionChecks {
             "Explicit microphone re-selection no longer reveals its timed controls")
         try require(editor.project == original && playback.outputTime == playhead && !playback.isInspectingSource,
             "Workspace resizing changed edits, history or the project playhead")
+        for (edge, from, to) in [("start", 0.0, 1.0), ("end", 12.0, 11.0)] {
+            let beforeTrim = editor.project
+            let start = timeline.convert(CGPoint(x: timeline.trimX(for: from), y: 24), to: nil)
+            let end = timeline.convert(CGPoint(x: timeline.trimX(for: to), y: 24), to: nil)
+            timeline.mouseDown(with: try event(.leftMouseDown, point: start, window: window))
+            timeline.mouseDragged(with: try event(.leftMouseDragged, point: end, window: window)); try await settle(host)
+            try require(editor.project == beforeTrim, "Source trim saved before release")
+            timeline.mouseUp(with: try event(.leftMouseUp, point: end, window: window)); try await settle(host)
+            try require(abs((edge == "start" ? editor.project.state.trimStart : editor.project.state.trimEnd) - to) < 0.000001
+                && editor.project.undoHistory.count == original.undoHistory.count + 1 && !playback.isInspectingSource,
+                "Output timeline \(edge) trim did not save one source-timed operation")
+            try require(editor.undo(), "Undo source trim"); try await settle(host)
+            try require(editor.project.state == original.state && timeline.sourceTrimDuration == project.duration,
+                "Undo did not recover the source trim and its full range")
+        }
         try require(!playback.hasMediaPlayer && !canvas.hasMediaPlayerLayer, "Vector resize opened media")
     }
     static func checkCanvasGeometry() throws {

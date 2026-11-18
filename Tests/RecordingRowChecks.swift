@@ -34,6 +34,12 @@ struct RecordingRowChecks {
         let editor = ProjectEditor(project: RecordingProject(screenFilename: "screen.mp4", duration: 5, title: "My recording"),
             url: directory.appendingPathComponent("recording.framethrower"))
         try require(editor.save(), "save fixture")
+        if CommandLine.arguments.contains("--export-only") {
+            try await checkVideoActions(directory: directory, first: editor)
+            try await checkExportDestination(directory: directory, editor: editor)
+            print("Video action checks passed: native Export destination, custom aspect-locked sizes, MP4/MOV selection, source-aware labels, row routing, cancellation and sharing.")
+            return
+        }
         let entry = RecordingLibraryEntry(projectURL: editor.url, sourceURL: source,
             displayName: editor.displayName, duration: 5, fileSize: Int64(sourceBytes.count), createdAt: Date())
         var removed = 0
@@ -133,6 +139,7 @@ struct RecordingRowChecks {
                     "removal releases thumbnail focus before its row disappears")
         try await checkThumbnailCache(directory: directory)
         try await checkVideoActions(directory: directory, first: editor)
+        try await checkExportDestination(directory: directory, editor: editor)
         print("Recording row checks passed (first-click remove/open, keyboard opening, rename protection, bounded thumbnails, per-recording Save/Share/Upload, export cancellation, and once-only sharing after progress dismissal).")
     }
 
@@ -179,7 +186,7 @@ struct RecordingRowChecks {
               let secondMenu = buttons.first(where: { $0.accessibilityLabel() == "Share Second recording" }) else {
             throw RowCheckError.failed("native recording video action menus")
         }
-        try require(firstMenu.acceptsFirstMouse(for: nil) && firstMenu.menu?.items.map(\.title) == ["Share", "Save Video…", "Share Video…", "", "Upload…"],
+        try require(firstMenu.acceptsFirstMouse(for: nil) && firstMenu.menu?.items.map(\.title) == ["Share", "Export…", "Share Video…", "", "Upload…"],
                     "each row uses the standard share menu with distinct Save, system Share, and optional Upload actions")
         firstMenu.menu?.performActionForItem(at: 1)
         try require(session.isBusy && selectedURL == first.url && session.currentProjectURL == first.url,
@@ -227,6 +234,57 @@ struct RecordingRowChecks {
         handshake.progressDidDismiss()
         try require(!handshake.isBusy && fastRequest != nil && handshake.shareRequest == fastRequest,
                     "instant preparation follows the same once-only dismissal handshake")
+    }
+
+    private static func checkExportDestination(directory: URL, editor: ProjectEditor) async throws {
+        let source = directory.appendingPathComponent("export-source.mp4")
+        try await EditorMovieFixtures.make(at: source, width: 320, height: 180, duration: 1, camera: false)
+        let exportEditor = ProjectEditor(project: RecordingProject(screenFilename: source.lastPathComponent,
+            duration: 1, title: editor.displayName), url: directory.appendingPathComponent("export.framethrower"))
+        try require(exportEditor.save(), "Save export chooser fixture")
+        let suite = "framethrower-export-destination-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("/", forKey: "export.directory")
+        var renders = 0
+        let session = VideoExportSession(defaults: defaults, requiresProgressPresentation: false,
+            renderer: { _, _, _, _, _, _ in renders += 1 })
+        let window = NSWindow(contentRect: CGRect(x: -20000, y: -20000, width: 400, height: 300),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.alphaValue = 0; window.orderBack(nil)
+        session.window = window
+        defer { session.cancel(); window.close() }
+        session.begin(editor: exportEditor, sharing: false)
+        try await waitUntil("native Export chooser opens") { window.attachedSheet is NSSavePanel }
+        guard let panel = window.attachedSheet as? NSSavePanel, let folder = panel.directoryURL else {
+            throw RowCheckError.failed("native Export destination")
+        }
+        try require(panel.title == "Export" && panel.prompt == "Export" && folder.path != "/"
+            && FileManager.default.isWritableFile(atPath: folder.path),
+            "Export must reject a remembered read-only root and start in a writable folder")
+        let options = VideoExportOptions(panel: panel, canvas: CGSize(width: 320, height: 180), preset: .fullResolution, format: .mp4)
+        try require(options.sizePicker.itemTitles.first == "Original · 320 × 180", "Original dimensions come from the source")
+        options.widthField.stringValue = "1000"
+        options.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: options.widthField))
+        try require(options.customSize == CGSize(width: 1000, height: 562), "Custom width maintains aspect ratio in even pixels")
+        options.heightField.stringValue = "720"
+        options.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: options.heightField))
+        try require(options.customSize == CGSize(width: 1280, height: 720), "Custom height maintains aspect ratio")
+        options.formatPicker.selectItem(at: 1)
+        _ = options.formatPicker.sendAction(options.formatPicker.action, to: options.formatPicker.target)
+        try require(panel.allowedContentTypes == [.quickTimeMovie] && panel.nameFieldStringValue.hasSuffix(".mov"),
+            "MOV format selection updates allowed type and filename")
+        panel.cancel(nil)
+        try await waitUntil("Export chooser cancels") { !session.isBusy }
+        defaults.set(directory.path, forKey: "export.directory")
+        session.begin(editor: exportEditor, sharing: false)
+        try await waitUntil("Export chooser reopens") { window.attachedSheet is NSSavePanel }
+        guard let repeated = window.attachedSheet as? NSSavePanel else { throw RowCheckError.failed("reopened Export chooser") }
+        try require(repeated.directoryURL?.resolvingSymlinksInPath() == directory.resolvingSymlinksInPath(),
+            "Export reopens in the last explicitly selected writable folder")
+        repeated.cancel(nil)
+        try await waitUntil("Export chooser cancels") { !session.isBusy }
+        try require(renders == 0, "Inspecting and cancelling export settings never renders")
     }
 
     private static func waitUntil(_ context: String, condition: () -> Bool) async throws {

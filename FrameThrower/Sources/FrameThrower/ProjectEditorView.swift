@@ -66,18 +66,13 @@ struct ProjectEditorView: View {
     @State private var transition: PIPTransition = .jump
     @State private var transitionDuration = 0.6
     @State private var dragTime = 0.0
-    @State private var isFramingPresented = false
-    @State private var framingTime = 0.0
-    @State private var cameraFrame: CGImage?
-    @State private var cameraFrameError: String?
+    @State private var cropRequest: VideoCropRequest?
     @StateObject private var exportSession = VideoExportSession()
     @StateObject private var assistant: EditorAssistantSession
     @State private var directorMode = false
     @State private var propertiesVisible = true
     @State private var propertyScrollRequest = UUID()
     @State private var timelineViewportHeight: CGFloat?
-    @State private var timelineInitialHeight: CGFloat?
-    @State private var timelineInitialAllocation: CGFloat?
     @State private var timelineHeightFraction: CGFloat?
     @State private var timelineResizeStart: CGFloat?
     @State private var expandedVideoVolumeLayerIDs: Set<UUID> = []
@@ -273,8 +268,6 @@ struct ProjectEditorView: View {
         GeometryReader { geometry in
             let timelineHeight = EditorWorkspaceAllocation.timeline(height: geometry.size.height,
                 content: videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36),
-                initialHeight: timelineInitialHeight ?? geometry.size.height,
-                initialTimeline: timelineInitialAllocation ?? min(220, videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36)),
                 fraction: timelineHeightFraction, dragHeight: timelineViewportHeight)
             HStack(alignment: .top, spacing: 12) {
                 VStack(spacing: 8) {
@@ -311,12 +304,6 @@ struct ProjectEditorView: View {
                     .frame(width: min(320, max(280, geometry.size.width * 0.27))).frame(maxHeight: .infinity)
                 }
             }
-            .onAppear {
-                if timelineInitialHeight == nil {
-                    timelineInitialHeight = geometry.size.height
-                    timelineInitialAllocation = min(220, videoTimelineHeight + 20 + (geometry.size.width < 850 ? 68 : 36))
-                }
-            }
         }
         .padding(12)
         .frame(minWidth: 720, idealWidth: 1100, maxWidth: .infinity,
@@ -337,6 +324,7 @@ struct ProjectEditorView: View {
             return true
         }
         .background(EditorDraftLifecycle(editor: editor).frame(width: 0, height: 0))
+        .sheet(item: $cropRequest) { request in VideoCropEditor(request: request, directory: editor.url.deletingLastPathComponent()) }
         .navigationTitle(editor.displayName)
         .focusedSceneObject(editor)
         .task {
@@ -911,8 +899,8 @@ struct ProjectEditorView: View {
                     .monospacedDigit().font(.caption).frame(width: 130, alignment: .trailing)
             }
             ScrollView(.vertical) {
-            RecordingTimeline(duration: timelineDuration, trimStart: isSourceTimeline ? state.trimStart : 0,
-                trimEnd: isSourceTimeline ? state.trimEnd : timelineDuration, playhead: timelinePosition,
+            RecordingTimeline(duration: timelineDuration, trimStart: state.trimStart,
+                trimEnd: state.trimEnd, playhead: timelinePosition,
                 onInteractionBegan: { playback.pause() },
                 onSeek: { if editor.draftState == nil { if isSourceTimeline { playback.scrubSource(to: $0) } else { playback.scrubOutput(to: $0) } } },
                 onScrubBegan: {
@@ -953,7 +941,8 @@ struct ProjectEditorView: View {
                 onDeleteAnimation: { id in
                     if timelineIsIdentity || outputProjection?.editableBindings[id] != nil { deleteAnimation(outputProjection?.sourceIDs[id] ?? id) }
                 },
-                showsClipLane: showsCutLane, showsCameraOpacityLane: editor.project.cameraFilename != nil, showsTrimHandles: isSourceTimeline,
+                showsClipLane: showsCutLane, showsCameraOpacityLane: editor.project.cameraFilename != nil,
+                sourceTrimDuration: isSourceTimeline ? nil : editor.project.duration,
                 allowsSeekingOutsideTrim: isSourceTimeline, clockID: timelineTimeBase.rawValue,
                 clipBands: timelineClipBands, cutMarkers: timelineCutMarkers,
                 selectedCutID: selectedCutID, selectedRange: cutSelection,
@@ -989,6 +978,9 @@ struct ProjectEditorView: View {
                 onVideoCancel: { videoGestureState = nil; _ = editor.cancelDraft() },
                 onDeleteVideo: { layer, clip, point in deleteVideo(layer: layer, clip: clip, point: point) })
                 .frame(height: videoTimelineHeight)
+                // SwiftUI positions its scroll document independently of the
+                // native ruler. Reserve its strip so it cannot cover controls.
+                .padding(.top, 20)
                 .popover(isPresented: Binding(get: { selectedCutID != nil }, set: { if !$0 { selectedCutID = nil } }),
                     attachmentAnchor: .point(cutPopoverAnchor)) { cutControls }
                 .contextMenu {
@@ -1249,6 +1241,8 @@ struct ProjectEditorView: View {
                     ContentLayersInspector(editor: editor, sourceTime: playback.time, selection: $selectedContentLayerID,
                         prepare: { assistant.cancel(); leaveConflictForManualEdit(); playback.pause() }, seek: { playback.seekProjectTime($0) })
                 case .canvas:
+                    Button("Crop main video…") { openMainCrop() }
+                        .help("Draw the main video crop and use it as the output frame for the whole recording.")
                     PresentationControls(presentation: canvasPresentation,
                         onBegin: {
                             leaveConflictForManualEdit()
@@ -1564,6 +1558,8 @@ struct ProjectEditorView: View {
 
     private var zoomControls: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Button("Crop main video…") { openMainCrop() }
+                .help("Draw a source crop and use it as the output frame for the whole recording.")
             EditorControlFlow(spacing: 12) {
                 CommitSlider(title: "Zoom", value: zoom.scale, range: 1...3, valueSuffix: "×", begin: { beginZoomGesture() }, preview: { value in
                     var next = zoom; next.scale = value
@@ -2053,29 +2049,8 @@ struct ProjectEditorView: View {
                 .pickerStyle(.menu)
                 .frame(maxWidth: .infinity, alignment: .leading).layoutValue(key: EditorFlowFullWidth.self, value: true)
                 .help("Change the camera's overlay outline at the selected edit or playhead. Changing Shape returns a fullscreen camera to its overlay.")
-                Button("Framing…") { openFraming() }
-                    .help("Zoom or reposition the original camera image inside its outline.")
-                    .popover(isPresented: $isFramingPresented) {
-                        CameraFramingPopover(image: cameraFrame, errorMessage: cameraFrameError,
-                            placement: state.placement(at: framingTime), canvasSize: cameraCanvasSize, preview: { crop in
-                                var next = state.placement(at: framingTime)
-                                next.crop = crop
-                                setPlacement(next, at: framingTime, name: "Edit")
-                            }, zoomPreview: { value in
-                                var next = state.placement(at: framingTime)
-                                next.sourceZoom = value
-                                setPlacement(next, at: framingTime, name: "Edit")
-                            }, zoomCommit: { value in
-                                var next = state.placement(at: framingTime)
-                                next.sourceZoom = value
-                                setPlacement(next, at: framingTime, name: "Zoom camera")
-                            }) { crop in
-                                var next = state.placement(at: framingTime)
-                                next.crop = crop
-                                setPlacement(next, at: framingTime, name: "Frame camera")
-                        }
-                        .task(id: framingTime) { await loadCameraFrame(at: framingTime) }
-                    }
+                Button("Crop…") { openCameraCrop() }
+                    .help("Draw a crop in the original camera video. The output canvas stays the same.")
                 CommitSlider(title: "Size", value: cameraWidthPercent, range: cameraMinimumWidthPercent...100,
                     valueSuffix: "%", valueFormat: "%.0f", begin: { beginCameraGesture() }, preview: { value in
                     setPlacement(cameraSized(to: value), at: editTime, name: "Edit")
@@ -2146,26 +2121,39 @@ struct ProjectEditorView: View {
         return edited
     }
 
-    private func openFraming() {
-        playback.pause()
-        framingTime = editTime
-        cameraFrame = nil
-        cameraFrameError = nil
-        isFramingPresented = true
+    private func openMainCrop() {
+        assistant.cancel(); leaveConflictForManualEdit(); playback.pause()
+        guard editor.finishDraft(), let source = editor.project.videoSources.first(where: { $0.id == VideoSource.legacyScreenID }) else { return }
+        let crop = state.presentation.sourceCrop ?? CropGeometry.full
+        cropRequest = VideoCropRequest(title: "Crop main video", source: source, time: playback.editingTime,
+            sourceSize: playback.sourceSize, crop: crop, setsOutputFrame: true, outputResolution: state.presentation.outputResolution) { rect, resolution in
+                var next = editor.editingState
+                next.presentation.sourceCrop = rect == CropGeometry.full ? nil : rect
+                next.presentation.aspect = .source
+                next.presentation.padding = 0
+                next.presentation.outputResolution = resolution
+                if editor.commit(next, name: "Crop main video") { presentationDraft = nil }
+            }
     }
 
-    private func loadCameraFrame(at time: Double) async {
-        do {
-            let image = try await playback.cameraFrame(at: time)
-            guard !Task.isCancelled, isFramingPresented, time == framingTime else { return }
-            cameraFrame = image
-            if image == nil { cameraFrameError = "No camera frame is available at this time." }
-        } catch is CancellationError {
-            return
-        } catch {
-            guard !Task.isCancelled, isFramingPresented, time == framingTime else { return }
-            cameraFrameError = error.localizedDescription
-        }
+    private func openCameraCrop() {
+        assistant.cancel(); leaveConflictForManualEdit(); playback.pause()
+        guard editor.finishDraft(), let source = editor.project.videoSources.first(where: { $0.id == VideoSource.legacyCameraID }) else { return }
+        let time = editTime
+        let size = CGSize(width: 1080 * playback.cameraAspect, height: 1080)
+        let current = state.placement(at: time)
+        let crop = CropGeometry.normalized(current.sourceViewport(in: size, canvas: cameraCanvasSize), in: size)
+        cropRequest = VideoCropRequest(title: "Crop camera", source: source, time: time - editor.project.cameraOffset,
+            sourceSize: size, crop: crop) { rect, _ in
+                var next = editor.editingState.placement(at: time)
+                next.sourceCrop = rect == CropGeometry.full ? nil : rect
+                next.shape = rect == CropGeometry.full ? .original : .rectangle
+                // The normalized rectangle's ratio is multiplied by the oriented source aspect.
+                next.aspectRatio = rect.width / rect.height * playback.cameraAspect
+                next.crop = PIPCrop(); next.sourceZoom = 1; next.fullscreen = nil
+                setPlacement(next, at: time, name: "Crop camera")
+                _ = editor.finishDraft(name: "Crop camera")
+            }
     }
 
     private func setPlacement(_ next: PIPPlacement, at time: Double, name: String) {

@@ -134,6 +134,10 @@ struct VideoSampleDrawingGeometry: Equatable, Sendable {
     var cornerRadius: Double
     var opacity: Double
 
+    init(frame: CGRect, viewport: CGRect, cornerRadius: Double, opacity: Double) {
+        self.frame = frame; self.viewport = viewport; self.cornerRadius = cornerRadius; self.opacity = opacity
+    }
+
     init(sample: VideoLayerSample, state: EditState, at projectTime: Double,
          sourceSize: CGSize, primarySize: CGSize, canvas: CGSize) {
         let bounds = CGRect(origin: .zero, size: canvas)
@@ -142,7 +146,7 @@ struct VideoSampleDrawingGeometry: Equatable, Sendable {
         case .screen:
             let presentation = PresentationGeometry(sourceSize: primarySize, presentation: state.presentation)
             frame = presentation.contentRect(in: bounds)
-            viewport = state.zoom(at: projectTime).viewport(in: sourceSize)
+            viewport = state.presentation.viewport(in: sourceSize, zoom: state.zoom(at: projectTime))
             let scale = min(canvas.width / presentation.outputSize.width, canvas.height / presentation.outputSize.height)
             cornerRadius = presentation.cornerRadius * scale
         case .camera:
@@ -152,8 +156,11 @@ struct VideoSampleDrawingGeometry: Equatable, Sendable {
             cornerRadius = placement.cornerRadius(in: frame.size)
             opacity *= placement.renderedOpacity
         case .custom:
-            frame = sample.geometry.frame(in: canvas, sourceSize: sourceSize)
-            viewport = sample.geometry.viewport(in: sourceSize, canvas: canvas)
+            // The main crop also applies when its clip has been moved/resized.
+            let base = sample.sourceID == VideoSource.legacyScreenID
+                ? state.presentation.viewport(in: sourceSize) : CGRect(origin: .zero, size: sourceSize)
+            frame = sample.geometry.frame(in: canvas, sourceSize: base.size)
+            viewport = sample.geometry.viewport(in: base.size, canvas: canvas).offsetBy(dx: base.minX, dy: base.minY)
             cornerRadius = 0
         }
     }
@@ -553,51 +560,19 @@ private final class PIPFrameComposer: @unchecked Sendable {
         let presentation = PresentationGeometry(sourceSize: instruction.screenGeometry.size,
                                                 presentation: state.presentation)
         let content = presentation.contentRect(in: canvas)
-        let sourceCanvas = CGRect(origin: .zero, size: content.size)
-        // A track can legitimately have no sample at the start/end of its
-        // declared time range (ScreenCaptureKit often starts a fraction late).
-        // Missing source pixels are black, never a fatal compositor error or
-        // a held frame from another time; camera timing remains independent.
-        var image = screenBuffer.map { instruction.screenGeometry.orientedImage($0)
-            .transformed(by: CGAffineTransform(scaleX: content.width / instruction.screenGeometry.size.width,
-                                              y: content.height / instruction.screenGeometry.size.height))
-        } ?? CIImage(color: .black).cropped(to: sourceCanvas)
+        let size = instruction.screenGeometry.size
         let zoom = state.zoom(at: seconds).clamped
-        let zoomScale = zoom.scale
-        if zoomScale > 1 {
-            // The same source viewport helper drives native focus/pan controls.
-            // Clamp the viewport rather than exposing empty space at an edge.
-            let topLeftViewport = zoom.viewport(in: sourceCanvas.size)
-            let viewport = CGRect(x: topLeftViewport.minX, y: sourceCanvas.height - topLeftViewport.maxY,
-                                  width: topLeftViewport.width, height: topLeftViewport.height)
-            image = image.clampedToExtent()
-                .transformed(by: CGAffineTransform(translationX: -viewport.minX, y: -viewport.minY))
-                .transformed(by: CGAffineTransform(scaleX: zoomScale, y: zoomScale))
-                .cropped(to: sourceCanvas)
-        }
+        var raw = screenBuffer.map { instruction.screenGeometry.orientedImage($0) }
+            ?? CIImage(color: .black).cropped(to: CGRect(origin: .zero, size: size))
         if let recording = instruction.cursorRecording, state.cursorStyle.visible {
-            image = cursor(over: image, recording: recording, style: state.cursorStyle,
-                           zoom: zoom, at: seconds, canvas: sourceCanvas)
+            raw = cursor(over: raw, recording: recording, style: state.cursorStyle,
+                         zoom: ZoomPlacement(), at: seconds, canvas: CGRect(origin: .zero, size: size))
         }
-        // Zoom and pointer coordinates remain attached to the full screen
-        // source. Presentation frames that source only after its edits render.
-        image = image.cropped(to: sourceCanvas)
-        if presentation.cornerRadius > 0 {
-            let scale = min(canvas.width / presentation.outputSize.width,
-                            canvas.height / presentation.outputSize.height)
-            if let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
-                "inputExtent": CIVector(cgRect: sourceCanvas),
-                "inputRadius": presentation.cornerRadius * scale,
-                "inputColor": CIColor.white
-            ])?.outputImage?.cropped(to: sourceCanvas) {
-                image = image.applyingFilter("CIBlendWithAlphaMask", parameters: [
-                    kCIInputBackgroundImageKey: CIImage(color: .clear).cropped(to: sourceCanvas),
-                    kCIInputMaskImageKey: mask
-                ])
-            }
-        }
-        image = image.transformed(by: CGAffineTransform(translationX: content.minX,
-                                                       y: canvas.height - content.maxY))
+        let scale = min(canvas.width / presentation.outputSize.width, canvas.height / presentation.outputSize.height)
+        let drawing = VideoSampleDrawingGeometry(frame: content,
+            viewport: state.presentation.viewport(in: size, zoom: zoom),
+            cornerRadius: presentation.cornerRadius * scale, opacity: 1)
+        var image = place(raw, sourceSize: size, drawing: drawing, canvas: canvas)
         let background = state.presentation.background
         image = image.composited(over: CIImage(color: CIColor(red: background.red, green: background.green,
                                                              blue: background.blue)).cropped(to: canvas))

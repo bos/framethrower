@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor
 final class VideoExportSession: ObservableObject {
-    struct Destination { let url: URL; let preset: VideoExportPreset }
+    struct Destination { let url: URL; let preset: VideoExportPreset; var customSize: CGSize? = nil }
     typealias Chooser = @MainActor (String, VideoExportPreset, NSWindow?) async -> Destination?
     typealias Renderer = @MainActor (RecordingProject, URL, URL, VideoExportPreset, Bool,
         @escaping @MainActor @Sendable (Double) -> Void) async throws -> Void
@@ -22,7 +22,7 @@ final class VideoExportSession: ObservableObject {
     private var sharePending = false
     private let defaults: UserDefaults
     private let chooser: Chooser?
-    private let renderer: Renderer
+    private let renderer: Renderer?
     private let requiresProgressPresentation: Bool
 
     init(defaults: UserDefaults = .standard, requiresProgressPresentation: Bool = true,
@@ -30,10 +30,7 @@ final class VideoExportSession: ObservableObject {
         self.defaults = defaults
         self.requiresProgressPresentation = requiresProgressPresentation
         self.chooser = chooser
-        self.renderer = renderer ?? { project, directory, url, preset, replace, progress in
-            try await ProjectRenderer.export(project: project, directory: directory, to: url,
-                preset: preset, replaceExisting: replace, progress: progress)
-        }
+        self.renderer = renderer
     }
 
     func begin(editor: ProjectEditor, sharing: Bool, anchor: NSView? = nil) {
@@ -67,6 +64,7 @@ final class VideoExportSession: ObservableObject {
             .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
         let filename = name.lowercased().hasSuffix(".mp4") ? name : name + ".mp4"
         var preset = VideoExportPreset(rawValue: defaults.string(forKey: "export.preset") ?? "") ?? .fullResolution
+        var customSize: CGSize?
         let url: URL
         if sharing {
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent("FrameThrower-Share-" + UUID().uuidString)
@@ -76,9 +74,15 @@ final class VideoExportSession: ObservableObject {
         } else {
             let destination: Destination?
             if let chooser { destination = await chooser(filename, preset, window) }
-            else { destination = await chooseDestination(filename: filename, preset: preset) }
+            else {
+                do {
+                    let canvas = try await ProjectRenderer.exportCanvasSize(project: snapshot, directory: directory)
+                    destination = await chooseDestination(filename: filename, preset: preset, canvas: canvas)
+                } catch { errorMessage = error.localizedDescription; return }
+            }
             guard let destination else { return }
             url = destination.url; preset = destination.preset
+            customSize = destination.customSize
             defaults.set(preset.rawValue, forKey: "export.preset")
         }
         guard !Task.isCancelled else { return }
@@ -92,31 +96,41 @@ final class VideoExportSession: ObservableObject {
                 try Task.checkCancellation()
                 try await Task.sleep(for: .milliseconds(10))
             }
-            try await renderer(snapshot, directory, url, preset, !sharing, { [weak self] value in self?.progress = value })
+            let update: @MainActor @Sendable (Double) -> Void = { [weak self] value in self?.progress = value }
+            if let renderer { try await renderer(snapshot, directory, url, preset, !sharing, update) }
+            else {
+                try await ProjectRenderer.export(project: snapshot, directory: directory, to: url, preset: preset,
+                    customSize: customSize, format: VideoExportFormat(rawValue: url.pathExtension.lowercased()) ?? .mp4,
+                    replaceExisting: !sharing, progress: update)
+            }
             try Task.checkCancellation()
             if sharing { shareURL = url; sharePending = true }
         } catch is CancellationError { }
         catch { if !Task.isCancelled { errorMessage = error.localizedDescription } }
     }
 
-    private func chooseDestination(filename: String, preset: VideoExportPreset) async -> Destination? {
+    private func chooseDestination(filename: String, preset: VideoExportPreset, canvas: CGSize) async -> Destination? {
         let panel = NSSavePanel()
         self.panel = panel
         defer { self.panel = nil }
-        panel.title = "Save Video"
-        panel.prompt = "Save"
-        panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = filename
+        panel.title = "Export"
+        panel.prompt = "Export"
+        let format = VideoExportFormat(rawValue: defaults.string(forKey: "export.format") ?? "") ?? .mp4
+        panel.allowedContentTypes = format == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
+        panel.nameFieldStringValue = (filename as NSString).deletingPathExtension + "." + format.rawValue
         panel.canCreateDirectories = true
-        let options = NSStackView()
-        options.orientation = .horizontal; options.spacing = 8
-        options.addArrangedSubview(NSTextField(labelWithString: "Size:"))
-        let size = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 180, height: 26), pullsDown: false)
-        size.addItems(withTitles: VideoExportPreset.allCases.map(\.title))
-        size.selectItem(at: VideoExportPreset.allCases.firstIndex(of: preset) ?? 0)
-        size.toolTip = "Smaller dimensions make smaller video files."
-        options.addArrangedSubview(size)
-        panel.accessoryView = options
+        // NSSavePanel can otherwise reopen at the read-only volume root.
+        // Start at a writable folder, remembering an explicit prior choice.
+        let files = FileManager.default
+        let remembered = defaults.string(forKey: "export.directory").map { URL(fileURLWithPath: $0, isDirectory: true) }
+        panel.directoryURL = ([remembered] + files.urls(for: .downloadsDirectory, in: .userDomainMask).map(Optional.some)
+            + [files.homeDirectoryForCurrentUser]).compactMap { $0 }.first { folder in
+                var isDirectory: ObjCBool = false
+                return files.fileExists(atPath: folder.path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue && files.isWritableFile(atPath: folder.path)
+            }
+        let options = VideoExportOptions(panel: panel, canvas: canvas, preset: preset, format: format)
+        panel.accessoryView = options.view
         let response: NSApplication.ModalResponse
         if let window {
             response = await withCheckedContinuation { continuation in
@@ -124,8 +138,87 @@ final class VideoExportSession: ObservableObject {
             }
         } else { response = panel.runModal() }
         guard response == .OK, let url = panel.url else { return nil }
-        let index = min(VideoExportPreset.allCases.count - 1, max(0, size.indexOfSelectedItem))
-        return Destination(url: url, preset: VideoExportPreset.allCases[index])
+        defaults.set(url.deletingLastPathComponent().path, forKey: "export.directory")
+        defaults.set(options.format.rawValue, forKey: "export.format")
+        return Destination(url: url, preset: options.preset, customSize: options.customSize)
+    }
+}
+
+/// The native save panel owns the view; this object stays alive across the
+/// panel's continuation and keeps the two dimension fields on one scale.
+@MainActor
+final class VideoExportOptions: NSObject, NSTextFieldDelegate {
+    let view = NSStackView()
+    let sizePicker = NSPopUpButton()
+    let formatPicker = NSPopUpButton()
+    let widthField = NSTextField()
+    let heightField = NSTextField()
+    private weak var panel: NSSavePanel?
+    private let canvas: CGSize
+    var format: VideoExportFormat { VideoExportFormat.allCases[max(0, formatPicker.indexOfSelectedItem)] }
+    var preset: VideoExportPreset { VideoExportPreset.allCases.indices.contains(sizePicker.indexOfSelectedItem)
+        ? VideoExportPreset.allCases[sizePicker.indexOfSelectedItem] : .fullResolution }
+    var customSize: CGSize? { sizePicker.indexOfSelectedItem == VideoExportPreset.allCases.count
+        ? VideoExportDimensions.size(for: canvas, width: widthField.doubleValue) : nil }
+
+    init(panel: NSSavePanel, canvas: CGSize, preset: VideoExportPreset, format: VideoExportFormat) {
+        self.panel = panel; self.canvas = canvas
+        super.init()
+        view.orientation = .vertical; view.alignment = .leading; view.spacing = 8
+        func row(_ label: String, _ controls: NSView...) {
+            let row = NSStackView(views: [NSTextField(labelWithString: label)] + controls)
+            row.orientation = .horizontal; row.spacing = 8; view.addArrangedSubview(row)
+        }
+        sizePicker.addItems(withTitles: VideoExportPreset.allCases.map {
+            let size = $0.outputSize(for: canvas)
+            return "\($0 == .fullResolution ? "Original" : $0.title) · \(Int(size.width)) × \(Int(size.height))"
+        } + ["Custom"])
+        sizePicker.selectItem(at: VideoExportPreset.allCases.firstIndex(of: preset) ?? 0)
+        sizePicker.setAccessibilityLabel("Export size")
+        sizePicker.target = self; sizePicker.action = #selector(sizeChanged)
+        row("Size:", sizePicker)
+        for (field, label) in [(widthField, "Width"), (heightField, "Height")] {
+            field.delegate = self; field.setAccessibilityLabel(label)
+            field.widthAnchor.constraint(equalToConstant: 80).isActive = true
+            field.toolTip = "Edit width or height; the other dimension follows the canvas aspect ratio. Maximum 8192 pixels."
+        }
+        row("Pixels:", widthField, NSTextField(labelWithString: "×"), heightField)
+        formatPicker.addItems(withTitles: VideoExportFormat.allCases.map(\.title))
+        formatPicker.selectItem(at: VideoExportFormat.allCases.firstIndex(of: format) ?? 0)
+        formatPicker.setAccessibilityLabel("File format")
+        formatPicker.target = self; formatPicker.action = #selector(formatChanged)
+        row("Format:", formatPicker)
+        sizeChanged()
+    }
+    @objc private func sizeChanged() {
+        guard sizePicker.indexOfSelectedItem < VideoExportPreset.allCases.count else { return }
+        show(preset.outputSize(for: canvas))
+    }
+    private func show(_ size: CGSize) {
+        widthField.stringValue = String(Int(size.width)); heightField.stringValue = String(Int(size.height))
+    }
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              let value = Double(field.stringValue), value.isFinite, value >= 2 else { return }
+        let size = VideoExportDimensions.size(for: canvas,
+            width: field === widthField ? value : nil, height: field === heightField ? value : nil)
+        sizePicker.selectItem(at: VideoExportPreset.allCases.count)
+        if field === widthField { heightField.stringValue = String(Int(size.height)) }
+        else { widthField.stringValue = String(Int(size.width)) }
+    }
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else { return }
+        show(VideoExportDimensions.size(for: canvas,
+            width: field === widthField ? field.doubleValue : nil,
+            height: field === heightField ? field.doubleValue : nil))
+    }
+    @objc private func formatChanged() {
+        guard let panel else { return }
+        panel.allowedContentTypes = format == .mp4 ? [.mpeg4Movie] : [.quickTimeMovie]
+        let name = panel.nameFieldStringValue as NSString
+        let base = VideoExportFormat(rawValue: name.pathExtension.lowercased()) == nil
+            ? String(name) : name.deletingPathExtension
+        panel.nameFieldStringValue = base + "." + format.rawValue
     }
 }
 
@@ -158,7 +251,7 @@ final class VideoActionsMenuButton: NSPopUpButton {
         (cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
         imagePosition = .imageOnly
         focusRingType = .none
-        toolTip = "Save or share the edited video"
+        toolTip = "Export or share the edited video"
     }
     required init?(coder: NSCoder) { nil }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -171,7 +264,7 @@ final class VideoActionsMenuButton: NSPopUpButton {
         let title = NSMenuItem(title: "Share", action: nil, keyEquivalent: "")
         title.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: nil)
         menu.addItem(title)
-        add("Save Video…", symbol: "square.and.arrow.down", action: save, to: menu)
+        add("Export…", symbol: "square.and.arrow.down", action: save, to: menu)
         add("Share Video…", symbol: "square.and.arrow.up", action: share, to: menu)
         if let upload { menu.addItem(.separator()); add("Upload…", symbol: "icloud.and.arrow.up", action: upload, to: menu) }
         self.menu = menu

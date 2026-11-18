@@ -38,7 +38,7 @@ final class FileMenuProbe: NSObject, NSApplicationDelegate {
             if let menu = NSApp.mainMenu?.items.first(where: { $0.title == "File" })?.submenu {
                 menu.update()
                 lastTitles = menu.items.map(\.title)
-                let expected = ["Save Recording", "Duplicate Recording", "Save Video…", "Share Video…", "Rename Recording…"]
+                let expected = ["Save Recording", "Duplicate Recording", "Export…", "Share Video…", "Rename Recording…"]
                 if expected.allSatisfy(lastTitles.contains), let duplicate = menu.items.first(where: { $0.title == "Duplicate Recording" }) {
                     guard duplicate.keyEquivalent == "s",
                           duplicate.keyEquivalentModifierMask.intersection([.command, .shift, .option, .control]) == [.command, .shift] else {

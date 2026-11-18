@@ -21,7 +21,7 @@ struct EditorFileCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
                 .disabled(actions?.duplicate == nil || actions?.isBusy == true)
                 .help("Create an independent project with the current edits and a fresh Undo history. The copy uses the same source files.")
-            Button("Save Video…") { actions?.saveVideo() }
+            Button("Export…") { actions?.saveVideo() }
                 .keyboardShortcut("e", modifiers: .command)
                 .disabled(MediaProcessing.isSuspended || actions == nil || actions?.isBusy == true)
             Button("Share Video…") { actions?.shareVideo() }

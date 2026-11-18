@@ -362,9 +362,8 @@ If pointer capture cannot start, recording retains the ordinary baked-in cursor.
 Camera edits create timed camera changes. Move the PIP by dragging or
 using a corner button; resize with **Size** or any of its four corner handles. **Original**
 preserves the camera aspect, **Rectangle** allows independent width and height,
-and **Square** and **Circle** crop without stretching. **Framing…** lets you move
-the crop within the full camera image and zoom the camera source independently
-of the PIP window size. Main-view and camera movement share transition timing,
+and **Square** and **Circle** crop without stretching. **Crop…** lets you draw and resize
+a source rectangle independently of the PIP window size. Main-view and camera movement share transition timing,
 easing, and viewport bounds. Shape, framing, zoom, size, position, and visibility
 can all change over time. Dragging updates the PIP picture live and joins the shared draft at that time. **Jump** changes placement instantly; **Smooth** eases
 position, size, aspect, and framing toward the change. Shape and visibility switch
@@ -394,10 +393,32 @@ Camera **Opacity** changes from 0% to 100% on its own lane, independently of cam
 position, size and crop. It uses the same duration and easing controls as camera
 movement; a fade can overlap a move without changing that move's path.
 
-**Canvas** sets the output shape (Source, 16:9, 9:16, or Square), padding, screen
-corner radius, and background color for the whole recording. The full screen image
-fits inside the canvas; camera placement uses the entire output, including margins.
-Preview and export use the same composition.
+**Crop main video…**, in **Zoom** or **Canvas**, opens the full original frame.
+Draw a rectangle, move it, or resize any corner or edge. Choose Freeform, Source,
+16:9, 9:16, Square, 4:3, 3:2, 4:5, or enter a Custom width:height ratio. The main
+video also offers Crop size, 720p, 1080p, 4K and Custom output resolutions; the
+Width and Height fields show the chosen output size once. Presets follow the
+aspect: 9:16 at 1080p produces 1080 × 1920, and Square produces 1080 × 1080.
+Clip and camera crop dialogs show the crop width and height in source pixels. After drawing, drag inside the rectangle to
+move it; **Draw crop** starts another rectangle. Arrow keys move the focused crop
+one source pixel (Shift: ten). **Apply crop** uses that rectangle as the output
+frame for the whole recording, with no padding. **Reset**, then Apply, restores
+the full source. Cancel or Escape discards the dialog; Escape during a drag cancels
+that gesture. Each applied crop is one Undo step and keeps the original file intact.
+
+**Crop…** in **Videos** uses the same editor for the selected clip, retaining its
+frame on the output canvas. The clip changes to custom layout; Fit preserves the
+selected source area and Fill covers its destination frame. Clip crops use the
+same source-time geometry points as other framing edits. **Camera → Crop…**
+sets a timed picture-in-picture crop and its rectangular aspect, independently
+of the output canvas.
+
+**Canvas** sets the output shape (Source/Crop, 16:9, 9:16, or Square), padding,
+screen corner radius, and background color for the whole recording. The selected
+main-video crop fits inside the canvas; zoom and pan operate within that crop.
+Camera placement uses the entire output, including margins. Preview and export
+use the same composition. Save Video's custom dimensions preserve this output
+aspect ratio.
 
 **Audio’s master controls** change all original tracks together. Fade
 in and fade out run from the kept trim boundaries and can last up to five seconds

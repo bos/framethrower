@@ -173,7 +173,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
         guard let frame = window.contentView?.superview else { throw ProbeError.failed("missing native window frame") }
         guard let share: VideoActionsMenuButton = find(in: frame), !share.isDescendant(of: host),
               share.imagePosition == .imageOnly && share.menu?.items.first?.image != nil &&
-              share.menu?.items.map(\.title) == ["Share", "Save Video…", "Share Video…"] else {
+              share.menu?.items.map(\.title) == ["Share", "Export…", "Share Video…"] else {
             throw ProbeError.failed("the native toolbar must contain an icon-only Share menu with separate Save and Share actions")
         }
         let titles = findAll(RecordingTitleField.self, in: frame)
@@ -307,7 +307,7 @@ private final class WindowGroupLayoutProbe: ObservableObject {
         guard let timeline: RecordingTimelineView = find(in: host) else { throw ProbeError.failed("missing timeline for Save boundary") }
         let baseline = measure(window: window, host: host, canvas: canvas, timeline: timeline)
         let shortcuts: [(String, String, NSEvent.ModifierFlags)] = [
-            ("Save Recording", "s", .command), ("Save Video…", "e", .command),
+            ("Save Recording", "s", .command), ("Export…", "e", .command),
             ("Share Video…", "e", [.command, .shift])
         ]
         for (title, key, modifiers) in shortcuts {
@@ -353,23 +353,28 @@ private final class WindowGroupLayoutProbe: ObservableObject {
         let beforePanel = editor.project
         let profile = UserDefaults.standard.string(forKey: "export.preset")
         guard let share: VideoActionsMenuButton = find(in: frame),
-              let menu = share.menu, let saveIndex = menu.items.firstIndex(where: { $0.title == "Save Video…" }) else {
-            throw ProbeError.failed("missing native Save Video action")
+              let menu = share.menu, let saveIndex = menu.items.firstIndex(where: { $0.title == "Export…" }) else {
+            throw ProbeError.failed("missing native Export action")
         }
-        if activeMenu { try performCommand("Save Video…") }
+        if activeMenu { try performCommand("Export…") }
         else { menu.performActionForItem(at: saveIndex) }
-        try await waitUntil("Save Video opens a native sheet on this editor window") {
+        try await waitUntil("Export opens a native sheet on this editor window") {
             window.attachedSheet is NSSavePanel
         }
         guard let panel = window.attachedSheet as? NSSavePanel,
+              panel.title == "Export", panel.prompt == "Export",
+              let folder = panel.directoryURL, folder.path != "/",
+              FileManager.default.isWritableFile(atPath: folder.path),
               let accessory = panel.accessoryView,
               let size: NSPopUpButton = find(in: accessory),
-              size.itemTitles == VideoExportPreset.allCases.map(\.title),
+              size.itemTitles.count == VideoExportPreset.allCases.count + 1,
+              size.itemTitles.first?.hasPrefix("Original · ") == true, size.itemTitles.last == "Custom",
+              findAll(NSPopUpButton.self, in: accessory).contains(where: { $0.itemTitles == VideoExportFormat.allCases.map(\.title) }),
               panel.nameFieldStringValue == editor.displayName + ".mp4" || panel.nameFieldStringValue == editor.displayName else {
             throw ProbeError.failed("native Save panel must use the recording name and offer all video size profiles")
         }
         try await waitUntil("a visible Save chooser must lock re-entry from toolbar and File commands") {
-            !share.isEnabled && (!activeMenu || command("Save Video…")?.item.isEnabled == false)
+            !share.isEnabled && (!activeMenu || command("Export…")?.item.isEnabled == false)
         }
         size.selectItem(at: VideoExportPreset.allCases.count - 1)
         panel.cancel(nil)

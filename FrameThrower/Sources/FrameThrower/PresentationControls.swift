@@ -24,14 +24,14 @@ struct PresentationControls: View {
                 var next = presentation; next.aspect = aspect
                 onCommit(next, "Change canvas aspect")
             })) {
-                Text("Source").tag(CanvasAspect.source)
+                Text(presentation.sourceCrop == nil ? "Source" : "Crop").tag(CanvasAspect.source)
                 Text("16:9").tag(CanvasAspect.wide)
                 Text("9:16").tag(CanvasAspect.portrait)
                 Text("Square").tag(CanvasAspect.square)
             }
             .pickerStyle(.menu)
             .frame(maxWidth: .infinity).frame(height: 24)
-            .help("Choose the exported frame shape. The whole recording fits inside it without cropping or stretching.")
+            .help("Choose the exported frame shape. The selected source crop fits inside it without stretching.")
             VStack(alignment: .leading, spacing: 12) {
                 PresentationSlider(title: "Padding", value: presentation.padding * 100, range: 0...20,
                     begin: onBegin, preview: { value in

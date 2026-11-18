@@ -5,18 +5,23 @@ private final class NavigationEvent: NSEvent {
     var dx: CGFloat = 0
     var dy: CGFloat = 0
     var position = CGPoint.zero
+    var eventPhase: NSEvent.Phase = []
+    var momentum: NSEvent.Phase = []
+    var modifiers: NSEvent.ModifierFlags = []
     override var magnification: CGFloat { amount }
     override var scrollingDeltaX: CGFloat { dx }
     override var scrollingDeltaY: CGFloat { dy }
     override var hasPreciseScrollingDeltas: Bool { true }
     override var locationInWindow: CGPoint { position }
-    override var phase: NSEvent.Phase { [] }
-    override var momentumPhase: NSEvent.Phase { [] }
-    override var modifierFlags: NSEvent.ModifierFlags { [] }
+    override var phase: NSEvent.Phase { eventPhase }
+    override var momentumPhase: NSEvent.Phase { momentum }
+    override var modifierFlags: NSEvent.ModifierFlags { modifiers }
 }
 @MainActor private final class ScrollParent: NSView {
-    var verticalEvents = 0
-    override func scrollWheel(with event: NSEvent) { verticalEvents += 1 }
+    var events: [(phase: NSEvent.Phase, momentum: NSEvent.Phase, dy: CGFloat)] = []
+    override func scrollWheel(with event: NSEvent) {
+        events.append((event.phase, event.momentumPhase, event.scrollingDeltaY))
+    }
 }
 
 @main @MainActor
@@ -137,7 +142,8 @@ struct TimelineTrackLayoutChecks {
         try require(projection.animations.allSatisfy(\.editable) && !projection.animations[0].showsEndHandle && !projection.animations[1].showsStartHandle,
             "fragments are draggable without treating cut edges as animation endpoints")
         try navigationAndLabels()
-        print("Timeline hierarchy checks passed: named grouped clips, real/default/read-only channels, shared content height, frozen gestures, stable selection, audio disclosure, ruler ranges, frame nudges and branch-aware cut fragments; no media or focus.")
+        try scrollGestureLifecycle()
+        print("Timeline hierarchy checks passed: named grouped clips, real/default/read-only channels, shared content height, frozen gestures, stable selection, audio disclosure, ruler ranges, frame nudges, branch-aware cut fragments and complete scroll/momentum gestures; no media or focus.")
     }
     static func navigationAndLabels() throws {
         let parent = ScrollParent(frame: CGRect(x: 0, y: 0, width: 1000, height: 300))
@@ -156,13 +162,13 @@ struct TimelineTrackLayoutChecks {
         try near(view.visibleStart + view.visibleDuration / 2, 600, "pinch remains anchored at the pointer")
         let before = view.visibleStart
         event.amount = 0; event.dx = -30; event.dy = 0; view.scrollWheel(with: event)
-        try require(view.visibleStart > before && parent.verticalEvents == 0, "horizontal natural scroll moves time only")
+        try require(view.visibleStart > before && parent.events.allSatisfy { $0.dy == 0 }, "horizontal natural scroll moves time only")
         let afterHorizontal = view.visibleStart
         event.dx = 0; event.dy = -30; view.scrollWheel(with: event)
         try near(view.visibleStart, afterHorizontal, "vertical track scroll does not pan time")
-        try require(parent.verticalEvents == 1, "vertical scroll reaches track container")
+        try require(parent.events.last?.dy == -30, "vertical scroll reaches track container")
         event.dx = -15; event.dy = -15; view.scrollWheel(with: event)
-        try require(view.visibleStart > afterHorizontal && parent.verticalEvents == 2, "diagonal gestures navigate tracks and time together")
+        try require(view.visibleStart > afterHorizontal && parent.events.last?.dy == -15, "diagonal gestures navigate tracks and time together")
         let start = view.visibleStart, span = view.visibleDuration
         let marker = RecordingTimelineMarker(id: UUID(), time: 1000, help: "Outside viewport", label: "Outside viewport")
         view.edits = [marker]; view.selectedEditID = marker.id
@@ -208,6 +214,52 @@ struct TimelineTrackLayoutChecks {
             "pinch updates pinned ruler labels with the new visible time range")
         try require(!view.timeRulerTicks().isEmpty, "compact scrolled timeline retains numeric time labels")
 
+    }
+    static func scrollGestureLifecycle() throws {
+        let parent = ScrollParent(frame: CGRect(x: 0, y: 0, width: 1000, height: 300))
+        let view = RecordingTimelineView(frame: parent.bounds)
+        parent.addSubview(view)
+        view.showsAnimationLanes = true
+        view.setClock("scroll-gesture", duration: 1200)
+        let event = NavigationEvent()
+        event.position = CGPoint(x: 500, y: 100)
+        let phases: [(NSEvent.Phase, NSEvent.Phase, CGFloat, CGFloat)] = [
+            (.mayBegin, [], 0, 0), (.began, [], 0, 0),
+            (.changed, [], -2, -20), (.changed, [], -20, -2),
+            (.ended, [], 0, 0), ([], .began, 0, 0),
+            ([], .changed, -4, -10), ([], .changed, -10, -1),
+            ([], .ended, 0, 0),
+            (.began, [], 0, 0), (.cancelled, [], 0, 0),
+            (.began, [], 0, 0), (.ended, [], 0, 0),
+            ([], .began, 0, 0), ([], .cancelled, 0, 0)
+        ]
+        var fingerLiftStart = 0.0
+        for (phase, momentum, dx, dy) in phases {
+            event.eventPhase = phase; event.momentum = momentum; event.dx = dx; event.dy = dy
+            // AppKit routes an active gesture to its original view even after the pointer moves.
+            event.position = momentum.isEmpty && phase != .ended ? CGPoint(x: 500, y: 100) : CGPoint(x: 1100, y: 100)
+            view.scrollWheel(with: event)
+            if phase == .ended { fingerLiftStart = view.visibleStart }
+            if momentum == .ended {
+                try require(view.visibleStart > fingerLiftStart, "time viewport continues moving during momentum after finger lift")
+            }
+        }
+        try require(parent.events.count == phases.count, "track scroller receives every gesture boundary and momentum event")
+        for (received, expected) in zip(parent.events, phases) {
+            try require(received.phase == expected.0 && received.momentum == expected.1 && received.dy == expected.3,
+                "track scroller receives the original phases and deltas without axis filtering")
+        }
+        try require(view.visibleStart > 0, "scrolling pans the time viewport")
+        let count = parent.events.count, start = view.visibleStart
+        event.momentum = .cancelled; event.dx = -100; event.dy = -100
+        view.scrollWheel(with: event)
+        try near(view.visibleStart, start, "cancelled momentum never pans time")
+        try require(parent.events.count == count + 1, "cancelled momentum reaches the native scroller")
+        event.position = CGPoint(x: 500, y: 100)
+        event.modifiers = .shift; event.momentum = []; event.eventPhase = .changed; event.dx = 0; event.dy = -20
+        let shiftedCount = parent.events.count
+        view.scrollWheel(with: event)
+        try require(view.visibleStart > start && parent.events.count == shiftedCount, "Shift-scroll pans time without scrolling tracks")
     }
     static func event(_ type: NSEvent.EventType, _ view: NSView, _ point: CGPoint, modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
         NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: modifiers, timestamp: 0,

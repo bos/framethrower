@@ -14,6 +14,17 @@ struct VideoExportChecks {
         try await EditorMovieFixtures.make(at: source, width: 2560, height: 1440, duration: 2, camera: false)
         let original = try Data(contentsOf: source)
         let project = RecordingProject(screenFilename: source.lastPathComponent, duration: 2)
+        do {
+            let missingFolder = directory.appendingPathComponent("missing-folder").appendingPathComponent("export.mp4")
+            try await ProjectRenderer.export(project: project, directory: directory, to: missingFolder)
+            throw ExportCheckError.failed("accepted an unavailable export folder")
+        } catch ProjectRenderer.RenderError.destinationNotWritable { }
+        do {
+            // The volume root is readable but cannot accept an export file.
+            try await ProjectRenderer.export(project: project, directory: directory,
+                to: URL(fileURLWithPath: "/framethrower-export-check-\(UUID()).mp4"))
+            throw ExportCheckError.failed("accepted the read-only volume root")
+        } catch ProjectRenderer.RenderError.destinationNotWritable { }
         for (preset, width, height) in [(VideoExportPreset.fullResolution, 2560, 1440), (.hd, 1920, 1080), (.small, 1280, 720)] {
             let url = directory.appendingPathComponent(preset.rawValue + ".mp4")
             var values: [Double] = []
@@ -25,6 +36,26 @@ struct VideoExportChecks {
             try require(values.last == 1 && values.allSatisfy { $0.isFinite && (0...1).contains($0) }, "bounded completed progress")
             try require(zip(values, values.dropFirst()).allSatisfy { $0 <= $1 }, "monotonic export progress")
         }
+        for (aspect, requested, format) in [(CanvasAspect.wide, 1000.0, VideoExportFormat.mp4),
+                                            (.portrait, 562.0, .mov), (.square, 734.0, .mov)] {
+            var resized = project; resized.state.presentation.aspect = aspect
+            let canvas = try await ProjectRenderer.exportCanvasSize(project: resized, directory: directory)
+            let size = VideoExportDimensions.size(for: canvas, width: requested)
+            let url = directory.appendingPathComponent("custom-\(aspect.rawValue).\(format.rawValue)")
+            try await ProjectRenderer.export(project: resized, directory: directory, to: url, customSize: size, format: format)
+            try await checkDimensions(url, expected: size, context: "custom \(aspect) \(format)")
+            try require(abs(size.width / size.height - canvas.width / canvas.height) < 0.005,
+                "Custom dimensions preserve the chosen canvas aspect ratio")
+        }
+        let portrait = VideoExportDimensions.size(for: CGSize(width: 1080, height: 1920), height: 1000)
+        try require(portrait == CGSize(width: 562, height: 1000), "Editing height computes width")
+        let bounded = VideoExportDimensions.size(for: CGSize(width: 1920, height: 1080), width: 100000)
+        try require(bounded.width == 8192 && bounded.height == 4608, "Custom dimensions bound encoder size")
+        do {
+            try await ProjectRenderer.export(project: project, directory: directory,
+                to: directory.appendingPathComponent("distorted.mp4"), customSize: CGSize(width: 1000, height: 1000))
+            throw ExportCheckError.failed("accepted a custom size that distorts the canvas")
+        } catch ProjectRenderer.RenderError.invalidExportSize { }
         let camera = directory.appendingPathComponent("camera.mp4")
         try await EditorMovieFixtures.make(at: camera, width: 80, height: 40, duration: 1, camera: true)
         let originalCamera = try Data(contentsOf: camera)

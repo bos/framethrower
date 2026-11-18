@@ -354,6 +354,7 @@ struct RecordingTimeline: NSViewRepresentable {
     var showsClipLane = false
     var showsCameraOpacityLane = false
     var showsTrimHandles = true
+    var sourceTrimDuration: Double? = nil
     var allowsSeekingOutsideTrim = false
     var clockID = "source"
     var clipBands: [TimelineClipBand] = []
@@ -387,6 +388,7 @@ struct RecordingTimeline: NSViewRepresentable {
         view.showsClipLane = showsClipLane
         view.showsCameraOpacityLane = showsCameraOpacityLane
         view.showsTrimHandles = showsTrimHandles
+        view.sourceTrimDuration = sourceTrimDuration
         view.allowsSeekingOutsideTrim = allowsSeekingOutsideTrim
         view.clipBands = clipBands
         view.cutMarkers = cutMarkers
@@ -920,8 +922,11 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
     private(set) var visibleStart = 0.0
     private(set) var visibleDuration = 1.0
-    var trimStart = 0.0 { didSet { needsDisplay = true } }
-    var trimEnd = 1.0 { didSet { needsDisplay = true } }
+    var trimStart = 0.0 { didSet { if trimStart != oldValue { needsDisplay = true; updateTooltips() } } }
+    var trimEnd = 1.0 { didSet { if trimEnd != oldValue { needsDisplay = true; updateTooltips() } } }
+    // The output clock cannot represent footage removed at either end. This
+    // separate, full-source rail keeps both trim edges recoverable after edits.
+    var sourceTrimDuration: Double? { didSet { if sourceTrimDuration != oldValue { needsDisplay = true; updateTooltips() } } }
     var playhead = 0.0 { didSet { needsDisplay = true } }
     var onSeek: ((Double) -> Void)?
     var onTrim: ((Double, Double) -> Void)?
@@ -975,7 +980,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     let rangeScroller = NSScroller(frame: CGRect(x: 0, y: 0, width: 100, height: 12))
     private var railOrigin: CGFloat { showsAnimationLanes ? 154 : 12 }
     private var railWidth: CGFloat { max(1, bounds.width - railOrigin - 12) }
-    private var minimumLength: Double { min(0.1, duration) }
+    private var minimumLength: Double { min(0.1, sourceTrimDuration ?? duration) }
+    func trimX(for time: Double) -> CGFloat {
+        guard let sourceTrimDuration else { return x(for: time) }
+        return railOrigin + CGFloat(time / max(sourceTrimDuration, .leastNonzeroMagnitude)) * railWidth
+    }
+    private func trimIsVisible(_ time: Double) -> Bool {
+        sourceTrimDuration != nil || markerIsVisible(time)
+    }
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: showsAnimationLanes ? trackLayout.contentHeight : 72) }
@@ -1006,11 +1018,17 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     func installPinnedTimeRuler() {
         guard showsAnimationLanes, let scroll = enclosingScrollView else { return }
         if let ruler = pinnedTimeRuler, scroll.horizontalRulerView === ruler { return }
+        let origin = scroll.contentView.bounds.origin
         let ruler = TimelineTimeRulerView(scrollView: scroll, timeline: self)
         pinnedTimeRuler = ruler
         scroll.horizontalRulerView = ruler
         scroll.hasHorizontalRuler = true
         scroll.rulersVisible = true
+        // Adding the ruler moves the clip view. Preserve the document's scroll
+        // position so the playhead and trim rail aren't hidden above its top.
+        scroll.tile()
+        scroll.contentView.scroll(to: origin)
+        scroll.reflectScrolledClipView(scroll.contentView)
         needsDisplay = true
     }
     private func updateRangeScroller() {
@@ -1059,6 +1077,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard duration.isFinite, duration > 0, bounds.width > 0, bounds.height > 0 else { return }
         let base = addToolTip(bounds, owner: self, userData: nil)
         tooltipText[base] = showsAnimationLanes ? "Drag the playhead to scrub; Shift-drag the ruler to select a cut range. Drag spans to move; selected edges and tall bars adjust timing. Pinch for finer controls." : "Drag the playhead to scrub, blue handles to trim, or an individual edit to move its time. Click a count badge to choose among nearby edits before dragging. Pinch to separate edits; scroll to navigate time."
+        if sourceTrimDuration != nil {
+            let tag = addToolTip(CGRect(x: 4, y: 12, width: bounds.width - 8, height: 22), owner: self, userData: nil)
+            tooltipText[tag] = String(format: "Source trim: %.2f–%.2f s. Drag the blue handles to trim or restore the original footage. Tracks and ruler show exported time.", trimStart, trimEnd)
+        }
         for row in trackLayout.rows {
             let frame = rowFrame(row.id)
             tooltipText[addToolTip(CGRect(x: 4, y: frame.minY, width: railOrigin - 22, height: frame.height), owner: self, userData: nil)] = row.help
@@ -1134,10 +1156,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         NSColor.quaternaryLabelColor.setFill()
         NSBezierPath(roundedRect: rail, xRadius: 3, yRadius: 3).fill()
         NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
-        let retained = CGRect(x: x(for: start), y: 21, width: max(1, x(for: end) - x(for: start)), height: 6).intersection(rail)
+        let retained = CGRect(x: trimX(for: start), y: 21, width: max(1, trimX(for: end) - trimX(for: start)), height: 6).intersection(rail)
         if !retained.isNull { NSBezierPath(rect: retained).fill() }
-        for boundary in (showsTrimHandles ? [start, end] : []) where markerIsVisible(boundary) {
-            let handle = CGRect(x: x(for: boundary) - 5, y: 14, width: 10, height: 20)
+        if sourceTrimDuration != nil, showsAnimationLanes {
+            ("Source trim" as NSString).draw(at: CGPoint(x: 8, y: 17), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor])
+        }
+        for boundary in (showsTrimHandles ? [start, end] : []) where trimIsVisible(boundary) {
+            let handle = CGRect(x: trimX(for: boundary) - 5, y: 14, width: 10, height: 20)
             NSColor.controlAccentColor.setFill()
             NSBezierPath(roundedRect: handle, xRadius: 3, yRadius: 3).fill()
             NSColor.white.setFill()
@@ -1323,6 +1349,10 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         guard markerIsVisible(time) else { return path }
         let position = x(for: time)
         path.move(to: CGPoint(x: position, y: 8))
+        if sourceTrimDuration != nil {
+            path.line(to: CGPoint(x: position, y: 12))
+            path.move(to: CGPoint(x: position, y: 35))
+        }
         path.line(to: CGPoint(x: position, y: showsAnimationLanes ? trackLayout.contentHeight - TimelineTrackLayout.footer - 3 : 34))
         return path
     }
@@ -1380,7 +1410,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             }
 
         }
-        drawConflictReview(keptStart: trimStart, keptEnd: trimEnd)
+        drawConflictReview(keptStart: sourceTrimDuration == nil ? trimStart : 0,
+                           keptEnd: sourceTrimDuration == nil ? trimEnd : duration)
         NSGraphicsContext.saveGraphicsState()
         let top = TimelineTrackLayout.top
         let bottom = trackLayout.contentHeight - TimelineTrackLayout.footer
@@ -1914,16 +1945,18 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
 
     override func scrollWheel(with event: NSEvent) {
         guard videoGesture == nil else { return }
-        guard drag == nil, animationGesture == nil, duration.isFinite, duration > 0,
-              !event.phase.contains(.cancelled), !event.momentumPhase.contains(.cancelled) else { return }
+        guard drag == nil, animationGesture == nil, duration.isFinite, duration > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(point) || !event.momentumPhase.isEmpty else { return }
+        guard bounds.contains(point) || !event.phase.isEmpty || !event.momentumPhase.isEmpty else { return }
         let shifted = event.modifierFlags.contains(.shift)
         let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
         guard dx.isFinite, dy.isFinite else { return }
-        // A vertical scroll belongs to the enclosing track viewport. Genuine
-        // diagonal gestures can scroll tracks and time together.
-        if !shifted, abs(dy) > abs(dx) * 0.5 { super.scrollWheel(with: event) }
+        // The native track scroller needs the complete gesture, including
+        // zero-delta boundaries and cancellation, to retain smooth scrolling
+        // and momentum. Filtering each event by direction breaks that stream.
+        // Its vertical-only viewport handles Y; we handle time panning below.
+        if !shifted { super.scrollWheel(with: event) }
+        guard !event.phase.contains(.cancelled), !event.momentumPhase.contains(.cancelled) else { return }
         let delta = shifted && dx == 0 ? dy : (abs(dx) >= abs(dy) * 0.5 ? dx : 0)
         guard delta != 0 else { return }
         // AppKit already applies the user's natural-scroll preference. Move
@@ -2129,12 +2162,17 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             return
         }
         guard point.y < 36 else { return }
-        let startDistance = markerIsVisible(trimStart) ? abs(point.x - x(for: trimStart)) : .infinity
-        let endDistance = markerIsVisible(trimEnd) ? abs(point.x - x(for: trimEnd)) : .infinity
+        let startDistance = trimIsVisible(trimStart) ? abs(point.x - trimX(for: trimStart)) : .infinity
+        let endDistance = trimIsVisible(trimEnd) ? abs(point.x - trimX(for: trimEnd)) : .infinity
         let interaction: Interaction
         if showsTrimHandles, point.y >= 12, min(startDistance, endDistance) <= 12 {
             interaction = startDistance <= endDistance ? .start : .end
-        } else { interaction = .scrub }
+        } else {
+            // Only handles edit the source rail. Scrubbing remains on the
+            // output playhead above it, with the same clock as every track.
+            if sourceTrimDuration != nil, point.y >= 12 { return }
+            interaction = .scrub
+        }
         let origin: Double
         if interaction == .scrub {
             onScrubBegan?()
@@ -2162,12 +2200,14 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
         let point = convert(event.locationInWindow, from: nil)
         drag.pointerMoved = drag.pointerMoved || max(abs(point.x - drag.originX), abs(point.y - drag.originY)) >= 3
         self.drag = drag
-        let next = drag.originTime + Double((point.x - drag.originX) / railWidth) * visibleDuration
+        let isTrim = drag.interaction == .start || drag.interaction == .end
+        let span = isTrim ? sourceTrimDuration ?? visibleDuration : visibleDuration
+        let next = drag.originTime + Double((point.x - drag.originX) / railWidth) * span
         switch drag.interaction {
         case .emptyEditLane, .cluster: break
         case .scrub: seek(next)
         case .start: drag.start = min(max(next, 0), drag.end - minimumLength)
-        case .end: drag.end = max(min(next, duration), drag.start + minimumLength)
+        case .end: drag.end = max(min(next, sourceTrimDuration ?? duration), drag.start + minimumLength)
         case .edit(let id):
             guard drag.movable, drag.hasMoved || abs(point.x - drag.originX) >= 3 else { return }
             let firstMovement = !drag.hasMoved
@@ -2179,7 +2219,7 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
             onMoveEdit?(id, drag.editTime, false)
         }
         self.drag = drag
-        if drag.interaction == .start || drag.interaction == .end {
+        if isTrim, sourceTrimDuration == nil {
             let current = scrubTime ?? playhead
             let clamped = min(max(current, drag.start), drag.end)
             if clamped != current {
@@ -2299,7 +2339,8 @@ final class RecordingTimelineView: NSView, NSViewToolTipOwner {
     }
 
     private func seek(_ value: Double) {
-        let bounded = min(max(value, allowsSeekingOutsideTrim ? 0 : trimStart), allowsSeekingOutsideTrim ? duration : trimEnd)
+        let fullTimeline = allowsSeekingOutsideTrim || sourceTrimDuration != nil
+        let bounded = min(max(value, fullTimeline ? 0 : trimStart), fullTimeline ? duration : trimEnd)
         scrubTime = bounded
         onSeek?(bounded)
         needsDisplay = true
